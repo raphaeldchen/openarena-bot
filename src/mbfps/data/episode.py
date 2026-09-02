@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from mbfps.envs.protocol import OBS_SHAPE
+
 
 @dataclass
 class Episode:
@@ -27,6 +29,12 @@ class Episode:
 
     def __post_init__(self) -> None:
         t = self.actions.shape[0]
+        if self.obs.dtype != np.uint8:
+            raise ValueError(f"obs must have dtype uint8, got {self.obs.dtype}")
+        if self.obs.shape[1:] != OBS_SHAPE:
+            raise ValueError(
+                f"obs must have per-frame shape {OBS_SHAPE}, got {self.obs.shape[1:]}"
+            )
         if self.obs.shape[0] != t + 1:
             raise ValueError(
                 f"obs must have one more entry than actions; "
@@ -36,12 +44,17 @@ class Episode:
             ("rewards", self.rewards, t),
             ("terminated", self.terminated, t),
             ("truncated", self.truncated, t),
-            ("privileged", self.privileged, t + 1),
         ):
             if arr.shape[0] != expected:
                 raise ValueError(
                     f"{name} must have length {expected}, got {arr.shape[0]}"
                 )
+        expected_privileged_shape = (t + 1, len(self.privileged_keys))
+        if self.privileged.shape != expected_privileged_shape:
+            raise ValueError(
+                f"privileged must have shape {expected_privileged_shape}, "
+                f"got {self.privileged.shape}"
+            )
 
     @property
     def length(self) -> int:
@@ -60,7 +73,7 @@ def save_episode(ep: Episode, path: Path) -> None:
         terminated=ep.terminated,
         truncated=ep.truncated,
         privileged=ep.privileged,
-        privileged_keys=np.array(ep.privileged_keys, dtype=object),
+        privileged_keys=np.asarray(ep.privileged_keys, dtype=np.str_),
         policy_name=ep.policy_name,
         seed=ep.seed,
         scenario=ep.scenario,
@@ -69,10 +82,12 @@ def save_episode(ep: Episode, path: Path) -> None:
 
 def load_episode(path: Path) -> Episode:
     """Read an episode written by `save_episode`."""
-    # allow_pickle=True is required because privileged_keys is stored as an
-    # object-dtype array of strings. Episodes are files this pipeline writes
-    # to its own data/ directory, not artifacts from an untrusted source.
-    with np.load(path, allow_pickle=True) as data:
+    # Pickle is not used: privileged_keys is stored as a fixed-width unicode
+    # array (numpy infers the dtype), which round-trips exactly through npz
+    # without allow_pickle, including the empty-tuple case. Leaving
+    # allow_pickle at its default of False means loading an episode can never
+    # execute arbitrary code embedded in the file.
+    with np.load(path) as data:
         return Episode(
             obs=data["obs"],
             actions=data["actions"],

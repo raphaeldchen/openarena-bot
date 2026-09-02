@@ -1796,11 +1796,6 @@ def test_length_is_number_of_transitions():
     assert make_episode(t=5).length == 5
 
 
-def test_obs_has_one_more_entry_than_actions():
-    ep = make_episode(t=5)
-    assert ep.obs.shape[0] == ep.actions.shape[0] + 1
-
-
 def test_round_trip_preserves_arrays(tmp_path):
     ep = make_episode()
     path = tmp_path / "ep.npz"
@@ -1863,7 +1858,41 @@ def test_mismatched_lengths_rejected():
             rewards=rng.standard_normal(5).astype(np.float32),
             terminated=np.zeros(5, dtype=bool),
             truncated=np.zeros(5, dtype=bool),
-            privileged=rng.standard_normal((5, len(KEYS))).astype(np.float32),
+            privileged=rng.standard_normal((6, len(KEYS))).astype(np.float32),
+            privileged_keys=KEYS,
+            policy_name="random",
+            seed=0,
+            scenario="my_way_home",
+        )
+
+
+def test_mismatched_privileged_width_rejected():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="privileged must have shape"):
+        Episode(
+            obs=rng.integers(0, 256, (6, *OBS_SHAPE), dtype=np.uint8),
+            actions=rng.integers(0, 4, 5).astype(np.int32),
+            rewards=rng.standard_normal(5).astype(np.float32),
+            terminated=np.zeros(5, dtype=bool),
+            truncated=np.zeros(5, dtype=bool),
+            privileged=rng.standard_normal((6, len(KEYS) - 2)).astype(np.float32),
+            privileged_keys=KEYS,
+            policy_name="random",
+            seed=0,
+            scenario="my_way_home",
+        )
+
+
+def test_wrong_obs_dtype_rejected():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="obs must have dtype uint8"):
+        Episode(
+            obs=rng.standard_normal((6, *OBS_SHAPE)).astype(np.float32),
+            actions=rng.integers(0, 4, 5).astype(np.int32),
+            rewards=rng.standard_normal(5).astype(np.float32),
+            terminated=np.zeros(5, dtype=bool),
+            truncated=np.zeros(5, dtype=bool),
+            privileged=rng.standard_normal((6, len(KEYS))).astype(np.float32),
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
@@ -1891,6 +1920,8 @@ from pathlib import Path
 
 import numpy as np
 
+from mbfps.envs.protocol import OBS_SHAPE
+
 
 @dataclass
 class Episode:
@@ -1909,6 +1940,12 @@ class Episode:
 
     def __post_init__(self) -> None:
         t = self.actions.shape[0]
+        if self.obs.dtype != np.uint8:
+            raise ValueError(f"obs must have dtype uint8, got {self.obs.dtype}")
+        if self.obs.shape[1:] != OBS_SHAPE:
+            raise ValueError(
+                f"obs must have per-frame shape {OBS_SHAPE}, got {self.obs.shape[1:]}"
+            )
         if self.obs.shape[0] != t + 1:
             raise ValueError(
                 f"obs must have one more entry than actions; "
@@ -1918,12 +1955,17 @@ class Episode:
             ("rewards", self.rewards, t),
             ("terminated", self.terminated, t),
             ("truncated", self.truncated, t),
-            ("privileged", self.privileged, t + 1),
         ):
             if arr.shape[0] != expected:
                 raise ValueError(
                     f"{name} must have length {expected}, got {arr.shape[0]}"
                 )
+        expected_privileged_shape = (t + 1, len(self.privileged_keys))
+        if self.privileged.shape != expected_privileged_shape:
+            raise ValueError(
+                f"privileged must have shape {expected_privileged_shape}, "
+                f"got {self.privileged.shape}"
+            )
 
     @property
     def length(self) -> int:
@@ -1942,7 +1984,7 @@ def save_episode(ep: Episode, path: Path) -> None:
         terminated=ep.terminated,
         truncated=ep.truncated,
         privileged=ep.privileged,
-        privileged_keys=np.array(ep.privileged_keys, dtype=object),
+        privileged_keys=np.asarray(ep.privileged_keys, dtype=np.str_),
         policy_name=ep.policy_name,
         seed=ep.seed,
         scenario=ep.scenario,
@@ -1951,7 +1993,12 @@ def save_episode(ep: Episode, path: Path) -> None:
 
 def load_episode(path: Path) -> Episode:
     """Read an episode written by `save_episode`."""
-    with np.load(path, allow_pickle=True) as data:
+    # Pickle is not used: privileged_keys is stored as a fixed-width unicode
+    # array (numpy infers the dtype), which round-trips exactly through npz
+    # without allow_pickle, including the empty-tuple case. Leaving
+    # allow_pickle at its default of False means loading an episode can never
+    # execute arbitrary code embedded in the file.
+    with np.load(path) as data:
         return Episode(
             obs=data["obs"],
             actions=data["actions"],
@@ -1969,7 +2016,7 @@ def load_episode(path: Path) -> Episode:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_episode.py -v`
-Expected: 7 passed.
+Expected: 8 passed.
 
 - [ ] **Step 5: Commit**
 

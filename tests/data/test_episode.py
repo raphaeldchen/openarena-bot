@@ -27,11 +27,6 @@ def test_length_is_number_of_transitions():
     assert make_episode(t=5).length == 5
 
 
-def test_obs_has_one_more_entry_than_actions():
-    ep = make_episode(t=5)
-    assert ep.obs.shape[0] == ep.actions.shape[0] + 1
-
-
 def test_round_trip_preserves_arrays(tmp_path):
     ep = make_episode()
     path = tmp_path / "ep.npz"
@@ -94,7 +89,41 @@ def test_mismatched_lengths_rejected():
             rewards=rng.standard_normal(5).astype(np.float32),
             terminated=np.zeros(5, dtype=bool),
             truncated=np.zeros(5, dtype=bool),
-            privileged=rng.standard_normal((5, len(KEYS))).astype(np.float32),
+            privileged=rng.standard_normal((6, len(KEYS))).astype(np.float32),
+            privileged_keys=KEYS,
+            policy_name="random",
+            seed=0,
+            scenario="my_way_home",
+        )
+
+
+def test_mismatched_privileged_width_rejected():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="privileged must have shape"):
+        Episode(
+            obs=rng.integers(0, 256, (6, *OBS_SHAPE), dtype=np.uint8),
+            actions=rng.integers(0, 4, 5).astype(np.int32),
+            rewards=rng.standard_normal(5).astype(np.float32),
+            terminated=np.zeros(5, dtype=bool),
+            truncated=np.zeros(5, dtype=bool),
+            privileged=rng.standard_normal((6, len(KEYS) - 2)).astype(np.float32),
+            privileged_keys=KEYS,
+            policy_name="random",
+            seed=0,
+            scenario="my_way_home",
+        )
+
+
+def test_wrong_obs_dtype_rejected():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="obs must have dtype uint8"):
+        Episode(
+            obs=rng.standard_normal((6, *OBS_SHAPE)).astype(np.float32),
+            actions=rng.integers(0, 4, 5).astype(np.int32),
+            rewards=rng.standard_normal(5).astype(np.float32),
+            terminated=np.zeros(5, dtype=bool),
+            truncated=np.zeros(5, dtype=bool),
+            privileged=rng.standard_normal((6, len(KEYS))).astype(np.float32),
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
