@@ -50,9 +50,11 @@ Every number below was measured on this machine against the committed code and d
 
 Loading costs ~6% of an Arm 1 step but ~63% of an Arm 2/3 step, so **prefetching matters only for the fast arms** — Task 3.
 
-### Hard platform constraint
+### Platform constraint (relaxed 2026-09-02)
 
-**The disk has 2.3 GB free (99% full).** The DINOv2 cache alone is 2.93 GB, so a second cache for Arm 3 **will not fit**. This plan therefore keeps **one feature cache on disk at a time**, selected by a `--backbone` flag, with an explicit free-space check that fails loudly before writing. Task 4.
+The disk previously had 2.3 GB free against a 2.93 GB feature cache, which would have forced one cache at a time. **Space has since been freed: 20 GB available.** Both caches (5.86 GB total) now fit simultaneously, so arms 2 and 3 can be cached once and kept.
+
+The `--backbone` flag and the `require_free_bytes` guard in Task 4 are still built: caching is the one operation here that can fill a disk, and failing before writing beats dying halfway and leaving a partial cache that loads as a `FileNotFoundError` on some episodes but not others. The guard stays; the one-at-a-time *workflow* is no longer needed.
 
 ---
 
@@ -292,7 +294,9 @@ git commit -m "feat: arm configuration with structurally-enforced parity"
 
 **Interfaces:**
 - Consumes: `ReplayBuffer` from `mbfps.data.buffer`; `load_episode` from `mbfps.data.episode`.
-- Produces: `SequenceLoader(buffer, batch_size=16, seq_len=64, seed=0, load_obs=True, load_features=False)`. When `load_features=True`, `sample()` adds `features (B, T+1, 64, 384) float16`. When `load_obs=False`, `sample()` omits `obs` and the loader never reads pixel data from disk.
+- Produces: `SequenceLoader(buffer, batch_size=16, seq_len=64, seed=0, load_obs=True, load_features=False, feature_backbone="dinov2")`. When `load_features=True`, `sample()` adds `features (B, T+1, 64, 384) float16` read from the cache for `feature_backbone`. When `load_obs=False`, `sample()` omits `obs` and the loader never reads pixel data from disk. Also `feature_suffix(backbone: str) -> str`.
+
+**Per-backbone suffixes.** Arms 2 and 3 use different frozen backbones, and both caches now live on disk at once. A single shared filename would let the second caching run silently overwrite the first, leaving both arms training on identical inputs — which would destroy the control without any error. `dinov2` keeps `.features.npy` (the 122 files M1 already wrote); every other backbone gets `.features_<backbone>.npy`.
 
 **Why:** Arms 2 and 3 never touch pixels, yet the current loader eagerly loads every episode's obs — 2.24 GB resident (measured). Metadata-only loading costs 0.07 s and 0.04 GB, and memmapping all 122 feature files costs 0.04 s and 0.04 GB. `.npz` is lazily decompressed per key, so simply not reading `obs` avoids the cost entirely.
 
@@ -363,6 +367,30 @@ def test_features_and_obs_windows_are_aligned(tmp_path):
         assert batch["obs"][i].shape == (17, *OBS_SHAPE)
 
 
+def test_feature_suffix_namespaces_non_default_backbones():
+    from mbfps.data.loader import feature_suffix
+
+    assert feature_suffix("dinov2") == ".features.npy"
+    assert feature_suffix("random_vit") == ".features_random_vit.npy"
+
+
+def test_loader_reads_the_requested_backbones_cache(tmp_path):
+    """Two caches coexist; picking the wrong one would silently destroy the
+    control by training arms 2 and 3 on identical inputs."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    path = buf.episode_paths()[0]
+    np.save(path.with_suffix(".features.npy"), np.zeros((81, 4, 8), np.float16))
+    np.save(path.with_suffix(".features_random_vit.npy"), np.ones((81, 4, 8), np.float16))
+
+    for backbone, expected in (("dinov2", 0.0), ("random_vit", 1.0)):
+        loader = SequenceLoader(
+            buf, 2, 16, seed=0, load_obs=False,
+            load_features=True, feature_backbone=backbone,
+        )
+        assert (loader.sample()["features"] == expected).all(), backbone
+
+
 def test_obs_free_loader_does_not_read_pixels(tmp_path, monkeypatch):
     """Guards the 2.24 GB regression: obs must never be decompressed."""
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
@@ -424,8 +452,21 @@ warning fires only when a run is genuinely at risk on the 16 GB shared budget,
 rather than on every ordinary run.
 """
 
-FEATURE_SUFFIX = ".features.npy"
-"""Sibling filename suffix for a cached feature array."""
+_DEFAULT_BACKBONE = "dinov2"
+
+
+def feature_suffix(backbone: str) -> str:
+    """Sibling filename suffix for `backbone`'s cached features.
+
+    `dinov2` keeps the bare `.features.npy` that M1 already wrote, so the
+    existing 122 files stay valid. Every other backbone is namespaced, because
+    two caches now coexist and a shared name would let one silently overwrite
+    the other -- leaving arms 2 and 3 training on identical inputs, with no
+    error to notice.
+    """
+    if backbone == _DEFAULT_BACKBONE:
+        return ".features.npy"
+    return f".features_{backbone}.npy"
 
 
 class SequenceLoader:
@@ -439,12 +480,14 @@ class SequenceLoader:
         seed: int = 0,
         load_obs: bool = True,
         load_features: bool = False,
+        feature_backbone: str = _DEFAULT_BACKBONE,
     ) -> None:
         self.buffer = buffer
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.load_obs = load_obs
         self.load_features = load_features
+        self.feature_backbone = feature_backbone
         self._rng = np.random.default_rng(seed)
 
         # Keep paths and episodes index-aligned by construction rather than by
@@ -454,12 +497,14 @@ class SequenceLoader:
 
         self._features: list[np.ndarray | None] = []
         if load_features:
+            suffix = feature_suffix(feature_backbone)
             for path in self._paths:
-                feature_path = path.with_suffix(FEATURE_SUFFIX)
+                feature_path = path.with_suffix(suffix)
                 if not feature_path.is_file():
                     raise FileNotFoundError(
                         f"no cached features for {path.name}; expected "
-                        f"{feature_path.name}. Run scripts/cache_features.py first."
+                        f"{feature_path.name}. Run scripts/cache_features.py "
+                        f"--backbone {feature_backbone} first."
                     )
                 self._features.append(np.load(feature_path, mmap_mode="r"))
 
@@ -582,7 +627,7 @@ class _EpisodeMeta:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_loader.py -v`
-Expected: 18 passed (12 existing plus the 6 added here).
+Expected: 20 passed (12 existing plus the 8 added here).
 
 - [ ] **Step 5: Verify the memory claim on the real dataset**
 
@@ -849,12 +894,14 @@ git commit -m "feat: background batch prefetching to overlap I/O with compute"
 
 **Files:**
 - Modify: `src/mbfps/data/features.py`
+- Modify: `src/mbfps/data/buffer.py` (eviction must clear every backbone's cache)
 - Modify: `tests/data/test_features.py`
+- Modify: `tests/data/test_buffer.py`
 - Create: `scripts/cache_features.py`
 
 **Interfaces:**
 - Consumes: `get_device` from `mbfps.utils.device`; `OBS_SHAPE`; `ReplayBuffer`.
-- Produces: `BACKBONES: tuple[str, ...] = ("dinov2", "random_vit")`; `build_backbone(kind: str, seed: int = 0) -> torch.nn.Module`; `FeatureExtractor(backbone: str = "dinov2", device: str = "mps", seed: int = 0)` retaining `encode` and the `N_PATCHES` / `FEATURE_DIM` constants; `require_free_bytes(path: Path, needed: int) -> None`; `cache_episode_features(ep_path, extractor, batch_size=32) -> Path` unchanged.
+- Produces: `BACKBONES: tuple[str, ...] = ("dinov2", "random_vit")`; `build_backbone(kind: str, seed: int = 0) -> torch.nn.Module`; `FeatureExtractor(backbone: str = "dinov2", device: str = "mps", seed: int = 0)` retaining `encode` and the `N_PATCHES` / `FEATURE_DIM` constants; `require_free_bytes(path: Path, needed: int) -> None`; `cache_episode_features(ep_path, extractor, batch_size=32) -> Path` — now writes to the suffix for `extractor.backbone`, so two caches coexist without colliding.
 
 **Two constraints this task exists to satisfy:**
 
@@ -1012,6 +1059,62 @@ Change `FeatureExtractor.__init__` to:
             param.requires_grad_(False)
 ```
 
+- [ ] **Step 3b: Route writes and eviction through the per-backbone suffix**
+
+Two places in the committed code hardcode `.features.npy` and must now use `feature_suffix`, or the second cache will overwrite the first and eviction will orphan it.
+
+In `src/mbfps/data/features.py`, `cache_episode_features` currently ends with:
+
+```python
+    out_path = ep_path.with_suffix(".features.npy")
+```
+
+Replace it with:
+
+```python
+    from mbfps.data.loader import feature_suffix
+
+    out_path = ep_path.with_suffix(feature_suffix(extractor.backbone))
+```
+
+and update its docstring to say the filename is namespaced by backbone.
+
+In `src/mbfps/data/buffer.py`, `_evict` currently unlinks one fixed name:
+
+```python
+            path.with_suffix(".features.npy").unlink(missing_ok=True)
+```
+
+Replace it with a glob over every cache variant, so a second backbone's features cannot outlive their episode:
+
+```python
+            for cache in path.parent.glob(f"{path.stem}.features*.npy"):
+                cache.unlink(missing_ok=True)
+```
+
+Add to `tests/data/test_buffer.py`:
+
+```python
+def test_eviction_removes_every_backbones_feature_cache(tmp_path):
+    """Two caches coexist; evicting only one orphans the other forever."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=25)
+    first = buf.add(make_episode(10, seed=1))
+    caches = [
+        first.with_suffix(".features.npy"),
+        first.with_suffix(".features_random_vit.npy"),
+    ]
+    for cache in caches:
+        np.save(cache, np.zeros((11, 4, 8), dtype=np.float16))
+    buf.add(make_episode(10, seed=2))
+    buf.add(make_episode(10, seed=3))
+    assert not first.is_file()
+    for cache in caches:
+        assert not cache.is_file(), f"{cache.name} outlived its episode"
+```
+
+Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
+Expected: 16 passed (15 existing plus this one).
+
 - [ ] **Step 4: Write the caching script**
 
 ```python
@@ -1043,7 +1146,7 @@ from mbfps.data.features import (
     cache_episode_features,
     require_free_bytes,
 )
-from mbfps.data.loader import FEATURE_SUFFIX
+from mbfps.data.loader import feature_suffix
 
 
 def main() -> None:
@@ -1065,11 +1168,11 @@ def main() -> None:
     if args.clear:
         removed = 0
         for path in paths:
-            feature_path = path.with_suffix(FEATURE_SUFFIX)
+            feature_path = path.with_suffix(feature_suffix(args.backbone))
             if feature_path.is_file():
                 feature_path.unlink()
                 removed += 1
-        print(f"removed={removed} feature files from {args.data}")
+        print(f"removed={removed} {args.backbone} feature files from {args.data}")
         return
 
     frames = sum(ep.length + 1 for ep in buffer.load_all())
@@ -1100,6 +1203,8 @@ if __name__ == "__main__":
 
 Run: `.venv/bin/python -m pytest tests/data/test_features.py -v`
 Expected: 17 passed (9 existing plus the 8 added here).
+
+Also confirm the existing M1 cache still loads: `.venv/bin/python -c "from mbfps.data.loader import feature_suffix; print(feature_suffix('dinov2'))"` must print `.features.npy`, matching the 122 files already on disk.
 
 - [ ] **Step 6: Verify the disk guard on the real filesystem**
 
@@ -1932,13 +2037,15 @@ git commit -m "feat: standalone autoencoder training for all three arms"
 
 This is the M2 exit gate: **reconstructions are visually recognisable, loss has plateaued, and a side-by-side grid exists for all three arms.**
 
-**Disk workflow.** Only one feature cache fits (2.3 GB free, one cache is 2.93 GB). Run in this order, and do not skip the `--clear` steps:
+**Disk workflow.** With 20 GB free, both caches coexist (5.86 GB total) and nothing needs clearing:
 
 ```
-arm 1: needs no cache
-arm 2: cache dinov2      -> train -> grid -> clear
-arm 3: cache random_vit  -> train -> grid -> clear
+arm 1: needs no cache          -> train -> grid
+arm 2: dinov2 (already cached) -> train -> grid
+arm 3: cache random_vit        -> train -> grid
 ```
+
+Check free space before the `random_vit` run. `cache_features.py` refuses if the result will not fit, which is intended behaviour, not a bug to work around.
 
 - [ ] **Step 1: Write the grid script**
 
@@ -2040,16 +2147,20 @@ ls data/my_way_home/*.features.npy | wc -l    # expect 122 already present
 
 The DINOv2 cache from M1 is already on disk, so no caching run is needed here. Record the same four numbers. Expected far faster than Arm 1 — no CNN in the loop.
 
-- [ ] **Step 4: Swap the cache and do Arm 3**
+- [ ] **Step 4: Cache the random-ViT features and do Arm 3**
+
+The `random_vit` cache must live alongside the DINOv2 one, so it needs its own filename suffix — otherwise caching it would silently overwrite Arm 2's features and both arms would train on the same inputs, quietly destroying the control. `cache_features.py` writes `.features.npy` for `dinov2` and `.features_random_vit.npy` for `random_vit`; `SequenceLoader` selects by the same rule.
 
 ```bash
-.venv/bin/python scripts/cache_features.py --backbone dinov2 --clear
+df -h . | tail -1                                    # confirm space before caching
 .venv/bin/python scripts/cache_features.py --backbone random_vit --seed 0
+ls data/my_way_home/*.features.npy | wc -l           # 122, dinov2, untouched
+ls data/my_way_home/*.features_random_vit.npy | wc -l  # 122, new
 .venv/bin/python scripts/train_autoencoder.py --arm random_vit --steps 2000
 .venv/bin/python scripts/reconstruction_grid.py --arm random_vit
 ```
 
-**Check free space before the caching run** — `cache_features.py` will refuse if the disk cannot hold the result, which is the intended behaviour, not a bug to work around. If it refuses, free space or reduce the dataset; do not disable the guard.
+If `cache_features.py` refuses on free space, free more or reduce the dataset; do not disable the guard.
 
 - [ ] **Step 5: Combine into the side-by-side grid**
 
@@ -2110,6 +2221,6 @@ The RSSM, KL balancing with free bits, reward and continue heads, the world-mode
 ## Carried constraints
 
 - **The study, not this plan, is the compute decision.** Measured: Arm 1 costs 1546 ms/step against 161 ms for the SSL arms — 9.6x. A 3-arm x 3-seed study is 31 h at 20k steps and 156 h at 100k, which is what the cloud budget was reserved for.
-- **One feature cache at a time.** 2.3 GB free, 2.93 GB per cache. **This plan ends with `random_vit` cached, not `dinov2`.** Whichever arm the next plan trains first must re-run `scripts/cache_features.py` for its backbone, and clear the other first.
+- **Both feature caches coexist** (5.86 GB of the 20 GB free), under distinct suffixes so neither can overwrite the other. The next plan inherits both and needs no re-caching.
 - **Generate features once, on one device.** CPU and MPS differ in ~3% of float16 elements.
 - **`my_way_home` coverage is near-saturated** at 61 episodes per policy; more of the same data will not add coverage.
