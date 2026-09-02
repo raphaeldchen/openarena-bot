@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from mbfps.data.buffer import ReplayBuffer
-from mbfps.data.episode import Episode
+from mbfps.data.episode import Episode, load_episode
 from mbfps.data.loader import SequenceLoader
 from mbfps.envs.protocol import OBS_SHAPE
 
@@ -188,3 +188,104 @@ def test_episode_path_and_window_start_slice_back_to_the_sampled_window(buffer):
         episode = load_episode(loader.episode_path(idx))
         reconstructed = episode.obs[start : start + loader.seq_len + 1]
         assert np.array_equal(reconstructed, batch["obs"][i])
+
+
+def test_load_obs_false_omits_obs(buffer):
+    loader = SequenceLoader(buffer, batch_size=4, seq_len=16, seed=0, load_obs=False)
+    batch = loader.sample()
+    assert "obs" not in batch
+    assert batch["actions"].shape == (4, 16)
+    assert batch["episode_index"].shape == (4,)
+    assert batch["window_start"].shape == (4,)
+
+
+def test_load_obs_false_still_supports_privileged(buffer):
+    loader = SequenceLoader(buffer, batch_size=4, seq_len=16, seed=0, load_obs=False)
+    batch = loader.sample(include_privileged=True)
+    assert batch["privileged"].shape[0] == 4
+
+
+def test_load_features_requires_cached_files(tmp_path):
+    """A missing cache must fail loudly, not silently train on nothing."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    with pytest.raises(FileNotFoundError, match="no cached features"):
+        SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_features=True)
+
+
+def test_features_window_matches_manual_slice(tmp_path):
+    """The batch must slice the cache at exactly the reported window_start."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2):
+        buf.add(make_episode(t=80, fill=fill))
+    rng = np.random.default_rng(0)
+    for path in buf.episode_paths():
+        feats = rng.random((81, 4, 8)).astype(np.float16)
+        np.save(path.with_suffix(".features.npy"), feats)
+
+    loader = SequenceLoader(
+        buf, batch_size=4, seq_len=16, seed=0, load_obs=False, load_features=True
+    )
+    batch = loader.sample()
+    assert batch["features"].shape == (4, 17, 4, 8)
+    assert batch["features"].dtype == np.float16
+    for i in range(4):
+        idx, start = int(batch["episode_index"][i]), int(batch["window_start"][i])
+        on_disk = np.load(loader.episode_path(idx).with_suffix(".features.npy"))
+        assert np.array_equal(on_disk[start : start + 17], batch["features"][i])
+
+
+def test_features_and_obs_windows_are_aligned(tmp_path):
+    """Both must come from the same episode and the same offset."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=3))
+    feats = np.arange(81 * 4 * 8, dtype=np.float16).reshape(81, 4, 8)
+    np.save(buf.episode_paths()[0].with_suffix(".features.npy"), feats)
+
+    loader = SequenceLoader(
+        buf, batch_size=2, seq_len=16, seed=0, load_obs=True, load_features=True
+    )
+    batch = loader.sample()
+    for i in range(2):
+        start = int(batch["window_start"][i])
+        assert np.array_equal(batch["features"][i], feats[start : start + 17])
+        assert batch["obs"][i].shape == (17, *OBS_SHAPE)
+
+
+def test_feature_suffix_namespaces_non_default_backbones():
+    from mbfps.data.loader import feature_suffix
+
+    assert feature_suffix("dinov2") == ".features.npy"
+    assert feature_suffix("random_vit") == ".features_random_vit.npy"
+
+
+def test_loader_reads_the_requested_backbones_cache(tmp_path):
+    """Two caches coexist; picking the wrong one would silently destroy the
+    control by training arms 2 and 3 on identical inputs."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    path = buf.episode_paths()[0]
+    np.save(path.with_suffix(".features.npy"), np.zeros((81, 4, 8), np.float16))
+    np.save(path.with_suffix(".features_random_vit.npy"), np.ones((81, 4, 8), np.float16))
+
+    for backbone, expected in (("dinov2", 0.0), ("random_vit", 1.0)):
+        loader = SequenceLoader(
+            buf, 2, 16, seed=0, load_obs=False,
+            load_features=True, feature_backbone=backbone,
+        )
+        assert (loader.sample()["features"] == expected).all(), backbone
+
+
+def test_obs_free_loader_does_not_read_pixels(tmp_path, monkeypatch):
+    """Guards the 2.24 GB regression: obs must never be decompressed."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+
+    import mbfps.data.loader as loader_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("load_obs=False must not call load_episode")
+
+    monkeypatch.setattr(loader_module, "load_episode", _boom)
+    loader = SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=False)
+    assert loader.sample()["actions"].shape == (2, 16)
