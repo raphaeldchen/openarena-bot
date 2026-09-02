@@ -812,6 +812,29 @@ def test_worker_exception_propagates_to_the_consumer(buffer):
 def test_depth_must_be_positive(buffer):
     with pytest.raises(ValueError, match="depth must be at least 1"):
         Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=0)
+
+
+def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
+    """A hang is a worse failure than an exception.
+
+    If the worker dies without delivering its error -- which a lost exception
+    guard in `_work` would cause -- the consumer must notice the dead thread
+    and raise, rather than blocking forever on an empty queue.
+    """
+    import mbfps.data.prefetch as prefetch_module
+
+    monkeypatch.setattr(prefetch_module, "_POLL_SECONDS", 0.05)
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    try:
+        pf._stop.set()          # stop the worker cleanly
+        pf._thread.join(timeout=2.0)
+        assert not pf._thread.is_alive(), "worker did not stop"
+        while not pf._queue.empty():
+            pf._queue.get_nowait()
+        with pytest.raises(RuntimeError, match="prefetch worker died"):
+            next(iter(pf))
+    finally:
+        pf.close()
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -841,6 +864,14 @@ from typing import Any, Iterator
 from mbfps.data.loader import SequenceLoader
 
 _SENTINEL = object()
+
+_POLL_SECONDS = 0.5
+"""How long the consumer waits before checking whether the worker is alive.
+
+Blocking indefinitely on the queue would turn a dead worker into a hang. A
+hang is worse than an exception: it stalls CI with no diagnostic. Removing
+`_work`'s exception guard was verified to produce exactly that.
+"""
 
 
 class Prefetcher:
@@ -872,7 +903,15 @@ class Prefetcher:
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=_POLL_SECONDS)
+            except queue.Empty:
+                if not self._thread.is_alive():
+                    raise RuntimeError(
+                        "prefetch worker died without reporting an error; "
+                        "the queue is empty and the thread is gone"
+                    ) from None
+                continue
             if item is _SENTINEL:
                 return
             if isinstance(item, BaseException):
@@ -902,7 +941,7 @@ class Prefetcher:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_prefetch.py -v`
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Measure the overlap on the real dataset**
 

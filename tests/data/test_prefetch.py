@@ -88,3 +88,26 @@ def test_worker_exception_propagates_to_the_consumer(buffer):
 def test_depth_must_be_positive(buffer):
     with pytest.raises(ValueError, match="depth must be at least 1"):
         Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=0)
+
+
+def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
+    """A hang is a worse failure than an exception.
+
+    If the worker dies without delivering its error -- which a lost exception
+    guard in `_work` would cause -- the consumer must notice the dead thread
+    and raise, rather than blocking forever on an empty queue.
+    """
+    import mbfps.data.prefetch as prefetch_module
+
+    monkeypatch.setattr(prefetch_module, "_POLL_SECONDS", 0.05)
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    try:
+        pf._stop.set()          # stop the worker cleanly
+        pf._thread.join(timeout=2.0)
+        assert not pf._thread.is_alive(), "worker did not stop"
+        while not pf._queue.empty():
+            pf._queue.get_nowait()
+        with pytest.raises(RuntimeError, match="prefetch worker died"):
+            next(iter(pf))
+    finally:
+        pf.close()

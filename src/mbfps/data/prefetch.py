@@ -17,6 +17,14 @@ from mbfps.data.loader import SequenceLoader
 
 _SENTINEL = object()
 
+_POLL_SECONDS = 0.5
+"""How long the consumer waits before checking whether the worker is alive.
+
+Blocking indefinitely on the queue would turn a dead worker into a hang. A
+hang is worse than an exception: it stalls CI with no diagnostic. Removing
+`_work`'s exception guard was verified to produce exactly that.
+"""
+
 
 class Prefetcher:
     """Yields batches from `loader`, produced on a background thread."""
@@ -47,7 +55,15 @@ class Prefetcher:
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=_POLL_SECONDS)
+            except queue.Empty:
+                if not self._thread.is_alive():
+                    raise RuntimeError(
+                        "prefetch worker died without reporting an error; "
+                        "the queue is empty and the thread is gone"
+                    ) from None
+                continue
             if item is _SENTINEL:
                 return
             if isinstance(item, BaseException):
