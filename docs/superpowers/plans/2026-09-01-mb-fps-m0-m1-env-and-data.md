@@ -17,7 +17,8 @@
 - **fp32 everywhere.** No fp16/bf16 autocast on MPS.
 - **`PYTORCH_ENABLE_MPS_FALLBACK=1`** must be set; every entry point accepts `--device {mps,cpu}` with `mps` the default and `cpu` the debugging escape hatch.
 - **`privileged_state` is evaluation-only.** It must never appear in any tensor fed to a model. Enforced by a test, not by convention.
-- **No network access at training time.** The only download is the DINOv2 checkpoint, fetched once in Task 14 and cached locally.
+- **No network access at training time.** The only download is the DINOv2 checkpoint, fetched once in Task 12 and cached locally.
+- **Default scenario is `deadly_corridor`.** Verified to be the only built-in ViZDoom scenario exposing forward/backward movement *and* turning (`MOVE_LEFT, MOVE_RIGHT, ATTACK, MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT`). `basic` exposes only `MOVE_LEFT, MOVE_RIGHT, ATTACK` and cannot support a meaningful scripted exploration policy.
 - **Package name is `mbfps`** (the directory is `csgo-bot`; this is intentional and recorded in the spec's open questions).
 
 ---
@@ -104,9 +105,23 @@ def test_get_device_honours_cpu_preference():
     assert get_device(prefer="cpu").type == "cpu"
 
 
-def test_get_device_sets_mps_fallback_env_var():
-    get_device()
+def test_mps_fallback_env_var_is_set():
     assert os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+
+
+def test_mps_fallback_is_set_before_torch_is_imported():
+    """The variable is only honoured if it precedes `import torch`.
+
+    Asserting that it merely exists would also pass when it is set too late,
+    so this checks the module source: the assignment must appear above the
+    import statement.
+    """
+    import inspect
+
+    import mbfps.utils.device as device_module
+
+    source = inspect.getsource(device_module)
+    assert source.index("PYTORCH_ENABLE_MPS_FALLBACK") < source.index("import torch")
 
 
 def test_seed_everything_makes_numpy_and_torch_reproducible():
@@ -174,13 +189,18 @@ MPS is the default target. `PYTORCH_ENABLE_MPS_FALLBACK` is set unconditionally
 so that any operator without an MPS kernel silently falls back to CPU instead of
 raising. Models in this project are small enough that `prefer="cpu"` is a viable
 debugging path, not just a formality.
+
+The env var is set BEFORE `import torch`. PyTorch reads it while initialising the
+MPS backend, so setting it afterwards has no effect -- the variable would be
+present in `os.environ` while the fallback stayed disabled, which looks correct
+and is not.
 """
 
 import os
 
-import torch
-
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import torch  # noqa: E402  -- must follow the env var above
 
 
 def get_device(prefer: str = "mps") -> torch.device:
@@ -189,7 +209,6 @@ def get_device(prefer: str = "mps") -> torch.device:
     Args:
         prefer: "mps", "cuda", or "cpu". Falls back to CPU when unavailable.
     """
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     if prefer == "cpu":
         return torch.device("cpu")
     if prefer == "mps" and torch.backends.mps.is_available():
@@ -225,7 +244,7 @@ def seed_everything(seed: int) -> None:
 .venv/bin/python -m pytest tests/test_environment_setup.py -v
 ```
 
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -424,9 +443,16 @@ except ImportError:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/test_protocol.py -v`
-Expected: 5 passed.
+Expected: 4 passed, 1 xfailed.
 
-Note: `test_make_env_lists_available_names_in_error` passes only once `vizdoom_env.py` exists (Task 3). Until then `_register_builtins` swallows the `ImportError` and the registry is empty. Mark that one test `@pytest.mark.xfail(reason="ViZDoomEnv lands in Task 3")` now and remove the marker in Task 3.
+Note: `test_make_env_lists_available_names_in_error` passes only once `vizdoom_env.py` exists, which is **Task 5** (not Task 3). Until then `_register_builtins` swallows the `ImportError` and the registry stays empty. Mark that one test now:
+
+```python
+@pytest.mark.xfail(reason="ViZDoomEnv lands in Task 5", strict=True)
+def test_make_env_lists_available_names_in_error():
+```
+
+`strict=True` makes the suite fail if it starts passing, so the marker cannot be silently left behind after Task 5 removes the cause.
 
 - [ ] **Step 5: Commit**
 
@@ -665,7 +691,13 @@ git commit -m "feat: frame preprocessing to 112x112 RGB uint8"
 
 **Interfaces:**
 - Consumes: `OBS_SHAPE`, `EnvProtocol` from `mbfps.envs.protocol`; `build_action_set` from `mbfps.envs.actions`; `preprocess_frame` from `mbfps.envs.wrappers`; `register` from `mbfps.envs.registry`.
-- Produces: `ViZDoomEnv(scenario: str = "basic", frame_skip: int = 4, seed: int = 0)` implementing `EnvProtocol`. Exposes `PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")`.
+- Produces: `ViZDoomEnv(scenario: str = "deadly_corridor", frame_skip: int = 4, seed: int = 0)` implementing `EnvProtocol`. Exposes `PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")`, a `button_names -> tuple[str, ...]` property, and a `scenario` attribute.
+
+**Three verified facts this task depends on** (measured against ViZDoom 1.3.0 on this machine — do not "simplify" them away):
+
+1. `get_state()` returns `None` once the episode is finished, so `privileged_state` is `None` on the terminal frame.
+2. There is **no** `is_episode_timeout()` method. Truncation must be derived from `get_episode_time() >= get_episode_timeout()`.
+3. `add_available_game_variable` **de-duplicates** against variables the scenario config already declares, so the resulting list length varies per scenario. Index game variables **by name**, never by a fixed slice.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -681,7 +713,7 @@ from mbfps.envs.vizdoom_env import PRIVILEGED_KEYS, ViZDoomEnv
 
 @pytest.fixture
 def env():
-    e = ViZDoomEnv(scenario="basic", frame_skip=4, seed=0)
+    e = ViZDoomEnv(scenario="deadly_corridor", frame_skip=4, seed=0)
     yield e
     e.close()
 
@@ -701,6 +733,13 @@ def test_action_space_is_discrete_and_nonempty(env):
     assert env.action_space.n >= 2
 
 
+def test_deadly_corridor_exposes_movement_and_turning(env):
+    """ScriptedPolicy's coverage behaviour depends on these existing."""
+    names = env.button_names
+    assert "MOVE_FORWARD" in names
+    assert "TURN_LEFT" in names and "TURN_RIGHT" in names
+
+
 def test_reset_returns_valid_observation(env):
     obs, info = env.reset(seed=0)
     assert obs.shape == OBS_SHAPE
@@ -718,18 +757,29 @@ def test_step_returns_five_tuple(env):
     assert isinstance(info, dict)
 
 
-def test_episode_eventually_terminates(env):
+def test_episode_eventually_ends(env):
     env.reset(seed=0)
-    for _ in range(2000):
+    for _ in range(3000):
         _, _, terminated, truncated, _ = env.step(env.action_space.sample())
         if terminated or truncated:
             return
-    pytest.fail("episode did not terminate within 2000 steps")
+    pytest.fail("episode did not end within 3000 steps")
 
 
-def test_observation_after_termination_is_still_valid(env):
+def test_terminated_and_truncated_are_mutually_exclusive(env):
+    """A time-limit cutoff must not also report a true terminal state."""
     env.reset(seed=0)
-    for _ in range(2000):
+    for _ in range(3000):
+        _, _, terminated, truncated, _ = env.step(0)
+        assert not (terminated and truncated)
+        if terminated or truncated:
+            return
+    pytest.fail("episode did not end within 3000 steps")
+
+
+def test_observation_after_end_is_still_valid(env):
+    env.reset(seed=0)
+    for _ in range(3000):
         obs, _, terminated, truncated, _ = env.step(0)
         assert obs.shape == OBS_SHAPE, "terminal observation must stay well-formed"
         if terminated or truncated:
@@ -741,6 +791,23 @@ def test_privileged_state_has_expected_keys(env):
     state = env.privileged_state
     assert set(state) == set(PRIVILEGED_KEYS)
     assert all(isinstance(v, float) for v in state.values())
+
+
+def test_privileged_state_is_none_after_the_episode_ends(env):
+    """ViZDoom's get_state() returns None once finished; callers must handle it."""
+    env.reset(seed=0)
+    for _ in range(3000):
+        _, _, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            break
+    assert env.privileged_state is None
+
+
+def test_privileged_keys_are_indexed_by_name_not_position(env):
+    """health is the scenario's own variable; the position vars are ours."""
+    env.reset(seed=0)
+    state = env.privileged_state
+    assert state["health"] > 0.0, "health should be positive at episode start"
 
 
 def test_close_is_idempotent(env):
@@ -779,20 +846,20 @@ from mbfps.envs.wrappers import preprocess_frame
 PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")
 """Keys of `privileged_state`. EVALUATION ONLY -- never a training input."""
 
-_PRIVILEGED_VARS = (
-    vzd.GameVariable.HEALTH,
-    vzd.GameVariable.POSITION_X,
-    vzd.GameVariable.POSITION_Y,
-    vzd.GameVariable.POSITION_Z,
-    vzd.GameVariable.ANGLE,
-)
+_PRIVILEGED_VARS: dict[str, "vzd.GameVariable"] = {
+    "health": vzd.GameVariable.HEALTH,
+    "pos_x": vzd.GameVariable.POSITION_X,
+    "pos_y": vzd.GameVariable.POSITION_Y,
+    "pos_z": vzd.GameVariable.POSITION_Z,
+    "angle": vzd.GameVariable.ANGLE,
+}
 
 
 class ViZDoomEnv:
     """A headless, seedable ViZDoom environment."""
 
     def __init__(
-        self, scenario: str = "basic", frame_skip: int = 4, seed: int = 0
+        self, scenario: str = "deadly_corridor", frame_skip: int = 4, seed: int = 0
     ) -> None:
         self.scenario = scenario
         self.frame_skip = frame_skip
@@ -808,10 +875,19 @@ class ViZDoomEnv:
         self._game.set_screen_format(vzd.ScreenFormat.RGB24)
         self._game.set_window_visible(False)
         self._game.set_mode(vzd.Mode.PLAYER)
-        for var in _PRIVILEGED_VARS:
+        for var in _PRIVILEGED_VARS.values():
             self._game.add_available_game_variable(var)
         self._game.set_seed(seed)
         self._game.init()
+
+        # add_available_game_variable de-duplicates against variables the config
+        # already declares, so the final list length varies per scenario. Resolve
+        # each key to its actual index by name; a fixed slice would silently read
+        # the wrong column on a scenario that declares its own HEALTH.
+        declared = [v.name for v in self._game.get_available_game_variables()]
+        self._var_index = {
+            key: declared.index(var.name) for key, var in _PRIVILEGED_VARS.items()
+        }
 
         self._actions = build_action_set(len(self._game.get_available_buttons()))
         self.observation_space = spaces.Box(0, 255, OBS_SHAPE, dtype=np.uint8)
@@ -819,7 +895,11 @@ class ViZDoomEnv:
         self._last_obs = np.zeros(OBS_SHAPE, dtype=np.uint8)
 
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
-        """Start a new episode, optionally reseeding first."""
+        """Start a new episode, optionally reseeding first.
+
+        `set_seed` after `init` is verified to reseed correctly in ViZDoom 1.3.0,
+        so no engine restart is needed.
+        """
         if seed is not None:
             self._seed = seed
             self._game.set_seed(seed)
@@ -830,12 +910,24 @@ class ViZDoomEnv:
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        """Advance `frame_skip` tics with the button vector for `action`."""
+        """Advance `frame_skip` tics with the button vector for `action`.
+
+        ViZDoom reports `is_episode_finished()` for both death and timeout. A
+        timeout is a time-limit cutoff, not a true terminal state -- conflating
+        them is the classic time-limit bootstrapping bug, and it would teach M3's
+        continue predictor that the world ends when the clock runs out.
+        """
         reward = float(self._game.make_action(self._actions[action], self.frame_skip))
-        terminated = bool(self._game.is_episode_finished())
-        if not terminated:
+        finished = bool(self._game.is_episode_finished())
+        truncated = finished and self._timed_out()
+        terminated = finished and not truncated
+        if not finished:
             self._last_obs = self._observe()
-        return self._last_obs, reward, terminated, False, {}
+        return self._last_obs, reward, terminated, truncated, {}
+
+    def _timed_out(self) -> bool:
+        timeout = self._game.get_episode_timeout()
+        return timeout > 0 and self._game.get_episode_time() >= timeout
 
     def close(self) -> None:
         """Release the ViZDoom instance. Safe to call more than once."""
@@ -845,12 +937,22 @@ class ViZDoomEnv:
 
     @property
     def privileged_state(self) -> dict[str, float] | None:
-        """Ground-truth engine state. EVALUATION PROBES ONLY."""
+        """Ground-truth engine state, or None once the episode has finished.
+
+        EVALUATION PROBES ONLY. Returns None on the terminal frame because
+        ViZDoom's `get_state()` does; callers must handle that rather than
+        assuming a row is always available.
+        """
         state = self._game.get_state()
         if state is None:
             return None
-        values = state.game_variables[-len(_PRIVILEGED_VARS) :]
-        return {k: float(v) for k, v in zip(PRIVILEGED_KEYS, values)}
+        variables = state.game_variables
+        return {k: float(variables[i]) for k, i in self._var_index.items()}
+
+    @property
+    def button_names(self) -> tuple[str, ...]:
+        """Names of the scenario's available buttons, in button-vector order."""
+        return tuple(b.name for b in self._game.get_available_buttons())
 
     def _observe(self) -> np.ndarray:
         state = self._game.get_state()
@@ -864,23 +966,19 @@ register("vizdoom", ViZDoomEnv)
 
 - [ ] **Step 4: Remove the xfail marker from Task 2's test**
 
-In `tests/envs/test_protocol.py`, delete the `@pytest.mark.xfail(...)` decorator above `test_make_env_lists_available_names_in_error`.
+In `tests/envs/test_protocol.py`, delete the `@pytest.mark.xfail(...)` decorator above `test_make_env_lists_available_names_in_error`. It is `strict=True`, so leaving it in place now fails the suite.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/ -v`
 Expected: all passed, including the previously-xfailed registry test.
 
-If `test_privileged_state_has_expected_keys` fails because `basic.cfg` already declares game variables, the slice `game_variables[-5:]` still selects ours because `add_available_game_variable` appends. If it fails for another reason, print `self._game.get_available_game_variables()` and align the slice with the actual ordering before proceeding.
-
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/mbfps/envs/vizdoom_env.py tests/envs/
-git commit -m "feat: headless seedable ViZDoom environment"
+git commit -m "feat: headless seedable ViZDoom environment with timeout truncation"
 ```
-
----
 
 ## Task 6: Determinism, action replay, and throughput
 
@@ -892,20 +990,27 @@ git commit -m "feat: headless seedable ViZDoom environment"
 - Consumes: `ViZDoomEnv`, `make_env`.
 - Produces: `scripts/benchmark_env.py` printing `steps_per_second=<float>`. No new library API.
 
-This task is the M0 exit gate: **same seed produces a bit-identical episode, and a recorded episode replays from its action sequence alone.**
+This task is the M0 exit gate: **same seed produces a bit-identical episode, and a recorded episode replays from its saved action sequence alone.**
+
+Note: `set_seed` after `init` is verified to reseed correctly in ViZDoom 1.3.0 (same seed reproduces, different seed diverges). No engine-restart fallback is needed, and none should be added -- an earlier draft of this plan proposed one guarded by `seed != self._seed`, which would have made the reseed a no-op in exactly the case the test exercises.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # tests/envs/test_determinism.py
+import json
+
 import numpy as np
 import pytest
 
 from mbfps.envs.vizdoom_env import ViZDoomEnv
 
+SCENARIO = "deadly_corridor"
 
-def _rollout(seed: int, actions: list[int]) -> tuple[list[np.ndarray], list[float]]:
-    env = ViZDoomEnv(scenario="basic", frame_skip=4, seed=seed)
+
+def _rollout(seed, actions):
+    """Replay a fixed action list and return (frames, rewards)."""
+    env = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=seed)
     try:
         obs, _ = env.reset(seed=seed)
         frames, rewards = [obs.copy()], []
@@ -940,18 +1045,53 @@ def test_same_seed_produces_identical_rewards(actions):
     assert a_rewards == b_rewards
 
 
-def test_episode_replays_from_action_sequence_alone(actions):
-    """The M0 exit criterion: actions + seed fully determine the episode."""
-    original_frames, original_rewards = _rollout(seed=11, actions=actions)
-    replay_frames, replay_rewards = _rollout(seed=11, actions=actions)
-    assert all(
-        np.array_equal(a, b) for a, b in zip(original_frames, replay_frames)
+def test_different_seeds_diverge(actions):
+    """Guards against a reseed that silently does nothing."""
+    a_frames, _ = _rollout(seed=7, actions=actions)
+    b_frames, _ = _rollout(seed=8, actions=actions)
+    pairs = list(zip(a_frames, b_frames))
+    assert any(not np.array_equal(a, b) for a, b in pairs), (
+        "two different seeds produced identical episodes -- set_seed is not taking effect"
     )
-    assert original_rewards == replay_rewards
 
 
-def test_reset_reseeds_within_one_instance(actions):
-    env = ViZDoomEnv(scenario="basic", frame_skip=4, seed=0)
+def test_recorded_episode_replays_from_saved_actions_alone(tmp_path):
+    """The M0 exit criterion.
+
+    Distinct from the same-seed tests: actions here are chosen ONLINE during the
+    first rollout, written to disk, then read back and replayed into a fresh
+    engine instance. That proves seed + saved actions fully determine the
+    episode, with no other state carried between runs.
+    """
+    seed = 11
+    env = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=seed)
+    rng = np.random.default_rng(3)
+    try:
+        obs, _ = env.reset(seed=seed)
+        original_frames, chosen = [obs.copy()], []
+        for _ in range(40):
+            action = int(rng.integers(0, env.action_space.n))
+            obs, _, terminated, truncated, _ = env.step(action)
+            chosen.append(action)
+            original_frames.append(obs.copy())
+            if terminated or truncated:
+                break
+    finally:
+        env.close()
+
+    record = tmp_path / "episode_actions.json"
+    record.write_text(json.dumps({"seed": seed, "actions": chosen}))
+
+    loaded = json.loads(record.read_text())
+    replay_frames, _ = _rollout(seed=loaded["seed"], actions=loaded["actions"])
+
+    assert len(replay_frames) == len(original_frames)
+    for i, (a, b) in enumerate(zip(original_frames, replay_frames)):
+        assert np.array_equal(a, b), f"replayed frame {i} differs from the recording"
+
+
+def test_reset_reseeds_within_one_instance():
+    env = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=0)
     try:
         first, _ = env.reset(seed=21)
         env.step(1)
@@ -961,33 +1101,12 @@ def test_reset_reseeds_within_one_instance(actions):
         env.close()
 ```
 
-- [ ] **Step 2: Run the test to verify it fails or passes**
+- [ ] **Step 2: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/test_determinism.py -v`
+Expected: 5 passed.
 
-Expected: PASS if `set_seed` before `new_episode` reseeds correctly.
-
-**If `test_reset_reseeds_within_one_instance` fails**, ViZDoom is not honouring a post-`init` reseed. Apply this fallback in `src/mbfps/envs/vizdoom_env.py` — replace the seeding block in `reset` with a full engine restart:
-
-```python
-    def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
-        """Start a new episode, optionally reseeding first.
-
-        ViZDoom only honours `set_seed` before `init`, so a reseed requires
-        closing and reinitialising the engine. This costs ~100ms and happens
-        once per reseed, not once per episode.
-        """
-        if seed is not None and seed != self._seed:
-            self._seed = seed
-            self._game.close()
-            self._game.set_seed(seed)
-            self._game.init()
-        self._game.new_episode()
-        self._last_obs = self._observe()
-        return self._last_obs, {"scenario": self.scenario}
-```
-
-Re-run until all four tests pass. Do not proceed to Task 7 with a failing determinism test — every downstream arm comparison depends on it.
+Do not proceed to Task 7 with a failing determinism test -- every downstream arm comparison depends on it. In particular, `test_different_seeds_diverge` failing means `set_seed` is not taking effect; investigate before continuing rather than working around it.
 
 - [ ] **Step 3: Write the throughput benchmark**
 
@@ -1007,7 +1126,7 @@ from mbfps.envs.registry import make_env
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="basic")
+    parser.add_argument("--scenario", default="deadly_corridor")
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--steps", type=int, default=2000)
     args = parser.parse_args()
@@ -1036,7 +1155,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the benchmark and record the number**
 
 Run: `.venv/bin/python scripts/benchmark_env.py --steps 2000`
-Expected: prints `steps_per_second=<N>`. Record N in the commit message — it is the M0 baseline and sizes every collection run in M1.
+Expected: prints `steps_per_second=<N>`. Record N in the commit message -- it is the M0 baseline and sizes every collection run in M1.
 
 - [ ] **Step 5: Commit**
 
@@ -1045,21 +1164,23 @@ git add tests/envs/test_determinism.py scripts/benchmark_env.py
 git commit -m "test: determinism and action-replay gate; add env throughput benchmark"
 ```
 
----
-
 ## Task 7: Collection policies
 
 **Files:**
 - Create: `src/mbfps/data/__init__.py`
 - Create: `src/mbfps/data/policies.py`
 - Create: `tests/data/test_policies.py`
-- Modify: `src/mbfps/envs/vizdoom_env.py` (add a `button_names` property)
 
 **Interfaces:**
-- Consumes: `ViZDoomEnv`.
-- Produces: `Policy` Protocol with `name: str` and `act(obs: np.ndarray) -> int` and `reset() -> None`; `RandomPolicy(n_actions: int, seed: int)`; `ScriptedPolicy(button_names: Sequence[str], seed: int)`. `ViZDoomEnv.button_names -> tuple[str, ...]`.
+- Consumes: nothing (`ViZDoomEnv.button_names` already exists from Task 5).
+- Produces: `Policy` Protocol with `name: str`, `act(obs: np.ndarray) -> int`, and `reset(seed: int | None = None) -> None`; `RandomPolicy(n_actions: int, seed: int = 0)`; `ScriptedPolicy(button_names: Sequence[str], seed: int = 0)`.
 
-Rationale (spec §5.2): a single random policy has poor state coverage, and the world model hallucinates wherever the collector never went. The M4 actor-critic then optimises straight into those hallucinations, producing high imagined return and near-zero real return. `ScriptedPolicy` exists to reach states `RandomPolicy` does not.
+**Two requirements that an earlier draft got wrong** (both would have silently defeated M1):
+
+1. **`reset(seed)` must reseed, not rewind.** The collector calls `reset()` once per episode. If `reset()` restores a fixed seed, every episode a policy produces replays one identical action sequence, and the dataset contains one trajectory per policy rather than hundreds.
+2. **`ScriptedPolicy` must adapt to the buttons that exist.** Button sets differ per scenario (verified: `deadly_corridor` has all seven; `basic` has only `MOVE_LEFT, MOVE_RIGHT, ATTACK`; `defend_the_center` has only `TURN_LEFT, TURN_RIGHT, ATTACK`). Hard-coding `MOVE_FORWARD` makes the policy degenerate to a constant `ATTACK` wherever that button is absent.
+
+Rationale (spec §5.2): a single random policy has poor state coverage, and the world model hallucinates wherever the collector never went. The M4 actor-critic then optimises straight into those hallucinations, producing high imagined return and near-zero real return. `ScriptedPolicy` exists to reach states `RandomPolicy` does not — it can only do that if it actually moves.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1071,7 +1192,11 @@ import pytest
 from mbfps.data.policies import Policy, RandomPolicy, ScriptedPolicy
 from mbfps.envs.protocol import OBS_SHAPE
 
-BUTTONS = ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT", "ATTACK")
+# Real button sets, verified against ViZDoom 1.3.0.
+CORRIDOR = ("MOVE_LEFT", "MOVE_RIGHT", "ATTACK", "MOVE_FORWARD", "MOVE_BACKWARD",
+            "TURN_LEFT", "TURN_RIGHT")
+BASIC = ("MOVE_LEFT", "MOVE_RIGHT", "ATTACK")
+CENTER = ("TURN_LEFT", "TURN_RIGHT", "ATTACK")
 
 
 @pytest.fixture
@@ -1079,76 +1204,115 @@ def obs():
     return np.zeros(OBS_SHAPE, dtype=np.uint8)
 
 
+def _run(policy, obs, n=1000):
+    return [policy.act(obs) for _ in range(n)]
+
+
 def test_random_policy_satisfies_protocol():
     assert isinstance(RandomPolicy(n_actions=5, seed=0), Policy)
 
 
 def test_scripted_policy_satisfies_protocol():
-    assert isinstance(ScriptedPolicy(BUTTONS, seed=0), Policy)
+    assert isinstance(ScriptedPolicy(CORRIDOR, seed=0), Policy)
 
 
 def test_policies_expose_distinct_names():
     assert RandomPolicy(5, seed=0).name == "random"
-    assert ScriptedPolicy(BUTTONS, seed=0).name == "scripted"
+    assert ScriptedPolicy(CORRIDOR, seed=0).name == "scripted"
 
 
 def test_random_policy_stays_in_range(obs):
-    policy = RandomPolicy(n_actions=5, seed=0)
-    assert all(0 <= policy.act(obs) < 5 for _ in range(200))
+    assert all(0 <= a < 5 for a in _run(RandomPolicy(5, seed=0), obs, 200))
 
 
 def test_random_policy_covers_every_action(obs):
-    policy = RandomPolicy(n_actions=5, seed=0)
-    assert {policy.act(obs) for _ in range(500)} == {0, 1, 2, 3, 4}
+    assert set(_run(RandomPolicy(5, seed=0), obs, 500)) == {0, 1, 2, 3, 4}
 
 
-def test_random_policy_is_reproducible(obs):
+def test_same_seed_gives_the_same_sequence(obs):
     p, q = RandomPolicy(5, seed=3), RandomPolicy(5, seed=3)
-    assert [p.act(obs) for _ in range(50)] == [q.act(obs) for _ in range(50)]
+    assert _run(p, obs, 50) == _run(q, obs, 50)
 
 
-def test_random_policy_reset_replays_the_same_sequence(obs):
-    policy = RandomPolicy(5, seed=3)
-    first = [policy.act(obs) for _ in range(50)]
-    policy.reset()
-    assert [policy.act(obs) for _ in range(50)] == first
+def test_reset_with_a_new_seed_changes_the_sequence(obs):
+    """The bug this guards: reset() rewinding to a fixed seed would make every
+    collected episode replay one identical action sequence."""
+    policy = RandomPolicy(5, seed=0)
+    policy.reset(seed=1)
+    first = _run(policy, obs, 200)
+    policy.reset(seed=2)
+    assert _run(policy, obs, 200) != first
 
 
-def test_scripted_policy_returns_valid_indices(obs):
-    policy = ScriptedPolicy(BUTTONS, seed=0)
-    assert all(0 <= policy.act(obs) <= len(BUTTONS) for _ in range(300))
+def test_reset_with_the_same_seed_reproduces(obs):
+    policy = RandomPolicy(5, seed=0)
+    policy.reset(seed=7)
+    first = _run(policy, obs, 100)
+    policy.reset(seed=7)
+    assert _run(policy, obs, 100) == first
 
 
-def test_scripted_policy_is_forward_biased(obs):
-    """Forward must dominate, or coverage is no better than random."""
-    policy = ScriptedPolicy(BUTTONS, seed=0)
-    actions = [policy.act(obs) for _ in range(1000)]
-    forward_index = BUTTONS.index("MOVE_FORWARD") + 1  # +1 skips the no-op
-    assert actions.count(forward_index) / len(actions) > 0.4
+def test_scripted_reset_with_a_new_seed_changes_the_sequence(obs):
+    policy = ScriptedPolicy(CORRIDOR, seed=0)
+    policy.reset(seed=1)
+    first = _run(policy, obs, 200)
+    policy.reset(seed=2)
+    assert _run(policy, obs, 200) != first
+
+
+@pytest.mark.parametrize("buttons", [CORRIDOR, BASIC, CENTER])
+def test_scripted_policy_returns_valid_indices(obs, buttons):
+    assert all(0 <= a <= len(buttons) for a in _run(ScriptedPolicy(buttons, seed=0), obs))
+
+
+@pytest.mark.parametrize("buttons", [CORRIDOR, BASIC, CENTER])
+def test_scripted_policy_never_degenerates_to_one_action(obs, buttons):
+    """The bug this guards: hard-coded button names made the policy emit a
+    constant ATTACK on any scenario lacking MOVE_FORWARD."""
+    actions = _run(ScriptedPolicy(buttons, seed=0), obs)
+    assert len(set(actions)) >= 2, f"degenerate policy on {buttons}"
+
+
+@pytest.mark.parametrize("buttons", [CORRIDOR, BASIC, CENTER])
+def test_scripted_policy_is_not_attack_dominated(obs, buttons):
+    actions = _run(ScriptedPolicy(buttons, seed=0), obs)
+    attack_index = buttons.index("ATTACK") + 1
+    assert actions.count(attack_index) / len(actions) < 0.5
+
+
+def test_scripted_policy_commits_to_forward_when_available(obs):
+    actions = _run(ScriptedPolicy(CORRIDOR, seed=0), obs)
+    forward = CORRIDOR.index("MOVE_FORWARD") + 1
+    assert actions.count(forward) / len(actions) > 0.4
 
 
 def test_scripted_policy_sweeps_both_directions(obs):
-    policy = ScriptedPolicy(BUTTONS, seed=0)
-    actions = {policy.act(obs) for _ in range(1000)}
-    assert BUTTONS.index("TURN_LEFT") + 1 in actions
-    assert BUTTONS.index("TURN_RIGHT") + 1 in actions
+    actions = set(_run(ScriptedPolicy(CORRIDOR, seed=0), obs))
+    assert CORRIDOR.index("TURN_LEFT") + 1 in actions
+    assert CORRIDOR.index("TURN_RIGHT") + 1 in actions
 
 
-def test_scripted_policy_is_reproducible(obs):
-    p, q = ScriptedPolicy(BUTTONS, seed=5), ScriptedPolicy(BUTTONS, seed=5)
-    assert [p.act(obs) for _ in range(100)] == [q.act(obs) for _ in range(100)]
+def test_scripted_policy_strafes_both_ways_without_turn_buttons(obs):
+    """On `basic` there is no turning, so the sweep must fall back to strafing."""
+    actions = set(_run(ScriptedPolicy(BASIC, seed=0), obs))
+    assert BASIC.index("MOVE_LEFT") + 1 in actions
+    assert BASIC.index("MOVE_RIGHT") + 1 in actions
 
 
-def test_scripted_policy_reset_restarts_the_sweep(obs):
-    policy = ScriptedPolicy(BUTTONS, seed=5)
-    first = [policy.act(obs) for _ in range(30)]
-    policy.reset()
-    assert [policy.act(obs) for _ in range(30)] == first
+def test_scripted_policy_sustains_a_direction(obs):
+    """Sustained commitment is what buys coverage over random oscillation."""
+    actions = _run(ScriptedPolicy(CORRIDOR, seed=0), obs, 200)
+    longest = best = 1
+    for prev, cur in zip(actions, actions[1:]):
+        longest = longest + 1 if cur == prev else 1
+        best = max(best, longest)
+    assert best >= 3
 
 
-def test_scripted_policy_without_movement_buttons_falls_back(obs):
-    policy = ScriptedPolicy(("ATTACK",), seed=0)
-    assert all(0 <= policy.act(obs) <= 1 for _ in range(50))
+def test_scripted_policy_with_only_attack_still_varies(obs):
+    """Degenerate button set: must fall back to random rather than a constant."""
+    actions = _run(ScriptedPolicy(("ATTACK",), seed=0), obs, 200)
+    assert set(actions) == {0, 1}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1157,10 +1321,6 @@ Run: `.venv/bin/python -m pytest tests/data/test_policies.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.data'`
 
 - [ ] **Step 3: Write the implementation**
-
-```python
-# src/mbfps/data/__init__.py
-```
 
 ```python
 # src/mbfps/data/policies.py
@@ -1185,8 +1345,8 @@ class Policy(Protocol):
         """Return an action index for `obs`."""
         ...
 
-    def reset(self) -> None:
-        """Reset any per-episode internal state."""
+    def reset(self, seed: int | None = None) -> None:
+        """Start a new episode, reseeding when `seed` is given."""
         ...
 
 
@@ -1202,82 +1362,102 @@ class RandomPolicy:
     def act(self, obs: np.ndarray) -> int:
         return int(self._rng.integers(0, self._n))
 
-    def reset(self) -> None:
+    def reset(self, seed: int | None = None) -> None:
+        """Reseed for a new episode.
+
+        The collector passes its per-episode seed here. Rewinding to a fixed
+        seed instead would make every episode replay one identical action
+        sequence, collapsing the dataset to a single trajectory.
+        """
+        if seed is not None:
+            self._seed = seed
         self._rng = np.random.default_rng(self._seed)
 
 
 class ScriptedPolicy:
-    """Forward-biased movement with a periodic left/right aim sweep.
+    """Committed movement with a periodic sweep, adapted to available buttons.
 
-    Random play in a corridor scenario tends to oscillate near the spawn point.
-    This policy commits to forward motion, sweeping the view so that the world
-    model sees walls, corners, and distant geometry that random play rarely
-    reaches.
+    Random play oscillates near the spawn point. This policy commits to an
+    advance action and sweeps the view, so the world model sees corridors,
+    corners and distant geometry that random play rarely reaches.
+
+    Button sets differ per scenario, so the roles are resolved from whatever the
+    engine exposes rather than hard-coded:
+
+    - advance: MOVE_FORWARD if present, else None
+    - sweep:   the first available (left, right) pair -- turning preferred,
+               strafing as a fallback
+    - attack:  ATTACK if present
+
+    With no advance and no sweep (a degenerate button set) it falls back to
+    uniform random, which is still better than emitting a constant.
     """
 
-    _FORWARD_PROB = 0.6
+    _ADVANCE_PROB = 0.6
+    _SWEEP_PROB = 0.75
     _SWEEP_LEN = 8
 
     def __init__(self, button_names: Sequence[str], seed: int = 0) -> None:
         self.name = "scripted"
         self._seed = seed
         self._n = len(button_names) + 1  # +1 for the no-op
-        self._forward = self._index_of(button_names, "MOVE_FORWARD")
-        self._left = self._index_of(button_names, "TURN_LEFT")
-        self._right = self._index_of(button_names, "TURN_RIGHT")
+
+        self._advance = self._index_of(button_names, "MOVE_FORWARD")
+        self._sweep = self._first_pair(
+            button_names, [("TURN_LEFT", "TURN_RIGHT"), ("MOVE_LEFT", "MOVE_RIGHT")]
+        )
         self._attack = self._index_of(button_names, "ATTACK")
-        self.reset()
+        self.reset(seed)
 
     @staticmethod
     def _index_of(names: Sequence[str], target: str) -> int | None:
-        """Return the action index for `target`, or None if absent."""
+        """Action index for `target`, or None if the button is unavailable."""
         for i, name in enumerate(names):
             if name == target:
                 return i + 1
         return None
 
+    @classmethod
+    def _first_pair(
+        cls, names: Sequence[str], candidates: Sequence[tuple[str, str]]
+    ) -> tuple[int, int] | None:
+        """First candidate pair whose buttons are both available."""
+        for left, right in candidates:
+            li, ri = cls._index_of(names, left), cls._index_of(names, right)
+            if li is not None and ri is not None:
+                return li, ri
+        return None
+
     def act(self, obs: np.ndarray) -> int:
         self._t += 1
-        sweeping_left = (self._t // self._SWEEP_LEN) % 2 == 0
-        turn = self._left if sweeping_left else self._right
-
-        if self._forward is not None and self._rng.random() < self._FORWARD_PROB:
-            return self._forward
-        if turn is not None and self._rng.random() < 0.75:
-            return turn
-        if self._attack is not None:
+        if self._advance is not None and self._rng.random() < self._ADVANCE_PROB:
+            return self._advance
+        if self._sweep is not None and self._rng.random() < self._SWEEP_PROB:
+            sweeping_left = (self._t // self._SWEEP_LEN) % 2 == 0
+            return self._sweep[0] if sweeping_left else self._sweep[1]
+        if self._attack is not None and self._rng.random() < 0.5:
             return self._attack
         return int(self._rng.integers(0, self._n))
 
-    def reset(self) -> None:
+    def reset(self, seed: int | None = None) -> None:
+        """Restart the sweep and reseed for a new episode."""
+        if seed is not None:
+            self._seed = seed
         self._t = 0
         self._rng = np.random.default_rng(self._seed)
 ```
 
-- [ ] **Step 4: Add `button_names` to the environment**
-
-In `src/mbfps/envs/vizdoom_env.py`, add this property after `privileged_state`:
-
-```python
-    @property
-    def button_names(self) -> tuple[str, ...]:
-        """Names of the scenario's available buttons, in button-vector order."""
-        return tuple(b.name for b in self._game.get_available_buttons())
-```
-
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_policies.py -v`
-Expected: 13 passed.
+Expected: 25 passed (several are parametrised over three button sets).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add src/mbfps/data tests/data src/mbfps/envs/vizdoom_env.py
-git commit -m "feat: random and scripted collection policies"
+git add src/mbfps/data tests/data
+git commit -m "feat: random and button-set-adaptive scripted collection policies"
 ```
-
----
 
 ## Task 8: Episode storage
 
@@ -1288,7 +1468,9 @@ git commit -m "feat: random and scripted collection policies"
 **Interfaces:**
 - Consumes: nothing. (`privileged_keys` travels with each episode as data, so this
   module has no dependency on any particular engine's key set.)
-- Produces: `Episode` dataclass with fields `obs (T+1, 112, 112, 3) uint8`, `actions (T,) int32`, `rewards (T,) float32`, `terminated (T,) bool`, `privileged (T+1, K) float32`, `privileged_keys tuple[str, ...]`, `policy_name str`, `seed int`, `scenario str`; property `length -> int` (= T). Functions `save_episode(ep: Episode, path: Path) -> None` and `load_episode(path: Path) -> Episode`.
+- Produces: `Episode` dataclass with fields `obs (T+1, 112, 112, 3) uint8`, `actions (T,) int32`, `rewards (T,) float32`, `terminated (T,) bool`, `truncated (T,) bool`, `privileged (T+1, K) float32`, `privileged_keys tuple[str, ...]`, `policy_name str`, `seed int`, `scenario str`; property `length -> int` (= T). Functions `save_episode(ep: Episode, path: Path) -> None` and `load_episode(path: Path) -> Episode`.
+
+`terminated` and `truncated` are stored separately. A ViZDoom episode that hits its time limit is not a true terminal state, and collapsing the two would teach M3's continue predictor that the world ends when the clock runs out — the classic time-limit bootstrapping bug.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1310,11 +1492,12 @@ def make_episode(t: int = 5) -> Episode:
         actions=rng.integers(0, 4, t).astype(np.int32),
         rewards=rng.standard_normal(t).astype(np.float32),
         terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
         privileged=rng.standard_normal((t + 1, len(KEYS))).astype(np.float32),
         privileged_keys=KEYS,
         policy_name="random",
         seed=42,
-        scenario="basic",
+        scenario="deadly_corridor",
     )
 
 
@@ -1336,6 +1519,7 @@ def test_round_trip_preserves_arrays(tmp_path):
     assert np.array_equal(loaded.actions, ep.actions)
     assert np.array_equal(loaded.rewards, ep.rewards)
     assert np.array_equal(loaded.terminated, ep.terminated)
+    assert np.array_equal(loaded.truncated, ep.truncated)
     assert np.array_equal(loaded.privileged, ep.privileged)
 
 
@@ -1346,7 +1530,7 @@ def test_round_trip_preserves_metadata(tmp_path):
     loaded = load_episode(path)
     assert loaded.policy_name == "random"
     assert loaded.seed == 42
-    assert loaded.scenario == "basic"
+    assert loaded.scenario == "deadly_corridor"
     assert loaded.privileged_keys == KEYS
 
 
@@ -1360,6 +1544,14 @@ def test_round_trip_preserves_dtypes(tmp_path):
     assert loaded.rewards.dtype == np.float32
     assert loaded.privileged.dtype == np.float32
     assert loaded.terminated.dtype == bool
+    assert loaded.truncated.dtype == bool
+
+
+def test_truncated_and_terminated_are_stored_separately():
+    ep = make_episode(t=3)
+    ep.terminated[-1] = False
+    ep.truncated[-1] = True
+    assert not ep.terminated[-1] and ep.truncated[-1]
 
 
 def test_mismatched_lengths_rejected():
@@ -1370,11 +1562,12 @@ def test_mismatched_lengths_rejected():
             actions=rng.integers(0, 4, 5).astype(np.int32),
             rewards=rng.standard_normal(5).astype(np.float32),
             terminated=np.zeros(5, dtype=bool),
+            truncated=np.zeros(5, dtype=bool),
             privileged=rng.standard_normal((5, len(KEYS))).astype(np.float32),
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
-            scenario="basic",
+            scenario="deadly_corridor",
         )
 ```
 
@@ -1406,7 +1599,8 @@ class Episode:
     obs: np.ndarray  # (T+1, 112, 112, 3) uint8
     actions: np.ndarray  # (T,) int32
     rewards: np.ndarray  # (T,) float32
-    terminated: np.ndarray  # (T,) bool
+    terminated: np.ndarray  # (T,) bool -- a true terminal state
+    truncated: np.ndarray  # (T,) bool -- a time-limit cutoff, NOT terminal
     privileged: np.ndarray  # (T+1, K) float32 -- EVALUATION ONLY
     privileged_keys: tuple[str, ...]
     policy_name: str
@@ -1423,6 +1617,7 @@ class Episode:
         for name, arr, expected in (
             ("rewards", self.rewards, t),
             ("terminated", self.terminated, t),
+            ("truncated", self.truncated, t),
             ("privileged", self.privileged, t + 1),
         ):
             if arr.shape[0] != expected:
@@ -1445,6 +1640,7 @@ def save_episode(ep: Episode, path: Path) -> None:
         actions=ep.actions,
         rewards=ep.rewards,
         terminated=ep.terminated,
+        truncated=ep.truncated,
         privileged=ep.privileged,
         privileged_keys=np.array(ep.privileged_keys, dtype=object),
         policy_name=ep.policy_name,
@@ -1461,6 +1657,7 @@ def load_episode(path: Path) -> Episode:
             actions=data["actions"],
             rewards=data["rewards"],
             terminated=data["terminated"],
+            truncated=data["truncated"],
             privileged=data["privileged"],
             privileged_keys=tuple(data["privileged_keys"].tolist()),
             policy_name=str(data["policy_name"]),
@@ -1472,7 +1669,7 @@ def load_episode(path: Path) -> Episode:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_episode.py -v`
-Expected: 6 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1490,10 +1687,14 @@ git commit -m "feat: episode container with verified npz round-trip"
 - Create: `tests/data/test_collector.py`
 
 **Interfaces:**
-- Consumes: `EnvProtocol`, `Policy`, `Episode`, `PRIVILEGED_KEYS`.
+- Consumes: `EnvProtocol`, `Policy`, `Episode`.
 - Produces: `Collector(env_factory: Callable[[], EnvProtocol], policy: Policy, max_steps: int = 1000)` with `collect_episode(seed: int) -> Episode | None` (None on engine crash, after restarting the env), `close() -> None`, and attribute `crash_count: int`.
 
-ViZDoom can segfault or raise mid-episode. A crash must discard the partial episode and restart the engine rather than poisoning the dataset with a truncated trajectory that looks terminal but is not.
+**The failure this task must avoid.** `ViZDoomEnv.privileged_state` returns `None` once the episode is finished (verified against ViZDoom 1.3.0 — `get_state()` is None at that point). A collector that queries privileged state *after* the terminal step, or that derives the key set *after* the loop, produces a ragged array; `np.stack` then raises, the blanket `except Exception` reclassifies it as an engine crash, and **every episode is discarded**. So:
+
+- Capture the key set **once, at reset**, before any stepping.
+- On the terminal frame, carry the last valid row forward rather than emitting a zero-width row.
+- Assert row width explicitly, so a future regression fails loudly instead of being swallowed as a crash.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1511,7 +1712,12 @@ KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
 
 
 class _StubEnv:
-    """Deterministic stand-in that can be told to crash at a given step."""
+    """Stand-in that mirrors ViZDoom's real terminal behaviour.
+
+    Critically, `privileged_state` returns None once the episode is finished,
+    exactly as ViZDoom's get_state() does. A more forgiving stub would let the
+    ragged-array bug through.
+    """
 
     instances = 0
 
@@ -1520,67 +1726,116 @@ class _StubEnv:
         self.observation_space = spaces.Box(0, 255, OBS_SHAPE, dtype=np.uint8)
         self.action_space = spaces.Discrete(4)
         self.button_names = ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
+        self.scenario = "stub"
         self._episode_len = episode_len
         self._crash_at = crash_at
         self._t = 0
+        self._done = False
 
     def reset(self, *, seed=None):
         self._t = 0
+        self._done = False
         return np.full(OBS_SHAPE, 1, dtype=np.uint8), {}
 
     def step(self, action):
         self._t += 1
         if self._crash_at is not None and self._t == self._crash_at:
             raise RuntimeError("simulated engine crash")
+        self._done = self._t >= self._episode_len
         obs = np.full(OBS_SHAPE, self._t % 256, dtype=np.uint8)
-        return obs, 1.0, self._t >= self._episode_len, False, {}
+        return obs, 1.0, self._done, False, {}
 
     def close(self):
         pass
 
     @property
     def privileged_state(self):
+        if self._done:
+            return None
         return {k: float(self._t) for k in KEYS}
 
 
+def _collector(episode_len=6, crash_at=None, max_steps=1000):
+    return Collector(
+        lambda: _StubEnv(episode_len, crash_at), RandomPolicy(4, seed=0), max_steps
+    )
+
+
 def test_collect_episode_returns_episode():
-    c = Collector(lambda: _StubEnv(episode_len=6), RandomPolicy(4, seed=0))
+    c = _collector(episode_len=6)
     ep = c.collect_episode(seed=0)
     assert ep is not None and ep.length == 6
     c.close()
 
 
+def test_terminal_episode_is_not_treated_as_a_crash():
+    """The bug this guards: a None privileged_state on the terminal frame
+    produced a ragged array, so every real episode was discarded."""
+    c = _collector(episode_len=6)
+    assert c.collect_episode(seed=0) is not None
+    assert c.crash_count == 0
+    c.close()
+
+
+def test_privileged_keys_survive_termination():
+    c = _collector(episode_len=6)
+    ep = c.collect_episode(seed=0)
+    assert ep.privileged_keys == KEYS, "keys must be captured at reset, not after"
+    c.close()
+
+
+def test_privileged_has_one_row_per_frame():
+    c = _collector(episode_len=6)
+    ep = c.collect_episode(seed=0)
+    assert ep.privileged.shape == (ep.length + 1, len(KEYS))
+    c.close()
+
+
+def test_terminal_privileged_row_carries_the_last_value_forward():
+    c = _collector(episode_len=6)
+    ep = c.collect_episode(seed=0)
+    assert np.array_equal(ep.privileged[-1], ep.privileged[-2])
+    c.close()
+
+
 def test_obs_has_one_more_frame_than_actions():
-    c = Collector(lambda: _StubEnv(episode_len=6), RandomPolicy(4, seed=0))
+    c = _collector(episode_len=6)
     ep = c.collect_episode(seed=0)
     assert ep.obs.shape[0] == ep.actions.shape[0] + 1
     c.close()
 
 
 def test_episode_records_policy_name_and_seed():
-    c = Collector(lambda: _StubEnv(episode_len=4), RandomPolicy(4, seed=0))
+    c = _collector(episode_len=4)
     ep = c.collect_episode(seed=77)
     assert ep.policy_name == "random" and ep.seed == 77
     c.close()
 
 
-def test_privileged_has_one_row_per_frame():
-    c = Collector(lambda: _StubEnv(episode_len=6), RandomPolicy(4, seed=0))
-    ep = c.collect_episode(seed=0)
-    assert ep.privileged.shape == (ep.length + 1, len(KEYS))
-    assert ep.privileged_keys == KEYS
+def test_each_episode_gets_a_different_action_sequence():
+    """The bug this guards: resetting the policy to a fixed seed made every
+    collected episode replay one identical action sequence."""
+    c = _collector(episode_len=40, max_steps=40)
+    a = c.collect_episode(seed=1)
+    b = c.collect_episode(seed=2)
+    assert not np.array_equal(a.actions, b.actions)
     c.close()
 
 
+def test_same_seed_reproduces_the_action_sequence():
+    a = _collector(episode_len=40, max_steps=40).collect_episode(seed=5)
+    b = _collector(episode_len=40, max_steps=40).collect_episode(seed=5)
+    assert np.array_equal(a.actions, b.actions)
+
+
 def test_max_steps_truncates():
-    c = Collector(lambda: _StubEnv(episode_len=999), RandomPolicy(4, seed=0), max_steps=5)
-    ep = c.collect_episode(seed=0)
-    assert ep.length == 5
+    c = _collector(episode_len=999, max_steps=5)
+    assert c.collect_episode(seed=0).length == 5
     c.close()
 
 
 def test_crash_returns_none_and_is_counted():
-    c = Collector(lambda: _StubEnv(episode_len=20, crash_at=3), RandomPolicy(4, seed=0))
+    c = _collector(episode_len=20, crash_at=3)
     assert c.collect_episode(seed=0) is None
     assert c.crash_count == 1
     c.close()
@@ -1588,7 +1843,7 @@ def test_crash_returns_none_and_is_counted():
 
 def test_crash_rebuilds_the_environment():
     _StubEnv.instances = 0
-    c = Collector(lambda: _StubEnv(episode_len=20, crash_at=3), RandomPolicy(4, seed=0))
+    c = _collector(episode_len=20, crash_at=3)
     c.collect_episode(seed=0)
     assert _StubEnv.instances >= 2, "collector must rebuild the env after a crash"
     c.close()
@@ -1599,6 +1854,20 @@ def test_collector_recovers_and_keeps_collecting():
     c = Collector(lambda: next(envs), RandomPolicy(4, seed=0))
     assert c.collect_episode(seed=0) is None
     assert c.collect_episode(seed=1) is not None
+    c.close()
+
+
+def test_env_with_no_privileged_state_still_collects():
+    class _Bare(_StubEnv):
+        @property
+        def privileged_state(self):
+            return None
+
+    c = Collector(lambda: _Bare(6), RandomPolicy(4, seed=0))
+    ep = c.collect_episode(seed=0)
+    assert ep is not None
+    assert ep.privileged_keys == ()
+    assert ep.privileged.shape == (ep.length + 1, 0)
     c.close()
 ```
 
@@ -1656,14 +1925,23 @@ class Collector:
             return None
 
     def _collect(self, seed: int) -> Episode:
-        self._policy.reset()
+        # Reseed the policy per episode. Rewinding it to a fixed seed would make
+        # every episode replay one identical action sequence.
+        self._policy.reset(seed=seed)
         obs, _ = self._env.reset(seed=seed)
 
+        # Capture the key set now, while the episode is live. Querying it after
+        # the loop would read a finished engine, whose state is None.
+        state = self._env.privileged_state
+        keys = tuple(state) if state else ()
+        width = len(keys)
+
         frames = [obs.copy()]
-        privileged = [self._privileged_row()]
+        privileged = [self._row(state, keys, previous=None)]
         actions: list[int] = []
         rewards: list[float] = []
         terminated_flags: list[bool] = []
+        truncated_flags: list[bool] = []
 
         for _ in range(self._max_steps):
             action = self._policy.act(obs)
@@ -1671,32 +1949,53 @@ class Collector:
             actions.append(action)
             rewards.append(reward)
             terminated_flags.append(terminated)
+            truncated_flags.append(truncated)
             frames.append(obs.copy())
-            privileged.append(self._privileged_row())
+            privileged.append(
+                self._row(self._env.privileged_state, keys, previous=privileged[-1])
+            )
             if terminated or truncated:
                 break
+
+        # Fail loudly rather than letting np.stack raise into the crash handler,
+        # which would silently misreport a data bug as an engine fault.
+        bad = [i for i, row in enumerate(privileged) if row.shape != (width,)]
+        if bad:
+            raise AssertionError(
+                f"ragged privileged rows at indices {bad[:5]}; expected width {width}"
+            )
 
         return Episode(
             obs=np.stack(frames).astype(np.uint8),
             actions=np.asarray(actions, dtype=np.int32),
             rewards=np.asarray(rewards, dtype=np.float32),
             terminated=np.asarray(terminated_flags, dtype=bool),
-            privileged=np.stack(privileged).astype(np.float32),
-            privileged_keys=self._privileged_keys(),
+            truncated=np.asarray(truncated_flags, dtype=bool),
+            privileged=np.stack(privileged).astype(np.float32).reshape(-1, width),
+            privileged_keys=keys,
             policy_name=self._policy.name,
             seed=seed,
             scenario=getattr(self._env, "scenario", "unknown"),
         )
 
-    def _privileged_keys(self) -> tuple[str, ...]:
-        state = self._env.privileged_state
-        return tuple(state) if state else ()
+    @staticmethod
+    def _row(
+        state: dict[str, float] | None,
+        keys: tuple[str, ...],
+        previous: np.ndarray | None,
+    ) -> np.ndarray:
+        """One privileged row, carrying the last value forward when unavailable.
 
-    def _privileged_row(self) -> np.ndarray:
-        state = self._env.privileged_state
-        if not state:
-            return np.zeros(len(self._privileged_keys()), dtype=np.float32)
-        return np.asarray(list(state.values()), dtype=np.float32)
+        The engine reports no state on the terminal frame, so the final row
+        repeats the last live reading. Zeros would be a plausible-looking lie:
+        position 0,0,0 is a real coordinate, and the M3 latent probe would fit
+        against it.
+        """
+        if state:
+            return np.asarray([state[k] for k in keys], dtype=np.float32)
+        if previous is not None:
+            return previous.copy()
+        return np.zeros(len(keys), dtype=np.float32)
 
     def _restart(self) -> None:
         try:
@@ -1713,16 +2012,14 @@ class Collector:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_collector.py -v`
-Expected: 8 passed.
+Expected: 14 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/mbfps/data/collector.py tests/data/test_collector.py
-git commit -m "feat: episode collector with engine crash recovery"
+git commit -m "feat: episode collector with crash recovery and terminal-frame handling"
 ```
-
----
 
 ## Task 10: Replay buffer with eviction
 
@@ -1733,6 +2030,8 @@ git commit -m "feat: episode collector with engine crash recovery"
 **Interfaces:**
 - Consumes: `Episode`, `save_episode`, `load_episode`.
 - Produces: `ReplayBuffer(root: Path, capacity_transitions: int)` with `add(ep: Episode) -> Path`, `episode_paths() -> list[Path]`, `load_all() -> list[Episode]`, `n_episodes -> int`, `n_transitions -> int`.
+
+**Episode length is encoded in the filename** (`ep_000042_len00318.npz`). Reading `.length` by decompressing the file would make `n_transitions` — called on every `add()` and every progress print — decompress every stored episode's full frame stack, giving O(n²) collection and putting M1's bounded-wall-clock criterion out of reach. The filename is metadata that costs nothing to read.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1753,18 +2052,17 @@ def make_episode(t: int, policy: str = "random", seed: int = 0) -> Episode:
         actions=np.zeros(t, dtype=np.int32),
         rewards=np.zeros(t, dtype=np.float32),
         terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
         privileged=np.zeros((t + 1, len(KEYS)), dtype=np.float32),
         privileged_keys=KEYS,
         policy_name=policy,
         seed=seed,
-        scenario="basic",
+        scenario="deadly_corridor",
     )
 
 
 def test_add_writes_a_file(tmp_path):
-    buf = ReplayBuffer(tmp_path, capacity_transitions=100)
-    path = buf.add(make_episode(10))
-    assert path.is_file()
+    assert ReplayBuffer(tmp_path, capacity_transitions=100).add(make_episode(10)).is_file()
 
 
 def test_counts_track_contents(tmp_path):
@@ -1773,6 +2071,21 @@ def test_counts_track_contents(tmp_path):
     buf.add(make_episode(15))
     assert buf.n_episodes == 2
     assert buf.n_transitions == 25
+
+
+def test_n_transitions_does_not_decompress_episodes(tmp_path, monkeypatch):
+    """Guards the O(n^2) regression: length must come from the filename."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    for _ in range(3):
+        buf.add(make_episode(10))
+
+    import mbfps.data.buffer as buffer_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("n_transitions must not load episode files")
+
+    monkeypatch.setattr(buffer_module, "load_episode", _boom)
+    assert buf.n_transitions == 30
 
 
 def test_eviction_respects_capacity(tmp_path):
@@ -1784,17 +2097,36 @@ def test_eviction_respects_capacity(tmp_path):
 
 def test_eviction_removes_oldest_first(tmp_path):
     buf = ReplayBuffer(tmp_path, capacity_transitions=25)
-    buf.add(make_episode(10, seed=1))
-    buf.add(make_episode(10, seed=2))
-    buf.add(make_episode(10, seed=3))
+    for seed in (1, 2, 3):
+        buf.add(make_episode(10, seed=seed))
     seeds = {ep.seed for ep in buf.load_all()}
     assert 1 not in seeds, "oldest episode should have been evicted"
     assert {2, 3} <= seeds
 
 
+def test_eviction_also_removes_cached_features(tmp_path):
+    """Orphaned .features.npy files would defeat the disk-growth bound."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=25)
+    first = buf.add(make_episode(10, seed=1))
+    features = first.with_suffix(".features.npy")
+    np.save(features, np.zeros((11, 4, 8), dtype=np.float16))
+    assert features.is_file()
+    buf.add(make_episode(10, seed=2))
+    buf.add(make_episode(10, seed=3))
+    assert not first.is_file()
+    assert not features.is_file(), "feature cache outlived its episode"
+
+
 def test_buffer_reopens_existing_directory(tmp_path):
     ReplayBuffer(tmp_path, capacity_transitions=100).add(make_episode(10))
     assert ReplayBuffer(tmp_path, capacity_transitions=100).n_episodes == 1
+
+
+def test_indices_continue_after_reopen(tmp_path):
+    ReplayBuffer(tmp_path, capacity_transitions=1000).add(make_episode(4, seed=1))
+    reopened = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    reopened.add(make_episode(4, seed=2))
+    assert reopened.n_episodes == 2, "second buffer must not overwrite the first file"
 
 
 def test_load_all_returns_episodes(tmp_path):
@@ -1826,12 +2158,18 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.data.buffer'`
 Capacity is measured in transitions rather than episodes because episode length
 varies with policy and scenario; transitions are what actually bound disk use
 and training-set size.
+
+Filenames carry both the ordering index and the episode length
+(`ep_000042_len00318.npz`), so capacity accounting never has to open a file.
 """
 
 import itertools
+import re
 from pathlib import Path
 
 from mbfps.data.episode import Episode, load_episode, save_episode
+
+_NAME_RE = re.compile(r"^ep_(\d+)_len(\d+)\.npz$")
 
 
 class ReplayBuffer:
@@ -1841,15 +2179,23 @@ class ReplayBuffer:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.capacity_transitions = capacity_transitions
-        self._counter = itertools.count(self._next_index())
+        indices = [self._parse(p)[0] for p in self.episode_paths()]
+        self._counter = itertools.count(max(indices) + 1 if indices else 0)
 
-    def _next_index(self) -> int:
-        indices = [int(p.stem.split("_")[1]) for p in self.episode_paths()]
-        return max(indices) + 1 if indices else 0
+    @staticmethod
+    def _parse(path: Path) -> tuple[int, int]:
+        """Return (index, length) parsed from an episode filename."""
+        match = _NAME_RE.match(path.name)
+        if match is None:
+            raise ValueError(f"malformed episode filename: {path.name}")
+        return int(match.group(1)), int(match.group(2))
 
     def episode_paths(self) -> list[Path]:
         """Episode files, oldest first."""
-        return sorted(self.root.glob("ep_*.npz"))
+        return sorted(
+            (p for p in self.root.glob("ep_*.npz") if _NAME_RE.match(p.name)),
+            key=lambda p: self._parse(p)[0],
+        )
 
     @property
     def n_episodes(self) -> int:
@@ -1857,11 +2203,12 @@ class ReplayBuffer:
 
     @property
     def n_transitions(self) -> int:
-        return sum(ep.length for ep in self.load_all())
+        """Total transitions stored, read from filenames without decompressing."""
+        return sum(self._parse(p)[1] for p in self.episode_paths())
 
     def add(self, ep: Episode) -> Path:
         """Write `ep` and evict oldest episodes until within capacity."""
-        path = self.root / f"ep_{next(self._counter):06d}.npz"
+        path = self.root / f"ep_{next(self._counter):06d}_len{ep.length:05d}.npz"
         save_episode(ep, path)
         self._evict()
         return path
@@ -1872,7 +2219,7 @@ class ReplayBuffer:
 
     def _evict(self) -> None:
         paths = self.episode_paths()
-        lengths = [load_episode(p).length for p in paths]
+        lengths = [self._parse(p)[1] for p in paths]
         total = sum(lengths)
         # Never evict the newest episode: an empty buffer is worse than an
         # oversized one.
@@ -1880,22 +2227,21 @@ class ReplayBuffer:
             if total <= self.capacity_transitions:
                 break
             path.unlink()
+            path.with_suffix(".features.npy").unlink(missing_ok=True)
             total -= length
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
-Expected: 7 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/mbfps/data/buffer.py tests/data/test_buffer.py
-git commit -m "feat: fixed-capacity replay buffer with oldest-first eviction"
+git commit -m "feat: replay buffer with O(1) capacity accounting and feature-cache eviction"
 ```
-
----
 
 ## Task 11: Sequence loader
 
@@ -1905,7 +2251,7 @@ git commit -m "feat: fixed-capacity replay buffer with oldest-first eviction"
 
 **Interfaces:**
 - Consumes: `ReplayBuffer`, `Episode`.
-- Produces: `SequenceLoader(buffer: ReplayBuffer, batch_size: int = 16, seq_len: int = 64, seed: int = 0)` with `sample(include_privileged: bool = False) -> dict[str, np.ndarray]`. Keys: `obs (B, T+1, 112, 112, 3) uint8`, `actions (B, T) int32`, `rewards (B, T) float32`, `terminated (B, T) bool`, `episode_index (B,) int32`. Adds `privileged (B, T+1, K) float32` **only** when `include_privileged=True`.
+- Produces: `SequenceLoader(buffer: ReplayBuffer, batch_size: int = 16, seq_len: int = 64, seed: int = 0)` with `sample(include_privileged: bool = False) -> dict[str, np.ndarray]`. Keys: `obs (B, T+1, 112, 112, 3) uint8`, `actions (B, T) int32`, `rewards (B, T) float32`, `terminated (B, T) bool`, `truncated (B, T) bool`, `episode_index (B,) int32`. Adds `privileged (B, T+1, K) float32` **only** when `include_privileged=True`.
 
 `include_privileged` defaults to False so the safe path is the default one: a training loop that never passes the flag can never receive privileged state.
 
@@ -1931,11 +2277,12 @@ def make_episode(t: int, fill: int) -> Episode:
         actions=np.zeros(t, dtype=np.int32),
         rewards=np.zeros(t, dtype=np.float32),
         terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
         privileged=np.full((t + 1, len(KEYS)), float(fill), dtype=np.float32),
         privileged_keys=KEYS,
         policy_name="random",
         seed=fill,
-        scenario="basic",
+        scenario="deadly_corridor",
     )
 
 
@@ -1953,6 +2300,7 @@ def test_batch_shapes(buffer):
     assert batch["actions"].shape == (4, 16)
     assert batch["rewards"].shape == (4, 16)
     assert batch["terminated"].shape == (4, 16)
+    assert batch["truncated"].shape == (4, 16)
     assert batch["episode_index"].shape == (4,)
 
 
@@ -1962,6 +2310,7 @@ def test_batch_dtypes(buffer):
     assert batch["actions"].dtype == np.int32
     assert batch["rewards"].dtype == np.float32
     assert batch["terminated"].dtype == bool
+    assert batch["truncated"].dtype == bool
 
 
 def test_windows_never_cross_episode_boundaries(buffer):
@@ -2065,7 +2414,8 @@ class SequenceLoader:
                 f"buffer holds {len(self._episodes)} episodes"
             )
 
-        obs, actions, rewards, terminated, privileged, indices = [], [], [], [], [], []
+        obs, actions, rewards, indices = [], [], [], []
+        terminated, truncated, privileged = [], [], []
         for _ in range(self.batch_size):
             idx = int(self._rng.choice(usable))
             ep = self._episodes[idx]
@@ -2075,6 +2425,7 @@ class SequenceLoader:
             actions.append(ep.actions[start:end])
             rewards.append(ep.rewards[start:end])
             terminated.append(ep.terminated[start:end])
+            truncated.append(ep.truncated[start:end])
             indices.append(idx)
             if include_privileged:
                 privileged.append(ep.privileged[start : end + 1])
@@ -2084,6 +2435,7 @@ class SequenceLoader:
             "actions": np.stack(actions).astype(np.int32),
             "rewards": np.stack(rewards).astype(np.float32),
             "terminated": np.stack(terminated).astype(bool),
+            "truncated": np.stack(truncated).astype(bool),
             "episode_index": np.asarray(indices, dtype=np.int32),
         }
         if include_privileged:
@@ -2189,11 +2541,12 @@ def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
         actions=np.zeros(3, dtype=np.int32),
         rewards=np.zeros(3, dtype=np.float32),
         terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
         privileged=np.zeros((4, len(keys)), dtype=np.float32),
         privileged_keys=keys,
         policy_name="random",
         seed=0,
-        scenario="basic",
+        scenario="deadly_corridor",
     )
     path = tmp_path / "ep_000000.npz"
     save_episode(ep, path)
@@ -2281,8 +2634,14 @@ class FeatureExtractor:
         return patches.to(torch.float16).cpu().numpy()
 
 
-def cache_episode_features(ep_path: Path, extractor: FeatureExtractor) -> Path:
+def cache_episode_features(
+    ep_path: Path, extractor: FeatureExtractor, batch_size: int = 32
+) -> Path:
     """Encode an episode's frames and write a sibling `.features.npy`.
+
+    Called by `scripts/collect.py --cache-features` as each episode is written.
+    Frames are encoded in batches: an episode can run to a thousand frames, and
+    a single forward pass over all of them would exhaust unified memory.
 
     Returns:
         Path to the written feature file.
@@ -2290,7 +2649,10 @@ def cache_episode_features(ep_path: Path, extractor: FeatureExtractor) -> Path:
     ep_path = Path(ep_path)
     with np.load(ep_path, allow_pickle=True) as data:
         obs = data["obs"]
-    features = extractor.encode(obs)
+    chunks = [
+        extractor.encode(obs[i : i + batch_size]) for i in range(0, len(obs), batch_size)
+    ]
+    features = np.concatenate(chunks, axis=0)
     out_path = ep_path.with_suffix(".features.npy")
     np.save(out_path, features)
     return out_path
@@ -2372,11 +2734,12 @@ def buffer(tmp_path):
             actions=np.zeros(80, dtype=np.int32),
             rewards=np.zeros(80, dtype=np.float32),
             terminated=np.zeros(80, dtype=bool),
+            truncated=np.zeros(80, dtype=bool),
             privileged=np.full((81, len(KEYS)), SENTINEL, dtype=np.float32),
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
-            scenario="basic",
+            scenario="deadly_corridor",
         )
     )
     return buf
@@ -2404,7 +2767,7 @@ def test_env_privileged_values_are_not_in_the_observation():
     """The engine's own observation must not encode privileged values."""
     from mbfps.envs.vizdoom_env import ViZDoomEnv
 
-    env = ViZDoomEnv(scenario="basic", frame_skip=4, seed=0)
+    env = ViZDoomEnv(scenario="deadly_corridor", frame_skip=4, seed=0)
     try:
         obs, _ = env.reset(seed=0)
         state = env.privileged_state
@@ -2437,6 +2800,7 @@ from pathlib import Path
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.collector import Collector
+from mbfps.data.features import cache_episode_features
 from mbfps.data.policies import RandomPolicy, ScriptedPolicy
 from mbfps.envs.registry import make_env
 from mbfps.utils.seeding import seed_everything
@@ -2444,8 +2808,13 @@ from mbfps.utils.seeding import seed_everything
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="basic")
+    parser.add_argument("--scenario", default="deadly_corridor")
     parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument(
+        "--cache-features",
+        action="store_true",
+        help="encode each episode with the frozen DINOv2 backbone as it is written",
+    )
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--capacity", type=int, default=200_000)
@@ -2475,12 +2844,20 @@ def main() -> None:
         ),
     }
 
+    extractor = None
+    if args.cache_features:
+        from mbfps.data.features import FeatureExtractor
+
+        extractor = FeatureExtractor()
+
     start, kept = time.perf_counter(), 0
     for i in range(args.episodes):
         name = "random" if i % 2 == 0 else "scripted"
         episode = collectors[name].collect_episode(seed=args.seed + i)
         if episode is not None:
-            buffer.add(episode)
+            path = buffer.add(episode)
+            if extractor is not None and path.is_file():
+                cache_episode_features(path, extractor)
             kept += 1
         if (i + 1) % 20 == 0:
             print(f"[{i + 1}/{args.episodes}] kept={kept} transitions={buffer.n_transitions}")
@@ -2501,8 +2878,10 @@ if __name__ == "__main__":
 
 - [ ] **Step 5: Run a small collection to verify it works end to end**
 
-Run: `.venv/bin/python scripts/collect.py --scenario basic --episodes 20`
-Expected: prints progress, then `episodes_kept=20` (or fewer with crashes reported), a positive `transitions_per_second`, and `output=data/basic`.
+Run: `.venv/bin/python scripts/collect.py --episodes 20`
+Expected: prints progress, then `episodes_kept=20`, a positive `transitions_per_second`, and `output=data/deadly_corridor`.
+
+**`episodes_kept` must equal the episode count.** A run reporting `episodes_kept=0 crashes=20` means the collector is discarding every terminating episode — re-read Task 9's terminal-frame handling before continuing rather than lowering the expectation.
 
 - [ ] **Step 6: Write the coverage report**
 
@@ -2530,7 +2909,7 @@ from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, default=Path("data/basic"))
+    parser.add_argument("--data", type=Path, default=Path("data/deadly_corridor"))
     parser.add_argument("--out", type=Path, default=Path("runs"))
     parser.add_argument("--bins", type=int, default=60)
     args = parser.parse_args()
@@ -2584,9 +2963,11 @@ if __name__ == "__main__":
 
 - [ ] **Step 7: Run the coverage report and confirm the scripted policy reaches further**
 
-Run: `.venv/bin/python scripts/coverage_report.py --data data/basic`
+Run: `.venv/bin/python scripts/coverage_report.py`
 
-Expected: prints `figure=runs/coverage_basic.png` and one line per policy. **The gate: `scripted` must show a larger `occupied_cells` count than `random`.** If it does not, raise `_FORWARD_PROB` in `src/mbfps/data/policies.py` or lengthen `_SWEEP_LEN`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds.
+Expected: prints `figure=runs/coverage_deadly_corridor.png` and one line per policy. **The gate: `scripted` must show a larger `occupied_cells` count than `random`.**
+
+If it does not, first confirm the policy is not degenerate — run `.venv/bin/python -c "from mbfps.envs.registry import make_env; e=make_env('vizdoom'); print(e.button_names); e.close()"` and check that `MOVE_FORWARD`, `TURN_LEFT` and `TURN_RIGHT` are present. If they are, tune `_ADVANCE_PROB` or `_SWEEP_LEN` in `src/mbfps/data/policies.py`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds.
 
 - [ ] **Step 8: Benchmark the loader**
 
@@ -2595,7 +2976,7 @@ Expected: prints `figure=runs/coverage_basic.png` and one line per policy. **The
 import time
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
-buf = ReplayBuffer('data/basic', capacity_transitions=10**9)
+buf = ReplayBuffer('data/deadly_corridor', capacity_transitions=10**9)
 loader = SequenceLoader(buf, batch_size=16, seq_len=64, seed=0)
 loader.sample()  # warm up
 start = time.perf_counter()
@@ -2626,11 +3007,12 @@ git commit -m "feat: mixed-policy collection CLI, coverage report, privileged is
 Both milestones' spec criteria, restated as things you can run:
 
 **M0:**
-- [ ] `pytest tests/envs/test_determinism.py` passes — same seed gives bit-identical frames and rewards, and an episode replays from its action sequence alone.
+- [ ] `pytest tests/envs/test_determinism.py` passes — same seed gives bit-identical frames and rewards, different seeds diverge, and a recorded episode replays from its saved action sequence in a fresh engine.
+- [ ] `pytest tests/envs/test_vizdoom_env.py` passes — including that `terminated` and `truncated` are mutually exclusive and `privileged_state` is `None` after the episode ends.
 - [ ] `scripts/benchmark_env.py` reports a recorded `steps_per_second`.
 
 **M1:**
-- [ ] `scripts/collect.py` produces a dataset with a reported `transitions_per_second`.
+- [ ] `scripts/collect.py` produces a dataset with a reported `transitions_per_second` **and `episodes_kept` equal to the requested episode count** (zero kept means the collector is discarding terminating episodes).
 - [ ] The loader benchmark reports `batches_per_second`.
 - [ ] `pytest tests/data/test_episode.py` passes — stored data equals collected data.
 - [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat.
