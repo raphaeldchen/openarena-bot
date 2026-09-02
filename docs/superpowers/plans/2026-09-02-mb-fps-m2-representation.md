@@ -1235,6 +1235,66 @@ def test_eviction_removes_every_backbones_feature_cache(tmp_path):
 Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
 Expected: 16 passed (15 existing plus this one).
 
+The routing fix above has no test covering `cache_episode_features` itself --
+the only existing test that touches it, `test_cache_episode_features_writes_sibling_file`,
+uses the default `dinov2` backbone, whose suffix is identical whether or not
+the fix is applied. Left uncovered, a regression back to a hardcoded
+`.features.npy` would leave the whole suite green while the `random_vit`
+caching run silently overwrote the `dinov2` cache -- collapsing the control
+arm into the treatment arm with no error anywhere. Close that gap:
+
+Add to `tests/data/test_features.py` (needs `Episode` and `save_episode` from
+`mbfps.data.episode`, and `OBS_SHAPE` from `mbfps.envs.protocol`, imported in
+the test module):
+
+```python
+def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
+    """Two caches must never collide.
+
+    A hardcoded suffix here would make the random_vit run overwrite dinov2's
+    cache, leaving arms 2 and 3 training on identical inputs with no error
+    anywhere -- the control silently becomes a copy of the treatment. Verified
+    by mutation: with the suffix hardcoded, the rest of the suite stays green.
+    """
+
+    class _StubExtractor:
+        backbone = "random_vit"
+
+        def encode(self, frames):
+            return np.zeros((len(frames), N_PATCHES, FEATURE_DIM), dtype=np.float16)
+
+    keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
+    episode = Episode(
+        obs=np.zeros((4, *OBS_SHAPE), dtype=np.uint8),
+        actions=np.zeros(3, dtype=np.int32),
+        rewards=np.zeros(3, dtype=np.float32),
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
+        privileged=np.zeros((4, len(keys)), dtype=np.float32),
+        privileged_keys=keys,
+        policy_name="random",
+        seed=0,
+        scenario="my_way_home",
+    )
+    path = tmp_path / "ep_000000_len00003.npz"
+    save_episode(episode, path)
+
+    # A pre-existing dinov2 cache that must survive untouched.
+    dinov2_cache = path.with_suffix(".features.npy")
+    np.save(dinov2_cache, np.full((4, N_PATCHES, FEATURE_DIM), 7, dtype=np.float16))
+
+    out_path = cache_episode_features(path, _StubExtractor())
+
+    assert out_path.name.endswith(".features_random_vit.npy"), out_path.name
+    assert out_path.is_file()
+    assert dinov2_cache.is_file(), "the dinov2 cache was deleted"
+    assert np.load(dinov2_cache)[0, 0, 0] == 7, "the dinov2 cache was overwritten"
+    assert np.load(out_path).shape == (4, N_PATCHES, FEATURE_DIM)
+```
+
+Run: `.venv/bin/python -m pytest tests/data/test_features.py -k backbones_own_suffix -v`
+Expected: 1 passed.
+
 - [ ] **Step 4: Write the caching script**
 
 ```python
@@ -1322,7 +1382,10 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_features.py -v`
-Expected: 17 passed (9 existing plus the 8 added here).
+Expected: 19 passed (9 existing, plus the 9 added in Step 1 -- the block above
+adds nine tests, not eight, so the pre-existing total here was 18, not the 17
+this step previously stated -- plus the 1 added in Step 3b to close the
+filename-routing gap).
 
 Also confirm the existing M1 cache still loads: `.venv/bin/python -c "from mbfps.data.loader import feature_suffix; print(feature_suffix('dinov2'))"` must print `.features.npy`, matching the 122 files already on disk.
 
@@ -1350,7 +1413,7 @@ Expected: the small request passes and the oversized one raises with both number
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/mbfps/data/features.py tests/data/test_features.py scripts/cache_features.py
+git add src/mbfps/data/features.py src/mbfps/data/buffer.py tests/data/test_features.py tests/data/test_buffer.py scripts/cache_features.py
 git commit -m "feat: backbone-parameterised feature caching with a disk guard"
 ```
 

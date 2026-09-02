@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import torch
 
+from mbfps.data.episode import Episode, save_episode
 from mbfps.data.features import (
     FEATURE_DIM,
     N_PATCHES,
@@ -107,8 +108,6 @@ def test_encode_applies_imagenet_normalization(extractor):
 
 
 def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
-    from mbfps.data.episode import Episode, save_episode
-
     keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
     ep = Episode(
         obs=np.zeros((4, *OBS_SHAPE), dtype=np.uint8),
@@ -132,6 +131,50 @@ def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
     # instead of float16, which would blow the ~49KB/frame storage budget
     # per spec §3.3.
     assert saved.dtype == np.float16
+
+
+def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
+    """Two caches must never collide.
+
+    A hardcoded suffix here would make the random_vit run overwrite dinov2's
+    cache, leaving arms 2 and 3 training on identical inputs with no error
+    anywhere -- the control silently becomes a copy of the treatment. Verified
+    by mutation: with the suffix hardcoded, the rest of the suite stays green.
+    """
+
+    class _StubExtractor:
+        backbone = "random_vit"
+
+        def encode(self, frames):
+            return np.zeros((len(frames), N_PATCHES, FEATURE_DIM), dtype=np.float16)
+
+    keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
+    episode = Episode(
+        obs=np.zeros((4, *OBS_SHAPE), dtype=np.uint8),
+        actions=np.zeros(3, dtype=np.int32),
+        rewards=np.zeros(3, dtype=np.float32),
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
+        privileged=np.zeros((4, len(keys)), dtype=np.float32),
+        privileged_keys=keys,
+        policy_name="random",
+        seed=0,
+        scenario="my_way_home",
+    )
+    path = tmp_path / "ep_000000_len00003.npz"
+    save_episode(episode, path)
+
+    # A pre-existing dinov2 cache that must survive untouched.
+    dinov2_cache = path.with_suffix(".features.npy")
+    np.save(dinov2_cache, np.full((4, N_PATCHES, FEATURE_DIM), 7, dtype=np.float16))
+
+    out_path = cache_episode_features(path, _StubExtractor())
+
+    assert out_path.name.endswith(".features_random_vit.npy"), out_path.name
+    assert out_path.is_file()
+    assert dinov2_cache.is_file(), "the dinov2 cache was deleted"
+    assert np.load(dinov2_cache)[0, 0, 0] == 7, "the dinov2 cache was overwritten"
+    assert np.load(out_path).shape == (4, N_PATCHES, FEATURE_DIM)
 
 
 def test_backbones_registered():
