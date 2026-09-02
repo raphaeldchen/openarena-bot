@@ -50,7 +50,6 @@ def test_make_env_rejects_unknown_name():
         make_env("nope")
 
 
-@pytest.mark.xfail(reason="ViZDoomEnv lands in Task 5", strict=True)
 def test_make_env_lists_available_names_in_error():
     with pytest.raises(KeyError, match="vizdoom"):
         make_env("nope")
