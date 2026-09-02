@@ -73,15 +73,44 @@ def test_episode_eventually_ends(env):
     pytest.fail("episode did not end within 3000 steps")
 
 
-def test_terminated_and_truncated_are_mutually_exclusive(env):
-    """A time-limit cutoff must not also report a true terminal state."""
+def test_timeout_sets_truncated_not_terminated(env):
+    """The time-limit bootstrapping guard.
+
+    A time-limit cutoff is not a true terminal state. Asserting only that the
+    two flags are never both true does not catch the bug: swapping them still
+    satisfies it. This asserts which flag a timeout actually sets.
+    """
     env.reset(seed=0)
-    for _ in range(3000):
+    for step in range(1, 3000):
         _, _, terminated, truncated, _ = env.step(0)
-        assert not (terminated and truncated)
         if terminated or truncated:
+            assert truncated, f"timeout at step {step} must set truncated"
+            assert not terminated, "a time limit is not a true terminal state"
             return
     pytest.fail("episode did not end within 3000 steps")
+
+
+def test_goal_reached_sets_terminated_not_truncated():
+    """The other direction: a real terminal must not be recorded as a timeout.
+
+    seed=5 with this exact RNG reaches the goal at step 96 (reward ~1.0),
+    well before the 525-step timeout.
+    """
+    env = ViZDoomEnv(scenario="my_way_home", frame_skip=4, seed=5)
+    try:
+        env.reset(seed=5)
+        rng = np.random.default_rng(5)
+        for step in range(1, 600):
+            action = int(rng.integers(0, env.action_space.n))
+            _, reward, terminated, truncated, _ = env.step(action)
+            if terminated or truncated:
+                assert terminated, f"goal reached at step {step} must set terminated"
+                assert not truncated, "a goal is not a time-limit cutoff"
+                assert reward > 0.5, f"expected goal reward, got {reward}"
+                return
+        pytest.fail("episode did not end within 600 steps")
+    finally:
+        env.close()
 
 
 def test_observation_after_end_is_still_valid(env):
