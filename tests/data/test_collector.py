@@ -20,7 +20,7 @@ class _StubEnv:
 
     instances = 0
 
-    def __init__(self, episode_len=6, crash_at=None):
+    def __init__(self, episode_len=6, crash_at=None, truncate: bool = False):
         type(self).instances += 1
         self.observation_space = spaces.Box(0, 255, OBS_SHAPE, dtype=np.uint8)
         self.action_space = spaces.Discrete(4)
@@ -28,12 +28,15 @@ class _StubEnv:
         self.scenario = "stub"
         self._episode_len = episode_len
         self._crash_at = crash_at
+        self._truncate = truncate
         self._t = 0
         self._done = False
+        self.seeds_seen: list = []
 
     def reset(self, *, seed=None):
         self._t = 0
         self._done = False
+        self.seeds_seen.append(seed)
         return np.full(OBS_SHAPE, 1, dtype=np.uint8), {}
 
     def step(self, action):
@@ -42,6 +45,8 @@ class _StubEnv:
             raise RuntimeError("simulated engine crash")
         self._done = self._t >= self._episode_len
         obs = np.full(OBS_SHAPE, self._t % 256, dtype=np.uint8)
+        if self._done and self._truncate:
+            return obs, 1.0, False, True, {}
         return obs, 1.0, self._done, False, {}
 
     def close(self):
@@ -235,6 +240,49 @@ def test_malformed_data_is_not_reported_as_an_engine_crash():
 
     c = Collector(lambda: _Shifting(6), RandomPolicy(4, seed=0))
     with pytest.raises(DataIntegrityError, match="lost keys mid-episode"):
+        c.collect_episode(seed=0)
+    assert c.crash_count == 0
+    c.close()
+
+
+def test_truncated_episode_ends_the_loop():
+    """A time-limit cutoff must end collection just like a terminal state."""
+    c = Collector(lambda: _StubEnv(6, truncate=True), RandomPolicy(4, seed=0), 1000)
+    ep = c.collect_episode(seed=0)
+    assert ep is not None and ep.length == 6
+    c.close()
+
+
+def test_truncation_is_recorded_separately_from_termination():
+    """Collapsing the two is the time-limit bootstrapping bug."""
+    c = Collector(lambda: _StubEnv(6, truncate=True), RandomPolicy(4, seed=0), 1000)
+    ep = c.collect_episode(seed=0)
+    assert ep.truncated[-1], "final step should be flagged truncated"
+    assert not ep.terminated[-1], "a time limit is not a true terminal state"
+    assert not ep.terminated.any()
+    c.close()
+
+
+def test_collector_passes_the_episode_seed_to_the_env():
+    """Without this, a dropped env seed is only caught at the ViZDoomEnv level."""
+    env = _StubEnv(6)
+    c = Collector(lambda: env, RandomPolicy(4, seed=0), 1000)
+    c.collect_episode(seed=11)
+    c.collect_episode(seed=12)
+    assert env.seeds_seen == [11, 12]
+    c.close()
+
+
+def test_malformed_obs_is_not_reported_as_an_engine_crash():
+    """Episode validation failures are our bug, not the engine's."""
+
+    class _BadObs(_StubEnv):
+        def step(self, action):
+            obs, reward, term, trunc, info = super().step(action)
+            return obs.astype(np.float32), reward, term, trunc, info
+
+    c = Collector(lambda: _BadObs(6), RandomPolicy(4, seed=0), 1000)
+    with pytest.raises(DataIntegrityError, match="failed validation"):
         c.collect_episode(seed=0)
     assert c.crash_count == 0
     c.close()

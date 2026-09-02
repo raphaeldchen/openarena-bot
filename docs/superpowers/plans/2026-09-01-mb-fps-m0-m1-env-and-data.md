@@ -2043,6 +2043,10 @@ git commit -m "feat: episode container with verified npz round-trip"
 - On the terminal frame, carry the last valid row forward rather than emitting a zero-width row.
 - Raise a **distinct `DataIntegrityError`** for malformed data and let it escape the crash handler. An `AssertionError` would be caught by `except Exception` and counted as an engine fault — landing in the very failure mode the guard exists to prevent.
 - Do **not** reshape the stacked array. `np.stack` of zero-length rows already gives `(T+1, 0)`; `reshape(-1, 0)` raises `cannot reshape array of size 0` (measured on numpy 2.5.2), which the crash handler would swallow.
+- `Episode.__post_init__` raises **`ValueError`** for obs/actions/privileged shape and dtype violations. That is our own bug reached via a different axis than the ragged-privileged-array case above, and the blanket `except Exception` catches it identically — a good episode gets discarded and miscounted as an engine fault. Wrap the `Episode(...)` construction in its own `try/except ValueError` and re-raise as `DataIntegrityError`. Do **not** force-cast `obs` to `uint8` before that call: a real engine already emits `uint8` frames, so the cast is a no-op for good data and would only mask a malformed one, defeating the validation it's supposed to trigger.
+- Let **`MemoryError`** escape the crash handler too — `np.stack` on a long episode can raise it, and it is exactly as much our own resource problem as a `DataIntegrityError` is our own data problem, not an engine fault.
+- `terminated` and `truncated` are a load-bearing distinction, not an interchangeable pair: a time-limit cutoff is not a true terminal state, and swapping the two arguments in the `Episode(...)` call, or narrowing `if terminated or truncated: break` to `if terminated:`, must be caught by a stub environment capable of actually setting `truncated=True` — a stub that always returns `truncated=False` cannot detect either bug.
+- The episode seed passed to `collect_episode` must reach `self._env.reset(seed=seed)`. A stub that ignores its `seed` argument cannot detect a dropped env seed.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2069,7 +2073,7 @@ class _StubEnv:
 
     instances = 0
 
-    def __init__(self, episode_len=6, crash_at=None):
+    def __init__(self, episode_len=6, crash_at=None, truncate: bool = False):
         type(self).instances += 1
         self.observation_space = spaces.Box(0, 255, OBS_SHAPE, dtype=np.uint8)
         self.action_space = spaces.Discrete(4)
@@ -2077,12 +2081,15 @@ class _StubEnv:
         self.scenario = "stub"
         self._episode_len = episode_len
         self._crash_at = crash_at
+        self._truncate = truncate
         self._t = 0
         self._done = False
+        self.seeds_seen: list = []
 
     def reset(self, *, seed=None):
         self._t = 0
         self._done = False
+        self.seeds_seen.append(seed)
         return np.full(OBS_SHAPE, 1, dtype=np.uint8), {}
 
     def step(self, action):
@@ -2091,6 +2098,8 @@ class _StubEnv:
             raise RuntimeError("simulated engine crash")
         self._done = self._t >= self._episode_len
         obs = np.full(OBS_SHAPE, self._t % 256, dtype=np.uint8)
+        if self._done and self._truncate:
+            return obs, 1.0, False, True, {}
         return obs, 1.0, self._done, False, {}
 
     def close(self):
@@ -2287,6 +2296,49 @@ def test_malformed_data_is_not_reported_as_an_engine_crash():
         c.collect_episode(seed=0)
     assert c.crash_count == 0
     c.close()
+
+
+def test_truncated_episode_ends_the_loop():
+    """A time-limit cutoff must end collection just like a terminal state."""
+    c = Collector(lambda: _StubEnv(6, truncate=True), RandomPolicy(4, seed=0), 1000)
+    ep = c.collect_episode(seed=0)
+    assert ep is not None and ep.length == 6
+    c.close()
+
+
+def test_truncation_is_recorded_separately_from_termination():
+    """Collapsing the two is the time-limit bootstrapping bug."""
+    c = Collector(lambda: _StubEnv(6, truncate=True), RandomPolicy(4, seed=0), 1000)
+    ep = c.collect_episode(seed=0)
+    assert ep.truncated[-1], "final step should be flagged truncated"
+    assert not ep.terminated[-1], "a time limit is not a true terminal state"
+    assert not ep.terminated.any()
+    c.close()
+
+
+def test_collector_passes_the_episode_seed_to_the_env():
+    """Without this, a dropped env seed is only caught at the ViZDoomEnv level."""
+    env = _StubEnv(6)
+    c = Collector(lambda: env, RandomPolicy(4, seed=0), 1000)
+    c.collect_episode(seed=11)
+    c.collect_episode(seed=12)
+    assert env.seeds_seen == [11, 12]
+    c.close()
+
+
+def test_malformed_obs_is_not_reported_as_an_engine_crash():
+    """Episode validation failures are our bug, not the engine's."""
+
+    class _BadObs(_StubEnv):
+        def step(self, action):
+            obs, reward, term, trunc, info = super().step(action)
+            return obs.astype(np.float32), reward, term, trunc, info
+
+    c = Collector(lambda: _BadObs(6), RandomPolicy(4, seed=0), 1000)
+    with pytest.raises(DataIntegrityError, match="failed validation"):
+        c.collect_episode(seed=0)
+    assert c.crash_count == 0
+    c.close()
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2319,6 +2371,9 @@ class DataIntegrityError(Exception):
     crash is an external fault worth retrying; malformed data is our own bug,
     and recording it as a crash is exactly how an earlier version of this
     collector discarded every episode while reporting a healthy `crash_count`.
+    This also covers episodes that fail `Episode`'s own validation --
+    `__post_init__` raises `ValueError` for obs/actions/privileged shape and
+    dtype violations, and that failure is our bug too, not the engine's.
     """
 
 
@@ -2346,7 +2401,7 @@ class Collector:
         """
         try:
             return self._collect(seed)
-        except DataIntegrityError:
+        except (DataIntegrityError, MemoryError):
             raise
         except Exception:
             self.crash_count += 1
@@ -2395,18 +2450,28 @@ class Collector:
                 f"ragged privileged rows at indices {bad[:5]}; expected width {width}"
             )
 
-        return Episode(
-            obs=np.stack(frames).astype(np.uint8),
-            actions=np.asarray(actions, dtype=np.int32),
-            rewards=np.asarray(rewards, dtype=np.float32),
-            terminated=np.asarray(terminated_flags, dtype=bool),
-            truncated=np.asarray(truncated_flags, dtype=bool),
-            privileged=np.stack(privileged).astype(np.float32),
-            privileged_keys=keys,
-            policy_name=self._policy.name,
-            seed=seed,
-            scenario=getattr(self._env, "scenario", "unknown"),
-        )
+        # obs is intentionally NOT force-cast to uint8 here: a real engine
+        # already emits uint8 frames, so casting is a no-op for good data and
+        # would only paper over a malformed one -- defeating Episode's own
+        # dtype check below and letting the exact bug this wrapper exists to
+        # catch slip back out as a phantom engine crash instead.
+        try:
+            return Episode(
+                obs=np.stack(frames),
+                actions=np.asarray(actions, dtype=np.int32),
+                rewards=np.asarray(rewards, dtype=np.float32),
+                terminated=np.asarray(terminated_flags, dtype=bool),
+                truncated=np.asarray(truncated_flags, dtype=bool),
+                privileged=np.stack(privileged).astype(np.float32),
+                privileged_keys=keys,
+                policy_name=self._policy.name,
+                seed=seed,
+                scenario=getattr(self._env, "scenario", "unknown"),
+            )
+        except ValueError as exc:
+            raise DataIntegrityError(
+                f"collected episode failed validation: {exc}"
+            ) from exc
 
     @staticmethod
     def _row(
@@ -2447,7 +2512,7 @@ class Collector:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_collector.py -v`
-Expected: 17 passed.
+Expected: 21 passed.
 
 - [ ] **Step 5: Commit**
 

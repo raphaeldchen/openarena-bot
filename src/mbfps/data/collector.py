@@ -20,6 +20,9 @@ class DataIntegrityError(Exception):
     crash is an external fault worth retrying; malformed data is our own bug,
     and recording it as a crash is exactly how an earlier version of this
     collector discarded every episode while reporting a healthy `crash_count`.
+    This also covers episodes that fail `Episode`'s own validation --
+    `__post_init__` raises `ValueError` for obs/actions/privileged shape and
+    dtype violations, and that failure is our bug too, not the engine's.
     """
 
 
@@ -47,7 +50,7 @@ class Collector:
         """
         try:
             return self._collect(seed)
-        except DataIntegrityError:
+        except (DataIntegrityError, MemoryError):
             raise
         except Exception:
             self.crash_count += 1
@@ -96,18 +99,28 @@ class Collector:
                 f"ragged privileged rows at indices {bad[:5]}; expected width {width}"
             )
 
-        return Episode(
-            obs=np.stack(frames).astype(np.uint8),
-            actions=np.asarray(actions, dtype=np.int32),
-            rewards=np.asarray(rewards, dtype=np.float32),
-            terminated=np.asarray(terminated_flags, dtype=bool),
-            truncated=np.asarray(truncated_flags, dtype=bool),
-            privileged=np.stack(privileged).astype(np.float32),
-            privileged_keys=keys,
-            policy_name=self._policy.name,
-            seed=seed,
-            scenario=getattr(self._env, "scenario", "unknown"),
-        )
+        # obs is intentionally NOT force-cast to uint8 here: a real engine
+        # already emits uint8 frames, so casting is a no-op for good data and
+        # would only paper over a malformed one -- defeating Episode's own
+        # dtype check below and letting the exact bug this wrapper exists to
+        # catch slip back out as a phantom engine crash instead.
+        try:
+            return Episode(
+                obs=np.stack(frames),
+                actions=np.asarray(actions, dtype=np.int32),
+                rewards=np.asarray(rewards, dtype=np.float32),
+                terminated=np.asarray(terminated_flags, dtype=bool),
+                truncated=np.asarray(truncated_flags, dtype=bool),
+                privileged=np.stack(privileged).astype(np.float32),
+                privileged_keys=keys,
+                policy_name=self._policy.name,
+                seed=seed,
+                scenario=getattr(self._env, "scenario", "unknown"),
+            )
+        except ValueError as exc:
+            raise DataIntegrityError(
+                f"collected episode failed validation: {exc}"
+            ) from exc
 
     @staticmethod
     def _row(
