@@ -1011,8 +1011,13 @@ from gymnasium import spaces
 
 from mbfps.envs.actions import build_action_set
 from mbfps.envs.protocol import OBS_SHAPE
-from mbfps.envs.registry import register
 from mbfps.envs.wrappers import preprocess_frame
+
+# NOTE: `register` is imported at the BOTTOM of this file, not here. `registry`
+# imports ViZDoomEnv from this module, so importing it at the top creates a
+# cycle: importing `mbfps.envs.vizdoom_env` first raises "cannot import name
+# 'ViZDoomEnv' from partially initialized module". The test suite hides this,
+# because pytest collects alphabetically and always imports registry first.
 
 PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")
 """Keys of `privileged_state`. EVALUATION ONLY -- never a training input."""
@@ -1141,8 +1146,12 @@ class ViZDoomEnv:
         return preprocess_frame(state.screen_buffer)
 
 
+from mbfps.envs.registry import register  # noqa: E402 -- see the note above
+
 register("vizdoom", ViZDoomEnv)
 ```
+
+**Any future engine module must use this bottom-import pattern.** Copying the top-import form into an OpenArena module at M7 reproduces the same cycle.
 
 - [ ] **Step 4: Remove the xfail marker from Task 2's test**
 
