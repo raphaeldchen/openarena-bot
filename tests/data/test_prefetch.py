@@ -58,10 +58,24 @@ def test_batches_match_direct_sampling_in_order(buffer):
 
 
 def test_close_is_idempotent(buffer):
+    """Two closes must leave the same observable state as one."""
     pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
     next(iter(pf))
     pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
     pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+
+
+def test_reuse_after_close_reports_closure_not_death(buffer):
+    """A deliberately closed prefetcher must not look like a crashed one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    with pytest.raises(RuntimeError, match="closed and cannot be reused"):
+        next(iter(pf))
 
 
 def test_context_manager_closes_the_thread(buffer):
@@ -107,6 +121,11 @@ def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
         assert not pf._thread.is_alive(), "worker did not stop"
         while not pf._queue.empty():
             pf._queue.get_nowait()
+        # The thread is now dead but nobody called close(): clear the flag so
+        # `_stop.is_set()` reflects "not closed" again, isolating the
+        # dead-thread branch from the closed-state branch added for the
+        # reuse-after-close fix.
+        pf._stop.clear()
         with pytest.raises(RuntimeError, match="prefetch worker died"):
             next(iter(pf))
     finally:

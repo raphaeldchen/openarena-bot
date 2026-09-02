@@ -15,8 +15,6 @@ from typing import Any, Iterator
 
 from mbfps.data.loader import SequenceLoader
 
-_SENTINEL = object()
-
 _POLL_SECONDS = 0.5
 """How long the consumer waits before checking whether the worker is alive.
 
@@ -27,7 +25,14 @@ hang is worse than an exception: it stalls CI with no diagnostic. Removing
 
 
 class Prefetcher:
-    """Yields batches from `loader`, produced on a background thread."""
+    """Yields batches from `loader`, produced on a background thread.
+
+    This is an infinite stream over `loader.sample()`: there is no
+    end-of-data condition, and `__iter__` never returns on its own. The only
+    way to stop consuming is to stop calling `next()` and `close()` the
+    prefetcher (or exit the `with` block); a closed `Prefetcher` cannot be
+    reused.
+    """
 
     def __init__(self, loader: SequenceLoader, depth: int = 2) -> None:
         if depth < 1:
@@ -55,17 +60,25 @@ class Prefetcher:
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         while True:
+            if self._stop.is_set():
+                raise RuntimeError(
+                    "Prefetcher has been closed and cannot be reused; "
+                    "construct a new one"
+                )
             try:
                 item = self._queue.get(timeout=_POLL_SECONDS)
             except queue.Empty:
+                if self._stop.is_set():
+                    raise RuntimeError(
+                        "Prefetcher has been closed and cannot be reused; "
+                        "construct a new one"
+                    ) from None
                 if not self._thread.is_alive():
                     raise RuntimeError(
                         "prefetch worker died without reporting an error; "
                         "the queue is empty and the thread is gone"
                     ) from None
                 continue
-            if item is _SENTINEL:
-                return
             if isinstance(item, BaseException):
                 raise item
             yield item

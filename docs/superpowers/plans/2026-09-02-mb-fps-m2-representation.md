@@ -782,10 +782,24 @@ def test_batches_match_direct_sampling_in_order(buffer):
 
 
 def test_close_is_idempotent(buffer):
+    """Two closes must leave the same observable state as one."""
     pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
     next(iter(pf))
     pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
     pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+
+
+def test_reuse_after_close_reports_closure_not_death(buffer):
+    """A deliberately closed prefetcher must not look like a crashed one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    with pytest.raises(RuntimeError, match="closed and cannot be reused"):
+        next(iter(pf))
 
 
 def test_context_manager_closes_the_thread(buffer):
@@ -831,6 +845,11 @@ def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
         assert not pf._thread.is_alive(), "worker did not stop"
         while not pf._queue.empty():
             pf._queue.get_nowait()
+        # The thread is now dead but nobody called close(): clear the flag so
+        # `_stop.is_set()` reflects "not closed" again, isolating the
+        # dead-thread branch from the closed-state branch added for the
+        # reuse-after-close fix.
+        pf._stop.clear()
         with pytest.raises(RuntimeError, match="prefetch worker died"):
             next(iter(pf))
     finally:
@@ -863,8 +882,6 @@ from typing import Any, Iterator
 
 from mbfps.data.loader import SequenceLoader
 
-_SENTINEL = object()
-
 _POLL_SECONDS = 0.5
 """How long the consumer waits before checking whether the worker is alive.
 
@@ -875,7 +892,14 @@ hang is worse than an exception: it stalls CI with no diagnostic. Removing
 
 
 class Prefetcher:
-    """Yields batches from `loader`, produced on a background thread."""
+    """Yields batches from `loader`, produced on a background thread.
+
+    This is an infinite stream over `loader.sample()`: there is no
+    end-of-data condition, and `__iter__` never returns on its own. The only
+    way to stop consuming is to stop calling `next()` and `close()` the
+    prefetcher (or exit the `with` block); a closed `Prefetcher` cannot be
+    reused.
+    """
 
     def __init__(self, loader: SequenceLoader, depth: int = 2) -> None:
         if depth < 1:
@@ -903,17 +927,25 @@ class Prefetcher:
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         while True:
+            if self._stop.is_set():
+                raise RuntimeError(
+                    "Prefetcher has been closed and cannot be reused; "
+                    "construct a new one"
+                )
             try:
                 item = self._queue.get(timeout=_POLL_SECONDS)
             except queue.Empty:
+                if self._stop.is_set():
+                    raise RuntimeError(
+                        "Prefetcher has been closed and cannot be reused; "
+                        "construct a new one"
+                    ) from None
                 if not self._thread.is_alive():
                     raise RuntimeError(
                         "prefetch worker died without reporting an error; "
                         "the queue is empty and the thread is gone"
                     ) from None
                 continue
-            if item is _SENTINEL:
-                return
             if isinstance(item, BaseException):
                 raise item
             yield item
@@ -941,7 +973,7 @@ class Prefetcher:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_prefetch.py -v`
-Expected: 7 passed.
+Expected: 8 passed.
 
 - [ ] **Step 5: Measure the overlap on the real dataset**
 
