@@ -3655,13 +3655,26 @@ Expected: prints progress, then `episodes_kept=20`, a positive `transitions_per_
 
 - [ ] **Step 6: Write the coverage report**
 
+The gate is **per-episode reach**, not aggregate reach pooled across episodes. See
+`scripts/coverage_report.py`:
+
 ```python
 # scripts/coverage_report.py
-"""Per-policy state-visitation histogram.
+"""Per-policy state-visitation histogram and per-episode coverage gate.
 
 Coverage gaps are invisible at the milestone that creates them and only become
 symptomatic three milestones later, as an M4 agent with high imagined return and
 near-zero real return. This makes them visible now.
+
+The gate compares *per-episode* reach (occupied cells within a single episode),
+not aggregate reach pooled across many episodes. Aggregate cell counts scale
+with maze size and episode count: once enough episodes have been collected on
+a small, fixed maze like `my_way_home`, both policies fill nearly all of the
+reachable grid and the aggregate count saturates -- at that point it measures
+how big the maze is and how much data was collected, not how good the policy
+is. Per-episode reach does not have this problem: it asks how much ground one
+episode of a given policy covers, which is exactly what the scripted policy
+exists to improve over random.
 """
 
 import argparse
@@ -3677,23 +3690,32 @@ import numpy as np  # noqa: E402
 from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 
 
+def _occupied_mask(xy: np.ndarray, bins: int, x_range, y_range) -> np.ndarray:
+    hist = np.histogram2d(xy[:, 0], xy[:, 1], bins=bins, range=[x_range, y_range])[0]
+    return hist > 0
+
+
+def _occupied_count(xy: np.ndarray, bins: int, x_range, y_range) -> int:
+    return int(_occupied_mask(xy, bins, x_range, y_range).sum())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--out", type=Path, default=Path("runs"))
     parser.add_argument("--bins", type=int, default=60)
     parser.add_argument(
-        "--gate-budget",
-        type=int,
-        default=5000,
+        "--gate-ratio",
+        type=float,
+        default=1.2,
         help=(
-            "Frame budget the pass/fail gate is evaluated at. Occupied-cell "
-            "counts saturate as the budget grows -- both policies eventually "
-            "fill most of the reachable grid -- so gating at the largest "
-            "budget the dataset allows becomes less informative the more "
-            "data is collected. Gate at a mid-range budget instead; the "
-            "largest ladder entry <= this value is used (falling back to "
-            "the max equalised budget if the dataset is smaller)."
+            "Pass/fail threshold for the per-episode-reach gate: the mean "
+            "occupied-cell count reached per scripted episode must exceed "
+            "the mean per random episode by at least this multiplicative "
+            "margin, i.e. mean(scripted) > mean(random) * ratio. The gate "
+            "does not depend on a frame budget -- episode length is itself "
+            "part of what a policy controls, so per-episode frame counts "
+            "are not equalised."
         ),
     )
     args = parser.parse_args()
@@ -3705,28 +3727,80 @@ def main() -> None:
     keys = episodes[0].privileged_keys
     x_i, y_i = keys.index("pos_x"), keys.index("pos_y")
 
-    positions: dict[str, list[np.ndarray]] = defaultdict(list)
+    by_policy: dict[str, list[np.ndarray]] = defaultdict(list)
     for ep in episodes:
-        positions[ep.policy_name].append(ep.privileged[:, [x_i, y_i]])
+        by_policy[ep.policy_name].append(ep.privileged[:, [x_i, y_i]])
 
-    names = sorted(positions)
-    stacked = {n: np.concatenate(positions[n]) for n in names}
+    names = sorted(by_policy)
+    stacked = {n: np.concatenate(by_policy[n]) for n in names}
 
-    # Occupied-cell counts scale with sample size, so a policy that merely
-    # survives longer looks like it explores more. Subsample every policy to a
-    # common frame count before comparing reach. But equalising only at the
-    # largest budget the data allows lets the metric saturate -- both policies
-    # eventually fill most of the reachable grid and the real difference in
-    # reach compresses away -- so we measure a ladder of budgets and gate on a
-    # mid-range one where the counts still discriminate.
+    # Shared bin range across all policies and episodes so that every
+    # occupied-cell count below -- per-episode, aggregate, or union -- refers
+    # to the same grid and is directly comparable.
+    all_xy = np.concatenate(list(stacked.values()))
+    x_range = (all_xy[:, 0].min(), all_xy[:, 0].max())
+    y_range = (all_xy[:, 1].min(), all_xy[:, 1].max())
+
+    # --- primary gate: per-episode reach -------------------------------
+    # Frame counts differ slightly per episode; they are intentionally NOT
+    # equalised here -- episode length is itself part of what the policy
+    # controls, and all episodes in this dataset run to the same timeout,
+    # so a policy that reaches more of the maze before timing out is doing
+    # exactly what it is supposed to do.
+    per_episode_counts: dict[str, np.ndarray] = {}
+    for name in names:
+        per_episode_counts[name] = np.array(
+            [_occupied_count(xy, args.bins, x_range, y_range) for xy in by_policy[name]],
+            dtype=float,
+        )
+
+    print("--- per-episode reach (the gate) ---")
+    means: dict[str, float] = {}
+    for name in names:
+        counts = per_episode_counts[name]
+        means[name] = float(counts.mean())
+        sd = float(counts.std(ddof=0))
+        print(
+            f"{name}: n_episodes={len(counts)} "
+            f"mean_cells_per_episode={counts.mean():.1f} sd={sd:.1f}"
+        )
+
+    have_both = "random" in means and "scripted" in means
+    ratio = means["scripted"] / means["random"] if have_both else float("nan")
+    if have_both:
+        print(f"ratio (mean scripted / mean random) = {ratio:.3f}")
+
+    # --- union analysis: does more of the same data buy coverage? ------
+    print()
+    print("--- union analysis (does more of the same data buy coverage?) ---")
+    masks = {n: _occupied_mask(stacked[n], args.bins, x_range, y_range) for n in names}
+    if have_both:
+        random_mask, scripted_mask = masks["random"], masks["scripted"]
+        random_alone = int(random_mask.sum())
+        scripted_alone = int(scripted_mask.sum())
+        scripted_only = int((scripted_mask & ~random_mask).sum())
+        union = int((random_mask | scripted_mask).sum())
+        pct_over_random = 100.0 * (union - random_alone) / random_alone
+        print(f"random alone            : {random_alone} cells")
+        print(f"scripted alone          : {scripted_alone} cells")
+        print(f"scripted-only cells     : {scripted_only}   (states random never reaches)")
+        print(
+            f"union                   : {union}   "
+            f"(+{pct_over_random:.1f}% over random alone)"
+        )
+    else:
+        print("union analysis requires both 'random' and 'scripted' policies; skipping")
+
+    # --- budget ladder: DIAGNOSTIC ONLY, not the gate ------------------
+    # Occupied-cell counts pooled across many episodes scale with sample
+    # size and, on a small fixed maze, saturate once the reachable area is
+    # filled -- both policies eventually cover most of the grid and the
+    # ladder flattens out regardless of policy quality. Kept here only as
+    # a diagnostic; see the per-episode reach above for the gate.
     max_budget = min(len(v) for v in stacked.values())
     ladder = [b for b in (2_000, 5_000, 10_000, 25_000) if b <= max_budget]
     ladder.append(max_budget)
     ladder = sorted(set(ladder))
-
-    all_xy = np.concatenate(list(stacked.values()))
-    x_range = (all_xy[:, 0].min(), all_xy[:, 0].max())
-    y_range = (all_xy[:, 1].min(), all_xy[:, 1].max())
 
     rng = np.random.default_rng(0)
     ladder_counts: dict[int, dict[str, int]] = {}
@@ -3736,10 +3810,7 @@ def main() -> None:
         for name in names:
             xy = stacked[name]
             sub = xy[rng.choice(len(xy), size=budget, replace=False)]
-            occupied = np.histogram2d(
-                sub[:, 0], sub[:, 1], bins=args.bins, range=[x_range, y_range]
-            )[0]
-            counts[name] = int((occupied > 0).sum())
+            counts[name] = _occupied_count(sub, args.bins, x_range, y_range)
             if budget == max_budget:
                 max_budget_sampled[name] = sub
         ladder_counts[budget] = counts
@@ -3758,6 +3829,7 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
 
+    print()
     print(f"figure={out_path}")
     print(f"max_equalised_budget={max_budget}")
     for name in names:
@@ -3770,27 +3842,38 @@ def main() -> None:
         )
 
     print()
+    print("--- aggregate coverage budget ladder (DIAGNOSTIC ONLY -- not the gate) ---")
+    print(
+        "Aggregate coverage saturates once episodes have filled the reachable "
+        "area, so it tracks maze size and episode count rather than policy "
+        "quality; it is not used for pass/fail."
+    )
     print(f"{'budget':>9}  {'random':>8}  {'scripted':>8}  {'ratio':>6}")
     for budget in ladder:
         counts = ladder_counts[budget]
-        ratio = counts.get("scripted", 0) / max(counts.get("random", 1), 1)
-        print(f"{budget:>9}  {counts.get('random', 0):>8}  "
-              f"{counts.get('scripted', 0):>8}  {ratio:>6.3f}")
+        agg_ratio = counts.get("scripted", 0) / max(counts.get("random", 1), 1)
+        print(
+            f"{budget:>9}  {counts.get('random', 0):>8}  "
+            f"{counts.get('scripted', 0):>8}  {agg_ratio:>6.3f}"
+        )
 
-    gate_candidates = [b for b in ladder if b <= args.gate_budget]
-    gate_budget = max(gate_candidates) if gate_candidates else max_budget
-    gate_counts = ladder_counts[gate_budget]
-    random_n = gate_counts.get("random", 0)
-    scripted_n = gate_counts.get("scripted", 0)
-    passed = scripted_n > random_n
+    # --- gate: mean per-episode reach -----------------------------------
+    print()
+    if not have_both:
+        raise SystemExit(
+            "coverage gate requires both 'random' and 'scripted' policies in the dataset"
+        )
+    passed = means["scripted"] > means["random"] * args.gate_ratio
     print(
         f"GATE: {'PASS' if passed else 'FAIL'} "
-        f"(budget={gate_budget}, random={random_n}, scripted={scripted_n})"
+        f"(mean_scripted={means['scripted']:.1f}, mean_random={means['random']:.1f}, "
+        f"ratio={ratio:.3f}, required_ratio={args.gate_ratio:.2f})"
     )
     if not passed:
         raise SystemExit(
-            f"coverage gate failed: scripted={scripted_n} <= random={random_n} "
-            f"at budget={gate_budget}"
+            f"coverage gate failed: mean(scripted)={means['scripted']:.1f} does not "
+            f"exceed mean(random)={means['random']:.1f} * {args.gate_ratio:.2f} "
+            f"(ratio={ratio:.3f} < required {args.gate_ratio:.2f})"
         )
 
 
@@ -3798,19 +3881,29 @@ if __name__ == "__main__":
     main()
 ```
 
-**Why gate on a mid-range budget instead of the max equalised budget:** occupied-cell counts
-saturate as the frame budget grows -- both policies eventually fill most of the reachable
-grid, so the metric that is supposed to discriminate exploration quality goes flat exactly
-when the dataset is largest. Measured on this project's data: independent ~5,800-frame
-trials gave a scripted/random occupied-cell ratio of 1.199, 1.260, 1.169, 1.481 (mean 1.28,
-scripted ahead in all four), while the same comparison at the full 200-episode run's
-28,791-frame equalised budget compressed to ratio ~1.02 (1018 vs 998) -- a real, measurable
-signal at the smaller budget nearly disappears at the larger one. A gate meant to protect
-the next milestone must not go blind exactly when the dataset is largest, so it now reports
-a ladder of budgets (2,000 / 5,000 / 10,000 / 25,000 / the max equalised budget, whichever
-of the fixed rungs are `<= max_budget`) and evaluates pass/fail at `--gate-budget` (default
-`5000`) -- specifically the largest ladder rung `<= --gate-budget`, falling back to the max
-equalised budget if the dataset is smaller than that.
+**Why the gate is per-episode reach, not aggregate reach:** an earlier version of this
+script gated on occupied-cell counts pooled across all episodes at a mid-range frame
+budget. Measured on the existing 200-episode `my_way_home` dataset (61 episodes per
+policy): aggregate occupied cells were 999 (random) vs 1018 (scripted) -- a ratio of only
+~1.02, and independent ~5,800-frame trials gave ratios of 1.199, 1.260, 1.169, 1.481
+(mean 1.28) with no stable value as the budget ladder grew. That instability is not noise
+in the policy; it is the metric going blind. `my_way_home` is a small, fixed maze, and by
+61 episodes per policy the *union* of cells random alone reaches (999) already covers all
+but 26 of the 1,025 cells either policy ever reaches (+2.6%). Once episodes have nearly
+saturated the reachable area, the aggregate count is dominated by maze size and episode
+count, not by policy quality -- exactly backwards for a gate meant to catch a policy that
+stopped exploring.
+
+**Per-episode reach does not saturate** and directly measures what the scripted policy
+exists to do: on the same dataset, scripted episodes reach a mean 125.0 cells (sd 40.1)
+against random's mean 86.7 cells (sd 33.5) -- a decisive, stable +44% per episode (ratio
+1.441, n=61 each), regardless of how many episodes have been collected. The gate is
+`mean(scripted) > mean(random) * --gate-ratio` (default `1.2`). The aggregate budget
+ladder is kept as a labelled diagnostic only -- useful for eyeballing where coverage
+saturates -- and a union analysis is printed alongside it so the next plan can tell
+whether collecting more episodes of these two policies would buy additional state
+coverage (see the constraint recorded after the exit criteria below: on `my_way_home`,
+at this episode count, it would not).
 
 - [ ] **Step 6b: Gate on episode length against the training window**
 
@@ -3844,7 +3937,14 @@ Record the measured `mean_len` in the commit message — Plan 2 needs it to size
 
 Run: `.venv/bin/python scripts/coverage_report.py`
 
-Expected: prints `figure=runs/coverage_my_way_home.png`, `max_equalised_budget=<N>`, one `total_frames`/`occupied_cells`/`x_span`/`y_span` diagnostic line per policy at that max budget, then a ladder table --
+Expected: prints a `--- per-episode reach (the gate) ---` block with `n_episodes`,
+`mean_cells_per_episode`, and `sd` per policy plus the ratio; a
+`--- union analysis (does more of the same data buy coverage?) ---` block reporting cells
+reached by random alone, by scripted alone, scripted-only cells (states random never
+reaches), and the union with its percentage gain over random alone; the figure path and
+per-policy `total_frames`/`occupied_cells`/`x_span`/`y_span` diagnostic line at the max
+equalised budget; a `--- aggregate coverage budget ladder (DIAGNOSTIC ONLY -- not the
+gate) ---` table --
 
 ```
    budget    random  scripted   ratio
@@ -3855,9 +3955,16 @@ Expected: prints `figure=runs/coverage_my_way_home.png`, `max_equalised_budget=<
     <max>       ...       ...    ...
 ```
 
--- followed by a `GATE: PASS` or `GATE: FAIL` line naming the budget the gate was evaluated at and both counts. **The gate: at the largest ladder rung `<= --gate-budget` (default `5000`), `scripted` must show a larger `occupied_cells` count than `random`.** The script exits non-zero on `GATE: FAIL` so the gate cannot be passed over silently.
+-- followed by a `GATE: PASS` or `GATE: FAIL` line naming the per-episode means, the ratio,
+and the required ratio. **The gate: `mean(scripted occupied cells per episode) >
+mean(random occupied cells per episode) * --gate-ratio` (default `1.2`).** The script exits
+non-zero on `GATE: FAIL` so the gate cannot be passed over silently.
 
-The equalisation matters: raw occupied-cell counts scale with sample size, so a policy that merely survives longer would look like it explores more. Comparing at a common frame budget measures reach rather than longevity. But equalising only at the *largest* budget the data allows lets the metric saturate: measured on this project's data, independent ~5,800-frame trials gave a scripted/random ratio of 1.199, 1.260, 1.169, 1.481 (mean 1.28, scripted ahead in all four), while the same comparison at the full 200-episode run's 28,791-frame budget compressed to ratio ~1.02 (1018 vs 998). Both policies have nearly filled the reachable grid by the time the budget is that large, so the counts hit a ceiling and the real difference is compressed away. Gating at the maximum budget therefore becomes *less* informative the more data is collected -- exactly backwards for a gate meant to protect the next milestone. Gate at the mid-range `--gate-budget` instead, and read the full ladder to see where (if anywhere) the counts saturate.
+Measured on the existing 200-episode dataset (61 episodes per policy): random reaches a
+mean 86.7 cells/episode (sd 33.5), scripted reaches a mean 125.0 cells/episode (sd 40.1) --
+ratio 1.441, comfortably above the default `1.2` threshold and stable regardless of how
+many episodes are collected, unlike the old aggregate-budget gate (see Step 6's rationale
+above and the constraint recorded after the exit criteria below).
 
 If `GATE: FAIL`, first confirm the policy is not degenerate — run `.venv/bin/python -c "from mbfps.envs.registry import make_env; e=make_env('vizdoom'); print(e.button_names); e.close()"` and check that `MOVE_FORWARD`, `TURN_LEFT` and `TURN_RIGHT` are present. If they are, tune `_ADVANCE_PROB` or `_SWEEP_LEN` in `src/mbfps/data/policies.py`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds. **Do not, however, re-tune merely to chase a passing number on a dataset that already exists** — the policy constants are tuned against the environment's exploration dynamics, not against one dataset's gate result; if a gate failure on an existing collection does not resolve after confirming the policy is non-degenerate, treat it as a real finding to report rather than a bug to tune away.
 
@@ -3909,8 +4016,26 @@ Both milestones' spec criteria, restated as things you can run:
 - [ ] `pytest tests/data/test_episode.py` passes — stored data equals collected data.
 - [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat **within a process on a given device** (CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements, so the cache must be generated once on one device and reused across every experimental arm, never regenerated per arm).
 - [ ] The episode-length gate passes: at least 80% of episodes are >= 64 transitions, with `mean_len` recorded.
-- [ ] `scripts/coverage_report.py` prints `GATE: PASS` — `scripted` occupies more cells than `random` at the largest ladder rung `<= --gate-budget` (default `5000`), **not just at the maximum equalised budget**, since the metric saturates there (measured: ratio ~1.28 mean at ~5,800 frames vs ~1.02 at the full 28,791-frame budget) and a gate that only checks the max budget goes blind as the dataset grows.
+- [ ] `scripts/coverage_report.py` prints `GATE: PASS` — the mean occupied-cell count reached **per scripted episode** exceeds the mean **per random episode** by at least `--gate-ratio` (default `1.2`), i.e. `mean(scripted) > mean(random) * 1.2` (measured: 125.0 vs 86.7 cells/episode, ratio 1.441). This is a **per-episode**, not aggregate, gate: aggregate cell counts pooled across many episodes saturate once a fixed maze's reachable area is filled and then track maze size and episode count rather than policy quality (measured on this dataset: aggregate cells 999 (random) vs 1018 (scripted), ratio ~1.02, union only +2.6% over random alone) — see the constraint below.
 - [ ] `pytest tests/test_privileged_isolation.py` passes.
+
+## Constraint carried into Plan 2: `my_way_home` coverage is near-saturated at 61 episodes/policy
+
+Measured while building the M1 coverage gate (see Task 13, Step 6): on the existing
+200-episode `my_way_home` dataset (61 episodes per policy), random alone already reaches
+999 of the 1,025 cells either policy ever reaches, and scripted adds only 26 cells (+2.6%)
+that random never visits. The two policies' *per-episode* reach differs sharply and
+reliably (scripted 125.0 cells/episode vs random's 86.7, +44%, the M1 gate) but their
+*aggregate* footprint over many episodes has nearly filled the small, fixed maze.
+
+**Implication for Plan 2 and beyond: collecting more episodes of `RandomPolicy` and
+`ScriptedPolicy` on `my_way_home` will not meaningfully increase state coverage.** The
+ceiling here is the maze's reachable area, not the sample size. If a later milestone needs
+broader state coverage than this dataset provides (e.g. the world model hallucinating in
+regions neither policy visits), the fix is additional scenarios or map variety — not more
+episodes of these two policies on this one map. Re-run `scripts/coverage_report.py --data
+data/<scenario>` (union analysis) before collecting a larger dataset on the same scenario,
+to check whether that scenario has already saturated the same way.
 
 ## Deferred to Plan 2 (M2–M3)
 
