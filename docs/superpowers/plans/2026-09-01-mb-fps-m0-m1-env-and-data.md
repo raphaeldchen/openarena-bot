@@ -3682,6 +3682,20 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--out", type=Path, default=Path("runs"))
     parser.add_argument("--bins", type=int, default=60)
+    parser.add_argument(
+        "--gate-budget",
+        type=int,
+        default=5000,
+        help=(
+            "Frame budget the pass/fail gate is evaluated at. Occupied-cell "
+            "counts saturate as the budget grows -- both policies eventually "
+            "fill most of the reachable grid -- so gating at the largest "
+            "budget the dataset allows becomes less informative the more "
+            "data is collected. Gate at a mid-range budget instead; the "
+            "largest ladder entry <= this value is used (falling back to "
+            "the max equalised budget if the dataset is smaller)."
+        ),
+    )
     args = parser.parse_args()
 
     episodes = ReplayBuffer(args.data, capacity_transitions=10**9).load_all()
@@ -3699,23 +3713,43 @@ def main() -> None:
     stacked = {n: np.concatenate(positions[n]) for n in names}
 
     # Occupied-cell counts scale with sample size, so a policy that merely
-    # survives longer looks like it explores more. Subsample every policy to the
-    # same frame count before comparing reach.
-    rng = np.random.default_rng(0)
-    budget = min(len(v) for v in stacked.values())
-    sampled = {
-        k: v[rng.choice(len(v), size=budget, replace=False)] for k, v in stacked.items()
-    }
+    # survives longer looks like it explores more. Subsample every policy to a
+    # common frame count before comparing reach. But equalising only at the
+    # largest budget the data allows lets the metric saturate -- both policies
+    # eventually fill most of the reachable grid and the real difference in
+    # reach compresses away -- so we measure a ladder of budgets and gate on a
+    # mid-range one where the counts still discriminate.
+    max_budget = min(len(v) for v in stacked.values())
+    ladder = [b for b in (2_000, 5_000, 10_000, 25_000) if b <= max_budget]
+    ladder.append(max_budget)
+    ladder = sorted(set(ladder))
 
     all_xy = np.concatenate(list(stacked.values()))
     x_range = (all_xy[:, 0].min(), all_xy[:, 0].max())
     y_range = (all_xy[:, 1].min(), all_xy[:, 1].max())
 
+    rng = np.random.default_rng(0)
+    ladder_counts: dict[int, dict[str, int]] = {}
+    max_budget_sampled: dict[str, np.ndarray] = {}
+    for budget in ladder:
+        counts = {}
+        for name in names:
+            xy = stacked[name]
+            sub = xy[rng.choice(len(xy), size=budget, replace=False)]
+            occupied = np.histogram2d(
+                sub[:, 0], sub[:, 1], bins=args.bins, range=[x_range, y_range]
+            )[0]
+            counts[name] = int((occupied > 0).sum())
+            if budget == max_budget:
+                max_budget_sampled[name] = sub
+        ladder_counts[budget] = counts
+
+    # Figure is drawn at the max equalised budget, as before.
     fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 5), squeeze=False)
     for ax, name in zip(axes[0], names):
-        xy = sampled[name]
+        xy = max_budget_sampled[name]
         ax.hist2d(xy[:, 0], xy[:, 1], bins=args.bins, range=[x_range, y_range])
-        ax.set_title(f"{name}  (n={len(xy)})")
+        ax.set_title(f"{name}  (n={len(xy)}, budget={max_budget})")
         ax.set_xlabel("pos_x")
         ax.set_ylabel("pos_y")
 
@@ -3725,23 +3759,58 @@ def main() -> None:
     fig.savefig(out_path, dpi=120)
 
     print(f"figure={out_path}")
-    print(f"comparison_budget={budget} frames per policy (equalised)")
+    print(f"max_equalised_budget={max_budget}")
     for name in names:
-        xy = sampled[name]
-        occupied = np.histogram2d(
-            xy[:, 0], xy[:, 1], bins=args.bins, range=[x_range, y_range]
-        )[0]
+        xy = max_budget_sampled[name]
         print(
             f"{name}: total_frames={len(stacked[name])} "
-            f"occupied_cells={int((occupied > 0).sum())}/{args.bins ** 2} "
-            f"(at {budget} frames) "
+            f"occupied_cells={ladder_counts[max_budget][name]}/{args.bins ** 2} "
+            f"(at {max_budget} frames) "
             f"x_span={np.ptp(xy[:, 0]):.1f} y_span={np.ptp(xy[:, 1]):.1f}"
+        )
+
+    print()
+    print(f"{'budget':>9}  {'random':>8}  {'scripted':>8}  {'ratio':>6}")
+    for budget in ladder:
+        counts = ladder_counts[budget]
+        ratio = counts.get("scripted", 0) / max(counts.get("random", 1), 1)
+        print(f"{budget:>9}  {counts.get('random', 0):>8}  "
+              f"{counts.get('scripted', 0):>8}  {ratio:>6.3f}")
+
+    gate_candidates = [b for b in ladder if b <= args.gate_budget]
+    gate_budget = max(gate_candidates) if gate_candidates else max_budget
+    gate_counts = ladder_counts[gate_budget]
+    random_n = gate_counts.get("random", 0)
+    scripted_n = gate_counts.get("scripted", 0)
+    passed = scripted_n > random_n
+    print(
+        f"GATE: {'PASS' if passed else 'FAIL'} "
+        f"(budget={gate_budget}, random={random_n}, scripted={scripted_n})"
+    )
+    if not passed:
+        raise SystemExit(
+            f"coverage gate failed: scripted={scripted_n} <= random={random_n} "
+            f"at budget={gate_budget}"
         )
 
 
 if __name__ == "__main__":
     main()
 ```
+
+**Why gate on a mid-range budget instead of the max equalised budget:** occupied-cell counts
+saturate as the frame budget grows -- both policies eventually fill most of the reachable
+grid, so the metric that is supposed to discriminate exploration quality goes flat exactly
+when the dataset is largest. Measured on this project's data: independent ~5,800-frame
+trials gave a scripted/random occupied-cell ratio of 1.199, 1.260, 1.169, 1.481 (mean 1.28,
+scripted ahead in all four), while the same comparison at the full 200-episode run's
+28,791-frame equalised budget compressed to ratio ~1.02 (1018 vs 998) -- a real, measurable
+signal at the smaller budget nearly disappears at the larger one. A gate meant to protect
+the next milestone must not go blind exactly when the dataset is largest, so it now reports
+a ladder of budgets (2,000 / 5,000 / 10,000 / 25,000 / the max equalised budget, whichever
+of the fixed rungs are `<= max_budget`) and evaluates pass/fail at `--gate-budget` (default
+`5000`) -- specifically the largest ladder rung `<= --gate-budget`, falling back to the max
+equalised budget if the dataset is smaller than that.
 
 - [ ] **Step 6b: Gate on episode length against the training window**
 
@@ -3775,11 +3844,22 @@ Record the measured `mean_len` in the commit message — Plan 2 needs it to size
 
 Run: `.venv/bin/python scripts/coverage_report.py`
 
-Expected: prints `figure=runs/coverage_my_way_home.png`, an equalised `comparison_budget`, and one line per policy. **The gate: `scripted` must show a larger `occupied_cells` count than `random` at the equalised frame budget.**
+Expected: prints `figure=runs/coverage_my_way_home.png`, `max_equalised_budget=<N>`, one `total_frames`/`occupied_cells`/`x_span`/`y_span` diagnostic line per policy at that max budget, then a ladder table --
 
-The equalisation matters: raw occupied-cell counts scale with sample size, so a policy that merely survives longer would look like it explores more. Comparing at a common frame budget measures reach rather than longevity.
+```
+   budget    random  scripted   ratio
+     2000       ...       ...    ...
+     5000       ...       ...    ...
+    10000       ...       ...    ...
+    25000       ...       ...    ...
+    <max>       ...       ...    ...
+```
 
-If it does not, first confirm the policy is not degenerate — run `.venv/bin/python -c "from mbfps.envs.registry import make_env; e=make_env('vizdoom'); print(e.button_names); e.close()"` and check that `MOVE_FORWARD`, `TURN_LEFT` and `TURN_RIGHT` are present. If they are, tune `_ADVANCE_PROB` or `_SWEEP_LEN` in `src/mbfps/data/policies.py`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds.
+-- followed by a `GATE: PASS` or `GATE: FAIL` line naming the budget the gate was evaluated at and both counts. **The gate: at the largest ladder rung `<= --gate-budget` (default `5000`), `scripted` must show a larger `occupied_cells` count than `random`.** The script exits non-zero on `GATE: FAIL` so the gate cannot be passed over silently.
+
+The equalisation matters: raw occupied-cell counts scale with sample size, so a policy that merely survives longer would look like it explores more. Comparing at a common frame budget measures reach rather than longevity. But equalising only at the *largest* budget the data allows lets the metric saturate: measured on this project's data, independent ~5,800-frame trials gave a scripted/random ratio of 1.199, 1.260, 1.169, 1.481 (mean 1.28, scripted ahead in all four), while the same comparison at the full 200-episode run's 28,791-frame budget compressed to ratio ~1.02 (1018 vs 998). Both policies have nearly filled the reachable grid by the time the budget is that large, so the counts hit a ceiling and the real difference is compressed away. Gating at the maximum budget therefore becomes *less* informative the more data is collected -- exactly backwards for a gate meant to protect the next milestone. Gate at the mid-range `--gate-budget` instead, and read the full ladder to see where (if anywhere) the counts saturate.
+
+If `GATE: FAIL`, first confirm the policy is not degenerate — run `.venv/bin/python -c "from mbfps.envs.registry import make_env; e=make_env('vizdoom'); print(e.button_names); e.close()"` and check that `MOVE_FORWARD`, `TURN_LEFT` and `TURN_RIGHT` are present. If they are, tune `_ADVANCE_PROB` or `_SWEEP_LEN` in `src/mbfps/data/policies.py`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds. **Do not, however, re-tune merely to chase a passing number on a dataset that already exists** — the policy constants are tuned against the environment's exploration dynamics, not against one dataset's gate result; if a gate failure on an existing collection does not resolve after confirming the policy is non-degenerate, treat it as a real finding to report rather than a bug to tune away.
 
 - [ ] **Step 8: Benchmark the loader**
 
@@ -3829,7 +3909,7 @@ Both milestones' spec criteria, restated as things you can run:
 - [ ] `pytest tests/data/test_episode.py` passes — stored data equals collected data.
 - [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat **within a process on a given device** (CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements, so the cache must be generated once on one device and reused across every experimental arm, never regenerated per arm).
 - [ ] The episode-length gate passes: at least 80% of episodes are >= 64 transitions, with `mean_len` recorded.
-- [ ] `scripts/coverage_report.py` shows `scripted` occupying more cells than `random` **at the equalised frame budget**.
+- [ ] `scripts/coverage_report.py` prints `GATE: PASS` — `scripted` occupies more cells than `random` at the largest ladder rung `<= --gate-budget` (default `5000`), **not just at the maximum equalised budget**, since the metric saturates there (measured: ratio ~1.28 mean at ~5,800 frames vs ~1.02 at the full 28,791-frame budget) and a gate that only checks the max budget goes blind as the dataset grows.
 - [ ] `pytest tests/test_privileged_isolation.py` passes.
 
 ## Deferred to Plan 2 (M2–M3)
