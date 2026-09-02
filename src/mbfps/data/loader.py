@@ -5,13 +5,30 @@ episode to the start of another would teach the RSSM a transition the engine can
 never produce.
 """
 
+import logging
+
 import numpy as np
 
 from mbfps.data.buffer import ReplayBuffer
 
+logger = logging.getLogger(__name__)
+
+# One real episode (my_way_home, 526 frames of 112x112x3 uint8) is ~19.8 MB.
+# 2 GB is roughly 100 such episodes -- comfortably inside a training run's
+# working set on a 16 GB unified-memory machine, but large enough to be worth
+# a warning rather than silence.
+_WARN_BYTES = 2_000_000_000
+
 
 class SequenceLoader:
-    """Samples `(B, T)` windows from episodes held in a `ReplayBuffer`."""
+    """Samples `(B, T)` windows from episodes held in a `ReplayBuffer`.
+
+    The entire buffer is loaded eagerly at construction and held resident in
+    RAM for the lifetime of this object -- there is no streaming path. Each
+    episode costs roughly 19.8 MB (526 frames of 112x112x3 uint8), so a
+    `ReplayBuffer` sized for hundreds of thousands of transitions can occupy
+    several GB. See `_WARN_BYTES` below.
+    """
 
     def __init__(
         self,
@@ -26,9 +43,16 @@ class SequenceLoader:
         self._rng = np.random.default_rng(seed)
         self._episodes = buffer.load_all()
 
-    def refresh(self) -> None:
-        """Reload episodes from disk. Call after new data is collected."""
-        self._episodes = self.buffer.load_all()
+        total_bytes = sum(ep.obs.nbytes for ep in self._episodes)
+        if total_bytes > _WARN_BYTES:
+            logger.warning(
+                "SequenceLoader holds %d episodes (%.2f GB) resident in RAM. "
+                "Episodes are loaded eagerly at construction; a streaming loader "
+                "is deferred to a later plan. Reduce ReplayBuffer capacity if "
+                "this competes with model memory.",
+                len(self._episodes),
+                total_bytes / 1e9,
+            )
 
     def _usable(self) -> list[int]:
         return [i for i, ep in enumerate(self._episodes) if ep.length >= self.seq_len]

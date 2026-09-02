@@ -129,3 +129,21 @@ def test_no_usable_episodes_raises(tmp_path):
     buf.add(make_episode(t=4, fill=9))
     with pytest.raises(ValueError, match="no episodes long enough"):
         SequenceLoader(buf, batch_size=4, seq_len=64, seed=0).sample()
+
+
+def test_large_buffer_logs_a_memory_warning(tmp_path, caplog, monkeypatch):
+    """The eager load is a real constraint on a 16 GB machine; make it visible."""
+    import mbfps.data.loader as loader_module
+
+    monkeypatch.setattr(loader_module, "_WARN_BYTES", 1)
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    with caplog.at_level("WARNING"):
+        SequenceLoader(buf, batch_size=2, seq_len=16, seed=0)
+    assert "resident in RAM" in caplog.text
+
+
+def test_small_buffer_logs_no_warning(buffer, caplog):
+    with caplog.at_level("WARNING"):
+        SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    assert "resident in RAM" not in caplog.text

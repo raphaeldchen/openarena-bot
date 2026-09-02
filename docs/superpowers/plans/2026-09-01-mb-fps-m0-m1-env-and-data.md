@@ -3020,6 +3020,24 @@ def test_no_usable_episodes_raises(tmp_path):
     buf.add(make_episode(t=4, fill=9))
     with pytest.raises(ValueError, match="no episodes long enough"):
         SequenceLoader(buf, batch_size=4, seq_len=64, seed=0).sample()
+
+
+def test_large_buffer_logs_a_memory_warning(tmp_path, caplog, monkeypatch):
+    """The eager load is a real constraint on a 16 GB machine; make it visible."""
+    import mbfps.data.loader as loader_module
+
+    monkeypatch.setattr(loader_module, "_WARN_BYTES", 1)
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    with caplog.at_level("WARNING"):
+        SequenceLoader(buf, batch_size=2, seq_len=16, seed=0)
+    assert "resident in RAM" in caplog.text
+
+
+def test_small_buffer_logs_no_warning(buffer, caplog):
+    with caplog.at_level("WARNING"):
+        SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    assert "resident in RAM" not in caplog.text
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -3038,13 +3056,30 @@ episode to the start of another would teach the RSSM a transition the engine can
 never produce.
 """
 
+import logging
+
 import numpy as np
 
 from mbfps.data.buffer import ReplayBuffer
 
+logger = logging.getLogger(__name__)
+
+# One real episode (my_way_home, 526 frames of 112x112x3 uint8) is ~19.8 MB.
+# 2 GB is roughly 100 such episodes -- comfortably inside a training run's
+# working set on a 16 GB unified-memory machine, but large enough to be worth
+# a warning rather than silence.
+_WARN_BYTES = 2_000_000_000
+
 
 class SequenceLoader:
-    """Samples `(B, T)` windows from episodes held in a `ReplayBuffer`."""
+    """Samples `(B, T)` windows from episodes held in a `ReplayBuffer`.
+
+    The entire buffer is loaded eagerly at construction and held resident in
+    RAM for the lifetime of this object -- there is no streaming path. Each
+    episode costs roughly 19.8 MB (526 frames of 112x112x3 uint8), so a
+    `ReplayBuffer` sized for hundreds of thousands of transitions can occupy
+    several GB. See `_WARN_BYTES` below.
+    """
 
     def __init__(
         self,
@@ -3059,9 +3094,16 @@ class SequenceLoader:
         self._rng = np.random.default_rng(seed)
         self._episodes = buffer.load_all()
 
-    def refresh(self) -> None:
-        """Reload episodes from disk. Call after new data is collected."""
-        self._episodes = self.buffer.load_all()
+        total_bytes = sum(ep.obs.nbytes for ep in self._episodes)
+        if total_bytes > _WARN_BYTES:
+            logger.warning(
+                "SequenceLoader holds %d episodes (%.2f GB) resident in RAM. "
+                "Episodes are loaded eagerly at construction; a streaming loader "
+                "is deferred to a later plan. Reduce ReplayBuffer capacity if "
+                "this competes with model memory.",
+                len(self._episodes),
+                total_bytes / 1e9,
+            )
 
     def _usable(self) -> list[int]:
         return [i for i, ep in enumerate(self._episodes) if ep.length >= self.seq_len]
@@ -3116,7 +3158,7 @@ class SequenceLoader:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_loader.py -v`
-Expected: 10 passed.
+Expected: 12 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -3487,7 +3529,12 @@ def main() -> None:
     )
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=1000)
-    parser.add_argument("--capacity", type=int, default=200_000)
+    # A real episode is ~19.8 MB resident once loaded by SequenceLoader (526
+    # frames of 112x112x3 uint8). At the default below (60,000 transitions,
+    # ~114 episodes) that is ~2.3 GB resident -- comfortably inside a 16 GB
+    # unified-memory machine shared with the model. Raise this only knowing
+    # what you are buying: 200,000 transitions (~380 episodes) costs ~7.5 GB.
+    parser.add_argument("--capacity", type=int, default=60_000)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
