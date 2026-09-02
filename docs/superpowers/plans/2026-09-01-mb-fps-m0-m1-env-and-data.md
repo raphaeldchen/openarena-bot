@@ -462,9 +462,12 @@ class EnvProtocol(Protocol):
 # src/mbfps/envs/registry.py
 """Environment construction by name."""
 
+import logging
 from typing import Any, Callable
 
 from mbfps.envs.protocol import EnvProtocol
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, Callable[..., EnvProtocol]] = {}
 
@@ -498,18 +501,72 @@ def _register_builtins() -> None:
     register("vizdoom", ViZDoomEnv)
 
 
-try:  # pragma: no cover - exercised once vizdoom_env exists
-    _register_builtins()
-except ImportError:
-    pass
+def _try_register_builtins() -> None:
+    """Register built-in environments, tolerating ones not yet written.
+
+    `vizdoom_env` does not exist until Task 5. Any other import failure -- a
+    missing third-party package, a broken native library, a misspelled class
+    name -- must propagate: swallowing it would leave an empty registry and
+    report a real bug as "unknown environment", sending a debugger to the
+    wrong file.
+    """
+    try:
+        _register_builtins()
+    except ModuleNotFoundError as exc:
+        if exc.name != "mbfps.envs.vizdoom_env":
+            raise
+        logger.debug("mbfps.envs.vizdoom_env not available yet; registry left empty")
+
+
+_try_register_builtins()
+```
+
+Also append these tests, which lock in the narrow catch by monkeypatching `_register_builtins` and calling `_try_register_builtins()` directly -- they must fail if the guard is ever widened back to a bare `except ImportError: pass`:
+
+```python
+def test_try_register_builtins_swallows_missing_vizdoom_env(monkeypatch):
+    def _raise():
+        raise ModuleNotFoundError(
+            "No module named 'mbfps.envs.vizdoom_env'",
+            name="mbfps.envs.vizdoom_env",
+        )
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    registry._try_register_builtins()  # must not raise
+
+
+def test_try_register_builtins_reraises_other_missing_module(monkeypatch):
+    def _raise():
+        raise ModuleNotFoundError(
+            "No module named 'some_native_lib'", name="some_native_lib"
+        )
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    with pytest.raises(ModuleNotFoundError, match="some_native_lib"):
+        registry._try_register_builtins()
+
+
+def test_try_register_builtins_reraises_plain_import_error(monkeypatch):
+    def _raise():
+        raise ImportError("cannot import name 'VizdoomEnv'")
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    with pytest.raises(ImportError, match="VizdoomEnv"):
+        registry._try_register_builtins()
+```
+
+This requires importing the module itself alongside its public names, at the top of the test file:
+
+```python
+from mbfps.envs import registry
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/test_protocol.py -v`
-Expected: 4 passed, 1 xfailed.
+Expected: 7 passed, 1 xfailed.
 
-Note: `test_make_env_lists_available_names_in_error` passes only once `vizdoom_env.py` exists, which is **Task 5** (not Task 3). Until then `_register_builtins` swallows the `ImportError` and the registry stays empty. Mark that one test now:
+Note: `test_make_env_lists_available_names_in_error` passes only once `vizdoom_env.py` exists, which is **Task 5** (not Task 3). Until then `_try_register_builtins` swallows the `ModuleNotFoundError` for `mbfps.envs.vizdoom_env` specifically -- any other import failure still propagates -- and the registry stays empty. Mark that one test now:
 
 ```python
 @pytest.mark.xfail(reason="ViZDoomEnv lands in Task 5", strict=True)

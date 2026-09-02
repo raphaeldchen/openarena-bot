@@ -1,8 +1,11 @@
 """Environment construction by name."""
 
+import logging
 from typing import Any, Callable
 
 from mbfps.envs.protocol import EnvProtocol
+
+logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, Callable[..., EnvProtocol]] = {}
 
@@ -36,7 +39,21 @@ def _register_builtins() -> None:
     register("vizdoom", ViZDoomEnv)
 
 
-try:  # pragma: no cover - exercised once vizdoom_env exists
-    _register_builtins()
-except ImportError:
-    pass
+def _try_register_builtins() -> None:
+    """Register built-in environments, tolerating ones not yet written.
+
+    `vizdoom_env` does not exist until Task 5. Any other import failure -- a
+    missing third-party package, a broken native library, a misspelled class
+    name -- must propagate: swallowing it would leave an empty registry and
+    report a real bug as "unknown environment", sending a debugger to the
+    wrong file.
+    """
+    try:
+        _register_builtins()
+    except ModuleNotFoundError as exc:
+        if exc.name != "mbfps.envs.vizdoom_env":
+            raise
+        logger.debug("mbfps.envs.vizdoom_env not available yet; registry left empty")
+
+
+_try_register_builtins()

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 
+from mbfps.envs import registry
 from mbfps.envs.protocol import OBS_SHAPE, EnvProtocol
 from mbfps.envs.registry import make_env
 
@@ -53,3 +54,34 @@ def test_make_env_rejects_unknown_name():
 def test_make_env_lists_available_names_in_error():
     with pytest.raises(KeyError, match="vizdoom"):
         make_env("nope")
+
+
+def test_try_register_builtins_swallows_missing_vizdoom_env(monkeypatch):
+    def _raise():
+        raise ModuleNotFoundError(
+            "No module named 'mbfps.envs.vizdoom_env'",
+            name="mbfps.envs.vizdoom_env",
+        )
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    registry._try_register_builtins()  # must not raise
+
+
+def test_try_register_builtins_reraises_other_missing_module(monkeypatch):
+    def _raise():
+        raise ModuleNotFoundError(
+            "No module named 'some_native_lib'", name="some_native_lib"
+        )
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    with pytest.raises(ModuleNotFoundError, match="some_native_lib"):
+        registry._try_register_builtins()
+
+
+def test_try_register_builtins_reraises_plain_import_error(monkeypatch):
+    def _raise():
+        raise ImportError("cannot import name 'VizdoomEnv'")
+
+    monkeypatch.setattr(registry, "_register_builtins", _raise)
+    with pytest.raises(ImportError, match="VizdoomEnv"):
+        registry._try_register_builtins()
