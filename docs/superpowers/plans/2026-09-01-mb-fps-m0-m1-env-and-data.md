@@ -700,6 +700,7 @@ git commit -m "feat: scenario-agnostic discrete action set"
 
 ```python
 # tests/envs/test_wrappers.py
+import cv2
 import numpy as np
 import pytest
 
@@ -722,10 +723,38 @@ def test_output_is_uint8():
     assert preprocess_frame(frame).dtype == np.uint8
 
 
-def test_output_values_stay_in_uint8_range():
-    frame = np.full((120, 160, 3), 255, dtype=np.uint8)
+def test_hwc_output_matches_area_interpolation():
+    """Pins the interpolation mode: INTER_NEAREST/INTER_LINEAR give different pixels."""
+    frame = np.random.default_rng(0).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+    expected = cv2.resize(frame, (112, 112), interpolation=cv2.INTER_AREA)
+    assert np.array_equal(preprocess_frame(frame), expected)
+
+
+def test_chw_input_transposes_on_the_correct_axes():
+    """A non-square CHW input catches a (2,1,0) transpose that (1,2,0) shape checks miss."""
+    frame_chw = np.random.default_rng(1).integers(0, 256, (3, 100, 160), dtype=np.uint8)
+    expected = cv2.resize(
+        np.transpose(frame_chw, (1, 2, 0)), (112, 112), interpolation=cv2.INTER_AREA
+    )
+    assert np.array_equal(preprocess_frame(frame_chw), expected)
+
+
+def test_vertical_split_stays_vertical():
+    """Independent of the implementation: a left/right split must not become top/bottom."""
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    frame[:, 80:, :] = 255
     out = preprocess_frame(frame)
-    assert out.min() >= 0 and out.max() <= 255
+    assert out[:, :50, :].mean() < 10, "left half should stay dark"
+    assert out[:, 62:, :].mean() > 245, "right half should stay bright"
+    assert 100 < out[:50, :, :].mean() < 155, "top half should be mixed, not uniform"
+
+
+def test_output_is_c_contiguous():
+    """Downstream code stacks these into batches; a non-contiguous view copies silently."""
+    frame = np.random.default_rng(2).integers(0, 256, (120, 160, 3), dtype=np.uint8)
+    assert preprocess_frame(frame).flags["C_CONTIGUOUS"]
+    already_sized = np.random.default_rng(3).integers(0, 256, (112, 112, 3), dtype=np.uint8)
+    assert preprocess_frame(already_sized[::-1]).flags["C_CONTIGUOUS"]
 
 
 def test_already_correct_size_is_passed_through_unchanged():
@@ -742,6 +771,15 @@ def test_grayscale_input_rejected():
     with pytest.raises(ValueError, match="expected 3 channels"):
         preprocess_frame(np.zeros((120, 160), dtype=np.uint8))
 ```
+
+Note: `test_output_values_stay_in_uint8_range` was deliberately dropped — for a `uint8`
+array, `min() >= 0 and max() <= 255` holds by construction and no source change can make
+it fail. `test_output_is_uint8` already covers dtype. The four tests added above catch
+resize-interpolation and transpose-axis regressions that shape/dtype checks cannot: a
+square `OBS_SHAPE` means a wrong transpose axis or a wrong interpolation mode still
+produces a `(112, 112, 3)` `uint8` array, so those checks must compare actual pixel
+values (pinned against `cv2.resize` directly, plus an implementation-independent
+vertical-split check) and contiguity flags.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -765,7 +803,7 @@ import numpy as np
 
 from mbfps.envs.protocol import OBS_SHAPE
 
-_TARGET_HW = (OBS_SHAPE[1], OBS_SHAPE[0])  # cv2.resize takes (width, height)
+_TARGET_WH = (OBS_SHAPE[1], OBS_SHAPE[0])  # cv2.resize takes (width, height)
 
 
 def preprocess_frame(frame: np.ndarray) -> np.ndarray:
@@ -785,14 +823,14 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected 3 channels, got shape {frame.shape}")
     if frame.shape[:2] == OBS_SHAPE[:2]:
         return np.ascontiguousarray(frame, dtype=np.uint8)
-    resized = cv2.resize(frame, _TARGET_HW, interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(frame, _TARGET_WH, interpolation=cv2.INTER_AREA)
     return np.ascontiguousarray(resized, dtype=np.uint8)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/test_wrappers.py -v`
-Expected: 7 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 

@@ -11,7 +11,7 @@ import numpy as np
 
 from mbfps.envs.protocol import OBS_SHAPE
 
-_TARGET_HW = (OBS_SHAPE[1], OBS_SHAPE[0])  # cv2.resize takes (width, height)
+_TARGET_WH = (OBS_SHAPE[1], OBS_SHAPE[0])  # cv2.resize takes (width, height)
 
 
 def preprocess_frame(frame: np.ndarray) -> np.ndarray:
@@ -31,5 +31,5 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
         raise ValueError(f"expected 3 channels, got shape {frame.shape}")
     if frame.shape[:2] == OBS_SHAPE[:2]:
         return np.ascontiguousarray(frame, dtype=np.uint8)
-    resized = cv2.resize(frame, _TARGET_HW, interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(frame, _TARGET_WH, interpolation=cv2.INTER_AREA)
     return np.ascontiguousarray(resized, dtype=np.uint8)
