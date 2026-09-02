@@ -18,7 +18,17 @@
 - **`PYTORCH_ENABLE_MPS_FALLBACK=1`** must be set; every entry point accepts `--device {mps,cpu}` with `mps` the default and `cpu` the debugging escape hatch.
 - **`privileged_state` is evaluation-only.** It must never appear in any tensor fed to a model. Enforced by a test, not by convention.
 - **No network access at training time.** The only download is the DINOv2 checkpoint, fetched once in Task 12 and cached locally.
-- **Default scenario is `deadly_corridor`.** Verified to be the only built-in ViZDoom scenario exposing forward/backward movement *and* turning (`MOVE_LEFT, MOVE_RIGHT, ATTACK, MOVE_FORWARD, MOVE_BACKWARD, TURN_LEFT, TURN_RIGHT`). `basic` exposes only `MOVE_LEFT, MOVE_RIGHT, ATTACK` and cannot support a meaningful scripted exploration policy.
+- **Default scenario is `my_way_home`** (buttons: `TURN_LEFT, TURN_RIGHT, MOVE_FORWARD, MOVE_LEFT, MOVE_RIGHT`; no `ATTACK`). Chosen on measured episode length, not button count. With `seq_len=64`, every episode must exceed 64 transitions or the loader silently discards it. Measured over 12 episodes at `frame_skip=4`:
+
+  | Scenario | random mean | scripted mean | episodes >= 65 |
+  |---|---|---|---|
+  | `deadly_corridor` (cfg `doom_skill=5`) | 32 | **16** | **1/12, 0/12** |
+  | `defend_the_center` | 74 | 74 | 9/12 |
+  | `health_gathering` | 111 | 105 | 12/12 |
+  | **`my_way_home`** | **489** | **525** | **12/12** |
+
+  `deadly_corridor` has the richest button set but its config sets `doom_skill = 5`; the agent dies in ~16 steps and the entire dataset falls below the training window. `my_way_home` is a maze-navigation task with long episodes and varied geometry.
+- **`doom_skill` is an explicit environment parameter**, never left implicit in a scenario config, so episode length is a controlled variable rather than an accident.
 - **Package name is `mbfps`** (the directory is `csgo-bot`; this is intentional and recorded in the spec's open questions).
 
 ---
@@ -49,7 +59,7 @@
 
 **Files:**
 - Create: `pyproject.toml`
-- Create: `src/mbfps/__init__.py`
+- Create: `src/mbfps/__init__.py` (sets the MPS fallback env var package-wide)
 - Create: `src/mbfps/utils/__init__.py`
 - Create: `src/mbfps/utils/device.py`
 - Create: `src/mbfps/utils/seeding.py`
@@ -109,19 +119,62 @@ def test_mps_fallback_env_var_is_set():
     assert os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
 
 
-def test_mps_fallback_is_set_before_torch_is_imported():
-    """The variable is only honoured if it precedes `import torch`.
+def test_package_init_sets_mps_fallback():
+    """The package root must set it, not just `device.py`.
 
-    Asserting that it merely exists would also pass when it is set too late,
-    so this checks the module source: the assignment must appear above the
-    import statement.
+    Python runs a parent package's `__init__` before any submodule body, so
+    setting it in `mbfps/__init__.py` guarantees it precedes every `import
+    torch` in the project -- including `mbfps.data.features`, which imports
+    torch at the top of its own file before importing anything from mbfps.
     """
+    import ast
+    import inspect
+
+    import mbfps
+
+    tree = ast.parse(inspect.getsource(mbfps))
+    assert any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "setdefault"
+        and any(
+            isinstance(a, ast.Constant) and a.value == "PYTORCH_ENABLE_MPS_FALLBACK"
+            for a in node.args
+        )
+        for node in ast.walk(tree)
+    ), "mbfps/__init__.py must set PYTORCH_ENABLE_MPS_FALLBACK"
+
+
+def test_mps_fallback_is_set_before_torch_is_imported():
+    """Checks statement order via the AST, not string search.
+
+    A `source.index(...)` comparison is vacuous here: device.py's docstring
+    mentions both `PYTORCH_ENABLE_MPS_FALLBACK` and `import torch`, so the
+    string assertion holds regardless of where the real statements sit --
+    verified to return True even on deliberately wrong-ordered source.
+    """
+    import ast
     import inspect
 
     import mbfps.utils.device as device_module
 
-    source = inspect.getsource(device_module)
-    assert source.index("PYTORCH_ENABLE_MPS_FALLBACK") < source.index("import torch")
+    tree = ast.parse(inspect.getsource(device_module))
+    env_line = min(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "setdefault"
+        and any(
+            isinstance(a, ast.Constant) and a.value == "PYTORCH_ENABLE_MPS_FALLBACK"
+            for a in node.args
+        )
+    )
+    torch_line = min(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and any(alias.name.split(".")[0] == "torch" for alias in node.names)
+    )
+    assert env_line < torch_line
 
 
 def test_seed_everything_makes_numpy_and_torch_reproducible():
@@ -174,7 +227,18 @@ addopts = "-ra"
 
 ```python
 # src/mbfps/__init__.py
-"""Model-Based First-Person Shooter Agent."""
+"""Model-Based First-Person Shooter Agent.
+
+Setting PYTORCH_ENABLE_MPS_FALLBACK at the package root is what makes the
+ordering guarantee project-wide. Python runs a parent package's `__init__`
+before any submodule body, so this precedes every `import torch` in the
+codebase -- including modules like `mbfps.data.features` that import torch at
+the top of their own file, before importing anything from mbfps.
+"""
+
+import os
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 ```
 
 ```python
@@ -244,7 +308,7 @@ def seed_everything(seed: int) -> None:
 .venv/bin/python -m pytest tests/test_environment_setup.py -v
 ```
 
-Expected: 7 passed.
+Expected: 8 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -691,7 +755,7 @@ git commit -m "feat: frame preprocessing to 112x112 RGB uint8"
 
 **Interfaces:**
 - Consumes: `OBS_SHAPE`, `EnvProtocol` from `mbfps.envs.protocol`; `build_action_set` from `mbfps.envs.actions`; `preprocess_frame` from `mbfps.envs.wrappers`; `register` from `mbfps.envs.registry`.
-- Produces: `ViZDoomEnv(scenario: str = "deadly_corridor", frame_skip: int = 4, seed: int = 0)` implementing `EnvProtocol`. Exposes `PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")`, a `button_names -> tuple[str, ...]` property, and a `scenario` attribute.
+- Produces: `ViZDoomEnv(scenario: str = "my_way_home", frame_skip: int = 4, seed: int = 0, doom_skill: int | None = None)` implementing `EnvProtocol`. Exposes `PRIVILEGED_KEYS: tuple[str, ...] = ("health", "pos_x", "pos_y", "pos_z", "angle")`, a `button_names -> tuple[str, ...]` property, and a `scenario` attribute.
 
 **Three verified facts this task depends on** (measured against ViZDoom 1.3.0 on this machine — do not "simplify" them away):
 
@@ -713,7 +777,7 @@ from mbfps.envs.vizdoom_env import PRIVILEGED_KEYS, ViZDoomEnv
 
 @pytest.fixture
 def env():
-    e = ViZDoomEnv(scenario="deadly_corridor", frame_skip=4, seed=0)
+    e = ViZDoomEnv(scenario="my_way_home", frame_skip=4, seed=0)
     yield e
     e.close()
 
@@ -733,11 +797,23 @@ def test_action_space_is_discrete_and_nonempty(env):
     assert env.action_space.n >= 2
 
 
-def test_deadly_corridor_exposes_movement_and_turning(env):
+def test_scenario_exposes_movement_and_turning(env):
     """ScriptedPolicy's coverage behaviour depends on these existing."""
     names = env.button_names
     assert "MOVE_FORWARD" in names
     assert "TURN_LEFT" in names and "TURN_RIGHT" in names
+
+
+def test_episodes_are_long_enough_for_the_training_window(env):
+    """seq_len=64 needs 65 frames; a shorter episode is silently discarded."""
+    env.reset(seed=0)
+    steps = 0
+    for _ in range(3000):
+        _, _, terminated, truncated, _ = env.step(env.action_space.sample())
+        steps += 1
+        if terminated or truncated:
+            break
+    assert steps >= 65, f"episode was only {steps} transitions; seq_len=64 needs 65"
 
 
 def test_reset_returns_valid_observation(env):
@@ -859,7 +935,11 @@ class ViZDoomEnv:
     """A headless, seedable ViZDoom environment."""
 
     def __init__(
-        self, scenario: str = "deadly_corridor", frame_skip: int = 4, seed: int = 0
+        self,
+        scenario: str = "my_way_home",
+        frame_skip: int = 4,
+        seed: int = 0,
+        doom_skill: int | None = None,
     ) -> None:
         self.scenario = scenario
         self.frame_skip = frame_skip
@@ -875,6 +955,11 @@ class ViZDoomEnv:
         self._game.set_screen_format(vzd.ScreenFormat.RGB24)
         self._game.set_window_visible(False)
         self._game.set_mode(vzd.Mode.PLAYER)
+        if doom_skill is not None:
+            # Difficulty drives episode length, which decides whether the
+            # dataset can supply a 64-step training window at all. Keep it
+            # explicit rather than inheriting whatever the .cfg happens to set.
+            self._game.set_doom_skill(doom_skill)
         for var in _PRIVILEGED_VARS.values():
             self._game.add_available_game_variable(var)
         self._game.set_seed(seed)
@@ -971,7 +1056,7 @@ In `tests/envs/test_protocol.py`, delete the `@pytest.mark.xfail(...)` decorator
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/ -v`
-Expected: all passed, including the previously-xfailed registry test.
+Expected: 32 passed — `test_protocol.py` 5 (the xfail is now removed, so all 5 pass), `test_actions.py` 6, `test_wrappers.py` 7, `test_vizdoom_env.py` 14. `test_determinism.py` does not exist until Task 6.
 
 - [ ] **Step 6: Commit**
 
@@ -1005,7 +1090,7 @@ import pytest
 
 from mbfps.envs.vizdoom_env import ViZDoomEnv
 
-SCENARIO = "deadly_corridor"
+SCENARIO = "my_way_home"
 
 
 def _rollout(seed, actions):
@@ -1126,7 +1211,7 @@ from mbfps.envs.registry import make_env
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="deadly_corridor")
+    parser.add_argument("--scenario", default="my_way_home")
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--steps", type=int, default=2000)
     args = parser.parse_args()
@@ -1197,6 +1282,8 @@ CORRIDOR = ("MOVE_LEFT", "MOVE_RIGHT", "ATTACK", "MOVE_FORWARD", "MOVE_BACKWARD"
             "TURN_LEFT", "TURN_RIGHT")
 BASIC = ("MOVE_LEFT", "MOVE_RIGHT", "ATTACK")
 CENTER = ("TURN_LEFT", "TURN_RIGHT", "ATTACK")
+HOME = ("TURN_LEFT", "TURN_RIGHT", "MOVE_FORWARD", "MOVE_LEFT", "MOVE_RIGHT")
+ALL_SETS = [CORRIDOR, BASIC, CENTER, HOME]  # HOME has no ATTACK button
 
 
 @pytest.fixture
@@ -1260,12 +1347,12 @@ def test_scripted_reset_with_a_new_seed_changes_the_sequence(obs):
     assert _run(policy, obs, 200) != first
 
 
-@pytest.mark.parametrize("buttons", [CORRIDOR, BASIC, CENTER])
+@pytest.mark.parametrize("buttons", ALL_SETS)
 def test_scripted_policy_returns_valid_indices(obs, buttons):
     assert all(0 <= a <= len(buttons) for a in _run(ScriptedPolicy(buttons, seed=0), obs))
 
 
-@pytest.mark.parametrize("buttons", [CORRIDOR, BASIC, CENTER])
+@pytest.mark.parametrize("buttons", ALL_SETS)
 def test_scripted_policy_never_degenerates_to_one_action(obs, buttons):
     """The bug this guards: hard-coded button names made the policy emit a
     constant ATTACK on any scenario lacking MOVE_FORWARD."""
@@ -1313,6 +1400,16 @@ def test_scripted_policy_with_only_attack_still_varies(obs):
     """Degenerate button set: must fall back to random rather than a constant."""
     actions = _run(ScriptedPolicy(("ATTACK",), seed=0), obs, 200)
     assert set(actions) == {0, 1}
+
+
+def test_scripted_policy_works_without_an_attack_button(obs):
+    """my_way_home, the default scenario, has no ATTACK. The policy must still
+    advance and sweep rather than falling through to uniform random."""
+    actions = _run(ScriptedPolicy(HOME, seed=0), obs)
+    forward = HOME.index("MOVE_FORWARD") + 1
+    assert actions.count(forward) / len(actions) > 0.4
+    assert HOME.index("TURN_LEFT") + 1 in set(actions)
+    assert HOME.index("TURN_RIGHT") + 1 in set(actions)
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1450,7 +1547,7 @@ class ScriptedPolicy:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_policies.py -v`
-Expected: 25 passed (several are parametrised over three button sets).
+Expected: 26 passed. Two tests are parametrised over all four button sets and one over the three sets that have an `ATTACK` button, so the collected count exceeds the number of `def test_` lines.
 
 - [ ] **Step 5: Commit**
 
@@ -1497,7 +1594,7 @@ def make_episode(t: int = 5) -> Episode:
         privileged_keys=KEYS,
         policy_name="random",
         seed=42,
-        scenario="deadly_corridor",
+        scenario="my_way_home",
     )
 
 
@@ -1530,7 +1627,7 @@ def test_round_trip_preserves_metadata(tmp_path):
     loaded = load_episode(path)
     assert loaded.policy_name == "random"
     assert loaded.seed == 42
-    assert loaded.scenario == "deadly_corridor"
+    assert loaded.scenario == "my_way_home"
     assert loaded.privileged_keys == KEYS
 
 
@@ -1547,11 +1644,20 @@ def test_round_trip_preserves_dtypes(tmp_path):
     assert loaded.truncated.dtype == bool
 
 
-def test_truncated_and_terminated_are_stored_separately():
+def test_truncated_and_terminated_survive_a_round_trip_independently(tmp_path):
+    """A time-limit cutoff must stay distinguishable from a true terminal."""
     ep = make_episode(t=3)
-    ep.terminated[-1] = False
+    ep.terminated[:] = False
+    ep.truncated[:] = False
     ep.truncated[-1] = True
-    assert not ep.terminated[-1] and ep.truncated[-1]
+
+    path = tmp_path / "ep.npz"
+    save_episode(ep, path)
+    loaded = load_episode(path)
+
+    assert not loaded.terminated.any(), "no step should be marked terminal"
+    assert loaded.truncated[-1], "the time-limit flag must survive the round trip"
+    assert not loaded.truncated[:-1].any()
 
 
 def test_mismatched_lengths_rejected():
@@ -1567,7 +1673,7 @@ def test_mismatched_lengths_rejected():
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
-            scenario="deadly_corridor",
+            scenario="my_way_home",
         )
 ```
 
@@ -1694,7 +1800,8 @@ git commit -m "feat: episode container with verified npz round-trip"
 
 - Capture the key set **once, at reset**, before any stepping.
 - On the terminal frame, carry the last valid row forward rather than emitting a zero-width row.
-- Assert row width explicitly, so a future regression fails loudly instead of being swallowed as a crash.
+- Raise a **distinct `DataIntegrityError`** for malformed data and let it escape the crash handler. An `AssertionError` would be caught by `except Exception` and counted as an engine fault — landing in the very failure mode the guard exists to prevent.
+- Do **not** reshape the stacked array. `np.stack` of zero-length rows already gives `(T+1, 0)`; `reshape(-1, 0)` raises `cannot reshape array of size 0` (measured on numpy 2.5.2), which the crash handler would swallow.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1704,7 +1811,7 @@ import numpy as np
 import pytest
 from gymnasium import spaces
 
-from mbfps.data.collector import Collector
+from mbfps.data.collector import Collector, DataIntegrityError
 from mbfps.data.policies import RandomPolicy
 from mbfps.envs.protocol import OBS_SHAPE
 
@@ -1858,6 +1965,14 @@ def test_collector_recovers_and_keeps_collecting():
 
 
 def test_env_with_no_privileged_state_still_collects():
+    """A zero-width privileged array must not be mistaken for a crash.
+
+    `np.stack` of zero-length rows gives shape (T+1, 0), which is correct.
+    Reshaping it would raise `cannot reshape array of size 0` (measured on
+    numpy 2.5.2), and the crash handler would swallow that as a phantom
+    engine fault -- discarding every episode from such an env.
+    """
+
     class _Bare(_StubEnv):
         @property
         def privileged_state(self):
@@ -1866,8 +1981,33 @@ def test_env_with_no_privileged_state_still_collects():
     c = Collector(lambda: _Bare(6), RandomPolicy(4, seed=0))
     ep = c.collect_episode(seed=0)
     assert ep is not None
+    assert c.crash_count == 0
     assert ep.privileged_keys == ()
     assert ep.privileged.shape == (ep.length + 1, 0)
+    c.close()
+
+
+def test_malformed_data_is_not_reported_as_an_engine_crash():
+    """A key vanishing mid-episode is our bug, not the engine's.
+
+    Without a distinct exception type this raises inside `_collect`, is caught
+    by the blanket crash handler, and is silently counted as an engine fault --
+    the exact failure mode this collector was rewritten to prevent.
+    """
+
+    class _Shifting(_StubEnv):
+        @property
+        def privileged_state(self):
+            if self._done:
+                return None
+            if self._t > 2:
+                return {k: 1.0 for k in KEYS[:-1]}  # drops "angle"
+            return {k: float(self._t) for k in KEYS}
+
+    c = Collector(lambda: _Shifting(6), RandomPolicy(4, seed=0))
+    with pytest.raises(DataIntegrityError, match="lost keys mid-episode"):
+        c.collect_episode(seed=0)
+    assert c.crash_count == 0
     c.close()
 ```
 
@@ -1894,6 +2034,16 @@ from mbfps.envs.protocol import EnvProtocol
 logger = logging.getLogger(__name__)
 
 
+class DataIntegrityError(Exception):
+    """The collected data is malformed.
+
+    Deliberately NOT caught by `collect_episode`'s crash handler. An engine
+    crash is an external fault worth retrying; malformed data is our own bug,
+    and recording it as a crash is exactly how an earlier version of this
+    collector discarded every episode while reporting a healthy `crash_count`.
+    """
+
+
 class Collector:
     """Collects episodes, restarting the engine when it crashes."""
 
@@ -1918,6 +2068,8 @@ class Collector:
         """
         try:
             return self._collect(seed)
+        except DataIntegrityError:
+            raise
         except Exception:
             self.crash_count += 1
             logger.warning("engine crashed during collection; restarting", exc_info=True)
@@ -1961,7 +2113,7 @@ class Collector:
         # which would silently misreport a data bug as an engine fault.
         bad = [i for i, row in enumerate(privileged) if row.shape != (width,)]
         if bad:
-            raise AssertionError(
+            raise DataIntegrityError(
                 f"ragged privileged rows at indices {bad[:5]}; expected width {width}"
             )
 
@@ -1971,7 +2123,7 @@ class Collector:
             rewards=np.asarray(rewards, dtype=np.float32),
             terminated=np.asarray(terminated_flags, dtype=bool),
             truncated=np.asarray(truncated_flags, dtype=bool),
-            privileged=np.stack(privileged).astype(np.float32).reshape(-1, width),
+            privileged=np.stack(privileged).astype(np.float32),
             privileged_keys=keys,
             policy_name=self._policy.name,
             seed=seed,
@@ -1992,6 +2144,11 @@ class Collector:
         against it.
         """
         if state:
+            missing = [k for k in keys if k not in state]
+            if missing:
+                raise DataIntegrityError(
+                    f"privileged state lost keys mid-episode: {missing}"
+                )
             return np.asarray([state[k] for k in keys], dtype=np.float32)
         if previous is not None:
             return previous.copy()
@@ -2012,7 +2169,7 @@ class Collector:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_collector.py -v`
-Expected: 14 passed.
+Expected: 15 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -2057,7 +2214,7 @@ def make_episode(t: int, policy: str = "random", seed: int = 0) -> Episode:
         privileged_keys=KEYS,
         policy_name=policy,
         seed=seed,
-        scenario="deadly_corridor",
+        scenario="my_way_home",
     )
 
 
@@ -2073,19 +2230,37 @@ def test_counts_track_contents(tmp_path):
     assert buf.n_transitions == 25
 
 
-def test_n_transitions_does_not_decompress_episodes(tmp_path, monkeypatch):
-    """Guards the O(n^2) regression: length must come from the filename."""
-    buf = ReplayBuffer(tmp_path, capacity_transitions=1000)
-    for _ in range(3):
-        buf.add(make_episode(10))
-
+def _poison_load_episode(monkeypatch):
+    """Make any load_episode call fail, so decompression becomes detectable."""
     import mbfps.data.buffer as buffer_module
 
     def _boom(*args, **kwargs):
-        raise AssertionError("n_transitions must not load episode files")
+        raise AssertionError("capacity accounting must not load episode files")
 
     monkeypatch.setattr(buffer_module, "load_episode", _boom)
+
+
+def test_n_transitions_does_not_decompress_episodes(tmp_path, monkeypatch):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    for _ in range(3):
+        buf.add(make_episode(10))
+    _poison_load_episode(monkeypatch)
     assert buf.n_transitions == 30
+
+
+def test_eviction_does_not_decompress_episodes(tmp_path, monkeypatch):
+    """`_evict` is the hotter path -- `add()` calls it on every episode.
+
+    Poison BEFORE the adds and use a capacity that forces eviction, so this
+    actually covers `_evict`. Poisoning afterwards leaves the O(n^2)
+    regression restorable with the whole suite still green.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=25)
+    _poison_load_episode(monkeypatch)
+    for _ in range(4):
+        buf.add(make_episode(10))
+    assert buf.n_episodes == 2, "eviction must have run without decompressing"
+    assert buf.n_transitions <= 25
 
 
 def test_eviction_respects_capacity(tmp_path):
@@ -2234,7 +2409,9 @@ class ReplayBuffer:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
-Expected: 10 passed.
+Expected: 11 passed.
+
+Sanity-check both guards by mutation: temporarily revert `n_transitions` to `sum(load_episode(p).length for p in self.episode_paths())` and confirm a test fails, then do the same for `_evict`. A mutation that leaves the suite green means that guard is not guarding.
 
 - [ ] **Step 5: Commit**
 
@@ -2282,7 +2459,7 @@ def make_episode(t: int, fill: int) -> Episode:
         privileged_keys=KEYS,
         policy_name="random",
         seed=fill,
-        scenario="deadly_corridor",
+        scenario="my_way_home",
     )
 
 
@@ -2546,7 +2723,7 @@ def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
         privileged_keys=keys,
         policy_name="random",
         seed=0,
-        scenario="deadly_corridor",
+        scenario="my_way_home",
     )
     path = tmp_path / "ep_000000.npz"
     save_episode(ep, path)
@@ -2739,7 +2916,7 @@ def buffer(tmp_path):
             privileged_keys=KEYS,
             policy_name="random",
             seed=0,
-            scenario="deadly_corridor",
+            scenario="my_way_home",
         )
     )
     return buf
@@ -2767,7 +2944,7 @@ def test_env_privileged_values_are_not_in_the_observation():
     """The engine's own observation must not encode privileged values."""
     from mbfps.envs.vizdoom_env import ViZDoomEnv
 
-    env = ViZDoomEnv(scenario="deadly_corridor", frame_skip=4, seed=0)
+    env = ViZDoomEnv(scenario="my_way_home", frame_skip=4, seed=0)
     try:
         obs, _ = env.reset(seed=0)
         state = env.privileged_state
@@ -2808,7 +2985,7 @@ from mbfps.utils.seeding import seed_everything
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="deadly_corridor")
+    parser.add_argument("--scenario", default="my_way_home")
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument(
         "--cache-features",
@@ -2879,7 +3056,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run a small collection to verify it works end to end**
 
 Run: `.venv/bin/python scripts/collect.py --episodes 20`
-Expected: prints progress, then `episodes_kept=20`, a positive `transitions_per_second`, and `output=data/deadly_corridor`.
+Expected: prints progress, then `episodes_kept=20`, a positive `transitions_per_second`, and `output=data/my_way_home`.
 
 **`episodes_kept` must equal the episode count.** A run reporting `episodes_kept=0 crashes=20` means the collector is discarding every terminating episode — re-read Task 9's terminal-frame handling before continuing rather than lowering the expectation.
 
@@ -2909,7 +3086,7 @@ from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, default=Path("data/deadly_corridor"))
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--out", type=Path, default=Path("runs"))
     parser.add_argument("--bins", type=int, default=60)
     args = parser.parse_args()
@@ -2927,13 +3104,23 @@ def main() -> None:
 
     names = sorted(positions)
     stacked = {n: np.concatenate(positions[n]) for n in names}
+
+    # Occupied-cell counts scale with sample size, so a policy that merely
+    # survives longer looks like it explores more. Subsample every policy to the
+    # same frame count before comparing reach.
+    rng = np.random.default_rng(0)
+    budget = min(len(v) for v in stacked.values())
+    sampled = {
+        k: v[rng.choice(len(v), size=budget, replace=False)] for k, v in stacked.items()
+    }
+
     all_xy = np.concatenate(list(stacked.values()))
     x_range = (all_xy[:, 0].min(), all_xy[:, 0].max())
     y_range = (all_xy[:, 1].min(), all_xy[:, 1].max())
 
     fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 5), squeeze=False)
     for ax, name in zip(axes[0], names):
-        xy = stacked[name]
+        xy = sampled[name]
         ax.hist2d(xy[:, 0], xy[:, 1], bins=args.bins, range=[x_range, y_range])
         ax.set_title(f"{name}  (n={len(xy)})")
         ax.set_xlabel("pos_x")
@@ -2945,14 +3132,16 @@ def main() -> None:
     fig.savefig(out_path, dpi=120)
 
     print(f"figure={out_path}")
+    print(f"comparison_budget={budget} frames per policy (equalised)")
     for name in names:
-        xy = stacked[name]
+        xy = sampled[name]
         occupied = np.histogram2d(
             xy[:, 0], xy[:, 1], bins=args.bins, range=[x_range, y_range]
         )[0]
         print(
-            f"{name}: frames={len(xy)} "
+            f"{name}: total_frames={len(stacked[name])} "
             f"occupied_cells={int((occupied > 0).sum())}/{args.bins ** 2} "
+            f"(at {budget} frames) "
             f"x_span={np.ptp(xy[:, 0]):.1f} y_span={np.ptp(xy[:, 1]):.1f}"
         )
 
@@ -2961,11 +3150,41 @@ if __name__ == "__main__":
     main()
 ```
 
+- [ ] **Step 6b: Gate on episode length against the training window**
+
+`SequenceLoader` silently discards any episode shorter than `seq_len + 1`. Without a gate that shows up later as a mysteriously small training set, not as an error. Measure it now:
+
+```bash
+.venv/bin/python -c "
+from mbfps.data.buffer import ReplayBuffer
+import numpy as np
+SEQ_LEN = 64
+buf = ReplayBuffer('data/my_way_home', capacity_transitions=10**9)
+lengths = np.array([ep.length for ep in buf.load_all()])
+usable = int((lengths >= SEQ_LEN).sum())
+frac = usable / len(lengths)
+print(f'episodes={len(lengths)} mean_len={lengths.mean():.1f} min={lengths.min()} max={lengths.max()}')
+print(f'usable_at_seq_len_{SEQ_LEN}={usable}/{len(lengths)} ({frac:.0%})')
+print('GATE:', 'PASS' if frac >= 0.8 else 'FAIL')
+"
+```
+
+**The gate: at least 80% of episodes must be at least `seq_len` (64) transitions long.**
+
+If it fails, the dataset cannot supply the training window and Plan 2 will not be able to train. Do not proceed. Diagnose in this order:
+1. Confirm the scenario is `my_way_home` — measured mean episode length 489 (random) / 525 (scripted), 12/12 above threshold.
+2. Check whether `doom_skill` is raising difficulty and shortening episodes; pass a lower `--doom-skill` if so.
+3. Only then consider whether `frame_skip` is too large (it divides episode length directly).
+
+Record the measured `mean_len` in the commit message — Plan 2 needs it to size training.
+
 - [ ] **Step 7: Run the coverage report and confirm the scripted policy reaches further**
 
 Run: `.venv/bin/python scripts/coverage_report.py`
 
-Expected: prints `figure=runs/coverage_deadly_corridor.png` and one line per policy. **The gate: `scripted` must show a larger `occupied_cells` count than `random`.**
+Expected: prints `figure=runs/coverage_my_way_home.png`, an equalised `comparison_budget`, and one line per policy. **The gate: `scripted` must show a larger `occupied_cells` count than `random` at the equalised frame budget.**
+
+The equalisation matters: raw occupied-cell counts scale with sample size, so a policy that merely survives longer would look like it explores more. Comparing at a common frame budget measures reach rather than longevity.
 
 If it does not, first confirm the policy is not degenerate — run `.venv/bin/python -c "from mbfps.envs.registry import make_env; e=make_env('vizdoom'); print(e.button_names); e.close()"` and check that `MOVE_FORWARD`, `TURN_LEFT` and `TURN_RIGHT` are present. If they are, tune `_ADVANCE_PROB` or `_SWEEP_LEN` in `src/mbfps/data/policies.py`, re-collect, and re-run. Do not proceed to Plan 2 with a scripted policy that adds no coverage — it is dead weight in the dataset and the M1 rationale no longer holds.
 
@@ -2976,7 +3195,7 @@ If it does not, first confirm the policy is not degenerate — run `.venv/bin/py
 import time
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
-buf = ReplayBuffer('data/deadly_corridor', capacity_transitions=10**9)
+buf = ReplayBuffer('data/my_way_home', capacity_transitions=10**9)
 loader = SequenceLoader(buf, batch_size=16, seq_len=64, seed=0)
 loader.sample()  # warm up
 start = time.perf_counter()
@@ -3016,7 +3235,8 @@ Both milestones' spec criteria, restated as things you can run:
 - [ ] The loader benchmark reports `batches_per_second`.
 - [ ] `pytest tests/data/test_episode.py` passes — stored data equals collected data.
 - [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat.
-- [ ] `scripts/coverage_report.py` shows `scripted` occupying more cells than `random`.
+- [ ] The episode-length gate passes: at least 80% of episodes are >= 64 transitions, with `mean_len` recorded.
+- [ ] `scripts/coverage_report.py` shows `scripted` occupying more cells than `random` **at the equalised frame budget**.
 - [ ] `pytest tests/test_privileged_isolation.py` passes.
 
 ## Deferred to Plan 2 (M2–M3)
