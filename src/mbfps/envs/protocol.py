@@ -25,6 +25,12 @@ class EnvProtocol(Protocol):
 
     observation_space: spaces.Box
     action_space: spaces.Discrete
+    scenario: str
+    """Episode provenance: which scenario/map produced this env's episodes."""
+    button_names: tuple[str, ...]
+    """The buttons underlying the discrete action set, in the order a
+    collection policy (e.g. `ScriptedPolicy`) resolves its roles from --
+    e.g. finding the index of `MOVE_FORWARD` to bias movement."""
 
     def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
         """Start a new episode. Returns (observation, info)."""

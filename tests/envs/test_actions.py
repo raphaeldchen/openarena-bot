@@ -1,11 +1,10 @@
 import pytest
 
-from mbfps.envs.actions import build_action_set, n_actions
+from mbfps.envs.actions import build_action_set
 
 
 def test_action_set_size_is_buttons_plus_noop():
     assert len(build_action_set(5)) == 6
-    assert n_actions(5) == 6
 
 
 def test_first_action_is_noop():

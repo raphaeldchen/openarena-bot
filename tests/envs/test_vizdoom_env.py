@@ -38,6 +38,7 @@ def test_scenario_exposes_movement_and_turning(env):
 def test_episodes_are_long_enough_for_the_training_window(env):
     """seq_len=64 needs 65 frames; a shorter episode is silently discarded."""
     env.reset(seed=0)
+    env.action_space.seed(0)
     steps = 0
     for _ in range(3000):
         _, _, terminated, truncated, _ = env.step(env.action_space.sample())

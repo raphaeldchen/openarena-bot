@@ -13,6 +13,8 @@ class _FakeEnv:
     def __init__(self) -> None:
         self.observation_space = spaces.Box(0, 255, OBS_SHAPE, dtype=np.uint8)
         self.action_space = spaces.Discrete(3)
+        self.scenario = "my_way_home"
+        self.button_names = ("MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT")
         self.closed = False
 
     def reset(self, *, seed=None):
@@ -43,6 +45,17 @@ def test_non_conforming_class_fails_protocol():
             return None, {}
 
     assert not isinstance(Incomplete(), EnvProtocol)
+
+
+def test_env_missing_scenario_fails_protocol():
+    """`scenario` is episode provenance; a leaky boundary let it be optional."""
+
+    class _NoScenario(_FakeEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            del self.scenario
+
+    assert not isinstance(_NoScenario(), EnvProtocol)
 
 
 def test_make_env_rejects_unknown_name():

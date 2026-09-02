@@ -6,18 +6,23 @@ never produce.
 """
 
 import logging
+from pathlib import Path
 
 import numpy as np
 
 from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.episode import load_episode
 
 logger = logging.getLogger(__name__)
 
 # One real episode (my_way_home, 526 frames of 112x112x3 uint8) is ~19.8 MB.
-# 2 GB is roughly 100 such episodes -- comfortably inside a training run's
-# working set on a 16 GB unified-memory machine, but large enough to be worth
-# a warning rather than silence.
-_WARN_BYTES = 2_000_000_000
+# scripts/collect.py's default --capacity (60,000 transitions, ~114 episodes)
+# already occupies ~2.24 GB resident, so a threshold at 2 GB fired on every
+# default run and taught nothing. Set well above that expected footprint --
+# 4 GB is roughly 200 such episodes -- so the warning is silent on the happy
+# path and fires only when a run is genuinely at risk on a 16 GB shared
+# unified-memory budget.
+_WARN_BYTES = 4_000_000_000
 
 
 class SequenceLoader:
@@ -28,6 +33,13 @@ class SequenceLoader:
     episode costs roughly 19.8 MB (526 frames of 112x112x3 uint8), so a
     `ReplayBuffer` sized for hundreds of thousands of transitions can occupy
     several GB. See `_WARN_BYTES` below.
+
+    A sampled batch's `window_start` (the offset into the episode where the
+    window begins) together with `episode_path(episode_index[i])` (the file
+    backing that episode) are what let a consumer locate and slice the
+    matching `<episode>.features.npy` cache written by
+    `cache_episode_features`, instead of re-running the frozen backbone on
+    every batch.
     """
 
     def __init__(
@@ -41,7 +53,12 @@ class SequenceLoader:
         self.batch_size = batch_size
         self.seq_len = seq_len
         self._rng = np.random.default_rng(seed)
-        self._episodes = buffer.load_all()
+        # Paths and episodes are loaded from the same call, in the same order,
+        # so `episode_index` (into `self._episodes`) and `episode_path()`
+        # (into `self._paths`) are aligned by construction -- not by the
+        # coincidence that `buffer.load_all()` happens to sort the same way.
+        self._paths = buffer.episode_paths()
+        self._episodes = [load_episode(p) for p in self._paths]
 
         total_bytes = sum(ep.obs.nbytes for ep in self._episodes)
         if total_bytes > _WARN_BYTES:
@@ -75,7 +92,7 @@ class SequenceLoader:
                 f"buffer holds {len(self._episodes)} episodes"
             )
 
-        obs, actions, rewards, indices = [], [], [], []
+        obs, actions, rewards, indices, starts = [], [], [], [], []
         terminated, truncated, privileged = [], [], []
         for _ in range(self.batch_size):
             idx = int(self._rng.choice(usable))
@@ -88,6 +105,7 @@ class SequenceLoader:
             terminated.append(ep.terminated[start:end])
             truncated.append(ep.truncated[start:end])
             indices.append(idx)
+            starts.append(start)
             if include_privileged:
                 privileged.append(ep.privileged[start : end + 1])
 
@@ -98,7 +116,18 @@ class SequenceLoader:
             "terminated": np.stack(terminated).astype(bool),
             "truncated": np.stack(truncated).astype(bool),
             "episode_index": np.asarray(indices, dtype=np.int32),
+            "window_start": np.asarray(starts, dtype=np.int32),
         }
         if include_privileged:
             batch["privileged"] = np.stack(privileged).astype(np.float32)
         return batch
+
+    def episode_path(self, index: int) -> Path:
+        """Return the file backing episode `index`.
+
+        `index` is a value from a batch's `episode_index`; this is the
+        mapping from that value to the `.npz` episode file, so a consumer can
+        find the sibling `<episode>.features.npy` cache and slice it with the
+        same batch's `window_start`.
+        """
+        return self._paths[index]

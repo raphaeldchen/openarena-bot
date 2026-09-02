@@ -115,7 +115,7 @@ class Collector:
                 privileged_keys=keys,
                 policy_name=self._policy.name,
                 seed=seed,
-                scenario=getattr(self._env, "scenario", "unknown"),
+                scenario=self._env.scenario,
             )
         except ValueError as exc:
             raise DataIntegrityError(

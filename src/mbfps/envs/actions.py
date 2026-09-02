@@ -21,8 +21,3 @@ def build_action_set(n_buttons: int) -> list[list[int]]:
     noop = [0] * n_buttons
     one_hots = [[1 if i == j else 0 for j in range(n_buttons)] for i in range(n_buttons)]
     return [noop, *one_hots]
-
-
-def n_actions(n_buttons: int) -> int:
-    """Return the size of the discrete action space for `n_buttons` buttons."""
-    return len(build_action_set(n_buttons))

@@ -1,8 +1,13 @@
 """Collect a mixed-policy ViZDoom dataset.
 
 Per spec §5.2, a single random policy has poor state coverage. This alternates
-`random` and `scripted` collection so the world model sees geometry random play
-never reaches.
+`random` and `scripted` collection: the two policies' *per-episode* reach
+differs sharply (scripted covers 125.0 cells/episode vs random's 86.7, a
+1.44x ratio, measured by `scripts/coverage_report.py`), so the mixture gives
+the world model more ground per episode than random alone would. It is not
+that scripted reaches geometry random can never reach at all -- on a small,
+fixed maze like `my_way_home`, the two policies' aggregate footprints across
+many episodes converge to nearly the same set of cells.
 """
 
 import argparse
@@ -24,7 +29,10 @@ def main() -> None:
     parser.add_argument(
         "--cache-features",
         action="store_true",
-        help="encode each episode with the frozen DINOv2 backbone as it is written",
+        help=(
+            "after collection, encode every surviving episode with the "
+            "frozen DINOv2 backbone"
+        ),
     )
     parser.add_argument("--frame-skip", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -60,20 +68,12 @@ def main() -> None:
         ),
     }
 
-    extractor = None
-    if args.cache_features:
-        from mbfps.data.features import FeatureExtractor
-
-        extractor = FeatureExtractor()
-
     start, kept = time.perf_counter(), 0
     for i in range(args.episodes):
         name = "random" if i % 2 == 0 else "scripted"
         episode = collectors[name].collect_episode(seed=args.seed + i)
         if episode is not None:
-            path = buffer.add(episode)
-            if extractor is not None and path.is_file():
-                cache_episode_features(path, extractor)
+            buffer.add(episode)
             kept += 1
         if (i + 1) % 20 == 0:
             print(f"[{i + 1}/{args.episodes}] kept={kept} transitions={buffer.n_transitions}")
@@ -86,6 +86,23 @@ def main() -> None:
     print(f"transitions={buffer.n_transitions} elapsed_s={elapsed:.1f}")
     print(f"transitions_per_second={buffer.n_transitions / elapsed:.1f}")
     print(f"output={out}")
+
+    features_cached = 0
+    if args.cache_features:
+        # Encoded AFTER collection, over the paths that survived eviction --
+        # not inside the loop above, where `buffer.add()` has already evicted
+        # by the time an episode is encoded, wasting DINOv2 compute on
+        # episodes deleted moments later.
+        from mbfps.data.features import FeatureExtractor
+
+        extractor = FeatureExtractor()
+        paths = buffer.episode_paths()
+        for i, path in enumerate(paths):
+            cache_episode_features(path, extractor)
+            features_cached += 1
+            if (i + 1) % 20 == 0:
+                print(f"[features {i + 1}/{len(paths)}] cached={features_cached}")
+        print(f"features_cached={features_cached}")
 
 
 if __name__ == "__main__":

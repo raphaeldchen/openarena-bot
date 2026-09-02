@@ -147,3 +147,44 @@ def test_small_buffer_logs_no_warning(buffer, caplog):
     with caplog.at_level("WARNING"):
         SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
     assert "resident in RAM" not in caplog.text
+
+
+def test_window_start_is_present_and_valid(buffer):
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0)
+    for _ in range(10):
+        batch = loader.sample()
+        starts = batch["window_start"]
+        assert starts.shape == (8,)
+        assert starts.dtype == np.int32
+        for start, idx in zip(starts, batch["episode_index"]):
+            ep = loader._episodes[idx]
+            assert 0 <= start <= ep.length - loader.seq_len
+
+
+def test_episode_path_matches_the_episode_the_window_came_from(buffer):
+    from mbfps.data.episode import load_episode
+
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0)
+    batch = loader.sample()
+    for idx in batch["episode_index"]:
+        path = loader.episode_path(int(idx))
+        assert path.is_file()
+        on_disk = load_episode(path)
+        in_memory = loader._episodes[idx]
+        assert on_disk.policy_name == in_memory.policy_name
+        assert on_disk.seed == in_memory.seed
+
+
+def test_episode_path_and_window_start_slice_back_to_the_sampled_window(buffer):
+    """The cache is only usable if a consumer can reconstruct a batch's window
+    from `episode_path()` and `window_start` alone -- this proves it can."""
+    from mbfps.data.episode import load_episode
+
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0)
+    batch = loader.sample()
+    for i in range(loader.batch_size):
+        idx = int(batch["episode_index"][i])
+        start = int(batch["window_start"][i])
+        episode = load_episode(loader.episode_path(idx))
+        reconstructed = episode.obs[start : start + loader.seq_len + 1]
+        assert np.array_equal(reconstructed, batch["obs"][i])
