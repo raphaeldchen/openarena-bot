@@ -76,6 +76,46 @@ def test_sampling_is_reproducible(buffer):
     assert np.array_equal(a["episode_index"], b["episode_index"])
 
 
+def test_batch_draws_from_multiple_episodes(buffer):
+    """A loader stuck on one episode would train on a fraction of the data.
+
+    The buffer fixture holds four usable episodes, so eight draws landing on a
+    single one has probability ~6e-5 per batch; over five batches it is
+    negligible, and the loader is seeded, so this is deterministic.
+    """
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0)
+    seen = set()
+    for _ in range(5):
+        seen.update(loader.sample()["episode_index"].tolist())
+    assert len(seen) > 1, f"every sample came from episode(s) {seen}"
+
+
+def test_window_offsets_vary(buffer):
+    """A loader fixed at offset 0 would only ever show each episode's opening.
+
+    Each episode here is filled with a constant, so the offset is invisible in
+    the pixels. Detect it through the frames themselves: write a per-timestep
+    marker into one episode and check that sampled windows start at different
+    points within it.
+    """
+    from mbfps.data.episode import load_episode, save_episode
+
+    path = buffer.episode_paths()[0]
+    episode = load_episode(path)
+    for t in range(episode.obs.shape[0]):
+        episode.obs[t, 0, 0, 0] = t % 251  # a per-timestep marker
+    save_episode(episode, path)
+
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0)
+    starts = set()
+    for _ in range(10):
+        batch = loader.sample()
+        for row, idx in zip(batch["obs"], batch["episode_index"]):
+            if idx == 0:
+                starts.add(int(row[0, 0, 0, 0]))
+    assert len(starts) > 1, f"all sampled windows began at the same offset: {starts}"
+
+
 def test_episodes_shorter_than_seq_len_are_skipped(tmp_path):
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
     buf.add(make_episode(t=4, fill=9))
