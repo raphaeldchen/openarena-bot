@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+/data/
 runs/
 checkpoints/
 *.npz
