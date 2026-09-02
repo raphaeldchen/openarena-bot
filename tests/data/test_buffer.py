@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import Episode
@@ -121,3 +122,45 @@ def test_single_oversized_episode_is_kept(tmp_path):
     buf = ReplayBuffer(tmp_path, capacity_transitions=5)
     buf.add(make_episode(50))
     assert buf.n_episodes == 1
+
+
+def test_stray_files_are_reported(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=100)
+    buf.add(make_episode(10))
+    stray_a = tmp_path / "ep_.npz"
+    stray_b = tmp_path / "ep_1_len.npz"
+    stray_a.touch()
+    stray_b.touch()
+    assert set(buf.stray_paths()) == {stray_a, stray_b}
+    assert buf.n_episodes == 1, "strays must not be counted as episodes"
+
+
+def test_stray_files_are_not_deleted(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=5)
+    stray_a = tmp_path / "ep_.npz"
+    stray_b = tmp_path / "ep_1_len.npz"
+    stray_a.touch()
+    stray_b.touch()
+    for seed in (1, 2, 3):
+        buf.add(make_episode(10, seed=seed))  # forces eviction, capacity=5
+    assert stray_a.is_file(), "eviction must never delete unrecognised files"
+    assert stray_b.is_file(), "eviction must never delete unrecognised files"
+
+
+def test_load_all_detects_filename_length_divergence(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=100)
+    path = buf.add(make_episode(10))
+    bad_path = path.with_name(path.name.replace("_len00010.npz", "_len00099.npz"))
+    path.rename(bad_path)
+    with pytest.raises(ValueError, match=r"99.*10"):
+        buf.load_all()
+
+
+def test_two_buffers_over_one_directory_do_not_overwrite(tmp_path):
+    buf_a = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    buf_b = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    buf_a.add(make_episode(10, seed=101))
+    buf_b.add(make_episode(10, seed=202))
+    assert buf_a.n_episodes == 2
+    seeds = {ep.seed for ep in buf_a.load_all()}
+    assert seeds == {101, 202}

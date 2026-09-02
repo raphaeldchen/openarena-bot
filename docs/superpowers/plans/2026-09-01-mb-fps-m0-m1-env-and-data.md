@@ -2529,15 +2529,22 @@ git commit -m "feat: episode collector with crash recovery and terminal-frame ha
 
 **Interfaces:**
 - Consumes: `Episode`, `save_episode`, `load_episode`.
-- Produces: `ReplayBuffer(root: Path, capacity_transitions: int)` with `add(ep: Episode) -> Path`, `episode_paths() -> list[Path]`, `load_all() -> list[Episode]`, `n_episodes -> int`, `n_transitions -> int`.
+- Produces: `ReplayBuffer(root: Path, capacity_transitions: int)` with `add(ep: Episode) -> Path`, `episode_paths() -> list[Path]`, `stray_paths() -> list[Path]`, `load_all() -> list[Episode]`, `n_episodes -> int`, `n_transitions -> int`.
 
 **Episode length is encoded in the filename** (`ep_000042_len00318.npz`). Reading `.length` by decompressing the file would make `n_transitions` — called on every `add()` and every progress print — decompress every stored episode's full frame stack, giving O(n²) collection and putting M1's bounded-wall-clock criterion out of reach. The filename is metadata that costs nothing to read.
+
+Three failure modes fall out of trusting the filename this much, and each needs its own guard rather than a shared one:
+
+- A file matching `ep_*.npz` but not the strict name pattern (`ep_.npz`, `ep_1_len.npz`) is invisible to `episode_paths()`, so it is never counted and never evicted — a silent, permanent disk leak. Auto-deleting it would risk destroying something a user placed there, so `stray_paths()` surfaces it instead, and the constructor logs a warning naming the count and up to three examples.
+- The encoded length is trusted without verification everywhere except `load_all()`, which already decompresses every episode to build `Episode` objects — the one place checking the actual `.length` against the filename costs nothing extra. `load_all()` raises `ValueError` naming both numbers on a mismatch.
+- The counter that picks the next index is seeded once at construction and never resynced, so two `ReplayBuffer` instances over the same directory can compute the same next index; since length is part of the filename, a bare `exists()` check would miss the collision anyway. `add()` reserves its index by checking the directory itself (`_next_path`), advancing past any index another writer already used.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # tests/data/test_buffer.py
 import numpy as np
+import pytest
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import Episode
@@ -2660,6 +2667,48 @@ def test_single_oversized_episode_is_kept(tmp_path):
     buf = ReplayBuffer(tmp_path, capacity_transitions=5)
     buf.add(make_episode(50))
     assert buf.n_episodes == 1
+
+
+def test_stray_files_are_reported(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=100)
+    buf.add(make_episode(10))
+    stray_a = tmp_path / "ep_.npz"
+    stray_b = tmp_path / "ep_1_len.npz"
+    stray_a.touch()
+    stray_b.touch()
+    assert set(buf.stray_paths()) == {stray_a, stray_b}
+    assert buf.n_episodes == 1, "strays must not be counted as episodes"
+
+
+def test_stray_files_are_not_deleted(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=5)
+    stray_a = tmp_path / "ep_.npz"
+    stray_b = tmp_path / "ep_1_len.npz"
+    stray_a.touch()
+    stray_b.touch()
+    for seed in (1, 2, 3):
+        buf.add(make_episode(10, seed=seed))  # forces eviction, capacity=5
+    assert stray_a.is_file(), "eviction must never delete unrecognised files"
+    assert stray_b.is_file(), "eviction must never delete unrecognised files"
+
+
+def test_load_all_detects_filename_length_divergence(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=100)
+    path = buf.add(make_episode(10))
+    bad_path = path.with_name(path.name.replace("_len00010.npz", "_len00099.npz"))
+    path.rename(bad_path)
+    with pytest.raises(ValueError, match=r"99.*10"):
+        buf.load_all()
+
+
+def test_two_buffers_over_one_directory_do_not_overwrite(tmp_path):
+    buf_a = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    buf_b = ReplayBuffer(tmp_path, capacity_transitions=1000)
+    buf_a.add(make_episode(10, seed=101))
+    buf_b.add(make_episode(10, seed=202))
+    assert buf_a.n_episodes == 2
+    seeds = {ep.seed for ep in buf_a.load_all()}
+    assert seeds == {101, 202}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2682,10 +2731,13 @@ Filenames carry both the ordering index and the episode length
 """
 
 import itertools
+import logging
 import re
 from pathlib import Path
 
 from mbfps.data.episode import Episode, load_episode, save_episode
+
+logger = logging.getLogger(__name__)
 
 _NAME_RE = re.compile(r"^ep_(\d+)_len(\d+)\.npz$")
 
@@ -2699,6 +2751,17 @@ class ReplayBuffer:
         self.capacity_transitions = capacity_transitions
         indices = [self._parse(p)[0] for p in self.episode_paths()]
         self._counter = itertools.count(max(indices) + 1 if indices else 0)
+        strays = self.stray_paths()
+        if strays:
+            examples = ", ".join(p.name for p in strays[:3])
+            logger.warning(
+                "%d file(s) in %s match the episode glob but not the episode "
+                "filename pattern; they are excluded from all counts and from "
+                "eviction and will accumulate forever (e.g. %s)",
+                len(strays),
+                self.root,
+                examples,
+            )
 
     @staticmethod
     def _parse(path: Path) -> tuple[int, int]:
@@ -2715,6 +2778,17 @@ class ReplayBuffer:
             key=lambda p: self._parse(p)[0],
         )
 
+    def stray_paths(self) -> list[Path]:
+        """Files matching the episode glob whose names this class cannot parse.
+
+        They are excluded from every count AND from eviction, so they accumulate
+        forever. Deleting them automatically would risk destroying something a
+        user placed here, so they are surfaced instead.
+        """
+        return sorted(
+            p for p in self.root.glob("ep_*.npz") if not _NAME_RE.match(p.name)
+        )
+
     @property
     def n_episodes(self) -> int:
         return len(self.episode_paths())
@@ -2726,14 +2800,43 @@ class ReplayBuffer:
 
     def add(self, ep: Episode) -> Path:
         """Write `ep` and evict oldest episodes until within capacity."""
-        path = self.root / f"ep_{next(self._counter):06d}_len{ep.length:05d}.npz"
+        path = self._next_path(ep.length)
         save_episode(ep, path)
         self._evict()
         return path
 
+    def _next_path(self, length: int) -> Path:
+        """Reserve the next unused index, resyncing if another writer advanced.
+
+        The counter alone is not enough: a second ReplayBuffer over the same
+        directory seeds its own counter at construction and can hand out an
+        index this one has already used. Length is part of the filename, so a
+        bare exists() check would miss the collision.
+        """
+        while True:
+            index = next(self._counter)
+            if not any(self.root.glob(f"ep_{index:06d}_len*.npz")):
+                return self.root / f"ep_{index:06d}_len{length:05d}.npz"
+
     def load_all(self) -> list[Episode]:
-        """Load every stored episode, oldest first."""
-        return [load_episode(p) for p in self.episode_paths()]
+        """Load every stored episode, oldest first.
+
+        This is the one place a filename/content divergence is detectable: the
+        encoded length is otherwise trusted as-is (by `n_transitions` and
+        `_evict`) to keep capacity accounting O(1), but `load_all` already pays
+        the decompression cost for every episode, so verifying here is free.
+        """
+        episodes = []
+        for path in self.episode_paths():
+            ep = load_episode(path)
+            _, encoded_length = self._parse(path)
+            if ep.length != encoded_length:
+                raise ValueError(
+                    f"{path.name}: filename encodes length {encoded_length}, "
+                    f"but the episode actually has {ep.length} transitions"
+                )
+            episodes.append(ep)
+        return episodes
 
     def _evict(self) -> None:
         paths = self.episode_paths()
@@ -2752,9 +2855,16 @@ class ReplayBuffer:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
-Expected: 11 passed.
+Expected: 15 passed.
 
-Sanity-check both guards by mutation: temporarily revert `n_transitions` to `sum(load_episode(p).length for p in self.episode_paths())` and confirm a test fails, then do the same for `_evict`. A mutation that leaves the suite green means that guard is not guarding.
+Sanity-check all four guards by mutation, restoring between each:
+
+1. Make `stray_paths()` return `[]` -- confirm `test_stray_files_are_reported` fails.
+2. Remove the divergence check from `load_all()` -- confirm `test_load_all_detects_filename_length_divergence` fails.
+3. Revert `add()` to build the path directly from `next(self._counter)` without the directory check -- confirm `test_two_buffers_over_one_directory_do_not_overwrite` fails.
+4. Revert `n_transitions` to `sum(load_episode(p).length for p in self.episode_paths())` -- confirm the existing O(1) guard tests (`test_n_transitions_does_not_decompress_episodes`, `test_eviction_does_not_decompress_episodes`) fail.
+
+A mutation that leaves the suite green means that guard is not guarding.
 
 - [ ] **Step 5: Commit**
 
