@@ -1278,7 +1278,7 @@ def test_different_seeds_diverge(actions):
     this proves construction-time seeding (the `set_seed` call in `__init__`)
     differentiates the two engines. It does NOT exercise `reset()`'s reseed
     path -- a `reset()` that silently no-ops would not be caught here. See
-    `test_reset_to_a_different_seed_diverges_within_one_instance` for the test
+    `test_reset_reseeds_rather_than_letting_the_engine_rng_drift` for the test
     that actually guards `reset()`'s reseed.
     """
     a_frames, _ = _rollout(seed=7, actions=actions)
@@ -1289,23 +1289,33 @@ def test_different_seeds_diverge(actions):
     )
 
 
-def test_reset_to_a_different_seed_diverges_within_one_instance():
-    """The operation M1's collector actually performs.
+def test_reset_reseeds_rather_than_letting_the_engine_rng_drift():
+    """A live engine reseeded to N must match a fresh engine constructed at N.
 
-    A long-lived engine is reseeded once per episode. Constructing a fresh env
-    per seed (as the other divergence test does) proves only that the
-    constructor seeds; it passes even when reset()'s reseed is a no-op.
+    This is the operation M1's collector performs: one long-lived engine,
+    reseeded once per episode. Comparing two different-seed resets on the same
+    instance proves nothing -- ViZDoom's RNG advances on every new_episode(), so
+    consecutive episodes differ even when reset() ignores the seed entirely.
+    The reference must be an engine whose history cannot matter.
     """
-    env = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=0)
+    live = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=0)
+    fresh = ViZDoomEnv(scenario=SCENARIO, frame_skip=4, seed=99)
     try:
-        first, _ = env.reset(seed=31)
-        second, _ = env.reset(seed=32)
-        assert not np.array_equal(first, second), (
-            "reset() to a different seed produced an identical first frame -- "
-            "reset() is not reseeding the engine"
+        live.reset(seed=31)
+        for _ in range(10):
+            live.step(1)
+        live.reset(seed=17)
+        for _ in range(10):
+            live.step(2)
+        reseeded, _ = live.reset(seed=99)
+        reference, _ = fresh.reset(seed=99)
+        assert np.array_equal(reseeded, reference), (
+            "a reseeded live engine diverged from a fresh engine at the same "
+            "seed -- reset() is advancing the engine RNG instead of reseeding it"
         )
     finally:
-        env.close()
+        live.close()
+        fresh.close()
 
 
 def test_recorded_episode_replays_from_saved_actions_alone(tmp_path):
