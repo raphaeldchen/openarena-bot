@@ -1566,14 +1566,28 @@ def test_scripted_policy_strafes_both_ways_without_turn_buttons(obs):
     assert BASIC.index("MOVE_RIGHT") + 1 in actions
 
 
-def test_scripted_policy_sustains_a_direction(obs):
-    """Sustained commitment is what buys coverage over random oscillation."""
-    actions = _run(ScriptedPolicy(CORRIDOR, seed=0), obs, 200)
-    longest = best = 1
-    for prev, cur in zip(actions, actions[1:]):
-        longest = longest + 1 if cur == prev else 1
-        best = max(best, longest)
-    assert best >= 3
+@pytest.mark.parametrize("buttons", ALL_SETS)
+def test_scripted_policy_commits_more_than_random(obs, buttons):
+    """Sustained commitment is what buys coverage over random oscillation.
+
+    Compared against random at the same seed rather than against a fixed
+    threshold. A longest-run check does not discriminate: uniform random clears
+    a run of 3 about 94% of the time, and on 3-button sets random reaches runs
+    of 8 while scripted's minimum is 7. The repeat rate separates cleanly --
+    measured worst-case paired ratio across four button sets and 60 seeds is
+    1.86, so 1.5 has headroom.
+    """
+
+    def repeat_rate(policy):
+        actions = np.array([policy.act(obs) for _ in range(400)])
+        return float((actions[1:] == actions[:-1]).mean())
+
+    scripted = repeat_rate(ScriptedPolicy(buttons, seed=0))
+    uniform = repeat_rate(RandomPolicy(len(buttons) + 1, seed=0))
+    assert scripted > uniform * 1.5, (
+        f"scripted repeat rate {scripted:.3f} vs random {uniform:.3f} -- "
+        "the policy is not committing to sustained actions"
+    )
 
 
 def test_scripted_policy_with_only_attack_still_varies(obs):
@@ -1727,7 +1741,7 @@ class ScriptedPolicy:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_policies.py -v`
-Expected: 26 passed. Two tests are parametrised over all four button sets and one over the three sets that have an `ATTACK` button, so the collected count exceeds the number of `def test_` lines.
+Expected: 29 passed. Three tests are parametrised over all four button sets and one over the three sets that have an `ATTACK` button, so the collected count exceeds the number of `def test_` lines.
 
 - [ ] **Step 5: Commit**
 
