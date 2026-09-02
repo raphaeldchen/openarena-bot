@@ -127,6 +127,43 @@ def test_same_seed_reproduces_the_action_sequence():
     assert np.array_equal(a.actions, b.actions)
 
 
+def test_same_seed_reproduces_actions_on_a_reused_collector():
+    """Guards the per-episode policy reseed.
+
+    A fresh collector per episode cannot detect a missing reset(): two new
+    RandomPolicy(seed=0) objects start from the same RNG state regardless.
+    Reusing ONE collector is what exposes it -- without the reseed the second
+    episode simply continues the first episode's RNG stream.
+
+    This is the failure a pre-flight audit rated critical: every collected
+    episode replaying one identical action sequence.
+    """
+    c = _collector(episode_len=40, max_steps=40)
+    try:
+        first = c.collect_episode(seed=5)
+        second = c.collect_episode(seed=5)
+        assert first is not None and second is not None
+        assert np.array_equal(first.actions, second.actions), (
+            "same seed on a reused collector produced different actions -- "
+            "the per-episode policy reseed is missing"
+        )
+    finally:
+        c.close()
+
+
+def test_different_seeds_differ_on_a_reused_collector():
+    """The complement: reseeding must actually track the seed, not ignore it."""
+    c = _collector(episode_len=40, max_steps=40)
+    try:
+        a = c.collect_episode(seed=5)
+        b = c.collect_episode(seed=6)
+        assert not np.array_equal(a.actions, b.actions), (
+            "different seeds on a reused collector produced identical actions"
+        )
+    finally:
+        c.close()
+
+
 def test_max_steps_truncates():
     c = _collector(episode_len=999, max_steps=5)
     assert c.collect_episode(seed=0).length == 5
