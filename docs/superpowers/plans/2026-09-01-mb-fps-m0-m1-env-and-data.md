@@ -3182,6 +3182,8 @@ git commit -m "feat: sequence loader with episode-boundary safety"
 
 Per spec §3.3: the learned bottleneck sits **downstream** of this cache, so the cache stores the frozen backbone's raw 64x384 patch features. Stored as float16 (~49KB/frame, about 1.3x a raw uint8 frame).
 
+**Determinism is per-device, not cross-device.** Repeat-encoding the same frame on the same device is byte-identical, but CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements (measured on `facebook/dinov2-small`). Collection defaults to MPS. Constraint for later plans: **the feature cache must be generated once on a single device and reused for every experimental arm** — regenerating it per arm, or mixing devices within one dataset, silently introduces a confound indistinguishable from a real signal.
+
 - [ ] **Step 1: Write the failing test**
 
 ```python
@@ -3229,6 +3231,16 @@ def test_encode_is_byte_identical_on_repeat(extractor):
     assert np.array_equal(a, b)
 
 
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_encode_is_byte_identical_on_repeat_on_mps():
+    """Collection runs on MPS by default, so CPU repeatability is not enough."""
+    mps_extractor = FeatureExtractor(device="mps")
+    frames = np.random.default_rng(1).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert np.array_equal(mps_extractor.encode(frames), mps_extractor.encode(frames))
+
+
 def test_encode_distinguishes_different_frames(extractor):
     frames = np.stack(
         [
@@ -3245,28 +3257,43 @@ def test_encode_rejects_wrong_shape(extractor):
         extractor.encode(np.zeros((2, 64, 64, 3), dtype=np.uint8))
 
 
-def test_encode_applies_imagenet_normalization(extractor):
-    """Mutation-testing gap-fill: none of the tests above pin down the actual
-    preprocessing values, so silently feeding raw [0, 1] pixels instead of
-    ImageNet-normalised ones passes every test above undetected. Recompute the
-    reference preprocessing independently and compare bit-for-bit against
-    `encode`'s output -- a frozen cache built on the wrong preprocessing would
-    be internally consistent (deterministic, distinguishes frames) but wrong.
-    """
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    frames = np.random.randint(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
-    x = (frames.astype(np.float32) / 255.0 - mean) / std
+def _encode_preprocessed(extractor, x):
+    """Run the frozen backbone on already-preprocessed NHWC float32 input."""
+    import torch
+
     tensor = torch.from_numpy(x).permute(0, 3, 1, 2).to(extractor.device)
     with torch.no_grad():
-        expected = (
-            extractor.model(pixel_values=tensor)
-            .last_hidden_state[:, 1:, :]
-            .to(torch.float16)
-            .cpu()
-            .numpy()
-        )
-    assert np.array_equal(extractor.encode(frames), expected)
+        out = extractor.model(pixel_values=tensor).last_hidden_state
+    return out[:, 1:, :].cpu().numpy().astype(np.float32)
+
+
+def test_encode_applies_imagenet_normalization(extractor):
+    """Normalisation must be applied -- but any equivalent formulation is fine.
+
+    An exact-equality check against the implementation's own expression is a
+    change-detector: a mathematically-equivalent refactor shifts results by
+    ~1e-6, which survives the float16 cast and fails the comparison. So this
+    asserts closeness to the reference AND clear separation from the
+    un-normalised alternative.
+    """
+    frames = np.random.default_rng(0).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    actual = extractor.encode(frames).astype(np.float32)
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    scaled = frames.astype(np.float32) / 255.0
+
+    normalised = _encode_preprocessed(extractor, (scaled - mean) / std)
+    unnormalised = _encode_preprocessed(extractor, scaled)
+
+    assert np.allclose(actual, normalised, atol=2e-2), (
+        "encode() does not match ImageNet-normalised input"
+    )
+    separation = np.abs(normalised - unnormalised).mean()
+    assert separation > 1e-2, (
+        f"normalised and un-normalised encodings differ by only {separation:.2e}; "
+        "this test cannot detect whether normalisation is applied"
+    )
 
 
 def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
@@ -3407,7 +3434,7 @@ def cache_episode_features(
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_features.py -v`
-Expected: 8 passed. Weights are cached locally after the first run.
+Expected: 9 passed on a machine with MPS available (8 passed, 1 skipped otherwise — `test_encode_is_byte_identical_on_repeat_on_mps` requires an MPS device). Weights are cached locally after the first run.
 
 - [ ] **Step 6: Commit**
 
@@ -3800,7 +3827,7 @@ Both milestones' spec criteria, restated as things you can run:
 - [ ] `scripts/collect.py` produces a dataset with a reported `transitions_per_second` **and `episodes_kept` equal to the requested episode count** (zero kept means the collector is discarding terminating episodes).
 - [ ] The loader benchmark reports `batches_per_second`.
 - [ ] `pytest tests/data/test_episode.py` passes — stored data equals collected data.
-- [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat.
+- [ ] `pytest tests/data/test_features.py` passes — the feature cache is byte-identical on repeat **within a process on a given device** (CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements, so the cache must be generated once on one device and reused across every experimental arm, never regenerated per arm).
 - [ ] The episode-length gate passes: at least 80% of episodes are >= 64 transitions, with `mean_len` recorded.
 - [ ] `scripts/coverage_report.py` shows `scripted` occupying more cells than `random` **at the equalised frame budget**.
 - [ ] `pytest tests/test_privileged_isolation.py` passes.

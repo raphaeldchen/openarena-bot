@@ -41,6 +41,16 @@ def test_encode_is_byte_identical_on_repeat(extractor):
     assert np.array_equal(a, b)
 
 
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_encode_is_byte_identical_on_repeat_on_mps():
+    """Collection runs on MPS by default, so CPU repeatability is not enough."""
+    mps_extractor = FeatureExtractor(device="mps")
+    frames = np.random.default_rng(1).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert np.array_equal(mps_extractor.encode(frames), mps_extractor.encode(frames))
+
+
 def test_encode_distinguishes_different_frames(extractor):
     frames = np.stack(
         [
@@ -57,28 +67,43 @@ def test_encode_rejects_wrong_shape(extractor):
         extractor.encode(np.zeros((2, 64, 64, 3), dtype=np.uint8))
 
 
-def test_encode_applies_imagenet_normalization(extractor):
-    """Mutation-testing gap-fill: none of the tests above pin down the actual
-    preprocessing values, so silently feeding raw [0, 1] pixels instead of
-    ImageNet-normalised ones passes every test above undetected. Recompute the
-    reference preprocessing independently and compare bit-for-bit against
-    `encode`'s output -- a frozen cache built on the wrong preprocessing would
-    be internally consistent (deterministic, distinguishes frames) but wrong.
-    """
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    frames = np.random.randint(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
-    x = (frames.astype(np.float32) / 255.0 - mean) / std
+def _encode_preprocessed(extractor, x):
+    """Run the frozen backbone on already-preprocessed NHWC float32 input."""
+    import torch
+
     tensor = torch.from_numpy(x).permute(0, 3, 1, 2).to(extractor.device)
     with torch.no_grad():
-        expected = (
-            extractor.model(pixel_values=tensor)
-            .last_hidden_state[:, 1:, :]
-            .to(torch.float16)
-            .cpu()
-            .numpy()
-        )
-    assert np.array_equal(extractor.encode(frames), expected)
+        out = extractor.model(pixel_values=tensor).last_hidden_state
+    return out[:, 1:, :].cpu().numpy().astype(np.float32)
+
+
+def test_encode_applies_imagenet_normalization(extractor):
+    """Normalisation must be applied -- but any equivalent formulation is fine.
+
+    An exact-equality check against the implementation's own expression is a
+    change-detector: a mathematically-equivalent refactor shifts results by
+    ~1e-6, which survives the float16 cast and fails the comparison. So this
+    asserts closeness to the reference AND clear separation from the
+    un-normalised alternative.
+    """
+    frames = np.random.default_rng(0).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    actual = extractor.encode(frames).astype(np.float32)
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    scaled = frames.astype(np.float32) / 255.0
+
+    normalised = _encode_preprocessed(extractor, (scaled - mean) / std)
+    unnormalised = _encode_preprocessed(extractor, scaled)
+
+    assert np.allclose(actual, normalised, atol=2e-2), (
+        "encode() does not match ImageNet-normalised input"
+    )
+    separation = np.abs(normalised - unnormalised).mean()
+    assert separation > 1e-2, (
+        f"normalised and un-normalised encodings differ by only {separation:.2e}; "
+        "this test cannot detect whether normalisation is applied"
+    )
 
 
 def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):

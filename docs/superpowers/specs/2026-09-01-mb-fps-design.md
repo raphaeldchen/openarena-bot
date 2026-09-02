@@ -297,7 +297,10 @@ loader, frozen-feature cache. Each episode is tagged with the policy that produc
 
 **Done when:** a target transition count is collected within a bounded wall-clock time; the loader's
 batches/sec is benchmarked; a round-trip test proves stored data equals collected data; the feature cache
-produces byte-identical features on repeat encoding of the same frame; and a **state-visitation histogram**
+produces byte-identical features on repeat encoding of the same frame **within a process on a given
+device** — CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements, so **the cache
+must be generated once on one device and reused for every experimental arm**, never regenerated per arm or
+mixed across devices within one dataset; and a **state-visitation histogram**
 over `privileged_state` is produced per policy, showing that `scripted` reaches regions `random` does not.
 
 *The visitation histogram is a diagnostic, not a gate — its purpose is to make coverage gaps visible before
