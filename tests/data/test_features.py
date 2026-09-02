@@ -132,3 +132,75 @@ def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
     # instead of float16, which would blow the ~49KB/frame storage budget
     # per spec §3.3.
     assert saved.dtype == np.float16
+
+
+def test_backbones_registered():
+    from mbfps.data.features import BACKBONES
+
+    assert BACKBONES == ("dinov2", "random_vit")
+
+
+def test_unknown_backbone_rejected():
+    from mbfps.data.features import build_backbone
+
+    with pytest.raises(KeyError, match="unknown backbone 'nope'"):
+        build_backbone("nope")
+
+
+@pytest.mark.slow
+def test_random_vit_has_the_same_output_shape_as_dinov2():
+    """Arm 3 must be Arm 2 with different weights, not a different shape."""
+    ext = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    frames = np.random.default_rng(0).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert ext.encode(frames).shape == (2, N_PATCHES, FEATURE_DIM)
+
+
+@pytest.mark.slow
+def test_random_vit_is_reproducible_from_its_seed():
+    a = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
+    b = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
+    frames = np.random.default_rng(1).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert np.array_equal(a.encode(frames), b.encode(frames))
+
+
+@pytest.mark.slow
+def test_random_vit_differs_from_dinov2():
+    """If these matched, Arm 3 would not be a control at all."""
+    rnd = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    pre = FeatureExtractor(backbone="dinov2", device="cpu")
+    frames = np.random.default_rng(2).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert not np.allclose(
+        rnd.encode(frames).astype(np.float32),
+        pre.encode(frames).astype(np.float32),
+        atol=1e-2,
+    )
+
+
+@pytest.mark.slow
+def test_different_seeds_give_different_random_backbones():
+    a = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    b = FeatureExtractor(backbone="random_vit", device="cpu", seed=1)
+    frames = np.random.default_rng(3).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert not np.array_equal(a.encode(frames), b.encode(frames))
+
+
+def test_require_free_bytes_passes_when_space_available(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    require_free_bytes(tmp_path, 1)
+
+
+def test_require_free_bytes_raises_when_space_insufficient(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    with pytest.raises(OSError, match="needs .* free"):
+        require_free_bytes(tmp_path, 10**15)
+
+
+def test_require_free_bytes_message_names_both_numbers(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    with pytest.raises(OSError) as excinfo:
+        require_free_bytes(tmp_path, 10**15)
+    message = str(excinfo.value)
+    assert "GB" in message and "available" in message

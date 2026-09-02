@@ -126,5 +126,6 @@ class ReplayBuffer:
             if total <= self.capacity_transitions:
                 break
             path.unlink()
-            path.with_suffix(".features.npy").unlink(missing_ok=True)
+            for cache in path.parent.glob(f"{path.stem}.features*.npy"):
+                cache.unlink(missing_ok=True)
             total -= length

@@ -97,6 +97,23 @@ def test_eviction_also_removes_cached_features(tmp_path):
     assert not features.is_file(), "feature cache outlived its episode"
 
 
+def test_eviction_removes_every_backbones_feature_cache(tmp_path):
+    """Two caches coexist; evicting only one orphans the other forever."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=25)
+    first = buf.add(make_episode(10, seed=1))
+    caches = [
+        first.with_suffix(".features.npy"),
+        first.with_suffix(".features_random_vit.npy"),
+    ]
+    for cache in caches:
+        np.save(cache, np.zeros((11, 4, 8), dtype=np.float16))
+    buf.add(make_episode(10, seed=2))
+    buf.add(make_episode(10, seed=3))
+    assert not first.is_file()
+    for cache in caches:
+        assert not cache.is_file(), f"{cache.name} outlived its episode"
+
+
 def test_buffer_reopens_existing_directory(tmp_path):
     ReplayBuffer(tmp_path, capacity_transitions=100).add(make_episode(10))
     assert ReplayBuffer(tmp_path, capacity_transitions=100).n_episodes == 1
