@@ -67,9 +67,9 @@ class ScriptedPolicy:
     uniform random, which is still better than emitting a constant.
     """
 
-    _ADVANCE_PROB = 0.6
+    _ADVANCE_PROB = 0.5
     _SWEEP_PROB = 0.75
-    _SWEEP_LEN = 8
+    _SWEEP_LEN = 100
 
     def __init__(self, button_names: Sequence[str], seed: int = 0) -> None:
         self.name = "scripted"
