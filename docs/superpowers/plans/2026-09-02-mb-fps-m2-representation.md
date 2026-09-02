@@ -166,10 +166,24 @@ def test_arms_differ_only_in_encoder_kind():
         assert differing <= {"kind"}, f"arm {arm!r} differs beyond kind: {differing}"
 
 
-def test_configs_are_frozen():
-    cfg = get_config("cnn")
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: setattr(c.train, "batch_size", 32),
+        lambda c: setattr(c.encoder, "embed_dim", 1024),
+        lambda c: setattr(c, "arm", "other"),
+    ],
+    ids=["train", "encoder", "config"],
+)
+def test_every_config_layer_is_frozen(mutate):
+    """All three layers must be immutable.
+
+    Checking only TrainConfig leaves a real hole: a mutable EncoderConfig
+    would let one arm's embedding width drift at runtime, silently breaking
+    the comparison the whole study rests on.
+    """
     with pytest.raises(dataclasses.FrozenInstanceError):
-        cfg.train.batch_size = 32
+        mutate(get_config("cnn"))
 
 
 def test_overrides_apply_to_train_settings():
@@ -275,7 +289,7 @@ def get_config(arm: str, **overrides) -> Config:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/utils/test_config.py -v`
-Expected: 11 passed.
+Expected: 13 passed (the frozen test is parametrised over all three config layers).
 
 - [ ] **Step 5: Commit**
 
