@@ -277,15 +277,50 @@ def test_loader_reads_the_requested_backbones_cache(tmp_path):
 
 
 def test_obs_free_loader_does_not_read_pixels(tmp_path, monkeypatch):
-    """Guards the 2.24 GB regression: obs must never be decompressed."""
+    """Guards the 2.24 GB regression at the point pixels would actually be read.
+
+    Spying on `load_episode` is not enough: the obs-free path never calls it,
+    so that version of this guard passed even when `from_npz` was changed to
+    read `data["obs"]` directly. Intercepting the npz key access catches an
+    obs read from any code path.
+
+    The patch is class-level because Python resolves `__getitem__` on the type,
+    so patching the NpzFile instance would not intercept `data["obs"]`.
+    """
+    from numpy.lib.npyio import NpzFile
+
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
     buf.add(make_episode(t=80, fill=1))
 
-    import mbfps.data.loader as loader_module
+    original = NpzFile.__getitem__
 
-    def _boom(*args, **kwargs):
-        raise AssertionError("load_obs=False must not call load_episode")
+    def guarded(self, key):
+        assert key != "obs", "obs must never be read when load_obs=False"
+        return original(self, key)
 
-    monkeypatch.setattr(loader_module, "load_episode", _boom)
+    monkeypatch.setattr(NpzFile, "__getitem__", guarded)
     loader = SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=False)
     assert loader.sample()["actions"].shape == (2, 16)
+
+
+def test_obs_loading_loader_does_read_pixels(tmp_path, monkeypatch):
+    """The complement: proves the guard above can actually fire.
+
+    Without this, a guard that never triggers under any condition would look
+    identical to one that correctly never triggers.
+    """
+    from numpy.lib.npyio import NpzFile
+
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+
+    original = NpzFile.__getitem__
+    seen: list[str] = []
+
+    def spy(self, key):
+        seen.append(key)
+        return original(self, key)
+
+    monkeypatch.setattr(NpzFile, "__getitem__", spy)
+    SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=True)
+    assert "obs" in seen, "load_obs=True should read obs; the spy is not wired up"
