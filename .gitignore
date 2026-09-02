@@ -7,3 +7,4 @@ checkpoints/
 *.npz
 *.pt
 .DS_Store
+.superpowers/
