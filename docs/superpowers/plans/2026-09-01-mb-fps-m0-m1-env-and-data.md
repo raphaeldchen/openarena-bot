@@ -1151,7 +1151,7 @@ In `tests/envs/test_protocol.py`, delete the `@pytest.mark.xfail(...)` decorator
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/envs/ -v`
-Expected: 32 passed — `test_protocol.py` 5 (the xfail is now removed, so all 5 pass), `test_actions.py` 6, `test_wrappers.py` 7, `test_vizdoom_env.py` 14. `test_determinism.py` does not exist until Task 6.
+Expected: 38 passed — `test_protocol.py` 8 (the strict xfail is removed in this task, so all 8 pass), `test_actions.py` 6, `test_wrappers.py` 10, `test_vizdoom_env.py` 14. `test_determinism.py` does not exist until Task 6.
 
 - [ ] **Step 6: Commit**
 
