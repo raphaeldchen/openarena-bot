@@ -641,7 +641,7 @@ class _EpisodeMeta:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/data/test_loader.py -v`
-Expected: 20 passed (12 existing plus the 8 added here).
+Expected: 23 passed (15 existing plus the 8 added here).
 
 - [ ] **Step 5: Verify the memory claim on the real dataset**
 
