@@ -25,7 +25,7 @@ def test_in_dim_is_configurable_for_later_recurrent_use():
 
 def test_wrong_input_width_raises():
     dec = PixelDecoder(in_dim=2048)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="2048"):
         dec(torch.randn(2, 1024))
 
 
@@ -53,6 +53,30 @@ def test_reconstruction_loss_accepts_uint8_targets_directly():
     target = torch.randint(0, 256, (2, *OBS_SHAPE), dtype=torch.uint8)
     pred = torch.rand((2, *OBS_SHAPE))
     assert torch.isfinite(reconstruction_loss(pred, target))
+
+
+def test_reconstruction_loss_rejects_an_unnormalised_float_target():
+    """A float target in [0, 255] is a units bug, not a valid input.
+
+    Guarding on dtype alone let this through silently, inflating the loss by
+    ~255^2 -- which reads as a diverging model rather than a scaling mistake.
+    """
+    pred = torch.rand((2, *OBS_SHAPE))
+    target = torch.rand((2, *OBS_SHAPE)) * 255.0
+    with pytest.raises(ValueError, match="expected \\[0, 1\\]"):
+        reconstruction_loss(pred, target)
+
+
+def test_reconstruction_loss_accepts_a_normalised_float_target():
+    """The complement: a correctly-scaled float target must still work."""
+    target = torch.rand((2, *OBS_SHAPE))
+    assert reconstruction_loss(target, target).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_reconstruction_loss_accepts_an_empty_target():
+    """The max() guard must not crash on a zero-element tensor."""
+    empty = torch.zeros((0, *OBS_SHAPE))
+    assert torch.isfinite(reconstruction_loss(empty, empty))
 
 
 def test_recorded_parameter_count():

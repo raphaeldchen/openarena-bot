@@ -12,8 +12,6 @@ this a concatenated recurrent state instead of a bare embedding.
 import torch
 import torch.nn as nn
 
-from mbfps.envs.protocol import OBS_SHAPE
-
 _SPATIAL = 7
 """Matches the encoder: four stride-2 steps between 7x7 and 112x112."""
 
@@ -45,13 +43,29 @@ class PixelDecoder(nn.Module):
 
 
 def reconstruction_loss(pred: torch.Tensor, target_obs: torch.Tensor) -> torch.Tensor:
-    """Mean squared error between a prediction in [0, 1] and a uint8 target.
+    """Mean squared error between a prediction in [0, 1] and an image target.
 
-    The loss owns the uint8 conversion so no caller has to remember to scale;
-    a forgotten division by 255 would train against a 255x-larger target and
-    look like a diverging model rather than a units bug.
+    A `uint8` target is normalised here so no caller has to remember to scale.
+    A float target must already be in [0, 1]; one still in [0, 255] is rejected
+    rather than silently used, because that produces a ~255^2 loss inflation
+    that looks like a diverging model rather than a units bug. Checking the
+    dtype alone missed exactly that case.
+
+    Raises:
+        ValueError: if a float target contains values above 1.
     """
-    target = target_obs.to(pred.dtype)
     if target_obs.dtype == torch.uint8:
-        target = target / 255.0
-    return (pred - target).square().mean()
+        target = target_obs.to(pred.dtype) / 255.0
+    else:
+        target = target_obs.to(pred.dtype)
+        if target.numel() and float(target.max()) > 1.0 + 1e-4:
+            raise ValueError(
+                f"float target has max {float(target.max()):.4f}, expected [0, 1]. "
+                "Pass a uint8 tensor to have it normalised, or normalise before "
+                "calling."
+            )
+    diff = (pred - target).square()
+    # `.mean()` on a zero-element tensor is NaN (0 / 0), not 0 -- guard it the
+    # same way the units check above guards `.max()`, so an empty batch stays
+    # a valid, finite loss rather than silently poisoning a running average.
+    return diff.mean() if diff.numel() else diff.sum()
