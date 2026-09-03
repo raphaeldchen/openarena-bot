@@ -119,3 +119,36 @@ def test_different_seeds_give_different_curves(buffer):
     b = train_autoencoder(get_config("cnn", steps=3, batch_size=2, seq_len=8,
                                      device="cpu", seed=1), buffer, out_dir=None)
     assert not np.allclose(a["loss"], b["loss"])
+
+
+def test_pixel_arm_trains_without_any_feature_cache(tmp_path):
+    """The pixel arm must work on a dataset that was never feature-cached.
+
+    The shared `buffer` fixture caches features for every arm, so a trainer
+    that always requested them stays green there. This buffer has no cache at
+    all, so requesting features raises FileNotFoundError in the loader.
+    Verified by mutation: forcing load_features=True passed all other tests.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    assert not list(tmp_path.glob("*.features*.npy")), "fixture must have no cache"
+
+    history = train_autoencoder(tiny("cnn"), buf, out_dir=None)
+    assert history["arm"] == "cnn"
+    assert history["steps"] == 3
+
+
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_feature_arms_require_a_cache(tmp_path, arm):
+    """The complement: proves the test above is not vacuous.
+
+    If the trainer never requested features for any arm, the test above would
+    pass for the wrong reason. These arms must fail loudly without a cache.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+
+    with pytest.raises(FileNotFoundError, match="no cached features"):
+        train_autoencoder(tiny(arm), buf, out_dir=None)
