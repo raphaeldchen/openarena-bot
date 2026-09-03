@@ -57,17 +57,28 @@ def main() -> None:
     orig = target.cpu().numpy().astype(np.float32) / 255.0
     mse = float(((recon - orig) ** 2).mean())
 
+    # A window of seq_len=1 yields seq_len+1 = 2 frames, so the flattened batch
+    # holds `frames_per_window * samples` rows ordered (win0,t0),(win0,t1),...
+    # Plotting rows 0..samples-1 showed the first half of the windows twice each
+    # as near-identical consecutive frames, and silently dropped the rest -- so
+    # the gate figure carried half the visual diversity it advertised.
     n = args.samples
+    frames_per_window = orig.shape[0] // n
+    shown = [i * frames_per_window for i in range(n)]
     fig, axes = plt.subplots(2, n, figsize=(2.2 * n, 4.8), squeeze=False)
-    for i in range(n):
-        axes[0][i].imshow(np.clip(orig[i], 0, 1))
-        axes[1][i].imshow(np.clip(recon[i], 0, 1))
+    for i, row in enumerate(shown):
+        axes[0][i].imshow(np.clip(orig[row], 0, 1))
+        axes[1][i].imshow(np.clip(recon[row], 0, 1))
         for row in (0, 1):
             axes[row][i].set_xticks([])
             axes[row][i].set_yticks([])
     axes[0][0].set_ylabel("original", fontsize=11)
     axes[1][0].set_ylabel("reconstruction", fontsize=11)
-    fig.suptitle(f"arm={args.arm}   pixel MSE={mse:.5f}", fontsize=13)
+    fig.suptitle(
+        f"arm={args.arm}   pixel MSE={mse:.5f} over {orig.shape[0]} frames "
+        f"({n} distinct windows shown)",
+        fontsize=13,
+    )
     fig.tight_layout()
 
     args.run.mkdir(parents=True, exist_ok=True)

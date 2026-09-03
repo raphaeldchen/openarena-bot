@@ -83,3 +83,34 @@ def test_recorded_parameter_count():
     """Pins the measured count so an architecture drift is visible."""
     n = sum(p.numel() for p in PixelDecoder(in_dim=2048).parameters())
     assert n == 26_392_547
+
+
+# --- Loss value tests with a discriminating error magnitude ------------------
+# Every existing value assertion uses a per-pixel error of exactly 0 or exactly
+# 1, and 0^2 == 0, 1^2 == 1 -- so MSE, MAE and any other p-norm agree on those
+# inputs. Swapping .square() for .abs() passed the whole suite. These use an
+# error where the norms disagree.
+
+
+def test_reconstruction_loss_is_mean_squared_not_mean_absolute():
+    """0.5^2 = 0.25 != 0.5, so this separates MSE from MAE."""
+    pred = torch.full((2, 4, 4, 3), 0.5)
+    target = torch.zeros((2, 4, 4, 3))
+    loss = reconstruction_loss(pred, target)
+    assert loss.item() == pytest.approx(0.25, abs=1e-6)
+
+
+def test_reconstruction_loss_scales_quadratically_with_error():
+    """Doubling the error must quadruple the loss; a linear norm would not."""
+    target = torch.zeros((2, 4, 4, 3))
+    small = reconstruction_loss(torch.full((2, 4, 4, 3), 0.2), target).item()
+    large = reconstruction_loss(torch.full((2, 4, 4, 3), 0.4), target).item()
+    assert large == pytest.approx(4.0 * small, rel=1e-5)
+
+
+def test_reconstruction_loss_normalises_uint8_targets_by_255():
+    """Pins the divisor: /256 or /128 would shift this away from the exact value."""
+    pred = torch.zeros((1, 2, 2, 3))
+    target = torch.full((1, 2, 2, 3), 51, dtype=torch.uint8)  # 51/255 == 0.2
+    loss = reconstruction_loss(pred, target)
+    assert loss.item() == pytest.approx(0.04, abs=1e-6)

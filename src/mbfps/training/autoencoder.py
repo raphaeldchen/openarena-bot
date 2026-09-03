@@ -27,6 +27,10 @@ from mbfps.utils.device import get_device
 from mbfps.utils.seeding import seed_everything
 
 
+_DECODER_SEED_OFFSET = 1_000_003
+"""Offset so the decoder's stream cannot coincide with the encoder's or the loader's."""
+
+
 class AutoencoderModel(nn.Module):
     """Encoder plus pixel decoder, with no recurrent state."""
 
@@ -35,9 +39,18 @@ class AutoencoderModel(nn.Module):
         self.cfg = cfg
         self.input_kind = encoder_input_kind(cfg.encoder)
         self.encoder = build_encoder(cfg.encoder)
-        self.decoder = PixelDecoder(
-            in_dim=cfg.encoder.embed_dim, depth=cfg.encoder.cnn_depth
-        )
+        # The decoder is shared across arms and must initialise to identical
+        # weights for all of them. Drawing it from the global RNG *after* the
+        # encoder made it depend on how many draws the encoder consumed --
+        # 26,382,304 for the CNN arm against 12,320 for the bottleneck arms --
+        # so the "shared" decoder silently differed between the pixel arm and
+        # the feature arms. Fork the RNG and seed it from the arm-invariant
+        # train seed so decoder init is a function of the seed alone.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(cfg.train.seed + _DECODER_SEED_OFFSET)
+            self.decoder = PixelDecoder(
+                in_dim=cfg.encoder.embed_dim, depth=cfg.encoder.cnn_depth
+            )
 
     def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
         """Return `(reconstruction, pixel_target)`, both `(N, 112, 112, 3)`.

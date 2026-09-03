@@ -247,3 +247,64 @@ def test_require_free_bytes_message_names_both_numbers(tmp_path):
         require_free_bytes(tmp_path, 10**15)
     message = str(excinfo.value)
     assert "GB" in message and "available" in message
+
+
+# --- Multi-chunk batching ---------------------------------------------------
+# Both existing tests of cache_episode_features use a 4-frame episode against a
+# default batch_size of 32, so the comprehension ran exactly once and
+# np.concatenate never joined more than one chunk. Real episodes are hundreds
+# of frames, so the loop that production actually exercises had no coverage:
+# an off-by-one in the range step, or a chunk written in the wrong order, would
+# not have been caught.
+
+
+class _CountingExtractor:
+    """Returns each frame's identity marker, and records the chunk sizes seen."""
+
+    backbone = "random_vit"
+
+    def __init__(self):
+        self.chunk_sizes = []
+
+    def encode(self, frames):
+        self.chunk_sizes.append(len(frames))
+        markers = frames[:, 0, 0, 0].astype(np.float16)
+        return np.broadcast_to(
+            markers[:, None, None], (len(frames), N_PATCHES, FEATURE_DIM)
+        ).copy()
+
+
+def test_cache_episode_features_batches_and_preserves_frame_order(tmp_path):
+    """A 70-frame episode at batch_size=32 must run three chunks, in order."""
+    keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
+    n = 70
+    obs = np.zeros((n, *OBS_SHAPE), dtype=np.uint8)
+    obs[:, 0, 0, 0] = np.arange(n, dtype=np.uint8)  # frame identity
+    episode = Episode(
+        obs=obs,
+        actions=np.zeros(n - 1, dtype=np.int32),
+        rewards=np.zeros(n - 1, dtype=np.float32),
+        terminated=np.zeros(n - 1, dtype=bool),
+        truncated=np.zeros(n - 1, dtype=bool),
+        privileged=np.zeros((n, len(keys)), dtype=np.float32),
+        privileged_keys=keys,
+        policy_name="random",
+        seed=0,
+        scenario="my_way_home",
+    )
+    path = tmp_path / "ep_000000_len00069.npz"
+    save_episode(episode, path)
+
+    extractor = _CountingExtractor()
+    out_path = cache_episode_features(path, extractor, batch_size=32)
+
+    assert extractor.chunk_sizes == [32, 32, 6], (
+        f"expected three chunks 32/32/6, got {extractor.chunk_sizes} -- the "
+        "batching loop is not covering the episode as claimed"
+    )
+    written = np.load(out_path)
+    assert written.shape == (n, N_PATCHES, FEATURE_DIM)
+    # Frame order must survive concatenation across chunk boundaries.
+    np.testing.assert_array_equal(
+        written[:, 0, 0].astype(np.int64), np.arange(n)
+    )

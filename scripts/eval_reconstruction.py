@@ -1,14 +1,19 @@
 # scripts/eval_reconstruction.py
 """Paired pixel-MSE evaluation across arms (milestone M2).
 
-`reconstruction_grid.py` prints an MSE over its 6 displayed frames, which is far
-too small a sample to separate the arms: at 6 frames the estimates were ~25% high
-even though they ranked the arms correctly. This script averages over many draws
-and, because every arm replays the same seed sequence, compares them pairwise --
-so the between-arm difference is measured on identical frames and the per-draw
-sampling noise cancels.
+`reconstruction_grid.py` reports an MSE over one batch only -- 12 frames at the
+default `--samples 6`, since a seq_len=1 window carries two frames. That is far
+too small a sample to separate the arms. This script averages over many draws and,
+because every arm replays the same seed sequence, compares them pairwise, so the
+between-arm difference is measured on identical frames and per-draw sampling
+noise cancels.
 
-These are training-set reconstructions; M2 has no held-out split.
+Two limits on how far the output can be read. These are training-set
+reconstructions -- M2 has no held-out split. And each arm contributes a single
+checkpoint, so the paired spread measures frame-sampling noise around two fixed
+models, not between-arm variability: `sem` shrinks as `1/sqrt(draws)` without
+bound, so it supports "these two checkpoints differ on this dataset" and not
+"this arm is better". Ranking arms needs several training seeds each.
 """
 
 import argparse

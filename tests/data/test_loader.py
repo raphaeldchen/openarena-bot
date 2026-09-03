@@ -324,3 +324,99 @@ def test_obs_loading_loader_does_read_pixels(tmp_path, monkeypatch):
     monkeypatch.setattr(NpzFile, "__getitem__", spy)
     SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=True)
     assert "obs" in seen, "load_obs=True should read obs; the spy is not wired up"
+
+
+# --- Value-level window alignment -------------------------------------------
+# The fixtures above fill actions/rewards/terminated/truncated with zeros and
+# assert only shape and dtype, so four separate single-line mutations in
+# SequenceLoader.sample() -- swapping truncated for terminated, slicing actions
+# or rewards from a fixed offset 0, or zeroing terminated -- all passed the
+# whole suite. Nothing tied those arrays to the sampled window. The episodes
+# below encode (episode, timestep) in every field, so any misalignment or
+# cross-wiring shows up as a value mismatch.
+
+
+def make_varied_episode(t: int, ep_id: int) -> Episode:
+    """Every field encodes its own index, so misalignment is visible."""
+    steps = np.arange(t, dtype=np.int64)
+    obs = np.zeros((t + 1, *OBS_SHAPE), dtype=np.uint8)
+    obs[:, 0, 0, 0] = np.arange(t + 1, dtype=np.uint8)  # timestep
+    obs[:, 0, 0, 1] = ep_id  # episode identity
+    return Episode(
+        obs=obs,
+        actions=(steps % 8).astype(np.int32),
+        rewards=(steps.astype(np.float32) + 0.5 * ep_id),
+        # Deliberately different periods: a terminated/truncated swap changes
+        # the values, not just their meaning.
+        terminated=(steps % 7 == 0),
+        truncated=(steps % 5 == 0),
+        privileged=np.full((t + 1, len(KEYS)), float(ep_id), dtype=np.float32),
+        privileged_keys=KEYS,
+        policy_name="random",
+        seed=ep_id,
+        scenario="my_way_home",
+    )
+
+
+@pytest.fixture
+def varied_buffer(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for ep_id in (1, 2, 3, 4):
+        buf.add(make_varied_episode(t=80, ep_id=ep_id))
+    return buf
+
+
+def _expected(path, start, seq_len):
+    ep = load_episode(path)
+    end = start + seq_len
+    return ep.actions[start:end], ep.rewards[start:end], ep.terminated[start:end], ep.truncated[start:end]
+
+
+def test_actions_and_rewards_come_from_the_sampled_window(varied_buffer):
+    """Slicing from a fixed offset instead of window_start must fail here."""
+    loader = SequenceLoader(varied_buffer, batch_size=6, seq_len=12, seed=0)
+    for _ in range(5):
+        batch = loader.sample()
+        for i in range(6):
+            idx = int(batch["episode_index"][i])
+            start = int(batch["window_start"][i])
+            actions, rewards, _, _ = _expected(loader.episode_path(idx), start, 12)
+            np.testing.assert_array_equal(batch["actions"][i], actions)
+            np.testing.assert_allclose(batch["rewards"][i], rewards)
+
+
+def test_terminated_and_truncated_are_distinct_and_window_aligned(varied_buffer):
+    """Invariant 4: the two flags must never be conflated.
+
+    Time-limit bootstrapping depends on the distinction -- a truncated episode
+    still bootstraps from its final value, a terminated one does not.
+    """
+    loader = SequenceLoader(varied_buffer, batch_size=6, seq_len=12, seed=0)
+    saw_disagreement = False
+    for _ in range(5):
+        batch = loader.sample()
+        for i in range(6):
+            idx = int(batch["episode_index"][i])
+            start = int(batch["window_start"][i])
+            _, _, terminated, truncated = _expected(loader.episode_path(idx), start, 12)
+            np.testing.assert_array_equal(batch["terminated"][i], terminated)
+            np.testing.assert_array_equal(batch["truncated"][i], truncated)
+            if (batch["terminated"][i] != batch["truncated"][i]).any():
+                saw_disagreement = True
+    assert saw_disagreement, (
+        "fixture is degenerate: terminated and truncated never differ, so a "
+        "swap between them would still pass"
+    )
+
+
+def test_obs_window_values_match_the_sampled_offset(varied_buffer):
+    """Pins obs to window_start by value, not just by shape."""
+    loader = SequenceLoader(varied_buffer, batch_size=6, seq_len=12, seed=0)
+    batch = loader.sample()
+    for i in range(6):
+        idx = int(batch["episode_index"][i])
+        start = int(batch["window_start"][i])
+        expected = load_episode(loader.episode_path(idx)).obs[start : start + 13]
+        np.testing.assert_array_equal(batch["obs"][i], expected)
+        # The timestep marker must actually advance, or the check is vacuous.
+        assert len(np.unique(batch["obs"][i][:, 0, 0, 0])) > 1

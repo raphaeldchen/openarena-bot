@@ -2667,11 +2667,19 @@ figure is `runs/m2/reconstruction_all_arms.png`.
 | `frozen_ssl` | 13.15 | 1521 s | 0.08924 | 0.00162 | 55x | 0.00161 +/- 0.00004 |
 | `random_vit` | 13.17 | 1519 s | 0.09061 | 0.00080 | 114x | **0.00081 +/- 0.00002** |
 
-`pixel_mse` is the mean over **2560 frames** (40 draws x 32 samples), not the 6 frames the
-grid script prints in its title. The 6-frame figures (`cnn` 0.00145, `frozen_ssl` 0.00196,
-`random_vit` 0.00109) ranked the arms correctly but overstated every magnitude by ~25%,
-which is why the table above uses the larger sample. Draws are seeded identically across
-arms, so the comparison is paired; all three pairwise differences separate at |t| = 29-34.
+`pixel_mse` is the mean over **2560 frames** (40 draws x 32 samples), not the frames the
+grid script prints in its title. Draws are seeded identically across arms, so the
+comparison is paired on identical frames.
+
+**The paired t-statistics originally recorded here (|t| = 29-34) have been withdrawn.**
+`eval_reconstruction.py` loads one checkpoint per arm and varies only the loader seed, so
+each arm's draws sample a *fixed* population mean over frames. The paired difference is a
+constant of those two checkpoints while `sem` shrinks as `1/sqrt(draws)`, so |t| grows
+without bound with `--draws` and carries no effect-size meaning. The statistic validly says
+*these two checkpoints differ on this dataset*; it does **not** support *this arm is better
+than that one*, which requires multiple training seeds per arm. Only the means and their
+frame-sampling SEMs above are descriptive; between-arm inference is deferred to the
+multi-seed study.
 
 **These are training-set reconstructions.** `SequenceLoader` draws from all 122 episodes and
 M2 has no held-out split. That is acceptable for this gate, which asks whether a
@@ -2712,7 +2720,18 @@ re-run to 20k, which is the table above.
 This task predicted *"Expect Arm 1 to reconstruct best."* At equal 20k steps it does not.
 The ordering is `random_vit` (0.00081) < `cnn` (0.00116) < `frozen_ssl` (0.00161).
 
-The likely mechanism is information preservation, not representation quality:
+Two mechanisms could produce this, and **M2 does not distinguish them**:
+
+**(a) An uncontrolled scale confound.** `BottleneckEncoder.forward` feeds cached features
+straight into `nn.Linear` with only a dtype cast - no standardisation. Measured on the real
+caches, DINOv2 features have mean +0.0566 / std 2.3559 / absmax 22.86, while random_vit
+features have mean -0.0000 / std 1.0000 / absmax 4.66. The treatment and control arms
+therefore present inputs differing 2.36x in scale to identically-initialised layers trained
+at the same learning rate, so they differ in optimisation conditioning as well as in
+representation. This is a defect in the controlled comparison, not a property of the
+backbones, and it must be resolved before any arm ranking is credible.
+
+**(b) Information preservation.** Independently of (a):
 
 - A **randomly initialised ViT** is close to a random projection of image patches, which
   approximately preserves distances and therefore retains nearly all pixel information. The
@@ -2723,8 +2742,9 @@ The likely mechanism is information preservation, not representation quality:
   here is consistent with being the most abstract.
 - The **CNN** must learn a lossy 2048-d code from scratch under the same step budget.
 
-So pixel reconstruction error is, if anything, *anti-correlated* with semantic abstraction.
-**This gate does not rank the arms for the study's purpose.** The study's question is whether
+So pixel reconstruction error may well be *anti-correlated* with semantic abstraction - but
+until the scale confound in (a) is removed, (b) remains a hypothesis this milestone has not
+tested. **This gate does not rank the arms for the study's purpose.** The study's question is whether
 a representation predicts *dynamics* better, which M3 answers via open-loop rollout error and
 the linear probe to `privileged_state`. Reading `random_vit` as "the best encoder" from this
 table would invert the actual finding.
@@ -2745,6 +2765,74 @@ timer) and logged a `Thermal Emergency Sleep` during the `cnn` run; `caffeinate 
 insufficient (it asserts only `PreventUserIdleSystemSleep`) and `caffeinate -dimsu` restored
 full throughput, 1.41 -> 15.00 steps/s. Any unattended M3 run needs the stronger assertion,
 and the thermal event argues for putting the multi-seed study on the cloud budget.
+
+### Whole-branch review findings (2026-09-03)
+
+A six-dimension review with adversarial verification (47 agents) raised 20 findings, 9 of
+which survived refutation, plus 5 gaps from a completeness critic. The critic's findings
+were the most damaging, and all were verified directly before acting on them.
+
+**Fixed in this branch:**
+
+1. **The shared decoder was not arm-invariant.** `seed_everything` runs once and
+   `AutoencoderModel` builds the encoder first, so decoder weights were drawn from a global
+   RNG the encoder had already advanced -- by 26,382,304 draws for `cnn` against 12,320 for
+   the bottleneck arms. Measured: `cnn`'s decoder started from different weights than the
+   feature arms'. This is an arm-parity violation *outside* `encoders.py`, the one module
+   allowed to differ. Fixed by forking the RNG and seeding decoder construction from the
+   arm-invariant train seed; pinned by `test_decoder_initialises_identically_for_every_arm`
+   and a companion test that the seed still controls it.
+2. **The exit-gate figure showed half its sample.** A `seq_len=1` window carries two frames,
+   so the batch held `2 * --samples` rows; the plot walked rows `0..samples-1`, rendering
+   the first three windows twice each as consecutive-frame near-duplicates and dropping
+   windows 3-5 entirely -- while the captioned MSE covered all 12. The grids were regenerated
+   showing six distinct windows; **all three arms still pass the structure criterion.**
+3. **Eleven mutations that the committed suite could not catch.** See the table below.
+4. **The recorded t-statistics were withdrawn** (see above).
+
+**Mutation results.** Each mutation was applied to a pristine `git archive HEAD` export and
+run against the committed tests and the new ones:
+
+| mutation | committed suite | with new tests |
+|---|---|---|
+| `truncated` sliced from `ep.terminated` | passes | caught |
+| `actions` sliced from fixed offset 0 | passes | caught |
+| `rewards` sliced from fixed offset 0 | passes | caught |
+| `terminated` forced all-False | passes | caught |
+| decoder built from post-encoder RNG | passes | caught |
+| decoder seed hardcoded | passes | caught |
+| `.square()` -> `.abs()` in the loss | passes | caught |
+| encoder output multiplied by 0 | passes | caught (all 3 arms) |
+| feature-cache chunk stride off-by-one | passes | caught |
+| feature-cache chunks concatenated reversed | passes | caught |
+| feature-cache chunk drops last frame | passes | caught |
+
+The `terminated`/`truncated` swap is the most consequential: it is the exact defect that
+breaks time-limit bootstrapping, in the module that will feed the M3 world model, and the
+committed suite asserted only shape and dtype on those four arrays. Every fixture filled
+them with zeros, so nothing could distinguish them.
+
+**A caution about the mutation evidence itself.** The first run of this harness reported
+that every mutation was caught -- including deliberately fatal ones. The package is
+installed editable, so `import mbfps` resolved to the real working tree and the mutated
+export was never loaded. The reviewer's own evidence ("192 passed" against a `git archive`
+export) is invalid for the same reason. The findings were nevertheless real, confirmed once
+the harness ran with `PYTHONPATH` pointing at the export and a deliberately fatal mutation
+was used as a self-check. **A mutation harness that cannot fail proves nothing; verify it
+against a mutation you know must fail before trusting any result from it.**
+
+**Open, not fixed -- requires a decision and a re-run:**
+
+- **The feature-scale confound (a) above.** Standardising the cached features before the
+  bottleneck changes the experiment and invalidates the current checkpoints, so it is left
+  for M3 to decide alongside its own design.
+- **Single seed per arm.** No between-arm claim is supportable until the multi-seed study
+  runs. At the measured 1.96x ratio, 3 arms x 3 seeds at 20k steps is ~5 h of active compute.
+
+**Logged, not fixed (minor):** `eval_reconstruction.py` rebuilds the whole `SequenceLoader`
+inside its per-draw loop, re-reading the dataset on every draw; and neither eval script
+verifies `checkpoint["arm"]` against the arm it was asked for, so a mismatched checkpoint
+would load silently between the two structurally identical feature arms.
 
 ## Deferred to the next plan (M3)
 
