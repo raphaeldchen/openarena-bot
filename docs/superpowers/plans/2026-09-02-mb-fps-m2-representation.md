@@ -1490,6 +1490,40 @@ def test_cnn_encoder_accepts_uint8_without_manual_conversion():
     assert torch.isfinite(enc(obs)).all()
 
 
+def test_cnn_encoder_normalises_and_reorders_its_input(monkeypatch):
+    """Pins the uint8 -> centred-unit-range conversion and the NCHW reorder.
+
+    Shape/dtype/finiteness assertions cannot catch a missing /255: SiLU and
+    Linear stay finite at any input scale, so a 255x units bug would surface
+    only as a model that refuses to converge. Verified by mutation -- removing
+    the normalisation left all other encoder tests green.
+    """
+    enc = CNNEncoder(cfg("cnn"))
+    seen: dict[str, torch.Tensor] = {}
+    original = enc.conv.forward
+
+    def spy(x):
+        seen["x"] = x.detach().clone()
+        return original(x)
+
+    monkeypatch.setattr(enc.conv, "forward", spy)
+
+    enc(torch.full((2, *OBS_SHAPE), 255, dtype=torch.uint8))
+    assert seen["x"].shape == (2, 3, 112, 112), "input must be NCHW float"
+    assert seen["x"].dtype == torch.float32
+    assert seen["x"].max().item() == pytest.approx(0.5, abs=1e-6), (
+        "uint8 255 must map to +0.5"
+    )
+
+    enc(torch.zeros((2, *OBS_SHAPE), dtype=torch.uint8))
+    assert seen["x"].min().item() == pytest.approx(-0.5, abs=1e-6), (
+        "uint8 0 must map to -0.5"
+    )
+
+    enc(torch.full((2, *OBS_SHAPE), 128, dtype=torch.uint8))
+    assert seen["x"].mean().item() == pytest.approx(128 / 255 - 0.5, abs=1e-6)
+
+
 def test_bottleneck_encoder_output_shape():
     enc = BottleneckEncoder(cfg("frozen_ssl"))
     feats = torch.randn(4, 64, 384)
@@ -1675,7 +1709,7 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/models/test_encoders.py -v`
-Expected: 17 passed (several are parametrised over the three arms).
+Expected: 18 passed (several are parametrised over the three arms).
 
 If `test_recorded_parameter_counts` fails, do **not** adjust the constant to match — the architecture has drifted from the spec's description. Compare your conv channel progression and projection width against section 3.2 before changing anything.
 
