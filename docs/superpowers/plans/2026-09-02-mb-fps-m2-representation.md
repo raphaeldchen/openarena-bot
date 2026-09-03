@@ -2460,20 +2460,36 @@ if __name__ == "__main__":
     main()
 ```
 
+### Why M2 uses `--seq-len 1`
+
+`seq_len` exists for the RSSM's temporal unroll in a later milestone. **This milestone has no recurrence**, so the sequence dimension does nothing here except multiply the effective batch: `batch_size x (seq_len + 1)` frames go through the decoder every step. At the world-model default of 16 x 65 that is 1040 frames at 112x112x3 per step, for a per-frame autoencoder that gains nothing from them.
+
+Measured on this machine, decoder forward+backward alone:
+
+| frames/step | ms/step | config |
+|---|---|---|
+| 1040 | 1720 | `--batch-size 16 --seq-len 64` |
+| 144 | 279 | `--batch-size 16 --seq-len 8` |
+| **32** | **74** | `--batch-size 16 --seq-len 1` |
+
+So `--seq-len 1` is **23x cheaper per step with no loss of validity**, and it is applied identically to all three arms, so parity is unaffected. Step counts are raised to keep the number of frames seen comparable.
+
+Also pass `-u` to Python: `print()` to a redirected file is block-buffered, so without it a long run shows an empty log and looks hung when it is progressing normally.
+
 - [ ] **Step 2: Train and render Arm 1 (no feature cache needed)**
 
 ```bash
-.venv/bin/python scripts/train_autoencoder.py --arm cnn --steps 2000
+.venv/bin/python -u scripts/train_autoencoder.py --arm cnn --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_cnn.log
 .venv/bin/python scripts/reconstruction_grid.py --arm cnn
 ```
 
-Record `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`. Expected from the measured CNN cost (649 ms fwd+bwd for 1024 frames, plus the decoder): roughly 0.7-1.0 steps/s, so 2000 steps is 35-50 minutes.
+Record `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`. Arm 1 adds its CNN encoder on top of the decoder cost, so expect roughly 5-8 steps/s and a few minutes for 4000 steps — not the 35-50 minutes an earlier draft of this plan predicted from the 1040-frame configuration.
 
 - [ ] **Step 3: Cache DINOv2 features, train and render Arm 2, then clear**
 
 ```bash
 ls data/my_way_home/*.features.npy | wc -l    # expect 122 already present
-.venv/bin/python scripts/train_autoencoder.py --arm frozen_ssl --steps 2000
+.venv/bin/python -u scripts/train_autoencoder.py --arm frozen_ssl --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_frozen_ssl.log
 .venv/bin/python scripts/reconstruction_grid.py --arm frozen_ssl
 ```
 
@@ -2488,7 +2504,7 @@ df -h . | tail -1                                    # confirm space before cach
 .venv/bin/python scripts/cache_features.py --backbone random_vit --seed 0
 ls data/my_way_home/*.features.npy | wc -l           # 122, dinov2, untouched
 ls data/my_way_home/*.features_random_vit.npy | wc -l  # 122, new
-.venv/bin/python scripts/train_autoencoder.py --arm random_vit --steps 2000
+.venv/bin/python -u scripts/train_autoencoder.py --arm random_vit --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_random_vit.log
 .venv/bin/python scripts/reconstruction_grid.py --arm random_vit
 ```
 
