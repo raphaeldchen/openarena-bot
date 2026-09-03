@@ -132,6 +132,30 @@ def test_ssl_arms_build_the_identical_module(arm):
     assert built.state_dict().keys() == reference.state_dict().keys()
 
 
+def test_ssl_arms_build_value_identical_modules():
+    """Structural checks cannot see a per-arm weight-init branch.
+
+    Under the same seed both arms must produce bit-identical parameters. A
+    branch like `if cfg.kind == "random_vit": nn.init.zeros_(...)` leaves every
+    type, shape and state-dict key identical while changing behaviour -- and
+    would confound the very comparison the study is built on. Verified by
+    mutation: the structural parity test passes under exactly that change.
+    """
+    torch.manual_seed(0)
+    reference = build_encoder(cfg("frozen_ssl"))
+    torch.manual_seed(0)
+    control = build_encoder(cfg("random_vit"))
+
+    ref_params = dict(reference.named_parameters())
+    ctl_params = dict(control.named_parameters())
+    assert ref_params.keys() == ctl_params.keys()
+    for name, ref in ref_params.items():
+        assert torch.equal(ref, ctl_params[name]), (
+            f"parameter {name!r} differs between the treatment and control arms; "
+            "their encoders must be identical apart from their cached inputs"
+        )
+
+
 def test_recorded_parameter_counts():
     """Pins the measured counts so a silent architecture change is visible.
 
