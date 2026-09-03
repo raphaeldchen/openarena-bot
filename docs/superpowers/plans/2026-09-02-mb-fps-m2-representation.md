@@ -1563,15 +1563,25 @@ def test_unknown_arm_rejected():
         build_encoder(EncoderConfig(kind="nope"))
 
 
-def test_ssl_arms_build_identical_architectures():
-    """Arm 3 is Arm 2 with different cached inputs -- the trainable module is
-    the same, or the control is not a control."""
-    a = BottleneckEncoder(cfg("frozen_ssl"))
-    b = BottleneckEncoder(cfg("random_vit"))
-    assert n_params(a) == n_params(b)
-    assert [tuple(p.shape) for p in a.parameters()] == [
-        tuple(p.shape) for p in b.parameters()
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_ssl_arms_build_the_identical_module(arm):
+    """Arm 3 is Arm 2 with different cached inputs -- nothing else.
+
+    Driven through `build_encoder` rather than the class constructor, so a
+    broken routing table is caught here rather than incidentally by a shape
+    assertion elsewhere. Compares module type and state-dict keys as well as
+    shapes, because a per-arm weight-init branch would leave shapes identical
+    while changing behaviour.
+    """
+    reference = build_encoder(cfg("frozen_ssl"))
+    built = build_encoder(cfg(arm))
+
+    assert type(built) is type(reference), "arms got different module types"
+    assert n_params(built) == n_params(reference)
+    assert [tuple(p.shape) for p in built.parameters()] == [
+        tuple(p.shape) for p in reference.parameters()
     ]
+    assert built.state_dict().keys() == reference.state_dict().keys()
 
 
 def test_recorded_parameter_counts():
@@ -1636,6 +1646,9 @@ from mbfps.utils.config import EncoderConfig
 _SPATIAL = 7
 """112 / 2^4 = 7, the spatial size after four stride-2 convolutions."""
 
+_N_PATCHES = 64
+"""112 / 14 = 8, so a patch-14 backbone yields an 8x8 = 64 patch grid."""
+
 
 class CNNEncoder(nn.Module):
     """Learned convolutional encoder over raw pixels (Arm 1).
@@ -1676,10 +1689,10 @@ class BottleneckEncoder(nn.Module):
 
     def __init__(self, cfg: EncoderConfig) -> None:
         super().__init__()
-        if 64 * cfg.bottleneck_dim != cfg.embed_dim:
+        if _N_PATCHES * cfg.bottleneck_dim != cfg.embed_dim:
             raise ValueError(
-                f"64 patches x bottleneck_dim {cfg.bottleneck_dim} must equal "
-                f"embed_dim {cfg.embed_dim}"
+                f"{_N_PATCHES} patches x bottleneck_dim {cfg.bottleneck_dim} "
+                f"must equal embed_dim {cfg.embed_dim}"
             )
         self.bottleneck = nn.Linear(cfg.patch_dim, cfg.bottleneck_dim)
 
@@ -1709,7 +1722,9 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/models/test_encoders.py -v`
-Expected: 18 passed (several are parametrised over the three arms).
+Expected: 19 passed (several are parametrised over the three arms; the
+arm-parity check runs once per SSL arm, so this test block now yields one
+more case than a naive count of `def test_` functions would suggest).
 
 If `test_recorded_parameter_counts` fails, do **not** adjust the constant to match — the architecture has drifted from the spec's description. Compare your conv channel progression and projection width against section 3.2 before changing anything.
 

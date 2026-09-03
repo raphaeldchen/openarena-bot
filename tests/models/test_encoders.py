@@ -111,15 +111,25 @@ def test_unknown_arm_rejected():
         build_encoder(EncoderConfig(kind="nope"))
 
 
-def test_ssl_arms_build_identical_architectures():
-    """Arm 3 is Arm 2 with different cached inputs -- the trainable module is
-    the same, or the control is not a control."""
-    a = BottleneckEncoder(cfg("frozen_ssl"))
-    b = BottleneckEncoder(cfg("random_vit"))
-    assert n_params(a) == n_params(b)
-    assert [tuple(p.shape) for p in a.parameters()] == [
-        tuple(p.shape) for p in b.parameters()
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_ssl_arms_build_the_identical_module(arm):
+    """Arm 3 is Arm 2 with different cached inputs -- nothing else.
+
+    Driven through `build_encoder` rather than the class constructor, so a
+    broken routing table is caught here rather than incidentally by a shape
+    assertion elsewhere. Compares module type and state-dict keys as well as
+    shapes, because a per-arm weight-init branch would leave shapes identical
+    while changing behaviour.
+    """
+    reference = build_encoder(cfg("frozen_ssl"))
+    built = build_encoder(cfg(arm))
+
+    assert type(built) is type(reference), "arms got different module types"
+    assert n_params(built) == n_params(reference)
+    assert [tuple(p.shape) for p in built.parameters()] == [
+        tuple(p.shape) for p in reference.parameters()
     ]
+    assert built.state_dict().keys() == reference.state_dict().keys()
 
 
 def test_recorded_parameter_counts():

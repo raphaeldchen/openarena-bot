@@ -18,6 +18,9 @@ from mbfps.utils.config import EncoderConfig
 _SPATIAL = 7
 """112 / 2^4 = 7, the spatial size after four stride-2 convolutions."""
 
+_N_PATCHES = 64
+"""112 / 14 = 8, so a patch-14 backbone yields an 8x8 = 64 patch grid."""
+
 
 class CNNEncoder(nn.Module):
     """Learned convolutional encoder over raw pixels (Arm 1).
@@ -58,10 +61,10 @@ class BottleneckEncoder(nn.Module):
 
     def __init__(self, cfg: EncoderConfig) -> None:
         super().__init__()
-        if 64 * cfg.bottleneck_dim != cfg.embed_dim:
+        if _N_PATCHES * cfg.bottleneck_dim != cfg.embed_dim:
             raise ValueError(
-                f"64 patches x bottleneck_dim {cfg.bottleneck_dim} must equal "
-                f"embed_dim {cfg.embed_dim}"
+                f"{_N_PATCHES} patches x bottleneck_dim {cfg.bottleneck_dim} "
+                f"must equal embed_dim {cfg.embed_dim}"
             )
         self.bottleneck = nn.Linear(cfg.patch_dim, cfg.bottleneck_dim)
 
