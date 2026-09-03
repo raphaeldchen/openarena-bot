@@ -33,8 +33,12 @@ def buffer(tmp_path):
     for fill in (10, 60, 110):
         buf.add(make_episode(t=40, fill=fill))
     for path in buf.episode_paths():
-        feats = rng.random((41, 64, 384)).astype(np.float16)
-        np.save(path.with_suffix(".features.npy"), feats)
+        # Cache both backbones: frozen_ssl reads dinov2, random_vit reads its
+        # own suffixed cache, and a fixture that caches only one would hide
+        # exactly the bug this file now tests for (the two arms colliding).
+        for suffix in (".features.npy", ".features_random_vit.npy"):
+            feats = rng.random((41, 64, 384)).astype(np.float16)
+            np.save(path.with_suffix(suffix), feats)
     return buf
 
 
@@ -152,3 +156,36 @@ def test_feature_arms_require_a_cache(tmp_path, arm):
 
     with pytest.raises(FileNotFoundError, match="no cached features"):
         train_autoencoder(tiny(arm), buf, out_dir=None)
+
+
+def test_random_vit_arm_will_not_silently_read_the_dinov2_cache(tmp_path):
+    """The bug this guards: without an explicit backbone the loader defaults to
+    dinov2, so the control arm trained on the treatment arm's features with no
+    error at all. Here only a dinov2 cache exists, so the random_vit arm must
+    fail rather than quietly use it.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(0)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    with pytest.raises(FileNotFoundError, match="features_random_vit"):
+        train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+
+
+def test_random_vit_arm_reads_its_own_cache(tmp_path):
+    """The complement: with the right cache present it must train normally."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(1)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features_random_vit.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    history = train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+    assert history["arm"] == "random_vit"
+    assert history["steps"] == 3

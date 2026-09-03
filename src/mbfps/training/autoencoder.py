@@ -21,7 +21,7 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
 from mbfps.data.prefetch import Prefetcher
 from mbfps.models.decoders import PixelDecoder, reconstruction_loss
-from mbfps.models.encoders import build_encoder, encoder_input_kind
+from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.utils.config import Config
 from mbfps.utils.device import get_device
 from mbfps.utils.seeding import seed_everything
@@ -87,6 +87,7 @@ def train_autoencoder(
     optimiser = torch.optim.Adam(model.parameters(), lr=cfg.train.lr)
 
     needs_features = model.input_kind == "features"
+    backbone = encoder_backbone(cfg.encoder)
     loader = SequenceLoader(
         buffer,
         batch_size=cfg.train.batch_size,
@@ -94,6 +95,7 @@ def train_autoencoder(
         seed=cfg.train.seed,
         load_obs=True,  # always: obs is the reconstruction target for every arm
         load_features=needs_features,
+        feature_backbone=backbone or "dinov2",
     )
 
     losses: list[float] = []

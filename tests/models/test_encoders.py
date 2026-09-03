@@ -6,6 +6,7 @@ from mbfps.models.encoders import (
     BottleneckEncoder,
     CNNEncoder,
     build_encoder,
+    encoder_backbone,
     encoder_input_kind,
 )
 from mbfps.utils.config import ARMS, EncoderConfig
@@ -109,6 +110,22 @@ def test_input_kind_is_obs_for_cnn_and_features_for_ssl_arms():
 def test_unknown_arm_rejected():
     with pytest.raises(KeyError, match="unknown encoder kind 'nope'"):
         build_encoder(EncoderConfig(kind="nope"))
+
+
+def test_each_arm_maps_to_its_own_backbone():
+    """The control arm must not read the treatment arm's cache.
+
+    Arm name and backbone name are not the same string for `frozen_ssl`, so a
+    naive identity mapping would send it to a cache that does not exist.
+    """
+    assert encoder_backbone(cfg("cnn")) is None
+    assert encoder_backbone(cfg("frozen_ssl")) == "dinov2"
+    assert encoder_backbone(cfg("random_vit")) == "random_vit"
+
+
+def test_feature_arms_map_to_distinct_backbones():
+    """If these collided, arms 2 and 3 would be the same experiment."""
+    assert encoder_backbone(cfg("frozen_ssl")) != encoder_backbone(cfg("random_vit"))
 
 
 @pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])

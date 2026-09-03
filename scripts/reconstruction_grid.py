@@ -13,6 +13,7 @@ import torch  # noqa: E402
 
 from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 from mbfps.data.loader import SequenceLoader  # noqa: E402
+from mbfps.models.encoders import encoder_backbone  # noqa: E402
 from mbfps.training.autoencoder import AutoencoderModel, to_device  # noqa: E402
 from mbfps.utils.config import ARMS, get_config  # noqa: E402
 from mbfps.utils.device import get_device  # noqa: E402
@@ -39,6 +40,7 @@ def main() -> None:
     model.eval()
 
     buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+    backbone = encoder_backbone(cfg.encoder)
     loader = SequenceLoader(
         buffer,
         batch_size=args.samples,
@@ -46,6 +48,7 @@ def main() -> None:
         seed=0,
         load_obs=True,
         load_features=model.input_kind == "features",
+        feature_backbone=backbone or "dinov2",
     )
     with torch.no_grad():
         reconstruction, target = model(to_device(loader.sample(), device))

@@ -78,6 +78,30 @@ def encoder_input_kind(cfg: EncoderConfig) -> str:
     return "obs" if cfg.kind == "cnn" else "features"
 
 
+_ARM_BACKBONE: dict[str, str | None] = {
+    "cnn": None,
+    "frozen_ssl": "dinov2",
+    "random_vit": "random_vit",
+}
+"""Which cached feature set each arm reads. None means the arm reads pixels.
+
+The arm name and the backbone name are deliberately not assumed equal:
+`frozen_ssl` reads the `dinov2` cache. Deriving one from the other by string
+identity would silently send the treatment arm to a cache that does not exist.
+"""
+
+
+def encoder_backbone(cfg: EncoderConfig) -> str | None:
+    """Backbone whose cached features this arm consumes, or None for pixels.
+
+    Raises:
+        KeyError: if `cfg.kind` is not a registered arm.
+    """
+    if cfg.kind not in _ARM_BACKBONE:
+        raise KeyError(f"unknown encoder kind {cfg.kind!r}")
+    return _ARM_BACKBONE[cfg.kind]
+
+
 def build_encoder(cfg: EncoderConfig) -> nn.Module:
     """Construct the encoder for `cfg.kind`.
 

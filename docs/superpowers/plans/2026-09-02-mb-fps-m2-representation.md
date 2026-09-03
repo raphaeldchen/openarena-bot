@@ -1458,6 +1458,7 @@ from mbfps.models.encoders import (
     BottleneckEncoder,
     CNNEncoder,
     build_encoder,
+    encoder_backbone,
     encoder_input_kind,
 )
 from mbfps.utils.config import ARMS, EncoderConfig
@@ -1561,6 +1562,22 @@ def test_input_kind_is_obs_for_cnn_and_features_for_ssl_arms():
 def test_unknown_arm_rejected():
     with pytest.raises(KeyError, match="unknown encoder kind 'nope'"):
         build_encoder(EncoderConfig(kind="nope"))
+
+
+def test_each_arm_maps_to_its_own_backbone():
+    """The control arm must not read the treatment arm's cache.
+
+    Arm name and backbone name are not the same string for `frozen_ssl`, so a
+    naive identity mapping would send it to a cache that does not exist.
+    """
+    assert encoder_backbone(cfg("cnn")) is None
+    assert encoder_backbone(cfg("frozen_ssl")) == "dinov2"
+    assert encoder_backbone(cfg("random_vit")) == "random_vit"
+
+
+def test_feature_arms_map_to_distinct_backbones():
+    """If these collided, arms 2 and 3 would be the same experiment."""
+    assert encoder_backbone(cfg("frozen_ssl")) != encoder_backbone(cfg("random_vit"))
 
 
 @pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
@@ -1730,6 +1747,30 @@ def encoder_input_kind(cfg: EncoderConfig) -> str:
     return "obs" if cfg.kind == "cnn" else "features"
 
 
+_ARM_BACKBONE: dict[str, str | None] = {
+    "cnn": None,
+    "frozen_ssl": "dinov2",
+    "random_vit": "random_vit",
+}
+"""Which cached feature set each arm reads. None means the arm reads pixels.
+
+The arm name and the backbone name are deliberately not assumed equal:
+`frozen_ssl` reads the `dinov2` cache. Deriving one from the other by string
+identity would silently send the treatment arm to a cache that does not exist.
+"""
+
+
+def encoder_backbone(cfg: EncoderConfig) -> str | None:
+    """Backbone whose cached features this arm consumes, or None for pixels.
+
+    Raises:
+        KeyError: if `cfg.kind` is not a registered arm.
+    """
+    if cfg.kind not in _ARM_BACKBONE:
+        raise KeyError(f"unknown encoder kind {cfg.kind!r}")
+    return _ARM_BACKBONE[cfg.kind]
+
+
 def build_encoder(cfg: EncoderConfig) -> nn.Module:
     """Construct the encoder for `cfg.kind`.
 
@@ -1746,13 +1787,19 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/models/test_encoders.py -v`
-Expected: 20 passed (several are parametrised over the three arms; the
+Expected: 22 passed (several are parametrised over the three arms; the
 structural arm-parity check runs once per SSL arm, so this test block yields
 more cases than a naive count of `def test_` functions would suggest. The
 structural and value-level arm-parity tests are deliberately separate: the
 structural test (type, parameter count, shapes, state-dict keys) cannot see a
 per-arm weight-init branch that changes values without changing shape, which
 is exactly what the value-level test exists to catch).
+
+`encoder_backbone` is the sanctioned single point of arm-to-cache routing,
+alongside `encoder_input_kind`: any caller that needs a `SequenceLoader`'s
+`feature_backbone` must derive it from here, never from `cfg.kind` directly,
+because the arm name and the backbone name are not the same string for
+`frozen_ssl`.
 
 If `test_recorded_parameter_counts` fails, do **not** adjust the constant to match — the architecture has drifted from the spec's description. Compare your conv channel progression and projection width against section 3.2 before changing anything.
 
@@ -2022,8 +2069,12 @@ def buffer(tmp_path):
     for fill in (10, 60, 110):
         buf.add(make_episode(t=40, fill=fill))
     for path in buf.episode_paths():
-        feats = rng.random((41, 64, 384)).astype(np.float16)
-        np.save(path.with_suffix(".features.npy"), feats)
+        # Cache both backbones: frozen_ssl reads dinov2, random_vit reads its
+        # own suffixed cache, and a fixture that caches only one would hide
+        # exactly the bug this file now tests for (the two arms colliding).
+        for suffix in (".features.npy", ".features_random_vit.npy"):
+            feats = rng.random((41, 64, 384)).astype(np.float16)
+            np.save(path.with_suffix(suffix), feats)
     return buf
 
 
@@ -2141,6 +2192,39 @@ def test_feature_arms_require_a_cache(tmp_path, arm):
 
     with pytest.raises(FileNotFoundError, match="no cached features"):
         train_autoencoder(tiny(arm), buf, out_dir=None)
+
+
+def test_random_vit_arm_will_not_silently_read_the_dinov2_cache(tmp_path):
+    """The bug this guards: without an explicit backbone the loader defaults to
+    dinov2, so the control arm trained on the treatment arm's features with no
+    error at all. Here only a dinov2 cache exists, so the random_vit arm must
+    fail rather than quietly use it.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(0)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    with pytest.raises(FileNotFoundError, match="features_random_vit"):
+        train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+
+
+def test_random_vit_arm_reads_its_own_cache(tmp_path):
+    """The complement: with the right cache present it must train normally."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(1)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features_random_vit.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    history = train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+    assert history["arm"] == "random_vit"
+    assert history["steps"] == 3
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2183,7 +2267,7 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
 from mbfps.data.prefetch import Prefetcher
 from mbfps.models.decoders import PixelDecoder, reconstruction_loss
-from mbfps.models.encoders import build_encoder, encoder_input_kind
+from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.utils.config import Config
 from mbfps.utils.device import get_device
 from mbfps.utils.seeding import seed_everything
@@ -2249,6 +2333,7 @@ def train_autoencoder(
     optimiser = torch.optim.Adam(model.parameters(), lr=cfg.train.lr)
 
     needs_features = model.input_kind == "features"
+    backbone = encoder_backbone(cfg.encoder)
     loader = SequenceLoader(
         buffer,
         batch_size=cfg.train.batch_size,
@@ -2256,6 +2341,7 @@ def train_autoencoder(
         seed=cfg.train.seed,
         load_obs=True,  # always: obs is the reconstruction target for every arm
         load_features=needs_features,
+        feature_backbone=backbone or "dinov2",
     )
 
     losses: list[float] = []
@@ -2343,8 +2429,12 @@ if __name__ == "__main__":
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/training/test_autoencoder.py -v`
-Expected: 14 passed (`test_training_runs_and_returns_history` is parametrised over the
-three arms; `test_feature_arms_require_a_cache` over the two feature arms).
+Expected: 16 passed (`test_training_runs_and_returns_history` is parametrised over the
+three arms; `test_feature_arms_require_a_cache` over the two feature arms;
+`test_random_vit_arm_will_not_silently_read_the_dinov2_cache` and
+`test_random_vit_arm_reads_its_own_cache` pin the loader's `feature_backbone`
+routing so the control arm can never again silently read the treatment arm's
+cache).
 
 `test_training_reduces_loss_on_a_trivial_dataset` is the one that matters: every episode is a single constant colour, so any working autoencoder fits it quickly. If it fails, the model is broken — do not raise the threshold to make it pass.
 
@@ -2397,6 +2487,7 @@ import torch  # noqa: E402
 
 from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 from mbfps.data.loader import SequenceLoader  # noqa: E402
+from mbfps.models.encoders import encoder_backbone  # noqa: E402
 from mbfps.training.autoencoder import AutoencoderModel, to_device  # noqa: E402
 from mbfps.utils.config import ARMS, get_config  # noqa: E402
 from mbfps.utils.device import get_device  # noqa: E402
@@ -2421,6 +2512,7 @@ def main() -> None:
     model.eval()
 
     buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+    backbone = encoder_backbone(cfg.encoder)
     loader = SequenceLoader(
         buffer,
         batch_size=args.samples,
@@ -2428,6 +2520,7 @@ def main() -> None:
         seed=0,
         load_obs=True,
         load_features=model.input_kind == "features",
+        feature_backbone=backbone or "dinov2",
     )
     with torch.no_grad():
         reconstruction, target = model(to_device(loader.sample(), device))
