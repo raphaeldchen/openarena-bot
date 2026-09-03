@@ -2661,11 +2661,14 @@ All three arms trained to **20,000 steps** at `--seq-len 1` on the frozen 122-ep
 `my_way_home` dataset. Checkpoints and per-arm grids in `runs/m2_long/`; the combined
 figure is `runs/m2/reconstruction_all_arms.png`.
 
+Canonical numbers are the **post-fix** run in `runs/m2_fixed/`, which is reproducible from
+HEAD (decoder-parity fix and feature standardisation both applied):
+
 | arm | steps/s | wall (active) | loss_first20 | loss_last20 | reduction | pixel MSE |
 |---|---|---|---|---|---|---|
-| `cnn` | 6.71 | 2982 s | 0.10690 | 0.00115 | 93x | 0.00116 +/- 0.00003 |
-| `frozen_ssl` | 13.15 | 1521 s | 0.08924 | 0.00162 | 55x | 0.00161 +/- 0.00004 |
-| `random_vit` | 13.17 | 1519 s | 0.09061 | 0.00080 | 114x | **0.00081 +/- 0.00002** |
+| `cnn` | 6.95 | 2878 s | 0.12048 | 0.00115 | 105x | 0.00116 +/- 0.00003 |
+| `frozen_ssl` | 13.18 | 1517 s | 0.11598 | 0.00184 | 63x | 0.00182 +/- 0.00005 |
+| `random_vit` | 13.42 | 1491 s | 0.11074 | 0.00081 | 137x | **0.00081 +/- 0.00002** |
 
 `pixel_mse` is the mean over **2560 frames** (40 draws x 32 samples), not the frames the
 grid script prints in its title. Draws are seeded identically across arms, so the
@@ -2765,6 +2768,42 @@ timer) and logged a `Thermal Emergency Sleep` during the `cnn` run; `caffeinate 
 insufficient (it asserts only `PreventUserIdleSystemSleep`) and `caffeinate -dimsu` restored
 full throughput, 1.41 -> 15.00 steps/s. Any unattended M3 run needs the stronger assertion,
 and the thermal event argues for putting the multi-seed study on the cloud budget.
+
+### The scale confound was real, and it was flattering DINOv2
+
+Standardisation gave a clean natural experiment, because the earlier unstandardised run is
+still on record. Re-running all three arms at 20k under the fixed code:
+
+| arm | unstandardised | standardised | change |
+|---|---|---|---|
+| `cnn` | 0.00116 | 0.00116 | none |
+| `frozen_ssl` | 0.00161 | 0.00182 | **worse by 0.00021** |
+| `random_vit` | 0.00081 | 0.00081 | none |
+
+**The confound existed but ran the opposite way to the hypothesis.** Equalising scale did not
+close `frozen_ssl`'s gap - it widened it. DINOv2's 2.36x larger features were producing
+proportionally larger gradients into the bottleneck, acting as a higher effective learning
+rate; removing that advantage cost it accuracy. So the arm ordering
+`random_vit` < `cnn` < `frozen_ssl` is *robust* to the confound, and explanation (b),
+information preservation, survives the test that could have falsified it.
+
+Two internal consistency checks support reading the table this way:
+
+- **`random_vit` is unchanged to five decimals**, as predicted before the run: its cached
+  features already have per-token std 1.0000 with coefficient of variation 0.000, so
+  LayerNorm is very nearly the identity for that arm. A change here would have meant the
+  normalisation was doing something other than rescaling.
+- **`cnn` is unchanged**, and it has no bottleneck, so standardisation cannot touch it. Its
+  decoder initialisation *did* change, and the result did not move - which shows the
+  decoder-parity fix has no measurable effect on outcome at this scale, and therefore
+  isolates `frozen_ssl`'s degradation to standardisation alone.
+
+`loss_first20` rose for every arm (e.g. `cnn` 0.10690 -> 0.12048) because the decoder now
+starts from different weights; only the converged values are comparable across the two runs.
+
+**This still does not rank the arms.** One training seed each: the caveat on the withdrawn
+t-statistics applies unchanged. What the re-run establishes is narrower and worth stating
+precisely - the pixel-reconstruction ordering is not an artifact of feature scale.
 
 ### Whole-branch review findings (2026-09-03)
 
