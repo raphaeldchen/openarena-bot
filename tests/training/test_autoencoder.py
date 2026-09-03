@@ -279,8 +279,17 @@ def learnable_buffer(tmp_path):
     for path in buf.episode_paths():
         levels = np.load(path)["obs"][:, 0, 0, 0].astype(np.float32) / 255.0
         # Features must carry the information the target needs, or the feature
-        # arms could not learn this even with a perfect bottleneck.
-        feats = np.repeat(levels, 64 * 384).reshape(-1, 64, 384).astype(np.float16)
+        # arms could not learn this even with a perfect bottleneck. The level
+        # has to change each token's *direction*, not merely its scale: the
+        # bottleneck standardises its input, so a token that is a constant, or
+        # one that is a fixed pattern times the level, normalises to the same
+        # vector for every frame and carries nothing. Real backbone features
+        # put ~100% of their variance within tokens, so this matches them.
+        rng_pat = np.random.default_rng(7)
+        base = rng_pat.standard_normal(384).astype(np.float32)
+        delta = rng_pat.standard_normal(384).astype(np.float32)
+        feats = (base[None, None, :] + levels[:, None, None] * delta[None, None, :])
+        feats = np.broadcast_to(feats, (len(levels), 64, 384)).astype(np.float16)
         for suffix in (".features.npy", ".features_random_vit.npy"):
             np.save(path.with_suffix(suffix), feats)
     return buf

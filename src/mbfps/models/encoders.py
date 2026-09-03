@@ -67,10 +67,20 @@ class BottleneckEncoder(nn.Module):
                 f"must equal embed_dim {cfg.embed_dim}"
             )
         self.bottleneck = nn.Linear(cfg.patch_dim, cfg.bottleneck_dim)
+        # Non-learnable on purpose: it must add no parameters and no arm-varying
+        # behaviour, only equalise the input scale the two caches arrive at.
+        # DINOv2's cache has std 2.3559 and random_vit's 1.0000, so without this
+        # the treatment and control arms train at effectively different learning
+        # rates and the contrast is confounded with optimisation conditioning.
+        self.norm: nn.Module = (
+            nn.LayerNorm(cfg.patch_dim, elementwise_affine=False)
+            if cfg.standardise_features
+            else nn.Identity()
+        )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """Map `(N, 64, 384)` to `(N, embed_dim)` float32."""
-        return self.bottleneck(features.to(torch.float32)).flatten(1)
+        return self.bottleneck(self.norm(features.to(torch.float32))).flatten(1)
 
 
 def encoder_input_kind(cfg: EncoderConfig) -> str:

@@ -1,7 +1,10 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
 from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.utils.config import get_config
 from mbfps.models.encoders import (
     BottleneckEncoder,
     CNNEncoder,
@@ -196,3 +199,64 @@ def test_bottleneck_gradients_flow_to_every_parameter():
     enc(torch.randn(2, 64, 384)).square().mean().backward()
     missing = [n for n, p in enc.named_parameters() if p.grad is None]
     assert not missing, f"no gradient reached: {missing}"
+
+
+# --- Feature standardisation ------------------------------------------------
+# The two caches arrive at very different scales (measured on disk: DINOv2 std
+# 2.3559, random_vit std 1.0000). Feeding both into a bare nn.Linear at one
+# learning rate confounds the treatment/control contrast with optimisation
+# conditioning, so the bottleneck normalises its input. It must do so without
+# adding parameters and without differing between the two feature arms.
+
+
+def _scaled_features(scale: float, shift: float = 0.0) -> torch.Tensor:
+    torch.manual_seed(0)
+    return torch.randn(8, 64, 384) * scale + shift
+
+
+def test_standardisation_equalises_inputs_arriving_at_different_scales():
+    """The whole point: two caches at 2.36x different scale must arrive alike."""
+    encoder = build_encoder(get_config("frozen_ssl", device="cpu").encoder)
+    wide = encoder.norm(_scaled_features(scale=2.3559, shift=0.0566))
+    narrow = encoder.norm(_scaled_features(scale=1.0))
+    assert wide.std().item() == pytest.approx(1.0, abs=0.02)
+    assert narrow.std().item() == pytest.approx(1.0, abs=0.02)
+    assert wide.mean().item() == pytest.approx(0.0, abs=0.02)
+
+
+def test_standardisation_adds_no_parameters():
+    """It must not change the trainable budget the arms are pinned to."""
+    encoder = build_encoder(get_config("frozen_ssl", device="cpu").encoder)
+    assert sum(p.numel() for p in encoder.parameters()) == 12_320
+    assert sum(p.numel() for p in encoder.norm.parameters()) == 0
+
+
+def test_both_feature_arms_standardise_identically():
+    """Arm parity: normalisation must not be one of the things that differs."""
+    features = _scaled_features(scale=2.0, shift=0.3)
+    outputs = {}
+    for arm in ("frozen_ssl", "random_vit"):
+        encoder = build_encoder(get_config(arm, device="cpu").encoder)
+        outputs[arm] = encoder.norm(features)
+    assert torch.equal(outputs["frozen_ssl"], outputs["random_vit"])
+
+
+def test_standardisation_actually_changes_the_encoder_output():
+    """Guards against a normalisation that is silently a no-op."""
+    cfg_on = get_config("frozen_ssl", device="cpu").encoder
+    cfg_off = replace(cfg_on, standardise_features=False)
+    features = _scaled_features(scale=2.3559, shift=0.0566)
+    torch.manual_seed(0)
+    on = build_encoder(cfg_on)
+    torch.manual_seed(0)
+    off = build_encoder(cfg_off)
+    # Same weights, different input conditioning -> different output.
+    assert torch.equal(on.bottleneck.weight, off.bottleneck.weight)
+    assert not torch.allclose(on(features), off(features))
+
+
+def test_standardisation_can_be_disabled_to_reproduce_the_earlier_runs():
+    cfg = replace(get_config("frozen_ssl", device="cpu").encoder, standardise_features=False)
+    encoder = build_encoder(cfg)
+    features = _scaled_features(scale=2.3559)
+    assert torch.equal(encoder.norm(features), features)

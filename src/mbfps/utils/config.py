@@ -27,6 +27,15 @@ class EncoderConfig:
     cnn_depth: int = 32
     patch_dim: int = 384
     bottleneck_dim: int = 32
+    standardise_features: bool = True
+    """Normalise each cached patch vector before the bottleneck.
+
+    Held identical across arms, like every other field here. It exists because
+    the two feature caches arrive at very different scales -- DINOv2 std 2.3559
+    against random_vit's 1.0000 -- and feeding both into a bare `nn.Linear` at
+    one learning rate confounds the treatment/control contrast with optimisation
+    conditioning. `False` reproduces the pre-2026-09-03 behaviour.
+    """
 
 
 @dataclass(frozen=True)
