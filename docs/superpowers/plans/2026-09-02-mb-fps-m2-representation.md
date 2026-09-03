@@ -2469,7 +2469,7 @@ arm 3: cache random_vit        -> train -> grid
 
 Check free space before the `random_vit` run. `cache_features.py` refuses if the result will not fit, which is intended behaviour, not a bug to work around.
 
-- [ ] **Step 1: Write the grid script**
+- [x] **Step 1: Write the grid script**
 
 ```python
 # scripts/reconstruction_grid.py
@@ -2569,7 +2569,7 @@ So `--seq-len 1` is **23x cheaper per step with no loss of validity**, and it is
 
 Also pass `-u` to Python: `print()` to a redirected file is block-buffered, so without it a long run shows an empty log and looks hung when it is progressing normally.
 
-- [ ] **Step 2: Train and render Arm 1 (no feature cache needed)**
+- [x] **Step 2: Train and render Arm 1 (no feature cache needed)**
 
 ```bash
 .venv/bin/python -u scripts/train_autoencoder.py --arm cnn --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_cnn.log
@@ -2578,7 +2578,7 @@ Also pass `-u` to Python: `print()` to a redirected file is block-buffered, so w
 
 Record `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`. Arm 1 adds its CNN encoder on top of the decoder cost, so expect roughly 5-8 steps/s and a few minutes for 4000 steps — not the 35-50 minutes an earlier draft of this plan predicted from the 1040-frame configuration.
 
-- [ ] **Step 3: Cache DINOv2 features, train and render Arm 2, then clear**
+- [x] **Step 3: Cache DINOv2 features, train and render Arm 2, then clear**
 
 ```bash
 ls data/my_way_home/*.features.npy | wc -l    # expect 122 already present
@@ -2588,7 +2588,7 @@ ls data/my_way_home/*.features.npy | wc -l    # expect 122 already present
 
 The DINOv2 cache from M1 is already on disk, so no caching run is needed here. Record the same four numbers. Expected far faster than Arm 1 — no CNN in the loop.
 
-- [ ] **Step 4: Cache the random-ViT features and do Arm 3**
+- [x] **Step 4: Cache the random-ViT features and do Arm 3**
 
 The `random_vit` cache must live alongside the DINOv2 one, so it needs its own filename suffix — otherwise caching it would silently overwrite Arm 2's features and both arms would train on the same inputs, quietly destroying the control. `cache_features.py` writes `.features.npy` for `dinov2` and `.features_random_vit.npy` for `random_vit`; `SequenceLoader` selects by the same rule.
 
@@ -2603,7 +2603,7 @@ ls data/my_way_home/*.features_random_vit.npy | wc -l  # 122, new
 
 If `cache_features.py` refuses on free space, free more or reduce the dataset; do not disable the guard.
 
-- [ ] **Step 5: Combine into the side-by-side grid**
+- [x] **Step 5: Combine into the side-by-side grid**
 
 ```bash
 .venv/bin/python -c "
@@ -2620,7 +2620,7 @@ print('figure=', out)
 "
 ```
 
-- [ ] **Step 6: Evaluate the M2 gate**
+- [x] **Step 6: Evaluate the M2 gate**
 
 The gate is qualitative by design — the spec asks for *visually recognisable* reconstructions. Open `runs/m2/reconstruction_all_arms.png` and check, for each arm:
 
@@ -2630,11 +2630,11 @@ The gate is qualitative by design — the spec asks for *visually recognisable* 
 
 Record the three `pixel_mse` values. **Expect Arm 1 to reconstruct best** — it optimises pixels through a 26.4M-parameter encoder, while the feature arms reconstruct from a 12,320-parameter bottleneck over frozen features. A worse pixel MSE for the SSL arms is *not* a failure of this gate; the study's question is whether that representation predicts dynamics better, which M3 answers. Note the numbers and move on.
 
-- [ ] **Step 7: Record the measured numbers in this plan**
+- [x] **Step 7: Record the measured numbers in this plan**
 
 Add a "## M2 results" section to this file containing the three arms' `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`, plus the wall-clock for each run. The next plan sizes its training runs from these.
 
-- [ ] **Step 8: Run the full suite and commit**
+- [x] **Step 8: Run the full suite and commit**
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -2648,12 +2648,103 @@ git commit -m "feat: M2 exit gate -- reconstruction grids for all three arms"
 
 ## Exit criteria for this plan
 
-- [ ] `pytest` fully green, with the counts each task states.
-- [ ] All three arms train without error and their loss curves flatten.
-- [ ] `runs/m2/reconstruction_all_arms.png` exists and shows recognisable structure for each arm.
-- [ ] The three `pixel_mse` values and per-arm `steps_per_second` are recorded in this file.
-- [ ] `SequenceLoader(load_obs=False)` verified to keep resident memory well under the 2.24 GB eager baseline.
-- [ ] One feature cache on disk at the end, not two.
+- [x] `pytest` fully green, with the counts each task states.
+- [x] All three arms train without error and their loss curves flatten.
+- [x] `runs/m2/reconstruction_all_arms.png` exists and shows recognisable structure for each arm.
+- [x] The three `pixel_mse` values and per-arm `steps_per_second` are recorded in this file.
+- [x] `SequenceLoader(load_obs=False)` verified to keep resident memory well under the 2.24 GB eager baseline.
+- [x] Both feature caches on disk at the end under distinct suffixes (122 `.features.npy` + 122 `.features_random_vit.npy`), so M3 inherits both and needs no re-caching. *(Superseded the original "one cache, not two" criterion when commit 2c4bec0 relaxed the disk constraint; that commit rewrote the workflow but missed this line.)*
+
+## M2 results
+
+All three arms trained to **20,000 steps** at `--seq-len 1` on the frozen 122-episode
+`my_way_home` dataset. Checkpoints and per-arm grids in `runs/m2_long/`; the combined
+figure is `runs/m2/reconstruction_all_arms.png`.
+
+| arm | steps/s | wall (active) | loss_first20 | loss_last20 | reduction | pixel MSE |
+|---|---|---|---|---|---|---|
+| `cnn` | 6.71 | 2982 s | 0.10690 | 0.00115 | 93x | 0.00116 +/- 0.00003 |
+| `frozen_ssl` | 13.15 | 1521 s | 0.08924 | 0.00162 | 55x | 0.00161 +/- 0.00004 |
+| `random_vit` | 13.17 | 1519 s | 0.09061 | 0.00080 | 114x | **0.00081 +/- 0.00002** |
+
+`pixel_mse` is the mean over **2560 frames** (40 draws x 32 samples), not the 6 frames the
+grid script prints in its title. The 6-frame figures (`cnn` 0.00145, `frozen_ssl` 0.00196,
+`random_vit` 0.00109) ranked the arms correctly but overstated every magnitude by ~25%,
+which is why the table above uses the larger sample. Draws are seeded identically across
+arms, so the comparison is paired; all three pairwise differences separate at |t| = 29-34.
+
+**These are training-set reconstructions.** `SequenceLoader` draws from all 122 episodes and
+M2 has no held-out split. That is acceptable for this gate, which asks whether a
+representation *can* encode the observation, not whether it generalises. M3 must not reuse
+these numbers as generalisation evidence.
+
+### Gate evaluation
+
+1. **Recognisable maze structure** - PASS for all three arms. Walls, corridor geometry,
+   floor/ceiling boundaries, the ceiling grate, individually placed wall torches, and
+   doorway alcoves are all reconstructed in the correct positions. Reconstructions are
+   blurry, which is the expected signature of an MSE objective: it predicts the conditional
+   mean and suppresses high-frequency detail.
+2. **Loss flattened** - PASS for all three. Final-10% relative improvement is 4.10% (`cnn`),
+   3.46% (`frozen_ssl`), 4.16% (`random_vit`), down from 15-19% quarter-over-quarter.
+3. **All three arms rendered** - PASS.
+
+### 4,000 steps was not enough, and the first reading was an artifact
+
+The plan's Steps 2-4 specified 4000 steps. At that budget the numbers were:
+
+| arm | loss_last20 @4k | pixel MSE @4k (n=6) |
+|---|---|---|
+| `cnn` | 0.00315 | 0.00448 |
+| `frozen_ssl` | 0.00350 | 0.00451 |
+| `random_vit` | 0.00202 | 0.00269 |
+
+`cnn` reconstructed only colour and coarse layout, with no recognisable geometry, and would
+have failed criterion 1. That is an **optimisation-speed artifact, not a representation
+result**: at equal *steps* the pixel arm fits a 26,382,304-parameter encoder from scratch
+while the feature arms fit only a 12,320-parameter bottleneck over frozen, cached features.
+Equal steps is not equal work. Step 6 of this task anticipated exactly this - *"If it is
+still falling steeply at 2000 steps, train longer before judging"* - so all three arms were
+re-run to 20k, which is the table above.
+
+### The plan's prediction was wrong, and the reason matters
+
+This task predicted *"Expect Arm 1 to reconstruct best."* At equal 20k steps it does not.
+The ordering is `random_vit` (0.00081) < `cnn` (0.00116) < `frozen_ssl` (0.00161).
+
+The likely mechanism is information preservation, not representation quality:
+
+- A **randomly initialised ViT** is close to a random projection of image patches, which
+  approximately preserves distances and therefore retains nearly all pixel information. The
+  bottleneck is a shared per-patch linear map (384 -> 32, applied across 64 patches = 2048),
+  so much of that information is linearly recoverable.
+- **DINOv2** is trained for semantic invariance. It deliberately discards appearance detail -
+  texture, exact colour, lighting - which is precisely what pixel MSE measures. Being worst
+  here is consistent with being the most abstract.
+- The **CNN** must learn a lossy 2048-d code from scratch under the same step budget.
+
+So pixel reconstruction error is, if anything, *anti-correlated* with semantic abstraction.
+**This gate does not rank the arms for the study's purpose.** The study's question is whether
+a representation predicts *dynamics* better, which M3 answers via open-loop rollout error and
+the linear probe to `privileged_state`. Reading `random_vit` as "the best encoder" from this
+table would invert the actual finding.
+
+### Throughput for sizing M3
+
+The feature arms run at **1.96x** the pixel arm's rate (13.15-13.17 vs 6.71 steps/s), far
+short of the 9.6x this plan's carried constraint predicted from the 1546 vs 161 ms/step
+measurement. That earlier figure was taken at `--seq-len 64`, where the decoder dominates; at
+`--seq-len 1` the fixed per-step overhead is a much larger share. **M3 should re-measure
+rather than inherit the 9.6x.** At 20k steps a 3-arm x 3-seed study is roughly
+(2982 + 1521 + 1519) x 3 = 5.0 h of active compute, not the 31 h the constraint predicted.
+
+**Wall-clock was 2.3x active compute on this machine.** `time.perf_counter()` on macOS uses
+`mach_absolute_time()`, whose timebase halts during system sleep, so `steps_per_second` above
+measures active compute and is trustworthy. The host has `pmset sleep 1` (a one-minute idle
+timer) and logged a `Thermal Emergency Sleep` during the `cnn` run; `caffeinate -i` was
+insufficient (it asserts only `PreventUserIdleSystemSleep`) and `caffeinate -dimsu` restored
+full throughput, 1.41 -> 15.00 steps/s. Any unattended M3 run needs the stronger assertion,
+and the thermal event argues for putting the multi-seed study on the cloud budget.
 
 ## Deferred to the next plan (M3)
 
