@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from mbfps.models.rssm import LATENT_DIM, RSSM, RSSMConfig
+from mbfps.models.rssm import LATENT_DIM, RSSM, RSSMConfig, kl_loss
 
 B, T = 3, 7
 
@@ -260,3 +260,88 @@ def test_init_is_independent_of_prior_rng_consumption():
         return next(RSSM(RSSMConfig(), seed=0).parameters()).detach().clone()
 
     assert torch.equal(build(0), build(500_000))
+
+
+def _logits(b=2, t=3, peak=0.0):
+    x = torch.zeros(b, t, 32, 32)
+    x[..., 0] = peak
+    return x
+
+
+def test_kl_is_zero_when_distributions_match_and_free_bits_off():
+    same = _logits(peak=3.0)
+    loss, parts = kl_loss(same, same.clone(), free_bits=0.0)
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert parts["dyn"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_kl_is_positive_when_distributions_differ():
+    loss, _ = kl_loss(_logits(peak=5.0), _logits(peak=0.0), free_bits=0.0)
+    assert loss.item() > 0
+
+
+def test_free_bits_clamps_small_divergences():
+    """Below the floor the KL must not be optimised away -- that is the point:
+    it stops posterior collapse to the prior."""
+    near = _logits(peak=0.01)
+    clamped, _ = kl_loss(near, _logits(peak=0.0), free_bits=1.0)
+    unclamped, _ = kl_loss(near, _logits(peak=0.0), free_bits=0.0)
+    assert unclamped.item() < clamped.item()
+
+
+def test_dyn_and_rep_are_weighted_differently():
+    """0.5 / 0.1 per the spec: the prior is pulled toward the posterior five
+    times as hard as the reverse."""
+    post, prior = _logits(peak=4.0), _logits(peak=0.0)
+    only_dyn, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=1.0, rep_scale=0.0)
+    only_rep, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=0.0, rep_scale=1.0)
+    both, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=0.5, rep_scale=0.1)
+    assert both.item() == pytest.approx(0.5 * only_dyn.item() + 0.1 * only_rep.item(), rel=1e-5)
+
+
+def test_kl_balancing_stops_gradients_on_the_right_side():
+    """dyn trains the PRIOR only; rep trains the POSTERIOR only. Getting this
+    backwards trains the posterior to be uninformative."""
+    post = _logits(peak=4.0).requires_grad_(True)
+    prior = _logits(peak=0.0).requires_grad_(True)
+    loss, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=1.0, rep_scale=0.0)
+    loss.backward()
+    assert post.grad.abs().sum() == 0, "dyn term must not train the posterior"
+    assert prior.grad.abs().sum() > 0, "dyn term must train the prior"
+
+
+def test_dyn_scale_and_rep_scale_control_independent_gradients():
+    """`test_dyn_and_rep_are_weighted_differently` checks the LOSS VALUE, but
+    `dyn` and `rep` are numerically identical for any `post`/`prior` pair --
+    `.detach()` only cuts gradient flow, it never changes a forward value, so
+    `KL(post.detach(), prior)` and `KL(post, prior.detach())` compute the same
+    number. That makes the weighted-sum assertion true for ANY (dyn_scale,
+    rep_scale) pair used consistently, including one where the two scales are
+    swapped in the implementation -- it cannot tell `dyn_scale` and
+    `rep_scale` apart.
+
+    Gradients can, because `dyn_scale` only ever reaches `prior` (through the
+    `dyn` term) and `rep_scale` only ever reaches `post` (through the `rep`
+    term). Raising `dyn_scale` 5x must scale `prior`'s gradient by exactly 5x
+    while leaving `post`'s gradient untouched, and vice versa; swapping the
+    two scales in the formula would swap which parameter's gradient tracks
+    which coefficient, which this test catches and the value-based test does
+    not.
+    """
+    post = _logits(peak=4.0).requires_grad_(True)
+    prior = _logits(peak=0.0).requires_grad_(True)
+
+    loss1, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=1.0, rep_scale=1.0)
+    grad_prior_1 = torch.autograd.grad(loss1, prior, retain_graph=True)[0].abs().sum()
+    grad_post_1 = torch.autograd.grad(loss1, post, retain_graph=True)[0].abs().sum()
+
+    loss2, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=5.0, rep_scale=1.0)
+    grad_prior_2 = torch.autograd.grad(loss2, prior, retain_graph=True)[0].abs().sum()
+    grad_post_2 = torch.autograd.grad(loss2, post, retain_graph=True)[0].abs().sum()
+
+    assert grad_prior_2.item() == pytest.approx(5 * grad_prior_1.item(), rel=1e-4), (
+        "raising dyn_scale 5x must scale prior's gradient by 5x"
+    )
+    assert grad_post_2.item() == pytest.approx(grad_post_1.item(), rel=1e-4), (
+        "raising dyn_scale must not change post's gradient"
+    )
