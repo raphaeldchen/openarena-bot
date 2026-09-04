@@ -3033,11 +3033,11 @@ git commit -m "feat: end-to-end rollout evaluation, local single-arm validation"
 
 | seq_len | ms/step | steps/s | hours for 20k |
 |---|---|---|---|
-| 16 | | | |
-| 32 | | | |
-| 64 | | | |
+| 16 | 27.1 | 36.900 | 0.15 |
+| 32 | 49.9 | 20.040 | 0.28 |
+| 64 | 96.7 | 10.341 | 0.54 |
 
-Decision: *(record whether the >3h gate fired and what was decided)*
+Decision: Gate did NOT fire. Maximum hours_for_20k_steps is 0.54 hours (well below 3-hour threshold). Study parameters approved for Plan 4.
 
 ---
 
