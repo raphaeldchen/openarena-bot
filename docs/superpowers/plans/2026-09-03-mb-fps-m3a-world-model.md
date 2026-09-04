@@ -698,28 +698,63 @@ def test_imagine_consumes_no_embeddings(rssm):
     assert "post_logits" not in out
 
 
+def _seeded_imagine(rssm, actions, state, seed=0):
+    """Reproducible rollout WITHOUT taking the mode.
+
+    Sampling is always stochastic -- taking the mode collapses the trajectory to
+    3 distinct latents out of 45 and roughly quadruples error. Reproducibility
+    therefore comes from fixing the generator, not from removing the sampling.
+    """
+    torch.manual_seed(seed)
+    return rssm.imagine(actions, state)
+
+
 def test_imagined_trajectory_depends_on_actions(rssm):
     """A model that ignores actions cannot be used for planning.
 
-    `deterministic=True` is essential here. With sampling, two calls differ by
-    RNG alone, so the assertion holds even when the action input is zeroed out
-    and the test cannot fail.
+    The shared seed is essential. Two unseeded calls differ by RNG alone, so the
+    assertion would hold even with the action input zeroed out, and the test
+    could not fail.
     """
     state = rssm.initial_state(B, torch.device("cpu"))
     a = torch.zeros(B, T, dtype=torch.long)
     b = torch.full((B, T), 3, dtype=torch.long)
-    ha = rssm.imagine(a, state, deterministic=True)["h"]
-    hb = rssm.imagine(b, state, deterministic=True)["h"]
+    ha = _seeded_imagine(rssm, a, state)["h"]
+    hb = _seeded_imagine(rssm, b, state)["h"]
     assert not torch.allclose(ha, hb)
 
 
-def test_identical_actions_give_identical_deterministic_rollouts(rssm):
-    """Guards the guard: if this fails, the test above passes on noise."""
+def test_same_seed_reproduces_an_imagined_rollout(rssm):
+    """Guards the guard: if this fails, the test above passes on RNG noise.
+
+    Also the property `evaluate_rollout` relies on -- an unseeded rollout made
+    gap_closed@45 swing -0.121 / +0.319 / -0.428 across three runs of the same
+    checkpoint, and the M3 gate is a test on that sign.
+    """
     state = rssm.initial_state(B, torch.device("cpu"))
     a = torch.zeros(B, T, dtype=torch.long)
-    first = rssm.imagine(a, state, deterministic=True)["h"]
-    second = rssm.imagine(a, state, deterministic=True)["h"]
-    torch.testing.assert_close(first, second)
+    torch.testing.assert_close(
+        _seeded_imagine(rssm, a, state)["h"], _seeded_imagine(rssm, a, state)["h"]
+    )
+
+
+def test_rollouts_are_stochastic_not_collapsed(rssm):
+    """Different seeds must give different trajectories.
+
+    Pins that sampling was not quietly replaced by the mode. Taking the mode
+    makes every rollout identical regardless of seed, and it is a tempting
+    "fix" for reproducibility -- measured, it quadruples position error and
+    gets worse as training sharpens the logits.
+    """
+    state = rssm.initial_state(B, torch.device("cpu"))
+    a = torch.zeros(B, T, dtype=torch.long)
+    first = _seeded_imagine(rssm, a, state, seed=0)["z"]
+    second = _seeded_imagine(rssm, a, state, seed=1)["z"]
+    assert not torch.equal(first, second), "sampling appears to be deterministic"
+    distinct = len({tuple(r.argmax(-1).tolist()) for r in first[0].view(T, 32, 32)})
+    assert distinct > T // 2, (
+        f"only {distinct}/{T} distinct latents -- the trajectory has collapsed"
+    )
 
 
 def test_deterministic_state_carries_history(rssm):
@@ -728,8 +763,8 @@ def test_deterministic_state_carries_history(rssm):
     a = torch.zeros(B, T, dtype=torch.long)
     b = a.clone()
     b[:, 0] = 5  # differ only at the first step
-    ha = rssm.imagine(a, state, deterministic=True)["h"][:, -1]
-    hb = rssm.imagine(b, state, deterministic=True)["h"][:, -1]
+    ha = _seeded_imagine(rssm, a, state)["h"][:, -1]
+    hb = _seeded_imagine(rssm, b, state)["h"][:, -1]
     assert not torch.allclose(ha, hb), "h does not propagate history"
 
 
@@ -828,25 +863,24 @@ class RSSM(nn.Module):
             torch.zeros(batch_size, self.z_dim, device=device),
         )
 
-    def _sample(self, logits: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
         """One-hot sample with a straight-through gradient.
 
         `argmax` has zero gradient everywhere, so the backward pass uses the
         softmax probabilities instead: `probs + (onehot - probs).detach()` is
         numerically the one-hot in forward and the softmax in backward.
 
-        `deterministic=True` takes the mode instead of sampling. Evaluation MUST
-        use it: with sampling, the same checkpoint and probe produced
-        gap_closed@45 of -0.121, +0.319 and -0.428 on three consecutive runs --
-        the M3 gate criterion is "gap_closed > 0", so its sign was being decided
-        by RNG rather than by the model.
+        **Sampling is always stochastic, including at evaluation.** Taking the
+        mode looks like a free way to make rollouts reproducible and is not:
+        measured, it collapses the imagined trajectory to 3 distinct latents out
+        of 45 and roughly quadruples position error (1406 against 356). It also
+        degrades WITH training, as sharpening logits make the mode more
+        dominant, so an untrained smoke test will not reveal it. Reproducibility
+        comes from seeding the generator -- see `evaluate_rollout`.
         """
         shaped = logits.view(*logits.shape[:-1], self.cfg.z_cats, self.cfg.z_classes)
         probs = F.softmax(shaped, dim=-1)
-        if deterministic:
-            index = probs.argmax(dim=-1)
-        else:
-            index = torch.distributions.Categorical(probs=probs).sample()
+        index = torch.distributions.Categorical(probs=probs).sample()
         onehot = F.one_hot(index, self.cfg.z_classes).to(probs.dtype)
         return (probs + (onehot - probs).detach()).flatten(-2)
 
@@ -871,18 +905,15 @@ class RSSM(nn.Module):
             priors.append(prior_logits); posts.append(post_logits)
         return self._pack(hs, zs, priors, posts)
 
-    def imagine(self, actions, state, deterministic: bool = False) -> dict[str, torch.Tensor]:
-        """Roll forward on the prior alone -- no embeddings consumed.
-
-        Pass `deterministic=True` for evaluation; see `_sample`.
-        """
+    def imagine(self, actions, state) -> dict[str, torch.Tensor]:
+        """Roll forward on the prior alone -- no embeddings consumed."""
         h, z = state
         actions_onehot = self._onehot_actions(actions)
         hs, zs, priors = [], [], []
         for i in range(actions.shape[1]):
             h = self._step(h, z, actions_onehot[:, i])
             prior_logits = self.prior_net(h)
-            z = self._sample(prior_logits, deterministic=deterministic)
+            z = self._sample(prior_logits)
             hs.append(h); zs.append(z); priors.append(prior_logits)
         return self._pack(hs, zs, priors, None)
 
@@ -1008,14 +1039,25 @@ def _categorical_kl(logits_q: torch.Tensor, logits_p: torch.Tensor) -> torch.Ten
     return per_group.sum(-1).mean()
 
 
-KL_FREE_BITS = 1.0
-"""Governing spec 3.5. Below this the KL is not optimised at all.
+KL_FREE_BITS = 0.20
+"""Below this the KL is not optimised at all, so the posterior cannot collapse.
 
-Measured on this dataset the dyn KL at initialisation is ~0.31 nat, so the prior
-is clamped -- and therefore frozen -- until the posterior becomes informative.
-That warm-up is intentional, but whether it ENDS here is empirical, which is why
-`train_world_model` records `kl_cleared_free_bits`. Clamping per (batch, time)
-element does not change this: measured per-element KL spans 0.266-0.352 nat.
+**Deliberately NOT the governing spec's 1.0 nat.** That value was inherited from
+DreamerV3 and measured wrong for this setup: the dynamics prior trains only when
+`dyn` exceeds the floor, and at 1.0 it receives gradient on 1 of 9 sampled steps
+because the measured KL rarely clears it. A floor of 0 is equally wrong in the
+other direction -- it penalises every nat and collapses the posterior into the
+prior. Measured over 2,000 steps on the real dataset:
+
+    free_bits   prior_net gets gradient   kl_dyn at end
+    0.00        --                        0.0001  (collapsed)
+    0.05        7/9 sampled steps         0.354
+    0.20        8/9 sampled steps         0.333   <- chosen
+    1.00        1/9 sampled steps         0.717
+
+Init KL is 0.022-0.038 nat depending on arm, so the prior is still clamped for
+the first steps; `train_world_model` records how often the floor is actually
+cleared rather than assuming it.
 """
 
 
@@ -1318,15 +1360,13 @@ def test_forward_returns_a_scalar_loss_and_named_parts(buffer):
 def test_every_trainable_parameter_receives_gradient(buffer):
     """The classic RSSM bug is a detached tensor silently freezing a submodule.
 
-    `prior_net` is excluded and handled by the next two tests. Free bits clamp
-    the dyn KL below 1.0 nat, and the measured KL at initialisation on this
-    dataset is ~0.31 nat, so `torch.maximum(dyn, 1.0)` is constant and the prior
-    legitimately receives no gradient yet. That is the intended DreamerV3
-    warm-up -- the prior must not be allowed to collapse the posterior before
-    the posterior carries anything -- not a detached tensor.
-
-    Note this is NOT fixed by clamping per (batch, time) element: measured
-    per-element KL spans 0.266-0.352 nat, so every element is below the floor.
+    `prior_net` is excluded and handled by the next two tests. The measured dyn
+    KL at initialisation is 0.022-0.038 nat depending on arm, below the 0.20
+    floor, so `torch.maximum(dyn, KL_FREE_BITS)` is constant at step 0 and the
+    prior legitimately receives no gradient yet. That is the intended warm-up --
+    the prior must not collapse the posterior before the posterior carries
+    anything -- not a detached tensor. It ends quickly at this floor: the prior
+    gets gradient on 8 of 9 sampled steps thereafter.
     """
     from mbfps.data.loader import SequenceLoader
     from mbfps.utils.device import to_device
@@ -1382,10 +1422,28 @@ def test_history_reports_whether_the_kl_ever_cleared_the_floor(buffer):
     """
     history = train_world_model(tiny(), buffer, out_dir=None)
     assert "kl_dyn_max" in history
-    assert "kl_cleared_free_bits" in history
+    assert "kl_rate_above_free_bits" in history
     assert history["kl_dyn_max"] == pytest.approx(
         max(p["kl_dyn"] for p in history["parts"])
     )
+    expected = sum(
+        1 for p in history["parts"] if p["kl_dyn"] > KL_FREE_BITS
+    ) / len(history["parts"])
+    assert history["kl_rate_above_free_bits"] == pytest.approx(expected)
+
+
+def test_kl_rate_distinguishes_a_barely_trained_prior_from_a_trained_one():
+    """A max cannot: one transient step above the floor sets it True forever.
+
+    Measured, that hid two arms whose priors trained on 1.1% and 11.2% of steps
+    behind an identical `True`.
+    """
+    from mbfps.training.world_model import _kl_rate
+
+    barely = [0.01] * 99 + [5.0]
+    trained = [0.5] * 100
+    assert max(barely) > max(trained)          # a max ranks them backwards
+    assert _kl_rate(barely) < _kl_rate(trained)
 
 
 def test_overfits_a_single_fixed_batch(buffer):
@@ -1625,6 +1683,20 @@ class WorldModel(nn.Module):
 
 ```python
 # src/mbfps/training/world_model.py  (append)
+def _kl_rate(kl_values: list[float]) -> float:
+    """Share of steps whose dyn KL cleared the free-bits floor.
+
+    A RATE, not a max. A max reads True after a single transient step above the
+    floor: measured, it reported True on a run whose prior trained on 1.1% of
+    steps while another arm's trained on 11.2%. Both looked identical through a
+    boolean, so a cross-arm comparison would have measured that asymmetry rather
+    than the representations.
+    """
+    if not kl_values:
+        return 0.0
+    return sum(1 for v in kl_values if v > KL_FREE_BITS) / len(kl_values)
+
+
 def train_world_model(
     cfg: Config,
     buffer: ReplayBuffer,
@@ -1670,7 +1742,9 @@ def train_world_model(
         if log_every and (step + 1) % log_every == 0:
             print(f"[{cfg.arm}] step {step + 1}/{cfg.train.steps} loss={losses[-1]:.5f}")
 
-    kl_dyn_max = max((p["kl_dyn"] for p in history_parts), default=0.0)
+    kl_values = [p["kl_dyn"] for p in history_parts]
+    kl_dyn_max = max(kl_values, default=0.0)
+    kl_rate = _kl_rate(kl_values)
     history = {
         "arm": cfg.arm,
         "steps": cfg.train.steps,
@@ -1684,13 +1758,15 @@ def train_world_model(
         # imagined rollout would come from random weights. Record it rather
         # than assume it.
         "kl_dyn_max": kl_dyn_max,
-        "kl_cleared_free_bits": bool(kl_dyn_max > KL_FREE_BITS),
+        "kl_rate_above_free_bits": kl_rate,
     }
-    if not history["kl_cleared_free_bits"]:
+    if kl_rate < 0.5:
         print(
-            f"[{cfg.arm}] WARNING: kl_dyn peaked at {kl_dyn_max:.4f}, never clearing "
-            f"the {KL_FREE_BITS} nat free-bits floor -- prior_net was never trained, "
-            "so imagine() runs on its initialisation. Lower free_bits or train longer."
+            f"[{cfg.arm}] WARNING: kl_dyn exceeded the {KL_FREE_BITS} nat floor on only "
+            f"{100 * kl_rate:.1f}% of steps (peak {kl_dyn_max:.4f}). The dynamics prior "
+            "is largely untrained, so imagine() runs close to its initialisation. Arms "
+            "whose rates differ cannot be compared: the comparison would measure how "
+            "much each prior trained, not the representations."
         )
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1798,8 +1874,11 @@ The probe is the ONLY place `privileged_state` is read. It is fit post-hoc on fr
 - Produces:
   - `PROBE_KEYS = ("pos_x", "pos_y", "angle")`
   - `probe_targets(privileged, keys) -> np.ndarray` of shape `(N, 4)` — `pos_x`, `pos_y`, `sin(angle)`, `cos(angle)`
-  - `fit_probe(latents: np.ndarray, targets: np.ndarray, ridge: float = 1.0) -> np.ndarray` returning weights `(LATENT_DIM + 1, 4)`
-  - `apply_probe(weights, latents) -> np.ndarray` `(N, 4)`
+  - `fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) -> dict` — the dict
+    carries `"w"`, `"mean"`, `"scale"`, `"ridge"`, and `"r2"` when validation data is given.
+    Ridge is SELECTED on held-out data; a fixed 1.0 costs R^2 0.16 against a 0.42 ceiling.
+  - `apply_probe(probe: dict, latents) -> np.ndarray` `(N, 4)`
+  - `RIDGES` — the candidate grid; measured optimum is 1e3-1e5
   - `position_error(pred, true) -> np.ndarray` `(N,)` euclidean, Doom map units
   - `angle_error_degrees(pred, true) -> np.ndarray` `(N,)` in `[0, 180]`
 
@@ -1812,6 +1891,7 @@ import pytest
 
 from mbfps.eval.probe import (
     PROBE_KEYS,
+    RIDGES,
     angle_error_degrees,
     apply_probe,
     fit_probe,
@@ -1851,8 +1931,8 @@ def test_probe_recovers_an_exact_linear_map():
     latents = rng.normal(size=(200, 16))
     true_w = rng.normal(size=(17, 4))
     targets = latents @ true_w[:-1] + true_w[-1]
-    weights = fit_probe(latents, targets, ridge=1e-8)
-    np.testing.assert_allclose(apply_probe(weights, latents), targets, atol=1e-4)
+    probe = fit_probe(latents, targets, ridge=1e-8)
+    np.testing.assert_allclose(apply_probe(probe, latents), targets, atol=1e-4)
 
 
 def test_probe_has_an_intercept():
@@ -1863,6 +1943,33 @@ def test_probe_has_an_intercept():
     np.testing.assert_allclose(
         apply_probe(fit_probe(latents, targets, ridge=1e-8), latents), targets, atol=1e-3
     )
+
+
+def test_ridge_selection_beats_a_fixed_default():
+    """The fix's whole point. A fixed ridge=1.0 on unstandardised inputs cost
+    held-out R^2 0.16 against a measured ceiling of 0.42 on real features."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(300, 24))
+    w = rng.normal(size=(25, 4)) * 200.0          # targets at Doom-coordinate scale
+    y = x @ w[:-1] + w[-1] + rng.normal(size=(300, 4)) * 5.0
+    xv = rng.normal(size=(150, 24))
+    yv = xv @ w[:-1] + w[-1] + rng.normal(size=(150, 4)) * 5.0
+
+    selected = fit_probe(x, y, xv, yv)
+    fixed = fit_probe(x, y, ridge=1.0)
+    assert probe_r2(selected, xv, yv) >= probe_r2(fixed, xv, yv)
+    assert "r2" in selected and selected["ridge"] in RIDGES
+
+
+def test_probe_standardises_its_inputs():
+    """Unstandardised features of wildly different scales make ridge meaningless:
+    one penalty strength cannot suit a column of std 1 and a column of std 1000."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(200, 3)) * np.array([1.0, 1000.0, 0.001])
+    y = rng.normal(size=(200, 4))
+    probe = fit_probe(x, y, ridge=1.0)
+    np.testing.assert_allclose(probe["scale"], x.std(0), rtol=1e-6)
+    np.testing.assert_allclose(probe["mean"], x.mean(0), rtol=1e-6)
 
 
 def test_position_error_is_euclidean():
@@ -1955,25 +2062,72 @@ def probe_targets(privileged: np.ndarray, keys: tuple[str, ...]) -> np.ndarray:
     )
 
 
-def fit_probe(latents: np.ndarray, targets: np.ndarray, ridge: float = 1.0) -> np.ndarray:
-    """Closed-form ridge regression with an intercept.
+RIDGES: tuple[float, ...] = (1e-1, 1e1, 1e3, 1e5, 1e7)
+"""Candidate strengths. The measured optimum here is 1e3-1e5, not 1."""
 
-    Returns weights of shape `(D + 1, 4)`; the last row is the intercept. The
-    intercept is not regularised -- penalising it would bias predictions toward
-    zero, and Doom coordinates are nowhere near zero-centred.
+
+def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
+    design = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
+    penalty = ridge * np.eye(design.shape[1])
+    penalty[-1, -1] = 0.0  # never regularise the intercept
+    return np.linalg.solve(design.T @ design + penalty, design.T @ y)
+
+
+def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) -> dict:
+    """Standardise the inputs, then SELECT the ridge on held-out data.
+
+    Returns a dict carrying the weights and the standardisation, because both
+    are needed to apply it. The intercept is never regularised: penalising it
+    biases predictions toward zero, and Doom coordinates are nowhere near
+    zero-centred.
+
+    Selection is not optional here. A fixed `ridge=1.0` on unstandardised inputs
+    underfits badly -- the targets have std ~240 in map units while the features
+    are order 1 -- and measured, that one default cost held-out R^2 0.16 against
+    a ceiling of 0.42. Without validation data the fallback is 1e3, the middle
+    of the measured optimum, not 1.
     """
     x = np.asarray(latents, dtype=np.float64)
     y = np.asarray(targets, dtype=np.float64)
-    design = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
-    penalty = ridge * np.eye(design.shape[1])
-    penalty[-1, -1] = 0.0
-    gram = design.T @ design + penalty
-    return np.linalg.solve(gram, design.T @ y)
+    mean, scale = x.mean(0), x.std(0) + 1e-8
+    xs = (x - mean) / scale
+    if ridge is not None:           # explicit override, for tests that pin a value
+        return {"w": _solve(xs, y, ridge), "mean": mean, "scale": scale, "ridge": ridge}
+    if val_latents is None:
+        return {"w": _solve(xs, y, 1e3), "mean": mean, "scale": scale, "ridge": 1e3}
+
+    xv = (np.asarray(val_latents, dtype=np.float64) - mean) / scale
+    best = None
+    for ridge in RIDGES:
+        w = _solve(xs, y, ridge)
+        pred = np.concatenate([xv, np.ones((xv.shape[0], 1))], axis=1) @ w
+        score = _mean_r2(pred, val_targets)
+        if best is None or score > best[0]:
+            best = (score, ridge, w)
+    return {"w": best[2], "mean": mean, "scale": scale, "ridge": best[1], "r2": best[0]}
 
 
-def apply_probe(weights: np.ndarray, latents: np.ndarray) -> np.ndarray:
-    x = np.asarray(latents, dtype=np.float64)
-    return np.concatenate([x, np.ones((x.shape[0], 1))], axis=1) @ weights
+def apply_probe(probe: dict, latents: np.ndarray) -> np.ndarray:
+    xs = (np.asarray(latents, dtype=np.float64) - probe["mean"]) / probe["scale"]
+    return np.concatenate([xs, np.ones((xs.shape[0], 1))], axis=1) @ probe["w"]
+
+
+def _mean_r2(predicted: np.ndarray, targets: np.ndarray) -> float:
+    """R^2 averaged PER COLUMN.
+
+    Pooling would let `pos_x` (std ~240) drown `sin(angle)` (std ~0.7), hiding a
+    completely useless angle prediction behind good position numbers.
+    """
+    scores = []
+    for c in range(targets.shape[1]):
+        truth = targets[:, c]
+        denom = float(((truth - truth.mean()) ** 2).sum())
+        if denom == 0.0:
+            continue
+        scores.append(1.0 - float(((truth - predicted[:, c]) ** 2).sum()) / denom)
+    if not scores:
+        raise ValueError("every target column has zero variance; nothing to score")
+    return float(np.mean(scores))
 
 
 def position_error(predicted: np.ndarray, true: np.ndarray) -> np.ndarray:
@@ -2000,7 +2154,7 @@ touch src/mbfps/eval/__init__.py tests/eval/__init__.py
 .venv/bin/python -m pytest tests/eval/test_probe.py -q
 ```
 
-Expected: PASS (9 tests)
+Expected: PASS (11 tests)
 
 - [ ] **Step 5: Mutation-test**
 
@@ -2010,6 +2164,8 @@ Expected: PASS (9 tests)
 | return raw degrees instead of `(sin, cos)` | `test_targets_are_continuous_across_the_wrap` |
 | `np.arcsin(predicted[:, 2])` instead of `atan2` | `test_unnormalised_sin_cos_predictions_still_give_a_valid_angle` |
 | drop the intercept column | `test_probe_has_an_intercept` |
+| return the fixed 1e3 instead of selecting | `test_ridge_selection_beats_a_fixed_default` |
+| skip standardisation (`xs = x`) | `test_probe_standardises_its_inputs` |
 | `penalty[-1, -1] = ridge` (regularise the intercept) | `test_probe_has_an_intercept` at larger ridge — verify, and add a test if not caught |
 | drop the `np.arctan2(sin, cos)` wrap in the error | `test_angle_error_wraps_the_short_way` |
 
@@ -2033,7 +2189,7 @@ git commit -m "feat: linear probe into privileged space, angle-aware and varianc
 - Produces:
   - `RolloutResult` dataclass with `horizon: np.ndarray (H,)`, `rssm_position: (H,)`, `persistence_position: (H,)`, `floor_position: (H,)`, and the three `*_angle` counterparts
   - `gap_closed(persistence, model, floor) -> np.ndarray` — elementwise, NOT clipped
-  - `evaluate_rollout(model, val_paths, embedding_probe_weights, context=5, horizon=45, device=None, feature_backbone=None) -> RolloutResult`
+  - `evaluate_rollout(model, val_paths, embedding_probe_weights, context=5, horizon=45, seed=0, device=None, feature_backbone=None) -> RolloutResult`
     — takes ONE probe, mapping the 2048-d encoder embedding. All three references live in
     embedding space so the band measures information content alone, not probe fit. The
     1536-d latent probe is fit separately and used only by Task 10's filtering comparison,
@@ -2189,6 +2345,7 @@ def evaluate_rollout(
     embedding_probe_weights: np.ndarray,
     context: int = 5,
     horizon: int = 45,
+    seed: int = 0,
     device: torch.device | None = None,
     feature_backbone: str | None = None,
 ) -> RolloutResult:
@@ -2199,6 +2356,11 @@ def evaluate_rollout(
     model.eval()
     device = device or next(model.parameters()).device
     need = context + horizon
+    # Reproducibility WITHOUT taking the mode. Seeding here makes two runs of
+    # this function identical; taking the categorical mode would also do that,
+    # and would collapse the trajectory to 3 distinct latents out of 45 while
+    # roughly quadrupling position error.
+    torch.manual_seed(seed)
 
     rssm_pos, pers_pos, floor_pos = [], [], []
     rssm_ang, pers_ang, floor_ang = [], [], []
@@ -2221,26 +2383,39 @@ def evaluate_rollout(
                 embeddings[:, :context], actions[:, :context]
             )
             state = (observed["h"][:, -1], observed["z"][:, -1])
-            imagined = model.rssm.imagine(
-                actions[:, context:], state, deterministic=True
-            )
+            imagined = model.rssm.imagine(actions[:, context:], state)
 
             # Floor: probe the ENCODER EMBEDDING of the real future frame, per
             # spec 3.2. The earlier version probed the posterior LATENT here,
             # which is not a lower bound on anything -- it carries per-step
             # sampling noise, and measured on real data it exceeded persistence
             # at 8 of 10 horizon steps, inverting gap_closed's denominator.
-            future_embeddings = embeddings[0, context:].cpu().numpy()
+            # Floor: the posterior run on the REAL future frames, same pipeline.
+            real = model.rssm.observe(
+                embeddings[:, context:], actions[:, context:], state=state
+            )
+            floor_embeddings = model.heads(real["latent"])["embedding"][0].cpu().numpy()
 
             truth = probe_targets(
                 episode.privileged[start + context : start + need], episode.privileged_keys
             )
-            # Persistence = the last REAL frame's embedding, held. Spec 3.2.
-            last_context_embedding = embeddings[0, context - 1].cpu().numpy()
+            # Persistence = the last context step's PREDICTED embedding, held.
+            # Predicted, not raw, so it shares the probe's distribution.
+            last_context_embedding = (
+                model.heads(observed["latent"][:, -1:])["embedding"][0, 0].cpu().numpy()
+            )
 
-            # ALL THREE references are probed in EMBEDDING space with the SAME
-            # probe. They differ only in what information produced the
-            # embedding, which is the only thing the band should measure.
+            # ALL THREE references go through the IDENTICAL pipeline
+            # (encode -> RSSM -> emb_head) and are probed with the SAME probe,
+            # which is fit on the model's OWN predicted embeddings. They differ
+            # only in what information produced the latent, which is the only
+            # thing the band should measure.
+            #
+            # Fitting on real encoder embeddings and applying to predicted ones
+            # is a distribution mismatch, and it was destroying the signal:
+            # band below 2 SE at 18 of 45 horizon steps, against 2 of 45 once
+            # every reference shares the pipeline. gap_closed at horizon 45
+            # moved from -7.26 to -0.78 on the same checkpoint.
             #
             # An earlier version probed the model and persistence in 1536-d
             # latent space and the floor in 2048-d embedding space. The band
@@ -2255,7 +2430,7 @@ def evaluate_rollout(
             model_pred = apply_probe(
                 embedding_probe_weights, predicted_embeddings[0].cpu().numpy()
             )
-            floor_pred = apply_probe(embedding_probe_weights, future_embeddings)
+            floor_pred = apply_probe(embedding_probe_weights, floor_embeddings)
             pers_pred = apply_probe(
                 embedding_probe_weights,
                 np.repeat(last_context_embedding[None, :], horizon, axis=0),
@@ -2465,7 +2640,7 @@ Expected: FAIL with `ImportError: cannot import name 'probe_r2'`
 
 ```python
 # src/mbfps/eval/probe.py  (append)
-def probe_r2(weights: np.ndarray, latents: np.ndarray, targets: np.ndarray) -> float:
+def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
     """Mean R^2 across the four target columns.
 
     Averaged per column rather than pooled: `pos_x` has std ~253 while
@@ -2476,18 +2651,7 @@ def probe_r2(weights: np.ndarray, latents: np.ndarray, targets: np.ndarray) -> f
     is why PROBE_KEYS excludes `health` and `pos_z`, but the guard stays in case
     a validation slice happens to be degenerate.
     """
-    predicted = apply_probe(weights, latents)
-    scores = []
-    for column in range(targets.shape[1]):
-        truth = targets[:, column]
-        denominator = float(((truth - truth.mean()) ** 2).sum())
-        if denominator == 0.0:
-            continue
-        residual = float(((truth - predicted[:, column]) ** 2).sum())
-        scores.append(1.0 - residual / denominator)
-    if not scores:
-        raise ValueError("every target column has zero variance; nothing to score")
-    return float(np.mean(scores))
+    return _mean_r2(apply_probe(probe, latents), targets)
 
 
 def filtering_comparison(
@@ -2497,7 +2661,6 @@ def filtering_comparison(
     embedding_val: np.ndarray,
     targets_train: np.ndarray,
     targets_val: np.ndarray,
-    ridge: float = 1.0,
 ) -> dict:
     """Does the posterior latent beat the raw embedding at the SAME timestep?
 
@@ -2505,8 +2668,11 @@ def filtering_comparison(
     over the embedding of t. What it can add is history, carried in the
     deterministic state `h`. If it does not win here, `h` is inert.
     """
-    latent_weights = fit_probe(latent_train, targets_train, ridge=ridge)
-    embedding_weights = fit_probe(embedding_train, targets_train, ridge=ridge)
+    # Ridge SELECTED on the validation split for each probe independently --
+    # one probe's optimum is not the other's, and forcing a shared value would
+    # handicap whichever space suits it worse, which is the comparison itself.
+    latent_weights = fit_probe(latent_train, targets_train, latent_val, targets_val)
+    embedding_weights = fit_probe(embedding_train, targets_train, embedding_val, targets_val)
     latent_r2 = probe_r2(latent_weights, latent_val, targets_val)
     embedding_r2 = probe_r2(embedding_weights, embedding_val, targets_val)
     return {
@@ -2812,7 +2978,7 @@ EOF
 
 **This is the real gate for Task 12.** The trained model must beat its own initialisation
 on raw position error. If it does not, training accomplished nothing and no amount of
-baseline arithmetic will disguise that — check `kl_cleared_free_bits` in the training
+baseline arithmetic will disguise that — check `kl_rate_above_free_bits` in the training
 history first, since a frozen `prior_net` produces exactly this symptom.
 
 A negative `gap_closed` is still an acceptable outcome at 2000 steps; this task gates the
@@ -2850,8 +3016,9 @@ git commit -m "feat: end-to-end rollout evaluation, local single-arm validation"
 - [ ] The rollout harness emits all three curves with no NaN and `floor <= persistence`.
 - [ ] Filtering probe implemented and its comparison reported (spec §4.4).
 - [ ] Training provably uses ONLY the training split (`test_loader_restricted_to_paths_never_samples_outside_them`).
-- [ ] `kl_cleared_free_bits` recorded; if False, the prior never trained and the run is void.
-- [ ] Rollout evaluation is deterministic — two runs of Task 12 give identical `gap_closed`.
+- [ ] `kl_rate_above_free_bits` recorded; below ~0.5 the prior is largely untrained and
+      arms with differing rates must not be compared.
+- [ ] Rollout evaluation is reproducible under a fixed `seed` — two runs of Task 12 give identical `gap_closed` — WITHOUT taking the categorical mode.
 - [ ] The trained model beats its own initialisation on raw position error.
 - [ ] Band width recorded, with the count of horizon steps where the floor exceeds persistence.
 - [ ] Golden-rollout digest pinned and stable across runs.
@@ -2889,7 +3056,7 @@ Decision: *(record whether the >3h gate fired and what was decided)*
 | horizon steps with floor above persistence | |
 | gap_closed finite at how many of 45 steps | |
 | ratio stable? (spec §9 Q1) | |
-| `kl_cleared_free_bits` | |
+| `kl_rate_above_free_bits` | |
 | trained beats untrained on raw error? | |
 | two eval runs identical? (determinism) | |
 | test count | |

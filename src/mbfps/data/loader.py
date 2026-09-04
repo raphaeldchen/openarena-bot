@@ -63,6 +63,7 @@ class SequenceLoader:
         load_obs: bool = True,
         load_features: bool = False,
         feature_backbone: str = _DEFAULT_BACKBONE,
+        paths: list[Path] | None = None,
     ) -> None:
         self.buffer = buffer
         self.batch_size = batch_size
@@ -74,7 +75,9 @@ class SequenceLoader:
 
         # Keep paths and episodes index-aligned by construction rather than by
         # relying on load_all() happening to preserve order.
-        self._paths: list[Path] = buffer.episode_paths()
+        self._paths: list[Path] = (
+            list(paths) if paths is not None else buffer.episode_paths()
+        )
         self._episodes = [self._read(p) for p in self._paths]
 
         self._features: list[np.ndarray | None] = []
