@@ -368,20 +368,42 @@ and `test_decoder_init_tracks_the_train_seed`.
 
 - [ ] **Step 7: Mutation-test the guard**
 
+This block is the harness every later task's mutation table depends on. Three things it
+must get right, each of which silently produced a meaningless result during M2:
+
+1. `git archive HEAD` exports the **last commit**, not the working tree — copy in the files
+   this task just wrote, one `cp` per file (`cp a b c d` means "copy a, b, c into directory d").
+2. The venv path must be **absolute**; `cd "$WORK"` makes `.venv/bin/python` unresolvable.
+3. `PYTHONPATH` must point at the export, or the editable install shadows it and the
+   mutated code is never imported.
+
 ```bash
-WORK=$(mktemp -d); git archive HEAD | tar -x -C "$WORK"
-cp src/mbfps/utils/seeding.py tests/utils/test_seeding.py "$WORK/"{src/mbfps/utils/,tests/utils/}
-cd "$WORK"
-# SELF-CHECK FIRST: a known-fatal mutation must fail, or the harness proves nothing.
-python3 - <<'EOF'
-p="src/mbfps/utils/seeding.py"; s=open(p).read()
-open(p,"w").write(s.replace("torch.manual_seed(fork_seed(base_seed, name))", "pass"))
+REPO=/Users/raphaelchen/Desktop/csgo-bot
+PY="$REPO/.venv/bin/python"
+WORK=$(mktemp -d)
+git -C "$REPO" archive HEAD | tar -x -C "$WORK"
+cp "$REPO/src/mbfps/utils/seeding.py"      "$WORK/src/mbfps/utils/seeding.py"
+cp "$REPO/tests/utils/test_seeding.py"     "$WORK/tests/utils/test_seeding.py"
+
+# SELF-CHECK: a known-fatal mutation MUST fail. If it passes, the harness is
+# shadowed and every mutation result in this plan is worthless.
+cp "$WORK/src/mbfps/utils/seeding.py" "$WORK/seeding.orig"
+python3 - "$WORK/src/mbfps/utils/seeding.py" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "torch.manual_seed(fork_seed(base_seed, name))"
+assert s.count(old) == 1, "anchor missing -- fix the harness, not the test"
+open(p, "w").write(s.replace(old, "pass"))
 EOF
-PYTHONPATH="$WORK/src" .venv/bin/python -m pytest tests/utils/test_seeding.py -q
+( cd "$WORK" && PYTHONPATH="$WORK/src" "$PY" -m pytest tests/utils/test_seeding.py -q )
 ```
 
-Expected: FAIL. If it PASSES, the harness is shadowed by the editable install — fix that
-before trusting any mutation result in this plan.
+Expected: **FAIL**, specifically on `test_seeded_init_is_independent_of_prior_rng_consumption`.
+
+A PASS, or a failure with `ImportError` / `no tests ran` / `file not found`, means the
+harness is broken rather than the mutation being caught. Fix it before trusting any
+mutation table in this plan. Restore with
+`cp "$WORK/seeding.orig" "$WORK/src/mbfps/utils/seeding.py"` between mutations.
 
 - [ ] **Step 8: Commit**
 
@@ -403,6 +425,10 @@ M2 had no held-out split and its numbers are recorded as training-set reconstruc
 **Interfaces:**
 - Consumes: `ReplayBuffer.episode_paths() -> list[Path]`
 - Produces: `episode_split(paths: list[Path], val_fraction: float = 0.2, seed: int = 0) -> tuple[list[Path], list[Path]]` returning `(train_paths, val_paths)`.
+- Produces: `SequenceLoader(..., paths: list[Path] | None = None)` — restricts sampling to
+  `paths`. **Without this the split is inert**: `SequenceLoader` reads
+  `buffer.episode_paths()` and has no way to exclude the validation episodes, so the world
+  model would train on every episode the probe is later evaluated on.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -513,7 +539,62 @@ def episode_split(
 Run: `.venv/bin/python -m pytest tests/data/test_split.py -q`
 Expected: PASS (7 tests)
 
-- [ ] **Step 5: Mutation-test**
+- [ ] **Step 5: Make the split reachable from the loader**
+
+`episode_split` is inert unless training can honour it. `SequenceLoader` reads
+`buffer.episode_paths()` directly, so add an override. In `SequenceLoader.__init__`, add
+`paths: list[Path] | None = None` as the final keyword argument and replace
+
+```python
+        self._paths: list[Path] = buffer.episode_paths()
+```
+
+with
+
+```python
+        self._paths: list[Path] = (
+            list(paths) if paths is not None else buffer.episode_paths()
+        )
+```
+
+documenting it as: *restrict sampling to these episodes; used to hold the validation split
+out of training -- without it the loader draws from every episode in the buffer and any
+held-out evaluation is contaminated.*
+
+```python
+# tests/data/test_split.py  (append)
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.loader import SequenceLoader
+from tests.data.test_loader import make_episode
+
+
+def test_loader_restricted_to_paths_never_samples_outside_them(tmp_path):
+    """If this fails the split is decorative: the world model would train on
+    the very episodes the probe is later evaluated on."""
+    buffer = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2, 3, 4):
+        buffer.add(make_episode(t=80, fill=fill))
+    train, _ = episode_split(buffer.episode_paths(), val_fraction=0.5, seed=0)
+
+    loader = SequenceLoader(buffer, batch_size=8, seq_len=16, seed=0, paths=train)
+    allowed = {p.name for p in train}
+    for _ in range(20):
+        batch = loader.sample()
+        for i in range(8):
+            name = loader.episode_path(int(batch["episode_index"][i])).name
+            assert name in allowed, f"sampled {name}, which is held out"
+
+
+def test_loader_without_paths_uses_the_whole_buffer(tmp_path):
+    buffer = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2, 3, 4):
+        buffer.add(make_episode(t=80, fill=fill))
+    assert len(SequenceLoader(buffer, seq_len=16)._paths) == 4
+```
+
+Run: `.venv/bin/python -m pytest tests/data/test_split.py -q` — expect PASS (9 tests).
+
+- [ ] **Step 6: Mutation-test**
 
 Apply each mutation to a `PYTHONPATH`-isolated export (self-check first, per Task 2 Step 7):
 
@@ -523,12 +604,13 @@ Apply each mutation to a `PYTHONPATH`-isolated export (self-check first, per Tas
 | `permutation = np.random.permutation(len(ordered))` (unseeded) | `test_split_is_deterministic` |
 | `val_index = set(permutation[:n_val + 1].tolist())` | `test_val_fraction_is_respected` |
 | drop the `n_val < 1` guard | `test_empty_val_is_rejected` |
+| ignore the `paths` argument in `SequenceLoader` | `test_loader_restricted_to_paths_never_samples_outside_them` |
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/mbfps/data/split.py tests/data/test_split.py
-git commit -m "feat: deterministic episode-level train/val split"
+git add src/mbfps/data/split.py src/mbfps/data/loader.py tests/data/test_split.py
+git commit -m "feat: deterministic episode-level split, honoured by the loader"
 ```
 
 ---
@@ -617,11 +699,27 @@ def test_imagine_consumes_no_embeddings(rssm):
 
 
 def test_imagined_trajectory_depends_on_actions(rssm):
-    """A model that ignores actions cannot be used for planning."""
+    """A model that ignores actions cannot be used for planning.
+
+    `deterministic=True` is essential here. With sampling, two calls differ by
+    RNG alone, so the assertion holds even when the action input is zeroed out
+    and the test cannot fail.
+    """
     state = rssm.initial_state(B, torch.device("cpu"))
     a = torch.zeros(B, T, dtype=torch.long)
     b = torch.full((B, T), 3, dtype=torch.long)
-    assert not torch.allclose(rssm.imagine(a, state)["h"], rssm.imagine(b, state)["h"])
+    ha = rssm.imagine(a, state, deterministic=True)["h"]
+    hb = rssm.imagine(b, state, deterministic=True)["h"]
+    assert not torch.allclose(ha, hb)
+
+
+def test_identical_actions_give_identical_deterministic_rollouts(rssm):
+    """Guards the guard: if this fails, the test above passes on noise."""
+    state = rssm.initial_state(B, torch.device("cpu"))
+    a = torch.zeros(B, T, dtype=torch.long)
+    first = rssm.imagine(a, state, deterministic=True)["h"]
+    second = rssm.imagine(a, state, deterministic=True)["h"]
+    torch.testing.assert_close(first, second)
 
 
 def test_deterministic_state_carries_history(rssm):
@@ -630,8 +728,8 @@ def test_deterministic_state_carries_history(rssm):
     a = torch.zeros(B, T, dtype=torch.long)
     b = a.clone()
     b[:, 0] = 5  # differ only at the first step
-    ha = rssm.imagine(a, state)["h"][:, -1]
-    hb = rssm.imagine(b, state)["h"][:, -1]
+    ha = rssm.imagine(a, state, deterministic=True)["h"][:, -1]
+    hb = rssm.imagine(b, state, deterministic=True)["h"][:, -1]
     assert not torch.allclose(ha, hb), "h does not propagate history"
 
 
@@ -730,16 +828,25 @@ class RSSM(nn.Module):
             torch.zeros(batch_size, self.z_dim, device=device),
         )
 
-    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
+    def _sample(self, logits: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
         """One-hot sample with a straight-through gradient.
 
         `argmax` has zero gradient everywhere, so the backward pass uses the
         softmax probabilities instead: `probs + (onehot - probs).detach()` is
         numerically the one-hot in forward and the softmax in backward.
+
+        `deterministic=True` takes the mode instead of sampling. Evaluation MUST
+        use it: with sampling, the same checkpoint and probe produced
+        gap_closed@45 of -0.121, +0.319 and -0.428 on three consecutive runs --
+        the M3 gate criterion is "gap_closed > 0", so its sign was being decided
+        by RNG rather than by the model.
         """
         shaped = logits.view(*logits.shape[:-1], self.cfg.z_cats, self.cfg.z_classes)
         probs = F.softmax(shaped, dim=-1)
-        index = torch.distributions.Categorical(probs=probs).sample()
+        if deterministic:
+            index = probs.argmax(dim=-1)
+        else:
+            index = torch.distributions.Categorical(probs=probs).sample()
         onehot = F.one_hot(index, self.cfg.z_classes).to(probs.dtype)
         return (probs + (onehot - probs).detach()).flatten(-2)
 
@@ -764,15 +871,18 @@ class RSSM(nn.Module):
             priors.append(prior_logits); posts.append(post_logits)
         return self._pack(hs, zs, priors, posts)
 
-    def imagine(self, actions, state) -> dict[str, torch.Tensor]:
-        """Roll forward on the prior alone -- no embeddings consumed."""
+    def imagine(self, actions, state, deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Roll forward on the prior alone -- no embeddings consumed.
+
+        Pass `deterministic=True` for evaluation; see `_sample`.
+        """
         h, z = state
         actions_onehot = self._onehot_actions(actions)
         hs, zs, priors = [], [], []
         for i in range(actions.shape[1]):
             h = self._step(h, z, actions_onehot[:, i])
             prior_logits = self.prior_net(h)
-            z = self._sample(prior_logits)
+            z = self._sample(prior_logits, deterministic=deterministic)
             hs.append(h); zs.append(z); priors.append(prior_logits)
         return self._pack(hs, zs, priors, None)
 
@@ -794,7 +904,7 @@ class RSSM(nn.Module):
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/models/test_rssm.py -q`
-Expected: PASS (10 tests)
+Expected: PASS (9 tests)
 
 - [ ] **Step 5: Mutation-test**
 
@@ -898,10 +1008,21 @@ def _categorical_kl(logits_q: torch.Tensor, logits_p: torch.Tensor) -> torch.Ten
     return per_group.sum(-1).mean()
 
 
+KL_FREE_BITS = 1.0
+"""Governing spec 3.5. Below this the KL is not optimised at all.
+
+Measured on this dataset the dyn KL at initialisation is ~0.31 nat, so the prior
+is clamped -- and therefore frozen -- until the posterior becomes informative.
+That warm-up is intentional, but whether it ENDS here is empirical, which is why
+`train_world_model` records `kl_cleared_free_bits`. Clamping per (batch, time)
+element does not change this: measured per-element KL spans 0.266-0.352 nat.
+"""
+
+
 def kl_loss(
     post_logits: torch.Tensor,
     prior_logits: torch.Tensor,
-    free_bits: float = 1.0,
+    free_bits: float = KL_FREE_BITS,
     dyn_scale: float = 0.5,
     rep_scale: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -926,7 +1047,7 @@ def kl_loss(
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/models/test_rssm.py -q`
-Expected: PASS (15 tests)
+Expected: PASS (14 tests)
 
 - [ ] **Step 5: Mutation-test**
 
@@ -1197,8 +1318,15 @@ def test_forward_returns_a_scalar_loss_and_named_parts(buffer):
 def test_every_trainable_parameter_receives_gradient(buffer):
     """The classic RSSM bug is a detached tensor silently freezing a submodule.
 
-    A parameter with grad None or all-zero after a backward pass is not being
-    trained, and nothing else in the suite would notice.
+    `prior_net` is excluded and handled by the next two tests. Free bits clamp
+    the dyn KL below 1.0 nat, and the measured KL at initialisation on this
+    dataset is ~0.31 nat, so `torch.maximum(dyn, 1.0)` is constant and the prior
+    legitimately receives no gradient yet. That is the intended DreamerV3
+    warm-up -- the prior must not be allowed to collapse the posterior before
+    the posterior carries anything -- not a detached tensor.
+
+    Note this is NOT fixed by clamping per (batch, time) element: measured
+    per-element KL spans 0.266-0.352 nat, so every element is below the floor.
     """
     from mbfps.data.loader import SequenceLoader
     from mbfps.utils.device import to_device
@@ -1210,9 +1338,54 @@ def test_every_trainable_parameter_receives_gradient(buffer):
     dead = [
         name
         for name, p in model.named_parameters()
-        if p.requires_grad and (p.grad is None or p.grad.abs().sum() == 0)
+        if p.requires_grad
+        and not name.startswith("rssm.prior_net")
+        and (p.grad is None or p.grad.abs().sum() == 0)
     ]
     assert not dead, f"parameters receiving no gradient: {dead}"
+
+
+def test_prior_net_trains_once_the_kl_exceeds_free_bits(buffer):
+    """The other half: the warm-up must actually end.
+
+    If the prior only ever sees a clamped constant it is never trained, and
+    every `imagine()` rollout -- the whole M3 gate and all of M4 -- runs on
+    random weights. This constructs the post-warm-up condition directly.
+    """
+    from mbfps.data.loader import SequenceLoader
+    from mbfps.utils.device import to_device
+
+    model = WorldModel(tiny())
+    # Drive the posterior far from the prior so the KL clears the floor.
+    with torch.no_grad():
+        for p in model.rssm.post_net[-1].parameters():
+            p.mul_(50.0)
+    batch = SequenceLoader(buffer, batch_size=2, seq_len=6, seed=0).sample()
+    loss, parts = model(to_device(batch, torch.device("cpu")))
+    assert parts["kl_dyn"] > 1.0, (
+        f"fixture failed to clear the free-bits floor (kl_dyn={parts['kl_dyn']:.3f}); "
+        "this test cannot check what it claims to"
+    )
+    loss.backward()
+    grad = sum(
+        p.grad.abs().sum() for p in model.rssm.prior_net.parameters() if p.grad is not None
+    )
+    assert grad > 0, "prior_net receives no gradient even above the free-bits floor"
+
+
+def test_history_reports_whether_the_kl_ever_cleared_the_floor(buffer):
+    """Makes the warm-up an observable, not an assumption.
+
+    Whether the KL crosses 1.0 nat on THIS dataset at THIS scale is an empirical
+    question. If it never does, the prior is frozen for the whole run and the
+    result is meaningless -- so the history must carry the evidence either way.
+    """
+    history = train_world_model(tiny(), buffer, out_dir=None)
+    assert "kl_dyn_max" in history
+    assert "kl_cleared_free_bits" in history
+    assert history["kl_dyn_max"] == pytest.approx(
+        max(p["kl_dyn"] for p in history["parts"])
+    )
 
 
 def test_overfits_a_single_fixed_batch(buffer):
@@ -1279,35 +1452,89 @@ def test_all_three_arms_train(buffer, arm, tmp_path):
 Run: `.venv/bin/python -m pytest tests/training/test_world_model.py -q`
 Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.training.world_model'`
 
-- [ ] **Step 3: Move `to_device` out of the autoencoder module**
+- [ ] **Step 3: Move `to_device` and widen its whitelist — carefully**
 
-`to_device` is a generic helper that currently lives in `src/mbfps/training/autoencoder.py`.
-The world model and the evaluation package both need it, and importing it from the
-autoencoder would make M3 depend on an M2 training module for a utility. Move it:
+Read the existing `to_device` in `src/mbfps/training/autoencoder.py` before changing it:
+
+```python
+        if isinstance(value, np.ndarray) and key in ("obs", "features"):
+```
+
+**It is a whitelist, not a converter.** Only `obs` and `features` reach the device. That is
+a *structural* barrier for invariant #2 — `privileged` cannot enter a training tensor
+because it never leaves the CPU dict. Two consequences:
+
+1. The world model needs `actions`, `rewards`, `terminated` and `truncated`, none of which
+   currently survive. Without widening the whitelist, `WorldModel.forward` raises `KeyError`
+   on its first line.
+2. Replacing the whitelist with a permissive `hasattr(value, "dtype")` converter would move
+   `privileged` onto the device and silently dissolve the barrier. **Do not do that.**
+
+Widen the whitelist to exactly what the world model needs, and name the exclusion:
 
 ```python
 # src/mbfps/utils/device.py  (append)
 from typing import Any
 
+import numpy as np
+
+_TRAINING_KEYS = ("obs", "features", "actions", "rewards", "terminated", "truncated")
+"""Keys allowed onto the compute device.
+
+A whitelist, deliberately. `privileged` is absent and must stay absent: it is
+evaluation-only, and keeping it off the device makes that a structural property
+rather than a rule someone has to remember. `episode_index` and `window_start`
+are bookkeeping and stay on the host.
+"""
+
 
 def to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    """Move a loader batch's arrays onto `device`, leaving non-arrays alone."""
-    out = {}
-    for key, value in batch.items():
-        out[key] = torch.as_tensor(value).to(device) if hasattr(value, "dtype") else value
-    return out
+    """Move the whitelisted arrays of a loader batch onto `device`."""
+    return {
+        key: torch.from_numpy(value).to(device)
+        for key, value in batch.items()
+        if isinstance(value, np.ndarray) and key in _TRAINING_KEYS
+    }
 ```
 
-In `src/mbfps/training/autoencoder.py`, delete the local `to_device` definition and
-re-export it so existing imports keep working:
+In `src/mbfps/training/autoencoder.py`, delete the local definition and re-export:
 
 ```python
 from mbfps.utils.device import get_device, to_device  # noqa: F401 -- re-exported
 ```
 
-Run `.venv/bin/python -m pytest tests/training/ -q` and confirm the M2 tests still pass.
-Then use `from mbfps.utils.device import to_device` everywhere below in this plan instead of
-importing from `mbfps.training.autoencoder`.
+Add the guard test:
+
+```python
+# tests/utils/test_device.py
+import numpy as np
+import torch
+
+from mbfps.utils.device import to_device
+
+
+def test_privileged_is_never_moved_to_the_device():
+    """Invariant #2 held structurally: privileged cannot reach a training
+    tensor because it never leaves the host dict."""
+    batch = {
+        "obs": np.zeros((1, 2), dtype=np.uint8),
+        "privileged": np.zeros((1, 5), dtype=np.float32),
+    }
+    moved = to_device(batch, torch.device("cpu"))
+    assert "privileged" not in moved
+    assert "obs" in moved
+
+
+def test_world_model_inputs_survive():
+    batch = {
+        k: np.zeros((1, 2), dtype=np.float32)
+        for k in ("obs", "features", "actions", "rewards", "terminated", "truncated")
+    }
+    assert set(to_device(batch, torch.device("cpu"))) == set(batch)
+```
+
+Run `.venv/bin/python -m pytest tests/training/ tests/utils/ -q` and confirm M2 still
+passes. Use `from mbfps.utils.device import to_device` everywhere below.
 
 - [ ] **Step 4: Implement the model**
 
@@ -1334,9 +1561,10 @@ import torch.nn.functional as F
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
+from mbfps.data.split import episode_split
 from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.models.heads import WorldModelHeads, continue_target
-from mbfps.models.rssm import RSSM, RSSMConfig, kl_loss
+from mbfps.models.rssm import KL_FREE_BITS, RSSM, RSSMConfig, kl_loss
 from mbfps.utils.config import Config
 from mbfps.utils.device import get_device
 from mbfps.utils.seeding import seed_everything
@@ -1412,6 +1640,11 @@ def train_world_model(
     optimiser = torch.optim.Adam(model.parameters(), lr=cfg.train.lr)
 
     backbone = encoder_backbone(cfg.encoder)
+    # Train on the TRAINING episodes only. The split seed is fixed at 0 and is
+    # deliberately NOT cfg.train.seed: every arm and every seed must be held out
+    # on the same episodes, or the comparison measures which episodes each run
+    # happened to get rather than which representation is better.
+    train_paths, _ = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
     loader = SequenceLoader(
         buffer,
         batch_size=cfg.train.batch_size,
@@ -1420,6 +1653,7 @@ def train_world_model(
         load_obs=model.input_kind == "obs",
         load_features=model.input_kind == "features",
         feature_backbone=backbone or "dinov2",
+        paths=train_paths,
     )
 
     losses: list[float] = []
@@ -1436,13 +1670,28 @@ def train_world_model(
         if log_every and (step + 1) % log_every == 0:
             print(f"[{cfg.arm}] step {step + 1}/{cfg.train.steps} loss={losses[-1]:.5f}")
 
+    kl_dyn_max = max((p["kl_dyn"] for p in history_parts), default=0.0)
     history = {
         "arm": cfg.arm,
         "steps": cfg.train.steps,
         "loss": losses,
         "parts": history_parts,
         "seconds": time.perf_counter() - start,
+        # Free bits clamp the dyn KL below KL_FREE_BITS nats, so prior_net is
+        # frozen until the posterior becomes informative enough to clear the
+        # floor. Whether that ever happens on this dataset is empirical, and a
+        # run where it never happens trained no dynamics prior at all -- every
+        # imagined rollout would come from random weights. Record it rather
+        # than assume it.
+        "kl_dyn_max": kl_dyn_max,
+        "kl_cleared_free_bits": bool(kl_dyn_max > KL_FREE_BITS),
     }
+    if not history["kl_cleared_free_bits"]:
+        print(
+            f"[{cfg.arm}] WARNING: kl_dyn peaked at {kl_dyn_max:.4f}, never clearing "
+            f"the {KL_FREE_BITS} nat free-bits floor -- prior_net was never trained, "
+            "so imagine() runs on its initialisation. Lower free_bits or train longer."
+        )
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -1784,7 +2033,10 @@ git commit -m "feat: linear probe into privileged space, angle-aware and varianc
 - Produces:
   - `RolloutResult` dataclass with `horizon: np.ndarray (H,)`, `rssm_position: (H,)`, `persistence_position: (H,)`, `floor_position: (H,)`, and the three `*_angle` counterparts
   - `gap_closed(persistence, model, floor) -> np.ndarray` — elementwise, NOT clipped
-  - `evaluate_rollout(model, val_paths, probe_weights, context=5, horizon=45, device=None, feature_backbone=None) -> RolloutResult`
+  - `evaluate_rollout(model, val_paths, probe_weights, embedding_probe_weights, context=5, horizon=45, device=None, feature_backbone=None) -> RolloutResult`
+    — `probe_weights` maps the 1536-d latent; `embedding_probe_weights` maps the 2048-d
+    encoder embedding and supplies the floor (spec §3.2). They are different shapes and
+    must be fit separately.
   - `source_for(model, path, episode, feature_backbone) -> np.ndarray` — pixels for the pixel arm, the arm's own cached features otherwise
 
 - [ ] **Step 1: Write the failing tests**
@@ -1816,6 +2068,15 @@ def test_gap_closed_is_nan_when_the_band_collapses():
     the ratio is 0/0. NaN is correct; a silent 0 or 1 would be a lie."""
     result = gap_closed(np.array([5.0]), np.array([5.0]), np.array([5.0]))
     assert np.isnan(result[0])
+
+
+def test_gap_closed_is_nan_when_the_floor_exceeds_persistence():
+    """A negative band inverts the ratio's sign, so a model WORSE than
+    persistence would score positive -- and "gap_closed > 0" is the M3 gate.
+    Measured on real data the floor does exceed persistence, so this is the
+    common case, not a corner."""
+    result = gap_closed(np.array([10.0]), np.array([12.0]), np.array([14.0]))
+    assert np.isnan(result[0]), "a negative band must not produce a signed score"
 
 
 def test_gap_closed_is_elementwise_over_the_horizon():
@@ -1871,7 +2132,13 @@ def gap_closed(
     """
     band = persistence - floor
     with np.errstate(divide="ignore", invalid="ignore"):
-        result = np.where(band == 0, np.nan, (persistence - model) / band)
+        # NaN for a non-positive band, not merely a zero one. A negative band
+        # means the floor sits ABOVE persistence, which flips the sign of the
+        # ratio -- an arm worse than persistence would then score positive, and
+        # "gap_closed > 0" is the M3 gate criterion. Measured on real data the
+        # band is ~0.6% of the error magnitude and does go negative, so this is
+        # the common case rather than a corner.
+        result = np.where(band <= 0, np.nan, (persistence - model) / band)
     return result
 ```
 
@@ -1919,6 +2186,7 @@ def evaluate_rollout(
     model,
     val_paths,
     probe_weights: np.ndarray,
+    embedding_probe_weights: np.ndarray,
     context: int = 5,
     horizon: int = 45,
     device: torch.device | None = None,
@@ -1953,12 +2221,16 @@ def evaluate_rollout(
                 embeddings[:, :context], actions[:, :context]
             )
             state = (observed["h"][:, -1], observed["z"][:, -1])
-            imagined = model.rssm.imagine(actions[:, context:], state)
-
-            # Floor: the posterior latent computed from the REAL future frames.
-            real = model.rssm.observe(
-                embeddings[:, context:], actions[:, context:], state=state
+            imagined = model.rssm.imagine(
+                actions[:, context:], state, deterministic=True
             )
+
+            # Floor: probe the ENCODER EMBEDDING of the real future frame, per
+            # spec 3.2. The earlier version probed the posterior LATENT here,
+            # which is not a lower bound on anything -- it carries per-step
+            # sampling noise, and measured on real data it exceeded persistence
+            # at 8 of 10 horizon steps, inverting gap_closed's denominator.
+            future_embeddings = embeddings[0, context:].cpu().numpy()
 
             truth = probe_targets(
                 episode.privileged[start + context : start + need], episode.privileged_keys
@@ -1966,7 +2238,7 @@ def evaluate_rollout(
             last_context = observed["latent"][0, -1].cpu().numpy()
 
             model_pred = apply_probe(probe_weights, imagined["latent"][0].cpu().numpy())
-            floor_pred = apply_probe(probe_weights, real["latent"][0].cpu().numpy())
+            floor_pred = apply_probe(embedding_probe_weights, future_embeddings)
             pers_pred = apply_probe(
                 probe_weights, np.repeat(last_context[None, :], horizon, axis=0)
             )
@@ -2041,10 +2313,24 @@ def test_rollout_produces_the_full_band_on_real_data():
     assert result.rssm_position.shape == (10,)
     assert np.isfinite(result.rssm_position).all()
     assert np.isfinite(result.persistence_position).all()
-    assert (result.floor_position <= result.persistence_position + 1e-6).all(), (
-        "the floor must not exceed persistence -- if it does, the probe or the "
-        "posterior path is wrong"
+    assert np.isfinite(result.floor_position).all()
+
+    # The band is REPORTED, not asserted. With the earlier posterior-latent
+    # floor it was measured inverting at 8 of 10 horizon steps; the floor is now
+    # the encoder-embedding probe per spec 3.2, which should behave better, but
+    # "should" is not evidence and this plan does not assert unverified
+    # relationships. Task 12 Step 5 records the real numbers.
+    band = result.persistence_position - result.floor_position
+    inverted = int((band <= 0).sum())
+    print(
+        f"\nband width: min={band.min():.3f} median={np.median(band):.3f} "
+        f"max={band.max():.3f}; floor above persistence at {inverted}/{len(band)} steps"
     )
+    if inverted:
+        print(
+            "NOTE: gap_closed is NaN at those steps by design -- a negative band "
+            "would otherwise invert the sign of the M3 gate criterion."
+        )
 ```
 
 - [ ] **Step 7: Run**
@@ -2341,11 +2627,17 @@ from mbfps.utils.device import get_device
 
 
 @torch.no_grad()
-def _fit_probe_on(model, paths, backbone, device, limit=20):
-    """Fit on POSTERIOR latents from training episodes only."""
-    from mbfps.eval.rollout import _source_for
+def fit_probes(model, paths, backbone, device, limit=20):
+    """Fit BOTH probes on training episodes only.
 
-    latents, targets = [], []
+    Returns `(latent_weights, embedding_weights)`. Two probes, because they map
+    different spaces: the 1536-d latent for the model and persistence, and the
+    2048-d encoder embedding for the floor (spec 3.2). Fitting one and reusing
+    it for the other is a shape error at best and a meaningless floor at worst.
+    """
+    from mbfps.eval.rollout import source_for
+
+    latents, embeds, targets = [], [], []
     for path in paths[:limit]:
         episode = load_episode(path)
         source = source_for(model, path, episode, backbone)
@@ -2353,8 +2645,13 @@ def _fit_probe_on(model, paths, backbone, device, limit=20):
         actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
         out = model.rssm.observe(embeddings, actions)
         latents.append(out["latent"][0].cpu().numpy())
+        embeds.append(embeddings[0].cpu().numpy())
         targets.append(probe_targets(episode.privileged[:-1], episode.privileged_keys))
-    return fit_probe(np.concatenate(latents), np.concatenate(targets))
+    y = np.concatenate(targets)
+    return (
+        fit_probe(np.concatenate(latents), y),
+        fit_probe(np.concatenate(embeds), y),
+    )
 
 
 def main() -> None:
@@ -2384,9 +2681,10 @@ def main() -> None:
     train, val = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
     backbone = encoder_backbone(cfg.encoder)
 
-    weights = _fit_probe_on(model, train, backbone, device)
+    latent_weights, embedding_weights = fit_probes(model, train, backbone, device)
     result = evaluate_rollout(
-        model, val, weights, context=args.context, horizon=args.horizon,
+        model, val, latent_weights, embedding_weights,
+        context=args.context, horizon=args.horizon,
         device=device, feature_backbone=backbone,
     )
 
@@ -2400,6 +2698,19 @@ def main() -> None:
           f"floor={result.floor_angle[-1]:6.2f}")
     print(f"position_gap_closed_final={pos_gap[-1]:.4f}")
     print(f"angle_gap_closed_final={result.angle_gap_closed()[-1]:.4f}")
+
+    # Report the WHOLE curve, not just its last point. The band is narrow and can
+    # invert at some horizons and not others, so a single final value hides both
+    # the shape and the NaNs.
+    band = result.persistence_position - result.floor_position
+    print(f"band_width  min={band.min():.3f} median={np.median(band):.3f} max={band.max():.3f}")
+    print(f"steps_with_floor_above_persistence={int((band <= 0).sum())}/{len(band)}")
+    print(f"gap_closed  finite={int(np.isfinite(pos_gap).sum())}/{len(pos_gap)} "
+          f"mean={np.nanmean(pos_gap):+.4f}")
+    if not np.isfinite(pos_gap).any():
+        print("WARNING: gap_closed is NaN at every horizon step -- the band is "
+              "non-positive throughout, so this metric says nothing here. Report "
+              "raw errors instead (spec 9, open question 1).")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -2428,12 +2739,60 @@ Record `steps_per_second` — this is the real measurement Plan 4 is scoped from
   --out runs/m3_local/curves_random_vit.json
 ```
 
-- [ ] **Step 4: Check the band is readable**
+- [ ] **Step 4: Run the untrained control — the gate that can actually fail**
 
-Confirm from the output that `floor <= rssm <= persistence` roughly holds and that
-`position_gap_closed_final` is a finite number. **A negative value is an acceptable
-outcome at 2000 steps** — this task gates the harness, not the model. What must not
-happen: NaN, a floor above persistence, or an exception.
+`gap_closed` against persistence and the floor does NOT establish that training did
+anything: an untrained model was measured outscoring a trained one, because at short
+horizons both are dominated by probe error. So compare the trained checkpoint against the
+SAME architecture at initialisation, evaluated identically:
+
+```bash
+.venv/bin/python - <<'EOF'
+import numpy as np, torch
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.split import episode_split
+from mbfps.eval.rollout import evaluate_rollout
+from mbfps.models.encoders import encoder_backbone
+from mbfps.training.world_model import WorldModel
+from mbfps.utils.config import get_config
+from mbfps.utils.device import get_device
+import scripts.eval_rollout as E
+
+cfg = get_config("random_vit", device="cpu", seed=0)
+device = get_device(prefer="cpu")
+buffer = ReplayBuffer("data/my_way_home", capacity_transitions=10**9)
+train, val = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
+backbone = encoder_backbone(cfg.encoder)
+
+scores = {}
+for label, load in (("untrained", False), ("trained", True)):
+    model = WorldModel(cfg).to(device)
+    if load:
+        ck = torch.load("runs/m3_local/world_model_random_vit_seed0.pt",
+                        map_location=device, weights_only=True)
+        model.load_state_dict(ck["state_dict"])
+    model.eval()
+    lw, ew = E.fit_probes(model, train, backbone, device)
+    r = evaluate_rollout(model, val, lw, ew, context=5, horizon=45,
+                         device=device, feature_backbone=backbone)
+    scores[label] = (r.rssm_position[-1], np.nanmean(r.position_gap_closed()))
+    print(f"{label:<10} position_error@45={scores[label][0]:8.2f}  "
+          f"mean gap_closed={scores[label][1]:+.4f}")
+
+print()
+print("trained beats untrained on raw error:",
+      scores["trained"][0] < scores["untrained"][0])
+EOF
+```
+
+**This is the real gate for Task 12.** The trained model must beat its own initialisation
+on raw position error. If it does not, training accomplished nothing and no amount of
+baseline arithmetic will disguise that — check `kl_cleared_free_bits` in the training
+history first, since a frozen `prior_net` produces exactly this symptom.
+
+A negative `gap_closed` is still an acceptable outcome at 2000 steps; this task gates the
+harness and the training signal, not final model quality. What must not happen: an
+exception, an all-NaN `gap_closed`, or trained scoring worse than untrained.
 
 - [ ] **Step 5: Record results**
 
@@ -2465,6 +2824,11 @@ git commit -m "feat: end-to-end rollout evaluation, local single-arm validation"
 - [ ] `privileged_state` proven absent from every training tensor.
 - [ ] The rollout harness emits all three curves with no NaN and `floor <= persistence`.
 - [ ] Filtering probe implemented and its comparison reported (spec §4.4).
+- [ ] Training provably uses ONLY the training split (`test_loader_restricted_to_paths_never_samples_outside_them`).
+- [ ] `kl_cleared_free_bits` recorded; if False, the prior never trained and the run is void.
+- [ ] Rollout evaluation is deterministic — two runs of Task 12 give identical `gap_closed`.
+- [ ] The trained model beats its own initialisation on raw position error.
+- [ ] Band width recorded, with the count of horizon steps where the floor exceeds persistence.
 - [ ] Golden-rollout digest pinned and stable across runs.
 - [ ] Every mutation listed in each task's mutation table is caught, using a **self-checked** harness.
 - [ ] `encoders.py` still the only arm-varying module (grep for `cfg.arm` / `kind` outside it).
@@ -2496,6 +2860,11 @@ Decision: *(record whether the >3h gate fired and what was decided)*
 | position error — rssm / persistence / floor | |
 | angle error — rssm / persistence / floor | |
 | position_gap_closed (final) | |
-| band width `persistence - floor` | |
+| band width `persistence - floor` (min/median/max) | |
+| horizon steps with floor above persistence | |
+| gap_closed finite at how many of 45 steps | |
 | ratio stable? (spec §9 Q1) | |
+| `kl_cleared_free_bits` | |
+| trained beats untrained on raw error? | |
+| two eval runs identical? (determinism) | |
 | test count | |
