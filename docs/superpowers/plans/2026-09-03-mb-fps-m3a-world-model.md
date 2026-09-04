@@ -2033,10 +2033,11 @@ git commit -m "feat: linear probe into privileged space, angle-aware and varianc
 - Produces:
   - `RolloutResult` dataclass with `horizon: np.ndarray (H,)`, `rssm_position: (H,)`, `persistence_position: (H,)`, `floor_position: (H,)`, and the three `*_angle` counterparts
   - `gap_closed(persistence, model, floor) -> np.ndarray` — elementwise, NOT clipped
-  - `evaluate_rollout(model, val_paths, probe_weights, embedding_probe_weights, context=5, horizon=45, device=None, feature_backbone=None) -> RolloutResult`
-    — `probe_weights` maps the 1536-d latent; `embedding_probe_weights` maps the 2048-d
-    encoder embedding and supplies the floor (spec §3.2). They are different shapes and
-    must be fit separately.
+  - `evaluate_rollout(model, val_paths, embedding_probe_weights, context=5, horizon=45, device=None, feature_backbone=None) -> RolloutResult`
+    — takes ONE probe, mapping the 2048-d encoder embedding. All three references live in
+    embedding space so the band measures information content alone, not probe fit. The
+    1536-d latent probe is fit separately and used only by Task 10's filtering comparison,
+    where latent-versus-embedding IS the question.
   - `source_for(model, path, episode, feature_backbone) -> np.ndarray` — pixels for the pixel arm, the arm's own cached features otherwise
 
 - [ ] **Step 1: Write the failing tests**
@@ -2185,7 +2186,6 @@ class RolloutResult:
 def evaluate_rollout(
     model,
     val_paths,
-    probe_weights: np.ndarray,
     embedding_probe_weights: np.ndarray,
     context: int = 5,
     horizon: int = 45,
@@ -2235,12 +2235,30 @@ def evaluate_rollout(
             truth = probe_targets(
                 episode.privileged[start + context : start + need], episode.privileged_keys
             )
-            last_context = observed["latent"][0, -1].cpu().numpy()
+            # Persistence = the last REAL frame's embedding, held. Spec 3.2.
+            last_context_embedding = embeddings[0, context - 1].cpu().numpy()
 
-            model_pred = apply_probe(probe_weights, imagined["latent"][0].cpu().numpy())
+            # ALL THREE references are probed in EMBEDDING space with the SAME
+            # probe. They differ only in what information produced the
+            # embedding, which is the only thing the band should measure.
+            #
+            # An earlier version probed the model and persistence in 1536-d
+            # latent space and the floor in 2048-d embedding space. The band
+            # then spanned two differently-fit probes, so "dynamics helped" was
+            # confounded with "one probe fits better" -- the same defect as M2's
+            # feature-scale confound, and the one spec 2 exists to prevent.
+            #
+            # The RSSM's prediction of the future observation IS its embedding
+            # head's output, so using it is not a handicap: it is the model's
+            # actual claim about what it will see.
+            predicted_embeddings = model.heads(imagined["latent"])["embedding"]
+            model_pred = apply_probe(
+                embedding_probe_weights, predicted_embeddings[0].cpu().numpy()
+            )
             floor_pred = apply_probe(embedding_probe_weights, future_embeddings)
             pers_pred = apply_probe(
-                probe_weights, np.repeat(last_context[None, :], horizon, axis=0)
+                embedding_probe_weights,
+                np.repeat(last_context_embedding[None, :], horizon, axis=0),
             )
 
             rssm_pos.append(position_error(model_pred, truth))
@@ -2302,9 +2320,9 @@ def test_rollout_produces_the_full_band_on_real_data():
     buffer = ReplayBuffer("data/my_way_home", capacity_transitions=10**9)
     _, val = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
 
-    latents = np.random.default_rng(0).normal(size=(64, 1536))
+    embeds = np.random.default_rng(0).normal(size=(64, 2048))
     targets = np.random.default_rng(1).normal(size=(64, 4))
-    weights = fit_probe(latents, targets)
+    weights = fit_probe(embeds, targets)
 
     result = evaluate_rollout(
         model, val[:2], weights, context=5, horizon=10,
@@ -2683,7 +2701,7 @@ def main() -> None:
 
     latent_weights, embedding_weights = fit_probes(model, train, backbone, device)
     result = evaluate_rollout(
-        model, val, latent_weights, embedding_weights,
+        model, val, embedding_weights,
         context=args.context, horizon=args.horizon,
         device=device, feature_backbone=backbone,
     )
@@ -2772,8 +2790,8 @@ for label, load in (("untrained", False), ("trained", True)):
                         map_location=device, weights_only=True)
         model.load_state_dict(ck["state_dict"])
     model.eval()
-    lw, ew = E.fit_probes(model, train, backbone, device)
-    r = evaluate_rollout(model, val, lw, ew, context=5, horizon=45,
+    _, ew = E.fit_probes(model, train, backbone, device)
+    r = evaluate_rollout(model, val, ew, context=5, horizon=45,
                          device=device, feature_backbone=backbone)
     scores[label] = (r.rssm_position[-1], np.nanmean(r.position_gap_closed()))
     print(f"{label:<10} position_error@45={scores[label][0]:8.2f}  "
