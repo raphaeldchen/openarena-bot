@@ -2303,7 +2303,7 @@ import torch
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import episode_split
-from mbfps.eval.probe import fit_probe, probe_targets
+from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.models.encoders import encoder_backbone
 from mbfps.training.world_model import WorldModel
@@ -2636,7 +2636,7 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import load_episode
 from mbfps.data.split import episode_split
-from mbfps.eval.probe import fit_probe, probe_targets
+from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.models.encoders import encoder_backbone
 from mbfps.training.world_model import WorldModel
@@ -2644,6 +2644,13 @@ from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
 
 
+# NOTE: this function lives in `src/mbfps/eval/probe.py`, NOT in this script.
+# Two callers need it -- this CLI and Task 12's untrained control -- and
+# `import scripts.eval_rollout` fails because `scripts/` is not a package
+# (verified: ModuleNotFoundError). Put it in the library and import it here:
+#     from mbfps.eval.probe import fit_probes
+#
+# Shown here for context; write it into src/mbfps/eval/probe.py.
 @torch.no_grad()
 def fit_probes(model, paths, backbone, device, limit=20):
     """Fit BOTH probes on training episodes only.
@@ -2774,7 +2781,7 @@ from mbfps.models.encoders import encoder_backbone
 from mbfps.training.world_model import WorldModel
 from mbfps.utils.config import get_config
 from mbfps.utils.device import get_device
-import scripts.eval_rollout as E
+from mbfps.eval.probe import fit_probes
 
 cfg = get_config("random_vit", device="cpu", seed=0)
 device = get_device(prefer="cpu")
@@ -2790,7 +2797,7 @@ for label, load in (("untrained", False), ("trained", True)):
                         map_location=device, weights_only=True)
         model.load_state_dict(ck["state_dict"])
     model.eval()
-    _, ew = E.fit_probes(model, train, backbone, device)
+    _, ew = fit_probes(model, train, backbone, device)
     r = evaluate_rollout(model, val, ew, context=5, horizon=45,
                          device=device, feature_backbone=backbone)
     scores[label] = (r.rssm_position[-1], np.nanmean(r.position_gap_closed()))
