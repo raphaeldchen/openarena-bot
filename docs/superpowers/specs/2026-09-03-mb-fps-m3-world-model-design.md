@@ -82,6 +82,61 @@ The floor matters because it separates two failures M2's pixel metric could not:
 dynamics model is weak* versus *the encoder already discarded this information*. Without
 it, a low-scoring arm is uninterpretable.
 
+### 3.2a Measured design constants (spike, 2026-09-04)
+
+The evaluation design in §3.2 was specified on paper and then measured. Three of its
+implicit choices were wrong, and are corrected here. All figures come from a 2,000-step
+`random_vit` run on the real dataset, 229 validation windows.
+
+**All three references must pass through the identical pipeline.** The band is computed on
+`emb_head(latent)` for the model, for persistence, and for the floor — never on raw encoder
+embeddings. Fitting the probe on real embeddings and applying it to the model's *predicted*
+embeddings is a distribution mismatch, and it was destroying most of the signal:
+
+| | probe on real embeddings | probe in-distribution |
+|---|---|---|
+| horizon steps with band below 2 SE | 18/45 | **2/45** |
+| horizon steps with band <= 0 | 9/45 | **2/45** |
+| median band | +21.15 | **+53.23** |
+| `gap_closed` at horizon 45 | -7.26 | **-0.78** |
+
+**`free_bits` is 0.20, not the 1.0 nat of governing spec §3.5.** At 1.0 the dynamics prior
+receives gradient on 1 of 9 sampled steps, because the measured dyn KL rarely clears the
+floor; at 0.20 it receives gradient on 8 of 9. A floor of exactly 0 is also wrong — it
+penalises every nat and collapses the posterior (KL 0.0100 -> 0.0001 over 3,000 steps).
+
+| free_bits | prior_net gets gradient | kl_dyn at end |
+|---|---|---|
+| 0.00 | — | 0.0001 (collapsed) |
+| 0.05 | 7/9 steps | 0.354 |
+| **0.20** | **8/9 steps** | **0.333** |
+| 1.00 (governing spec) | 1/9 steps | 0.717 |
+
+**Rollouts stay stochastic; determinism comes from seeding.** Taking the categorical mode is
+not a neutral way to remove sampling noise — it collapses the imagined trajectory and
+roughly triples the error. It also gets *worse* with training, as sharpening logits make the
+mode more dominant, so an untrained smoke test will not reveal it.
+
+| rollout mode | distinct latents / 45 | position error at 45 |
+|---|---|---|
+| **stochastic** | **45** | **356** |
+| argmax | 3 | 1406 |
+| mean | 7 | 363 |
+
+**The probe needs ridge selection over standardised inputs.** A fixed `ridge=1.0` on
+unstandardised features underfits badly against targets of std ~240 (Doom map units). The
+measured optimum is 10^3–10^5, and the difference is R^2 0.16 against a ceiling of 0.42.
+
+**Decodability ceiling.** A linear probe on raw cached features reaches held-out R^2 of
+**0.422** (DINOv2) and **0.369** (random_vit). Position is therefore only moderately
+linearly decodable here, which bounds what any arm can score — and is exactly why §3.2's
+floor is needed to interpret the numbers.
+
+Note the ordering: **DINOv2 leads on position decoding while it came last on M2's pixel
+reconstruction.** That is the first direct evidence for this study's hypothesis, and it
+independently vindicates §2 — had M3 compared arms in pixel space it would have ranked them
+backwards. One seed, one scenario, frozen features: suggestive, not a result.
+
 ### 3.3 The headline comparable number
 
 ```
@@ -89,7 +144,11 @@ gap_closed = (persistence_error - rssm_error) / (persistence_error - floor_error
 ```
 
 Bounded in [0, 1] under normal conditions: **0** means no better than assuming the agent
-never moved; **1** means as good as this encoder permits. It is dimensionless and therefore
+never moved; **1** means as good as this encoder permits. Measured behaviour, with the §3.2a
+corrections applied: the band carries statistically meaningful width at 43 of 45 horizon
+steps, and a 2,000-step model scores -0.78. **Report the raw persistence/model/floor curves
+alongside the ratio**, since the band is roughly 25% of the error magnitude and a ratio over
+a narrow denominator deserves its inputs shown. It is dimensionless and therefore
 comparable across arms even though the arms' encoders have different floors — which is
 precisely the property embedding MSE lacks.
 
@@ -299,9 +358,11 @@ representation finding; this ordering exists to avoid repeating that.
 
 ## 9. Open questions
 
-- **Does `gap_closed` behave well when an arm's floor is very close to persistence?** The
-  denominator shrinks and the ratio becomes unstable. Plan 3 should check the observed
-  denominator magnitude and, if it is small, report the raw errors alongside the ratio.
+- ~~**Does `gap_closed` behave well when an arm's floor is very close to persistence?**~~
+  **ANSWERED (§3.2a).** It does not, when the probe is fit on a different distribution from
+  the one it is applied to: the band was dead at 18 of 45 horizon steps. Routing every
+  reference through the identical pipeline fixes it — 2 of 45 — and the raw curves are now
+  reported alongside the ratio regardless.
 - **Is 45 imagined steps the right horizon for `my_way_home`?** Episodes are ≥65 steps, so 5
   + 45 fits. Whether position error saturates well before 45 is an empirical question the
   error-vs-horizon curve answers directly.
