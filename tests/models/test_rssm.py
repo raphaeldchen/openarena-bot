@@ -161,6 +161,94 @@ def test_initial_state_shapes(rssm):
     assert h.abs().sum() == 0 and z.abs().sum() == 0
 
 
+def test_post_logits_depend_on_this_steps_action(rssm):
+    """`post_logits[:, i]` must depend on `actions[:, i]` -- i.e. `h` has
+    already been advanced with action `i` before the posterior at `i` is
+    formed. Moving `h = self._step(...)` to AFTER the posterior is formed
+    passes all the original 12 tests but shifts this dependency by one: the
+    posterior would then depend on `actions[0..i-1]` instead of `actions[0..i]`.
+
+    Two action sequences differing ONLY at step `i`, with the RNG pinned
+    identically, must produce identical `post_logits` for every step BEFORE
+    `i` (causality) and DIFFERENT `post_logits` at step `i` itself.
+    """
+    embeddings, actions = _batch()
+    i = 3
+    actions_a = actions.clone()
+    actions_b = actions.clone()
+    actions_b[:, i] = (actions_b[:, i] + 1) % 6  # differ ONLY at step i
+
+    torch.manual_seed(0)
+    post_a = rssm.observe(embeddings, actions_a)["post_logits"]
+    torch.manual_seed(0)
+    post_b = rssm.observe(embeddings, actions_b)["post_logits"]
+
+    torch.testing.assert_close(post_a[:, :i], post_b[:, :i])
+    assert not torch.allclose(post_a[:, i], post_b[:, i]), (
+        "post_logits[:, i] is unaffected by actions[:, i] -- "
+        "the posterior appears to see the PRE-action h"
+    )
+
+
+def test_post_logits_layout_matches_the_sampled_z(rssm):
+    """`post_logits`' (cats, classes) group layout must match the groups `z`
+    was actually sampled from. Replacing `_pack`'s
+    `unflatten(-1, (cats, classes))` with
+    `unflatten(-1, (classes, cats)).transpose(-1, -2)` keeps the same
+    (B, T, 32, 32) shape and passes all 12 original tests, because
+    cats == classes == 32 leaves no shape assertion able to catch it -- but
+    the next task's KL loss consumes `post_logits` assuming it lines up with
+    `z`, and a permuted layout would train silently on the wrong pairing.
+
+    `post_net`'s last layer is scaled way up so its softmax is extremely
+    peaked: sampling then almost always takes the mode, so a correctly
+    laid-out `z`'s argmax must equal `post_logits`' argmax.
+    """
+    with torch.no_grad():
+        last_layer = rssm.post_net[-1]
+        last_layer.weight.mul_(1e5)
+        last_layer.bias.mul_(1e5)
+
+    embeddings, actions = _batch()
+    out = rssm.observe(embeddings, actions)
+    z_modes = out["z"].view(B, T, 32, 32).argmax(-1)
+    logit_modes = out["post_logits"].argmax(-1)
+    assert torch.equal(z_modes, logit_modes)
+
+
+def test_observe_state_parameter_is_honoured(rssm):
+    """Passing an explicit `state` must actually be used. Deleting the
+    `state if state is not None else` fallback (always starting from zeros)
+    passes all the original 12 tests, since none of them pass a non-None
+    `state` into `observe`.
+    """
+    embeddings, actions = _batch()
+    zero_state = rssm.initial_state(B, embeddings.device)
+    nonzero_state = (torch.randn(B, 512), rssm._sample(torch.randn(B, 1024)))
+
+    torch.manual_seed(0)
+    out_none = rssm.observe(embeddings, actions, state=None)
+    torch.manual_seed(0)
+    out_zero = rssm.observe(embeddings, actions, state=zero_state)
+    torch.manual_seed(0)
+    out_nonzero = rssm.observe(embeddings, actions, state=nonzero_state)
+
+    torch.testing.assert_close(out_none["h"], out_zero["h"])
+    assert not torch.allclose(out_none["h"], out_nonzero["h"]), (
+        "observe() output is unaffected by a non-None state -- "
+        "the state= parameter appears to be ignored"
+    )
+
+
+def test_latent_dim_mismatch_is_rejected():
+    """`LATENT_DIM` is hardcoded as `512 + 32*32`. A non-default `RSSMConfig`
+    whose `h_dim + z_cats*z_classes` does not match it would silently diverge
+    from what the heads and probes assume the latent width is, unless
+    `RSSM.__init__` guards it."""
+    with pytest.raises(ValueError, match="1535.*1536|1536.*1535"):
+        RSSM(RSSMConfig(h_dim=511))
+
+
 def test_init_is_independent_of_prior_rng_consumption():
     """Same guarantee as the shared decoder: construction order must not decide
     weights, or arms with different encoder sizes get different RSSMs."""

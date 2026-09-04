@@ -1646,14 +1646,21 @@ class WorldModel(nn.Module):
     def embed(self, batch: dict[str, Any]) -> torch.Tensor:
         """Encode a `(B, T+1, ...)` window down to `(B, T, 2048)`.
 
-        The window carries one more frame than transitions; the RSSM consumes
-        the first T, which are the states the T actions were taken from.
+        The window carries one more frame than transitions. `RSSM.observe`
+        requires `actions[:, i]` to be the action that PRODUCED
+        `embeddings[:, i]` -- i.e. embedding `i` must be the frame action `i`
+        led to, not the frame it was taken from. `batch["actions"][i]` is
+        taken AT `obs[i]` and leads to `obs[i+1]`, so the RSSM consumes the
+        LAST T of the T+1 encoded frames -- `obs[1:T+1]` -- paired with the T
+        actions `actions[0:T]`. Returning `embeddings[:, :-1]` (the FIRST T)
+        instead would pair each action with the frame it was taken FROM,
+        making the posterior acausal.
         """
         source = batch["obs"] if self.input_kind == "obs" else batch["features"]
         b, t_plus_one = source.shape[0], source.shape[1]
         flat = source.reshape(b * t_plus_one, *source.shape[2:])
         embeddings = self.encoder(flat).view(b, t_plus_one, -1)
-        return embeddings[:, :-1]
+        return embeddings[:, 1:]
 
     def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
         embeddings = self.embed(batch)
@@ -2372,8 +2379,11 @@ def evaluate_rollout(
         source = source_for(model, path, episode, feature_backbone)
         for start in range(0, episode.length - need, need):
             window = slice(start, start + need + 1)
+            # `window` spans need+1 frames; drop the FIRST one so
+            # embeddings[k] is the frame actions[k] led to, matching the
+            # RSSM.observe convention documented on WorldModel.embed.
             embeddings = model.encoder(
-                torch.as_tensor(source[window][:-1]).to(device)
+                torch.as_tensor(source[window][1:]).to(device)
             ).unsqueeze(0)
             actions = torch.as_tensor(
                 episode.actions[start : start + need].astype(np.int64)
@@ -2832,12 +2842,17 @@ def fit_probes(model, paths, backbone, device, limit=20):
     for path in paths[:limit]:
         episode = load_episode(path)
         source = source_for(model, path, episode, backbone)
-        embeddings = model.encoder(torch.as_tensor(source[:-1]).to(device)).unsqueeze(0)
+        # Drop the FIRST frame, not the last: embeddings[i] must be the frame
+        # actions[i] led to, matching the RSSM.observe convention documented
+        # on WorldModel.embed. The target below shifts the same way, or
+        # latents[i] (now describing frame i+1) would be fit against
+        # privileged[i] (frame i) -- a one-step-misaligned regression.
+        embeddings = model.encoder(torch.as_tensor(source[1:]).to(device)).unsqueeze(0)
         actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
         out = model.rssm.observe(embeddings, actions)
         latents.append(out["latent"][0].cpu().numpy())
         embeds.append(embeddings[0].cpu().numpy())
-        targets.append(probe_targets(episode.privileged[:-1], episode.privileged_keys))
+        targets.append(probe_targets(episode.privileged[1:], episode.privileged_keys))
     y = np.concatenate(targets)
     return (
         fit_probe(np.concatenate(latents), y),

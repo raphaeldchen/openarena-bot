@@ -52,6 +52,15 @@ class RSSM(nn.Module):
     def __init__(self, cfg: RSSMConfig, seed: int = 0) -> None:
         super().__init__()
         self.cfg = cfg
+        computed_latent_dim = cfg.h_dim + cfg.z_cats * cfg.z_classes
+        if computed_latent_dim != LATENT_DIM:
+            raise ValueError(
+                f"cfg.h_dim + cfg.z_cats * cfg.z_classes = {computed_latent_dim}, "
+                f"but LATENT_DIM = {LATENT_DIM} is hardcoded as 512 + 32*32 for "
+                "the heads and probes that consume `latent`. A non-default "
+                "RSSMConfig that does not match LATENT_DIM would silently "
+                "diverge from every downstream shape assumption."
+            )
         self.z_dim = cfg.z_cats * cfg.z_classes
         with seeded_init(seed, "rssm"):
             self.cell = nn.GRUCell(self.z_dim + cfg.n_actions, cfg.h_dim)
@@ -93,7 +102,27 @@ class RSSM(nn.Module):
         return F.one_hot(actions.long(), self.cfg.n_actions).float()
 
     def observe(self, embeddings, actions, state=None) -> dict[str, torch.Tensor]:
-        """Filter: the posterior sees each embedding."""
+        """Filter: the posterior sees each embedding.
+
+        Ordering, per step: `h` is advanced with `actions[:, i]` FIRST, and the
+        posterior is formed only afterwards from that already-advanced `h`. So
+        `post_logits[:, i]` depends on `actions[0..i]` inclusive -- action `i`
+        has already moved `h` before the posterior at `i` is conditioned on it.
+        Moving the `_step` call to after the posterior is formed keeps every
+        shape and loss the same but silently conditions the posterior on the
+        PRE-action `h` instead -- a real behaviour change with no shape or
+        smoke test able to catch it.
+
+        Action-time convention (binds every caller of `observe`): `actions[:,
+        i]` must be the action that PRODUCED `embeddings[:, i]` -- i.e.
+        `embeddings[:, i]` is the encoding of the frame action `i` led to, not
+        the frame it was taken from. An `Episode` stores `obs` of length T+1,
+        where `actions[i]` is taken AT `obs[i]` and leads to `obs[i+1]`; the
+        correct pairing is therefore `encoder(obs[1:T+1])` with `actions[0:T]`.
+        Pairing `obs[0:T]` with `actions[0:T]` instead makes the model
+        acausal: the posterior at step `i` would be conditioned on the frame
+        from BEFORE action `i` was taken, rather than the frame it caused.
+        """
         b, t, _ = embeddings.shape
         h, z = state if state is not None else self.initial_state(b, embeddings.device)
         actions_onehot = self._onehot_actions(actions)
