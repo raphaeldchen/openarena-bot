@@ -3029,15 +3029,19 @@ git commit -m "feat: end-to-end rollout evaluation, local single-arm validation"
 
 ## Task 1 results
 
-*(fill in during execution)*
-
 | seq_len | ms/step | steps/s | hours for 20k |
 |---|---|---|---|
-| 16 | 27.1 | 36.900 | 0.15 |
-| 32 | 49.9 | 20.040 | 0.28 |
-| 64 | 96.7 | 10.341 | 0.54 |
+| 16 | 30.7 | 32.608 | 0.17 |
+| 32 | 56.6 | 17.659 | 0.31 |
+| 64 | 107.4 | 9.313 | 0.60 |
 
-Decision: Gate did NOT fire. Maximum hours_for_20k_steps is 0.54 hours (well below 3-hour threshold). Study parameters approved for Plan 4.
+These figures cover the RSSM and heads only; they exclude the encoder, which for the pixel
+arm is a 26.4M-parameter CNN that will dominate a real training step (Task 12 measures a
+real step, encoder included).
+
+Decision: Gate re-evaluated against the corrected head depth. Maximum hours_for_20k_steps
+is 0.60 hours (seq_len=64), still well below the 3-hour threshold. Gate did NOT fire. Study
+parameters remain approved for Plan 4.
 
 ---
 

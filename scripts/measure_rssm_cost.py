@@ -5,8 +5,14 @@ Plan 4's study is scoped from this number. M2's equivalent estimate predicted a
 the same mistake from setting a multi-hour compute budget.
 
 The stand-in is shape- and structure-accurate: a GRUCell stepped `seq_len`
-times at the real widths, plus heads at the real widths. Cost is determined by
-tensor shapes and the sequential structure, not by trained weights.
+times at the real widths, plus heads at the real widths (two hidden layers of
+512, matching the real RSSM's head MLPs). Cost is determined by tensor shapes
+and the sequential structure, not by trained weights.
+
+Scope: this measures the RSSM AND HEADS ONLY. It does NOT include the encoder.
+For the pixel arm the encoder is a 26.4M-parameter CNN that will dominate a
+real training step's cost -- do not mistake this number for the full per-step
+cost. Task 12 measures a real step, encoder included.
 """
 
 import argparse
@@ -24,25 +30,26 @@ EMBED_DIM = 2048
 N_ACTIONS = 6
 
 
+def _mlp(in_dim: int, out_dim: int, hidden: int = 512) -> nn.Sequential:
+    """Two hidden layers, matching the real RSSM's heads."""
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden), nn.SiLU(),
+        nn.Linear(hidden, hidden), nn.SiLU(),
+        nn.Linear(hidden, out_dim),
+    )
+
+
 class _Standin(nn.Module):
     """Same shapes and same sequential structure as the real RSSM."""
 
     def __init__(self) -> None:
         super().__init__()
         self.cell = nn.GRUCell(Z_DIM + N_ACTIONS, H_DIM)
-        self.prior = nn.Sequential(nn.Linear(H_DIM, 512), nn.SiLU(), nn.Linear(512, Z_DIM))
-        self.post = nn.Sequential(
-            nn.Linear(H_DIM + EMBED_DIM, 512), nn.SiLU(), nn.Linear(512, Z_DIM)
-        )
-        self.emb_head = nn.Sequential(
-            nn.Linear(LATENT_DIM, 512), nn.SiLU(), nn.Linear(512, EMBED_DIM)
-        )
-        self.reward_head = nn.Sequential(
-            nn.Linear(LATENT_DIM, 512), nn.SiLU(), nn.Linear(512, 1)
-        )
-        self.cont_head = nn.Sequential(
-            nn.Linear(LATENT_DIM, 512), nn.SiLU(), nn.Linear(512, 1)
-        )
+        self.prior = _mlp(H_DIM, Z_DIM)
+        self.post = _mlp(H_DIM + EMBED_DIM, Z_DIM)
+        self.emb_head = _mlp(LATENT_DIM, EMBED_DIM)
+        self.reward_head = _mlp(LATENT_DIM, 1)
+        self.cont_head = _mlp(LATENT_DIM, 1)
 
     def forward(self, embeddings, actions):
         b, t, _ = embeddings.shape
@@ -95,6 +102,8 @@ def main() -> None:
     print(f"ms_per_step={ms:.1f}")
     print(f"steps_per_second={1000 / ms:.3f}")
     print(f"hours_for_20k_steps={20_000 * ms / 3_600_000:.2f}")
+    print("NOTE: RSSM + heads only. Encoder cost is NOT included -- for the pixel arm")
+    print("      the 26.4M-param CNN encoder dominates. Task 12 measures a real step.")
 
 
 if __name__ == "__main__":
