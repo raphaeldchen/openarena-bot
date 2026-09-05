@@ -8,6 +8,7 @@ from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.models.rssm import KL_FREE_BITS
 from mbfps.training.world_model import WorldModel, train_world_model
 from mbfps.utils.config import get_config
+from mbfps.utils.seeding import seed_everything
 
 KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
 
@@ -135,9 +136,10 @@ def test_prior_net_trains_once_the_kl_exceeds_free_bits(buffer):
 def test_history_reports_whether_the_kl_ever_cleared_the_floor(buffer):
     """Makes the warm-up an observable, not an assumption.
 
-    Whether the KL crosses 1.0 nat on THIS dataset at THIS scale is an empirical
-    question. If it never does, the prior is frozen for the whole run and the
-    result is meaningless -- so the history must carry the evidence either way.
+    Whether the KL ever clears the `KL_FREE_BITS` floor (0.20 nat) on THIS dataset at
+    THIS scale is an empirical question. If it never does, the prior is frozen for the
+    whole run and the result is meaningless -- so the history must carry the evidence
+    either way.
     """
     history = train_world_model(tiny(), buffer, out_dir=None)
     assert "kl_dyn_max" in history
@@ -641,7 +643,7 @@ def test_the_split_seed_is_fixed_at_zero_not_the_training_seed(buffer, monkeypat
 
     seeded_differently = episode_split(buffer.episode_paths(), 0.2, 1)[0]
     assert seeded_differently != episode_split(buffer.episode_paths(), 0.2, 0)[0], (
-        "seeds 0 and 7 give the same split on this fixture, so this test cannot "
+        "seeds 0 and 1 give the same split on this fixture, so this test cannot "
         "detect a split that follows cfg.train.seed"
     )
     assert captured[0] == captured[1]
@@ -708,3 +710,254 @@ def test_history_records_every_step(buffer):
     assert len(history["parts"]) == 4
     assert history["seconds"] > 0
     assert history["arm"] == "cnn"
+
+
+# --------------------------------------------------------------------------
+# Behavioural guards added on top of the brief. Every test above this line
+# counts calls or inspects gradients before `step()` -- none of them looks at
+# what the loop actually DID. These six close exactly that gap: a training
+# loop that is a complete, silent no-op passes every test above.
+# --------------------------------------------------------------------------
+
+
+def test_parameters_actually_move_during_training(buffer, tmp_path):
+    """The loop must actually train something, not just run without crashing.
+
+    Found by mutation: moving `optimiser.zero_grad()` from before `loss.backward()` to
+    after it survives every test above, INCLUDING
+    `test_gradients_are_zeroed_between_optimiser_steps` -- `zero_grad()` is still called
+    exactly once per step, just too late to matter. Adam's update then divides a zeroed
+    first moment by a zeroed second moment and takes an exact 0.0 step every time, so the
+    loop runs to completion, logs a perfectly finite and perfectly reproducible loss
+    curve, and trains nothing at all for the entire run. Measured: max parameter change
+    over 3 steps is exactly 0.0 under this mutation.
+
+    Uses the checkpoint -- the only route a trained model leaves `train_world_model` by --
+    so this observes the real loop, not a hand-rolled one. `seed_everything` followed by
+    `WorldModel(cfg)` with the same `cfg` reproduces the loop's own pre-training weights
+    bit-for-bit (the same determinism `test_same_seed_reproduces_the_loss_curve` already
+    relies on), so diffing the checkpoint against that reference isolates exactly what
+    `step()` changed.
+    """
+    cfg = tiny()
+    seed_everything(cfg.train.seed)
+    init_model = WorldModel(cfg)
+    init_state = init_model.state_dict()
+    trainable = [name for name, p in init_model.named_parameters() if p.requires_grad]
+    init_snapshot = {name: init_state[name].clone() for name in trainable}
+
+    out = tmp_path / "ckpt"
+    train_world_model(cfg, buffer, out_dir=out)
+    payload = torch.load(
+        out / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt", weights_only=True
+    )
+    trained_state = payload["state_dict"]
+
+    total_change = 0.0
+    changed = 0
+    for name in trainable:
+        diff = (
+            (trained_state[name].cpu() - init_snapshot[name].cpu()).abs().sum().item()
+        )
+        total_change += diff
+        if diff > 0:
+            changed += 1
+
+    assert total_change > 0, (
+        "no trainable parameter moved at all across training -- the loop is a no-op"
+    )
+    assert changed > len(trainable) / 2, (
+        f"only {changed}/{len(trainable)} trainable tensors changed; a healthy "
+        "optimiser step moves most of them, not just one submodule"
+    )
+
+
+def test_grad_clip_reduces_a_large_gradient_norm_to_the_configured_max(buffer, monkeypatch):
+    """The clip must run AFTER `backward()`, on real gradients -- not before, on zeros.
+
+    Found by mutation: moving `clip_grad_norm_` before `loss.backward()` survives every
+    test above, including `test_gradients_are_clipped_at_the_specified_norm` -- that
+    test's spy only records the `max_norm` ARGUMENT, never whether the call had any
+    effect. Moved early, the clip runs on gradients that were just zeroed by
+    `zero_grad()` (`.grad` is `None` at that point, since `Adam.zero_grad()` defaults to
+    `set_to_none=True`) and is a permanent no-op: the run trains completely unclipped,
+    exactly the failure this code's own comment claims to prevent.
+
+    This spy multiplies whatever gradients exist at the moment `clip_grad_norm_` is
+    called by 1e6, then measures the total grad norm before and after the real clip. If
+    gradients are real (populated by `backward()` already having run), the pre-clip norm
+    is astronomically over `max_norm` and the post-clip norm must come back down to it.
+    If the clip runs before `backward()`, every `.grad` is `None` at that point,
+    multiplying by 1e6 does nothing, and the pre-clip norm is exactly zero -- which the
+    first assertion below rules out.
+    """
+    captured = {}
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def grad_norm(params):
+        squared = torch.zeros(())
+        for p in params:
+            if p.grad is not None:
+                squared = squared + (p.grad.detach() ** 2).sum()
+        return torch.sqrt(squared)
+
+    def spy(parameters, max_norm, *args, **kwargs):
+        params = list(parameters)
+        with torch.no_grad():
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(1e6)
+        before = grad_norm(params)
+        result = real_clip(params, max_norm, *args, **kwargs)
+        after = grad_norm(params)
+        captured["before"] = float(before)
+        captured["after"] = float(after)
+        captured["max_norm"] = max_norm
+        return result
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy)
+    train_world_model(tiny(steps=1), buffer, out_dir=None)
+
+    assert captured["before"] > captured["max_norm"], (
+        "gradients were zero (or absent) when clip_grad_norm_ was called, so this run "
+        "cannot tell whether the clip runs before or after backward()"
+    )
+    assert captured["after"] <= captured["max_norm"] + 1e-3, (
+        f"post-clip grad norm {captured['after']:.3f} exceeds max_norm "
+        f"{captured['max_norm']}; the clip had no effect"
+    )
+
+
+def test_rssm_and_head_seeds_each_follow_cfg_train_seed():
+    """`RSSM(seed=cfg.train.seed)` and `WorldModelHeads(seed=cfg.train.seed)` are two
+    independent wires, and each can be hardcoded without the other noticing.
+
+    Found by mutation: hardcoding EITHER constructor's `seed=` kwarg to a constant `0`
+    survives `test_different_seeds_diverge`, because that test only requires ONE source
+    of variation anywhere in the loop -- the loader, the RSSM init, or the heads init --
+    to produce a different loss curve. A multi-seed study needs every source pinned, not
+    just one, so each submodule is checked on its own here.
+    """
+    model_a = WorldModel(tiny(seed=0))
+    model_b = WorldModel(tiny(seed=1))
+
+    rssm_a = torch.cat([p.detach().flatten() for p in model_a.rssm.parameters()])
+    rssm_b = torch.cat([p.detach().flatten() for p in model_b.rssm.parameters()])
+    assert not torch.allclose(rssm_a, rssm_b), (
+        "RSSM parameters are identical across cfg.train.seed 0 and 1 -- the RSSM "
+        "constructor's seed looks hardcoded"
+    )
+
+    heads_a = torch.cat([p.detach().flatten() for p in model_a.heads.parameters()])
+    heads_b = torch.cat([p.detach().flatten() for p in model_b.heads.parameters()])
+    assert not torch.allclose(heads_a, heads_b), (
+        "WorldModelHeads parameters are identical across cfg.train.seed 0 and 1 -- the "
+        "heads constructor's seed looks hardcoded"
+    )
+
+
+def test_loader_seed_follows_cfg_train_seed(buffer, monkeypatch):
+    """The loop's `SequenceLoader(seed=cfg.train.seed, ...)` wire, checked directly.
+
+    Found by mutation: hardcoding the loader's `seed=` kwarg to a constant `0` survives
+    `test_different_seeds_diverge` -- comparing loss curves conflates the loader's
+    sampling seed with `seed_everything`'s effect on the model's own forward-pass
+    randomness (the categorical sampler) and weight init, any ONE of which is enough to
+    move the loss. Two runs at different `cfg.train.seed` produce different losses even
+    if BOTH loaders sample the identical windows, so a loss-only comparison cannot tell
+    whether this wire is connected at all. This looks at the windows themselves.
+    """
+    import mbfps.training.world_model as wm
+
+    captured_batches = []
+    real_loader = wm.SequenceLoader
+
+    def spy(*args, **kwargs):
+        loader = real_loader(*args, **kwargs)
+        real_sample = loader.sample
+
+        def sample(*a, **kw):
+            batch = real_sample(*a, **kw)
+            captured_batches.append(
+                (batch["window_start"].copy(), batch["episode_index"].copy())
+            )
+            return batch
+
+        loader.sample = sample
+        return loader
+
+    monkeypatch.setattr(wm, "SequenceLoader", spy)
+    train_world_model(tiny(seed=0, steps=1), buffer, out_dir=None)
+    train_world_model(tiny(seed=1, steps=1), buffer, out_dir=None)
+
+    assert len(captured_batches) == 2
+    (starts_a, idx_a), (starts_b, idx_b) = captured_batches
+    assert not (np.array_equal(starts_a, starts_b) and np.array_equal(idx_a, idx_b)), (
+        "cfg.train.seed 0 and 1 sampled the identical window(s) from the training "
+        "split, so this test cannot detect a loader seed hardcoded to a constant"
+    )
+
+
+def test_val_fraction_is_pinned_at_point_two(buffer, monkeypatch):
+    """`episode_split(..., val_fraction=0.2, ...)` -- the literal, not just its effect.
+
+    Found by mutation: `val_fraction=0.25` survives every test above, because on this
+    five-episode fixture `int(5 * 0.25) == int(5 * 0.2) == 1` -- the two values produce
+    an IDENTICAL split here and pass `test_training_holds_out_the_validation_split`
+    unchanged. On the real 122-episode dataset the same drift moves the hold-out from 24
+    to 30 episodes. This pins the literal value the call site passes, not its effect on
+    one fixture size.
+    """
+    import mbfps.training.world_model as wm
+
+    captured = {}
+    real_split = wm.episode_split
+
+    def spy(paths, val_fraction, seed):
+        captured["val_fraction"] = val_fraction
+        return real_split(paths, val_fraction, seed)
+
+    monkeypatch.setattr(wm, "episode_split", spy)
+    train_world_model(tiny(steps=1), buffer, out_dir=None)
+    assert captured["val_fraction"] == pytest.approx(0.2)
+
+
+def test_model_parameters_land_on_the_configured_device(buffer, monkeypatch):
+    """`cfg.train.device` must actually place the model, not merely get threaded through.
+
+    Found by mutation: calling `get_device()` with no argument (defaulting to `"mps"`)
+    survives every test above that only inspects losses or history, and every test in
+    this file that declares `device="cpu"` was, under that mutation, silently training on
+    MPS instead. This spies on `get_device` to prove `cfg.train.device` reaches it, and
+    then reads a live parameter's `.device` off the actual model the loop built and
+    trained, to prove that value is what placed it.
+    """
+    import mbfps.training.world_model as wm
+
+    captured = {}
+    real_get_device = wm.get_device
+
+    def spy(prefer="mps"):
+        captured["prefer"] = prefer
+        return real_get_device(prefer=prefer)
+
+    real_world_model_cls = wm.WorldModel
+    instances = []
+
+    def spy_world_model(cfg):
+        model = real_world_model_cls(cfg)
+        instances.append(model)
+        return model
+
+    monkeypatch.setattr(wm, "get_device", spy)
+    monkeypatch.setattr(wm, "WorldModel", spy_world_model)
+    train_world_model(tiny(steps=1, device="cpu"), buffer, out_dir=None)
+
+    assert captured["prefer"] == "cpu", (
+        "cfg.train.device did not reach get_device() as its 'prefer' argument"
+    )
+    assert instances, "WorldModel was never constructed"
+    device_seen = next(instances[0].parameters()).device
+    assert device_seen.type == "cpu", (
+        f"model parameters landed on {device_seen.type!r}, not the configured 'cpu'"
+    )
