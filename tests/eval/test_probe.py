@@ -7,17 +7,24 @@ from mbfps.eval.probe import (
     _mean_r2,
     angle_error_degrees,
     apply_probe,
+    filtering_comparison,
     fit_probe,
     position_error,
+    probe_r2,
     probe_targets,
 )
 
 KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
 
 
-def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
-    """Per-column R^2, averaged -- independent of the module's own _mean_r2 so
-    a mutation to that private helper doesn't also corrupt the check on it."""
+def _reference_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
+    """Per-column R^2, averaged -- independent of the module's own _mean_r2 (and
+    of the module's own `probe_r2`, which delegates straight to it) so a
+    mutation to that private helper doesn't also corrupt the check on it.
+
+    Named apart from the module's `probe_r2` (imported above, and exercised
+    directly by the filtering-comparison tests below) so the two are never
+    confused: this one exists purely as an independent oracle."""
     pred = apply_probe(probe, latents)
     scores = []
     for c in range(targets.shape[1]):
@@ -82,7 +89,7 @@ def test_ridge_selection_beats_a_fixed_default():
 
     selected = fit_probe(x, y, xv, yv)
     fixed = fit_probe(x, y, ridge=1.0)
-    assert probe_r2(selected, xv, yv) >= probe_r2(fixed, xv, yv)
+    assert _reference_r2(selected, xv, yv) >= _reference_r2(fixed, xv, yv)
     assert "r2" in selected and selected["ridge"] in RIDGES
 
 
@@ -231,12 +238,12 @@ def test_ridge_selection_picks_the_genuine_held_out_maximum():
     """Catches turning selection into a no-op: `if best is None or score >
     best[0]` mutated to `if best is None`, which always keeps the first grid
     entry (RIDGES[0] = 1e-1) and never updates thereafter. The correct pick
-    on this data is measured independently below (via `probe_r2`, not the
-    module's own `_mean_r2`) and is far from RIDGES[0]."""
+    on this data is measured independently below (via `_reference_r2`, not
+    the module's own `_mean_r2`) and is far from RIDGES[0]."""
     x, y, xv, yv = _overparameterised_case()
 
     independently_scored = {
-        ridge: probe_r2(fit_probe(x, y, ridge=ridge), xv, yv) for ridge in RIDGES
+        ridge: _reference_r2(fit_probe(x, y, ridge=ridge), xv, yv) for ridge in RIDGES
     }
     correct_ridge = max(independently_scored, key=independently_scored.get)
     assert correct_ridge != RIDGES[0]  # confirms the case is discriminating
@@ -254,8 +261,8 @@ def test_ridge_selection_scores_on_held_out_data_not_training_data():
     be the held-out score, not the training score."""
     x, y, xv, yv = _overparameterised_case()
 
-    train_scored = {ridge: probe_r2(fit_probe(x, y, ridge=ridge), x, y) for ridge in RIDGES}
-    val_scored = {ridge: probe_r2(fit_probe(x, y, ridge=ridge), xv, yv) for ridge in RIDGES}
+    train_scored = {ridge: _reference_r2(fit_probe(x, y, ridge=ridge), x, y) for ridge in RIDGES}
+    val_scored = {ridge: _reference_r2(fit_probe(x, y, ridge=ridge), xv, yv) for ridge in RIDGES}
     train_optimal = max(train_scored, key=train_scored.get)
     val_optimal = max(val_scored, key=val_scored.get)
     assert train_optimal != val_optimal  # confirms the case is discriminating
@@ -320,3 +327,149 @@ def test_probe_targets_names_the_missing_keys():
     assert "pos_x" in message
     assert "pos_y" in message
     assert "angle" in message
+
+
+# --- Filtering probe: does the posterior latent carry history? ------------
+#
+# The posterior has already seen frame t, so by the data-processing
+# inequality it cannot add information about t over the encoder embedding of
+# t. What it can add is history, carried in the deterministic state `h`. If
+# a probe on the posterior latent does not beat a probe on the raw embedding
+# at the same timestep, `h` is inert -- a specific, actionable bug.
+
+
+def test_r2_is_one_for_a_perfect_linear_fit():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(100, 8))
+    w = rng.normal(size=(9, 4))
+    y = x @ w[:-1] + w[-1]
+    assert probe_r2(fit_probe(x, y, ridge=1e-10), x, y) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_r2_is_near_zero_for_unrelated_features():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(400, 8))
+    y = rng.normal(size=(400, 4))
+    assert probe_r2(fit_probe(x, y, ridge=1.0), rng.normal(size=(400, 8)), y) < 0.2
+
+
+def test_r2_uses_per_column_variance_not_pooled():
+    """pos_x has std ~253 and sin(angle) ~0.7. Pooling the variance would let
+    the position columns dominate and hide a useless angle prediction."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(200, 6))
+    y = np.column_stack([
+        x[:, 0] * 250.0,            # large scale, perfectly predictable
+        x[:, 1] * 250.0,
+        rng.normal(size=200) * 0.7,  # small scale, pure noise
+        rng.normal(size=200) * 0.7,
+    ])
+    r2 = probe_r2(fit_probe(x, y, ridge=1e-8), x, y)
+    assert r2 < 0.9, f"pooled variance hid two unpredictable columns (r2={r2:.3f})"
+
+
+def test_filtering_comparison_detects_history_in_the_latent():
+    """Synthetic: the latent carries a lagged signal the embedding lacks, so a
+    probe on it must score higher."""
+    rng = np.random.default_rng(0)
+    n = 400
+    signal = rng.normal(size=n)
+    lagged = np.roll(signal, 1)
+    embed = signal[:, None] * np.ones((1, 4))
+    latent = np.column_stack([embed, lagged[:, None] * np.ones((1, 4))])
+    targets = np.column_stack([lagged, lagged, lagged, lagged]) + 0.01 * rng.normal(size=(n, 4))
+
+    half = n // 2
+    result = filtering_comparison(
+        latent[:half], embed[:half], latent[half:], embed[half:],
+        targets[:half], targets[half:],
+    )
+    assert result["latent_r2"] > result["embedding_r2"]
+    assert result["latent_beats_embedding"] is True
+
+
+def test_filtering_comparison_reports_failure_when_the_latent_adds_nothing():
+    """If h is dead the latent is just the embedding, and this must say so
+    rather than passing quietly."""
+    rng = np.random.default_rng(0)
+    n = 400
+    embed = rng.normal(size=(n, 4))
+    latent = np.concatenate([embed, np.zeros((n, 4))], axis=1)  # dead h
+    targets = embed + 0.01 * rng.normal(size=(n, 4))
+    half = n // 2
+    result = filtering_comparison(
+        latent[:half], embed[:half], latent[half:], embed[half:],
+        targets[:half], targets[half:],
+    )
+    assert result["latent_beats_embedding"] is False
+
+
+def test_filtering_comparison_fits_on_the_train_split_not_the_validation_split():
+    """A probe fit on the *validation* set (a leak: passing val data as the
+    fit arguments instead of train) would memorise a small val split when it
+    has more features than rows, reporting a near-perfect R^2 that has
+    nothing to do with genuine held-out generalisation. This is caught
+    empirically here, not by inspection: `test_r2_is_near_zero_for_unrelated_
+    features` -- the test the task brief names as the guard against exactly
+    this mutation -- never calls `filtering_comparison` at all, so it cannot
+    catch anything wrong inside it (confirmed: the mutation survives the
+    entire pre-existing suite, 27/27 green, before this test was added).
+
+    On fully unrelated features and targets, a probe correctly fit only on a
+    large TRAIN split, then scored on a small held-out split, must not reach
+    a high R^2 -- unlike a leaked fit-on-val, which (measured) reaches
+    ~0.9999 on this exact data by memorising 5 points with 20 features.
+    """
+    rng = np.random.default_rng(0)
+    n_train, n_val, p = 200, 5, 20
+    latent_train = rng.normal(size=(n_train, p))
+    embed_train = rng.normal(size=(n_train, p))
+    latent_val = rng.normal(size=(n_val, p))
+    embed_val = rng.normal(size=(n_val, p))
+    targets_train = rng.normal(size=(n_train, 4))
+    targets_val = rng.normal(size=(n_val, 4))
+
+    result = filtering_comparison(
+        latent_train, embed_train, latent_val, embed_val, targets_train, targets_val
+    )
+    assert result["latent_r2"] < 0.5
+    assert result["embedding_r2"] < 0.5
+
+
+def test_filtering_comparison_selects_each_probes_ridge_independently():
+    """Sharing one ridge across both probes (e.g. reusing whichever ridge the
+    latent probe selected to also fit the embedding probe) would handicap
+    whichever space needs different regularisation -- exactly what passing
+    validation data to each `fit_probe` call independently exists to avoid.
+    This mutation is not cosmetic: measured, it survives the entire
+    pre-existing suite (27/27 green) before this test was added.
+
+    Engineered gap: latent is low-dimensional and well-determined (a small
+    ridge already generalises well); embedding is overparameterised relative
+    to n_train (only heavy regularisation generalises). A correct, per-probe
+    independent selection must score the embedding at least as well as
+    forcing the latent probe's selected ridge onto it would."""
+    rng = np.random.default_rng(0)
+    n_train, n_val = 50, 60
+    p_lat, p_emb = 3, 150
+
+    w_lat = rng.normal(size=(p_lat + 1, 4)) * 3.0
+    latent_train = rng.normal(size=(n_train, p_lat))
+    latent_val = rng.normal(size=(n_val, p_lat))
+    targets_train = latent_train @ w_lat[:-1] + w_lat[-1] + rng.normal(size=(n_train, 4)) * 0.2
+    targets_val = latent_val @ w_lat[:-1] + w_lat[-1] + rng.normal(size=(n_val, 4)) * 0.2
+
+    # Overparameterised relative to n_train=50, unrelated to targets: a small
+    # ridge overfits noise, only heavy regularisation generalises.
+    embed_train = rng.normal(size=(n_train, p_emb))
+    embed_val = rng.normal(size=(n_val, p_emb))
+
+    result = filtering_comparison(
+        latent_train, embed_train, latent_val, embed_val, targets_train, targets_val
+    )
+
+    latent_only = fit_probe(latent_train, targets_train, latent_val, targets_val)
+    forced = fit_probe(embed_train, targets_train, ridge=latent_only["ridge"])
+    forced_r2 = probe_r2(forced, embed_val, targets_val)
+
+    assert result["embedding_r2"] > forced_r2

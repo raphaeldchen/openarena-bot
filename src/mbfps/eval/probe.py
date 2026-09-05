@@ -129,3 +129,45 @@ def angle_error_degrees(predicted: np.ndarray, true: np.ndarray) -> np.ndarray:
     real = np.arctan2(true[:, 2], true[:, 3])
     difference = np.abs(np.rad2deg(np.arctan2(np.sin(pred - real), np.cos(pred - real))))
     return difference
+
+
+def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
+    """Mean R^2 across the four target columns.
+
+    Averaged per column rather than pooled: `pos_x` has std ~253 while
+    `sin(angle)` has std ~0.7, so a pooled variance would be dominated by
+    position and a completely useless angle prediction would not show up.
+
+    A column with zero variance contributes nothing rather than a NaN -- which
+    is why PROBE_KEYS excludes `health` and `pos_z`, but the guard stays in case
+    a validation slice happens to be degenerate.
+    """
+    return _mean_r2(apply_probe(probe, latents), targets)
+
+
+def filtering_comparison(
+    latent_train: np.ndarray,
+    embedding_train: np.ndarray,
+    latent_val: np.ndarray,
+    embedding_val: np.ndarray,
+    targets_train: np.ndarray,
+    targets_val: np.ndarray,
+) -> dict:
+    """Does the posterior latent beat the raw embedding at the SAME timestep?
+
+    The posterior has already seen frame t, so it cannot add information about t
+    over the embedding of t. What it can add is history, carried in the
+    deterministic state `h`. If it does not win here, `h` is inert.
+    """
+    # Ridge SELECTED on the validation split for each probe independently --
+    # one probe's optimum is not the other's, and forcing a shared value would
+    # handicap whichever space suits it worse, which is the comparison itself.
+    latent_weights = fit_probe(latent_train, targets_train, latent_val, targets_val)
+    embedding_weights = fit_probe(embedding_train, targets_train, embedding_val, targets_val)
+    latent_r2 = probe_r2(latent_weights, latent_val, targets_val)
+    embedding_r2 = probe_r2(embedding_weights, embedding_val, targets_val)
+    return {
+        "latent_r2": latent_r2,
+        "embedding_r2": embedding_r2,
+        "latent_beats_embedding": bool(latent_r2 > embedding_r2),
+    }
