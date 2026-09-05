@@ -36,6 +36,12 @@ def main() -> None:
     print(f"steps_per_second={history['steps'] / history['seconds']:.2f}")
     print(f"loss_first{n}={sum(history['loss'][:n]) / n:.5f}")
     print(f"loss_last{n}={sum(history['loss'][-n:]) / n:.5f}")
+    # Printed unconditionally, not only inside train_world_model's sub-0.5
+    # warning: a run whose prior DID train is exactly the case where the number
+    # has to be on record, and the plan's exit criteria require it recorded for
+    # every arm so two arms' rates can be compared before their errors are.
+    print(f"kl_dyn_max={history['kl_dyn_max']:.5f}")
+    print(f"kl_rate_above_free_bits={history['kl_rate_above_free_bits']:.4f}")
 
 
 if __name__ == "__main__":

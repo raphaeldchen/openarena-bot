@@ -3062,20 +3062,71 @@ parameters remain approved for Plan 4.
 
 ## Task 12 results
 
-*(fill in during execution)*
+Measured 2026-09-04 on the M1 dataset (122 episodes, 98 train / 24 val), fp32,
+MPS for the CLI and CPU for the untrained control. Errors are Doom map units.
 
 | quantity | value |
 |---|---|
 | arm / seed / steps | random_vit / 0 / 2000 |
-| steps_per_second (measured) | |
-| position error — rssm / persistence / floor | |
-| angle error — rssm / persistence / floor | |
-| position_gap_closed (final) | |
-| band width `persistence - floor` (min/median/max) | |
-| horizon steps with floor above persistence | |
-| gap_closed finite at how many of 45 steps | |
-| ratio stable? (spec §9 Q1) | |
-| `kl_rate_above_free_bits` | |
-| trained beats untrained on raw error? | |
-| two eval runs identical? (determinism) | |
-| test count | |
+| steps_per_second (measured) | **7.58** (2000 steps in 264 s, seq_len 32, batch 16) |
+| position error — rssm / persistence / floor | 306.79 / 265.96 / 249.53 |
+| angle error — rssm / persistence / floor | 94.59° / 86.56° / 86.21° |
+| position_gap_closed (final) | **-2.4851** (mean over horizon -8.96, min -88.61, max -1.87) |
+| band width `persistence - floor` (min/median/max) | -2.491 / 5.648 / 16.430 — i.e. -1.0% / 2.2% / 6.2% of the persistence error |
+| horizon steps with floor above persistence | 2 / 45 (steps 1 and 3) |
+| gap_closed finite at how many of 45 steps | 43 / 45 |
+| ratio stable? (spec §9 Q1) | **No.** See below. |
+| `kl_rate_above_free_bits` | **0.7265** (peak kl_dyn 8.096) — the prior did train |
+| trained beats untrained on raw error? | **Yes overall, no at the single endpoint.** See below. |
+| two eval runs identical? (determinism) | **Yes** — all seven curves bitwise identical, `gap_closed` identical NaN-for-NaN |
+| test count | **423 passed** (416 before, +7 for `fit_probes`) |
+
+**The ratio is not stable, and the reason is not the harness.** The band is only
+~2% of the error it divides, so `gap_closed` ranges over -1.87 to -88.61 across
+adjacent horizon steps of one run. On the untrained control the band collapses
+to ~0.01 units and two runs of the identical script returned mean `gap_closed`
+of +1.0778 and +0.8224 — a swing produced by CPU float-reduction order alone.
+Spec §9 open question 1 is answered: **at this training scale the ratio must
+not be reported without the band width beside it**, and the raw errors are the
+reportable quantity. `scripts/eval_rollout.py` therefore always prints the
+width, the band as a fraction of persistence, and the count of degenerate steps.
+
+**Trained vs its own initialisation** (same seed, so `WorldModel(cfg)` IS the
+checkpoint's initialisation; both evaluated identically on CPU):
+
+| protocol | untrained @45 | trained @45 | trained better at | horizon mean |
+|---|---|---|---|---|
+| ridge SELECTED on held-out episodes | 300.29 | 303.22 | 39/45 steps | 284.89 vs 296.97 (**+4.1%**) |
+| ridge fixed at 1e3 (no selection) | 304.81 | 300.82 | **45/45 steps** | 282.13 vs 304.10 (**+7.2%**) |
+
+Training is a clear improvement on both protocols; they disagree only on the
+last few horizon steps. Under selection the untrained model's probe is pushed
+to ridge 1e7 with held-out R² **-0.0335** — a *constant* predictor sitting at
+the dataset mean, whose error is flat at ~300 at every horizon (299.22 at step
+1, 300.29 at step 45). That is a deceptively strong baseline: the trained
+model's rollout degrades from 264.78 to 303.22 and crosses the flat line at
+horizon 39. So the endpoint comparison is "a drifting predictor vs the mean",
+not "training accomplished nothing" — `kl_rate_above_free_bits` of 0.73 rules
+out the frozen-`prior_net` diagnosis, and the trained model's own floor (257.72)
+and persistence (277.52) sit far below the untrained model's 300.31.
+
+**Where the position information goes — the finding Plan 4 should be scoped
+from.** One probe protocol (ridge selected on 4 held-out episodes), four spaces,
+same 20 training episodes:
+
+| space | dim | selected ridge | held-out R² |
+|---|---|---|---|
+| raw cached `random_vit` features (patch-mean) | 384 | 1e-1 | **0.3498** |
+| encoder embedding (bottleneck output) | 2048 | 1e3 | **0.3278** |
+| RSSM posterior latent | 1536 | 1e5 | **-0.0058** |
+| predicted embedding (what the rollout probes) | 2048 | 1e5 | **0.0011** |
+
+The 0.3498 reproduces spec §3.2's measured 0.369 ceiling for this arm, so the
+episode-level held-out protocol is sound and the encoder preserves position
+almost intact. **The RSSM latent is where it is destroyed.** Every rollout
+number above is therefore measuring a probe with no signal, which is why all
+three references land within 2% of each other and why the band is degenerate.
+Fixing rollout accuracy at this scale means getting position into the latent
+first; tuning the dynamics against a probe with R² 0.001 would be measuring
+noise. Whether 2000 steps is simply too few (the config default is 20,000) is
+untested and is the first thing Plan 4 should settle.

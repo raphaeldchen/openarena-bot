@@ -20,6 +20,9 @@ Positions are Doom map units, not metres.
 """
 
 import numpy as np
+import torch
+
+from mbfps.data.episode import load_episode
 
 PROBE_KEYS: tuple[str, ...] = ("pos_x", "pos_y", "angle")
 """Privileged channels that actually vary in this scenario."""
@@ -143,6 +146,98 @@ def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
     a validation slice happens to be degenerate.
     """
     return _mean_r2(apply_probe(probe, latents), targets)
+
+
+@torch.no_grad()
+def fit_probes(
+    model,
+    paths,
+    backbone,
+    device,
+    limit: int = 20,
+    seed: int = 0,
+    select_episodes: int = 4,
+    ridge: float | None = None,
+) -> tuple[dict, dict]:
+    """Fit both probes on TRAINING episodes only.
+
+    Returns `(latent_probe, embedding_probe)`.
+
+    Which one the rollout uses, and why there are still two:
+
+    - `embedding_probe` is THE probe `evaluate_rollout` takes. It is fit on the
+      model's OWN PREDICTED embeddings -- `heads(latent)["embedding"]` -- not on
+      the raw encoder output, because all three rollout references (model,
+      persistence, floor) are scored after passing through that same head. A
+      probe fit on real encoder embeddings and applied to predicted ones is a
+      distribution mismatch, and it measurably destroys the signal: band below
+      2 SE at 18 of 45 horizon steps against 2 of 45, and gap_closed at horizon
+      45 moving from -7.26 to -0.78 on one unchanged checkpoint. See the module
+      docstring of `mbfps.eval.rollout`.
+    - `latent_probe` is a DIAGNOSTIC on the 1536-d posterior latent, reported
+      alongside. It is deliberately NOT a second space for the band: an earlier
+      design probed model and persistence in latent space and the floor in
+      embedding space, so the band spanned two differently-fit probes and
+      "dynamics helped" was confounded with "one probe fits better".
+
+    Sampling in `observe` is stochastic, so this seeds the global RNG: without
+    it two identical evaluation runs fit two different probes and every
+    downstream number moves. `evaluate_rollout` re-seeds independently, so how
+    much RNG is drawn here does not perturb the rollout.
+
+    Args:
+        model: a `WorldModel` (or anything duck-typed like one).
+        paths: TRAINING episode paths. Passing validation paths would leak.
+        backbone: cached-feature backbone name, or None for the pixel arm.
+        device: where to run the encoder and RSSM.
+        limit: how many episodes to fit on.
+        seed: fixes the posterior samples, and so the probe.
+        select_episodes: how many of the used episodes are held back to SELECT
+            the ridge rather than fit it. Selection is not optional -- a fixed
+            ridge on unstandardised inputs cost held-out R^2 0.16 against a
+            ceiling of 0.42 -- but it needs data the weights did not see. Zero,
+            or too few episodes to spare, falls back to `fit_probe`'s default.
+        ridge: pin the penalty and skip selection entirely (tests).
+    """
+    from mbfps.eval.rollout import source_for
+
+    torch.manual_seed(seed)
+    latents, embeds, targets = [], [], []
+    for path in paths[:limit]:
+        episode = load_episode(path)
+        source = source_for(model, path, episode, backbone)
+        # Drop the FIRST frame, not the last: embeddings[i] must be the frame
+        # actions[i] led to, matching the RSSM.observe convention documented on
+        # WorldModel.embed. The target below shifts the same way, or latents[i]
+        # (now describing frame i+1) would be fit against privileged[i] (frame
+        # i) -- a one-step-misaligned regression that no shape check can see.
+        embeddings = model.encoder(torch.as_tensor(source[1:]).to(device)).unsqueeze(0)
+        actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
+        out = model.rssm.observe(embeddings, actions)
+        latents.append(out["latent"][0].float().cpu().numpy())
+        embeds.append(model.heads(out["latent"])["embedding"][0].float().cpu().numpy())
+        targets.append(probe_targets(episode.privileged[1:], episode.privileged_keys))
+
+    if not latents:
+        raise ValueError("no episodes to fit the probe on; `paths` was empty")
+
+    # Split at EPISODE granularity, like the train/val split itself. Splitting
+    # rows would put frames from one episode on both sides, and consecutive
+    # frames are near-duplicates, so the selection set would not be held out in
+    # any meaningful sense and every ridge would look equally good.
+    spare = len(latents) - select_episodes
+    if ridge is not None or select_episodes <= 0 or spare < 1:
+        return (
+            fit_probe(np.concatenate(latents), np.concatenate(targets), ridge=ridge),
+            fit_probe(np.concatenate(embeds), np.concatenate(targets), ridge=ridge),
+        )
+
+    cat = lambda xs: np.concatenate(xs)  # noqa: E731
+    y_fit, y_sel = cat(targets[:spare]), cat(targets[spare:])
+    return (
+        fit_probe(cat(latents[:spare]), y_fit, cat(latents[spare:]), y_sel),
+        fit_probe(cat(embeds[:spare]), y_fit, cat(embeds[spare:]), y_sel),
+    )
 
 
 def filtering_comparison(

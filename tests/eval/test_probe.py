@@ -539,3 +539,193 @@ def test_filtering_comparison_genuinely_selects_a_ridge_for_each_probe():
     )
     assert result["latent_r2"] == pytest.approx(latent_scores[latent_best], abs=1e-6)
     assert result["embedding_r2"] == pytest.approx(embedding_scores[embedding_best], abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# fit_probes -- the whole-episode driver. Task 12's CLI and its untrained
+# control both call it, so what it returns IS the measurement.
+# ---------------------------------------------------------------------------
+
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+
+from mbfps.data.episode import Episode, save_episode  # noqa: E402
+from mbfps.envs.protocol import OBS_SHAPE  # noqa: E402
+from mbfps.eval.probe import fit_probes  # noqa: E402
+
+DX, DY = 10.0, -3.0
+
+
+def _tagged_episode(length: int) -> Episode:
+    """`obs[t]` carries `t` verbatim and `pos_x = 10*t`, `pos_y = -3*t`."""
+    obs = np.zeros((length + 1, *OBS_SHAPE), dtype=np.uint8)
+    obs[:, 0, 0, 0] = np.arange(length + 1, dtype=np.uint8)
+    t = np.arange(length + 1, dtype=np.float32)
+    privileged = np.zeros((length + 1, len(KEYS)), dtype=np.float32)
+    privileged[:, 0] = 100.0
+    privileged[:, 1] = DX * t
+    privileged[:, 2] = DY * t
+    return Episode(
+        obs=obs,
+        actions=np.arange(length, dtype=np.int32) % 6,
+        rewards=np.zeros(length, dtype=np.float32),
+        terminated=np.zeros(length, dtype=bool),
+        truncated=np.zeros(length, dtype=bool),
+        privileged=privileged,
+        privileged_keys=KEYS,
+        policy_name="synthetic",
+        seed=0,
+        scenario="probe",
+    )
+
+
+def _write_episodes(tmp_path, lengths) -> list:
+    paths = []
+    for i, length in enumerate(lengths):
+        path = tmp_path / f"ep_{i:06d}_len{length:05d}.npz"
+        save_episode(_tagged_episode(length), path)
+        paths.append(path)
+    return paths
+
+
+class _TagEncoder(nn.Module):
+    """`emb[n] = [index of the frame obs[n]]` -- an exact, invertible tag."""
+
+    def forward(self, obs):
+        return obs[:, 0, 0, 0].to(torch.float32).unsqueeze(-1)
+
+
+class _PassThroughRSSM(nn.Module):
+    def observe(self, embeddings, actions, state=None):
+        return {"latent": embeddings}
+
+
+class _NoisyRSSM(nn.Module):
+    """A posterior that genuinely SAMPLES, like the real categorical one."""
+
+    def observe(self, embeddings, actions, state=None):
+        return {"latent": embeddings + torch.randn_like(embeddings)}
+
+
+class _WideningHeads(nn.Module):
+    """Predicted embedding is a different WIDTH from the encoder's output, so
+    which of the two the probe was fit on is visible in its shape alone."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.width = width
+
+    def forward(self, latent):
+        return {"embedding": latent.repeat_interleave(self.width, dim=-1)}
+
+
+class _FakeModel(nn.Module):
+    input_kind = "obs"
+
+    def __init__(self, rssm=None, head_width: int = 1) -> None:
+        super().__init__()
+        self.encoder = _TagEncoder()
+        self.rssm = rssm or _PassThroughRSSM()
+        self.heads = _WideningHeads(head_width)
+
+
+def _fit(paths, **kwargs):
+    return fit_probes(_FakeModel(**kwargs.pop("model", {})), paths, None,
+                      torch.device("cpu"), **kwargs)
+
+
+def test_fit_probes_fits_the_embedding_probe_on_predicted_not_encoder_embeddings(
+    tmp_path,
+):
+    """THE pipeline test. `evaluate_rollout` scores all three references after
+    the embedding HEAD, so the probe must be fit on the head's output. Fitting
+    it on the raw encoder embedding instead is a distribution mismatch that was
+    measured destroying the signal -- band below 2 SE at 18 of 45 horizon steps
+    against 2 of 45, gap_closed at 45 moving -7.26 -> -0.78 on one checkpoint.
+
+    Made visible by giving the head a different width from the encoder: the
+    encoder emits 1 feature, the head 5, so the fitted weight matrix's shape
+    says unambiguously which one was regressed."""
+    paths = _write_episodes(tmp_path, [20])
+    latent_probe, embedding_probe = _fit(paths, model={"head_width": 5}, ridge=1e-8)
+
+    assert latent_probe["w"].shape == (1 + 1, 4), "latent probe is the 1-d tag"
+    assert embedding_probe["w"].shape == (5 + 1, 4), (
+        "embedding probe must be fit on the 5-wide PREDICTED embedding, not on "
+        "the 1-wide encoder output"
+    )
+
+
+def test_fit_probes_aligns_each_latent_with_the_frame_its_action_produced(tmp_path):
+    """The regression must pair `latent[i]` with the privileged state of the
+    frame action `i` LED TO, matching RSSM.observe's convention. Dropping the
+    last frame instead of the first shifts every pair by one step and still
+    fits perfectly -- both sides stay linear in the frame index -- so only the
+    recovered VALUES can catch it. Here a tag of 5 must decode to frame 5's
+    position; under the off-by-one it decodes to frame 6's."""
+    paths = _write_episodes(tmp_path, [20])
+    latent_probe, _ = _fit(paths, ridge=1e-8)
+
+    decoded = apply_probe(latent_probe, np.array([[5.0]]))
+    expected = probe_targets(_tagged_episode(20).privileged[5:6], KEYS)
+    np.testing.assert_allclose(decoded, expected, atol=1e-4)
+    assert not np.allclose(
+        decoded, probe_targets(_tagged_episode(20).privileged[6:7], KEYS), atol=1.0
+    ), "a tag of 5 decoded to frame 6 -- the pairing is off by one"
+
+
+def test_fit_probes_is_reproducible_under_a_fixed_seed(tmp_path):
+    """The posterior samples, so two evaluation runs fit two different probes
+    unless the seed pins them -- and then every downstream error, band and
+    gap_closed moves for no reason anyone could trace. Reproducibility comes
+    from the seed, never from taking the categorical mode."""
+    paths = _write_episodes(tmp_path, [20, 21])
+    first, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
+    second, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
+    np.testing.assert_array_equal(first["w"], second["w"])
+
+
+def test_fit_probes_seed_actually_drives_the_sampling(tmp_path):
+    """Guards the test above from passing vacuously: if the seed were ignored
+    (or the model were secretly deterministic) two seeds would agree too, and
+    the reproducibility check would prove nothing."""
+    paths = _write_episodes(tmp_path, [20, 21])
+    first, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
+    other, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=1, ridge=1e-8)
+    assert not np.array_equal(first["w"], other["w"])
+
+
+def test_fit_probes_selects_the_ridge_on_episodes_it_did_not_fit_on(tmp_path):
+    """Selection needs data the weights never saw. Held out at EPISODE
+    granularity, because consecutive frames are near-duplicates: a row-wise
+    split would put the same scene on both sides and every ridge would score
+    the same."""
+    lengths = [20, 21, 22, 23, 40]
+    paths = _write_episodes(tmp_path, lengths)
+    latent_probe, _ = _fit(paths, select_episodes=1)
+
+    assert latent_probe["ridge"] in RIDGES
+    assert "r2" in latent_probe, "a selected probe must report what it scored"
+
+    # The standardisation is computed from the FIT episodes only. Lengths
+    # differ, so the mean tag over the first four episodes is not the mean over
+    # all five -- fitting on everything is therefore visible here.
+    fit_tags = np.concatenate([np.arange(1, n + 1) for n in lengths[:4]])
+    all_tags = np.concatenate([np.arange(1, n + 1) for n in lengths])
+    assert latent_probe["mean"][0] == pytest.approx(fit_tags.mean())
+    assert latent_probe["mean"][0] != pytest.approx(all_tags.mean())
+
+
+def test_fit_probes_falls_back_when_there_is_nothing_to_spare(tmp_path):
+    """One episode cannot be both fit on and selected on. The fallback is
+    fit_probe's default penalty, not a crash and not a leaked selection."""
+    paths = _write_episodes(tmp_path, [20])
+    latent_probe, _ = _fit(paths, select_episodes=4)
+
+    assert latent_probe["ridge"] == 1e3
+    assert "r2" not in latent_probe
+
+
+def test_fit_probes_rejects_an_empty_episode_list():
+    with pytest.raises(ValueError, match="no episodes"):
+        _fit([])
