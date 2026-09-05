@@ -899,23 +899,39 @@ def test_gather_probe_data_windows_an_episode_exactly_as_the_rollout_does(tmp_pa
     np.testing.assert_array_equal(data["latent"][:, 0], expected)
 
 
-def test_gather_probe_data_returns_aligned_rows_under_the_three_documented_keys(
+def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
     tmp_path,
 ):
-    """`filtering_report` consumes this dict positionally by key, and pairs
-    `latent` against `embedding` at the SAME timestep. Misaligned rows would
-    compare two different frames and no shape check would notice."""
+    """Two consumers read this dict by key and pair their arrays at the SAME
+    timestep, so misaligned rows would compare two different frames and no
+    shape check would notice.
+
+    There are FOUR keys, and the two embeddings are not interchangeable:
+    `"embedding"` is the head's PREDICTED embedding (the space the rollout band
+    is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
+    RAW encoder output for the same frame (the reference the filtering gate
+    criterion needs, per spec section 3.4). The widening head makes the two
+    different WIDTHS here, so any collapse of one into the other is visible in
+    the shapes alone."""
     paths = _write_episodes(tmp_path, [20])
     data = _gather(paths, head_width=7, context=2, horizon=3)
 
-    assert set(data) == {"latent", "embedding", "targets"}
+    assert set(data) == {"latent", "embedding", "encoder_embedding", "targets"}
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
+    assert data["encoder_embedding"].shape == (20, 1), (
+        "encoder_embedding is the ENCODER's output, not the head's"
+    )
     assert data["targets"].shape == (20, TARGET_DIM)
     # Rows are aligned: the widening head repeats the tag, so column 0 of the
     # embedding must still be the frame the target describes.
     np.testing.assert_allclose(data["targets"][:, 0], DX * data["embedding"][:, 0],
                                atol=1e-4)
+    # ...and the raw encoder embedding is the tag itself, on the same rows.
+    np.testing.assert_allclose(data["encoder_embedding"][:, 0], np.arange(1, 21.0),
+                               atol=1e-4)
+    np.testing.assert_allclose(data["targets"][:, 0],
+                               DX * data["encoder_embedding"][:, 0], atol=1e-4)
 
 
 def test_gather_probe_data_skips_episodes_too_short_for_one_window(tmp_path):
@@ -1103,4 +1119,255 @@ def test_fit_probes_selection_and_fit_paths_are_disjoint(tmp_path, monkeypatch):
     assert set(fit_paths).isdisjoint(select_paths), (
         f"fit paths {fit_paths} and selection paths {select_paths} overlap -- "
         "the ridge would be selected on data it was also fit on"
+    )
+
+
+# ---------------------------------------------------------------------------
+# filtering_report -- spec section 4, gate criterion 4.
+#
+# `filtering_comparison` was implemented and unit-tested but called from
+# NOTHING in src/ or scripts/, so the criterion could not be produced at all.
+# This is the driver that produces it.
+#
+# The reference it compares the latent against is the RAW ENCODER embedding
+# (`gather_probe_data`'s "encoder_embedding"), per spec section 3.4:
+# "compared against a probe on the encoder embedding at t". That is the whole
+# argument, not a detail. The posterior has already seen frame t, so by the
+# data-processing inequality it cannot add information about t over the
+# ENCODING of t -- the only thing it can add is memory of earlier frames.
+# Against the model's own PREDICTED embedding the question would instead be
+# "does the latent beat its own head's reconstruction of itself", which a
+# latent can win with `h` completely inert, since the head is lossy and the
+# latent is its input. The gate would then be passable without the property it
+# certifies. `gather_probe_data` returns both arrays for exactly this reason.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.probe import filtering_report  # noqa: E402
+
+
+class _DeadHeads(nn.Module):
+    """A head whose predicted embedding carries NO information at all.
+
+    Stands in for the general fact that the head is lossy: comparing the latent
+    against the head's own output can only flatter the latent.
+    """
+
+    def __init__(self, width: int = 3) -> None:
+        super().__init__()
+        self.width = width
+
+    def forward(self, latent):
+        zeros = torch.zeros_like(latent).repeat_interleave(self.width, dim=-1)
+        return {"embedding": zeros}
+
+
+def test_filtering_report_returns_the_gate_criterion_keys(monkeypatch):
+    """Spec section 4 criterion 4 cannot be reported unless something calls this."""
+    rng = np.random.default_rng(0)
+    n = 300
+    signal = rng.normal(size=n)
+    lagged = np.roll(signal, 1)
+    embedding = signal[:, None] * np.ones((1, 4))
+    latent = np.column_stack([embedding, lagged[:, None] * np.ones((1, 4))])
+    targets = np.column_stack([lagged] * 4) + 0.01 * rng.normal(size=(n, 4))
+
+    calls = []
+
+    def fake_gather(model, paths, backbone, device, context=5, horizon=45,
+                    limit=20, seed=0):
+        calls.append(list(paths))
+        half = n // 2
+        sl = slice(0, half) if len(calls) == 1 else slice(half, n)
+        return {"latent": latent[sl], "embedding": np.zeros((sl.stop - sl.start, 2)),
+                "encoder_embedding": embedding[sl], "targets": targets[sl]}
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", fake_gather)
+    out = filtering_report(object(), ["train"], ["val"], None, torch.device("cpu"))
+
+    assert set(out) == {"latent_r2", "embedding_r2", "latent_beats_embedding"}
+    assert out["latent_beats_embedding"] is True
+    assert calls == [["train"], ["val"]], "train and val must be gathered separately"
+
+
+def test_filtering_report_does_not_gather_train_and_val_together(monkeypatch):
+    """Fitting and scoring on the same rows would make the criterion vacuous.
+
+    Measured on the leaking version, this comparison ran from R^2 -0.246 to
+    0.9997: with more features than validation rows the probe simply memorises
+    the split it is then scored on."""
+    seen = []
+
+    def fake_gather(model, paths, backbone, device, **kwargs):
+        seen.append(tuple(paths))
+        k = 200
+        rng = np.random.default_rng(len(seen))
+        return {"latent": rng.normal(size=(k, 6)),
+                "embedding": rng.normal(size=(k, 4)),
+                "encoder_embedding": rng.normal(size=(k, 4)),
+                "targets": rng.normal(size=(k, 4))}
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", fake_gather)
+    filtering_report(object(), ["a", "b"], ["c"], None, torch.device("cpu"))
+    assert seen == [("a", "b"), ("c",)]
+
+
+def test_filtering_report_probes_the_raw_encoder_embedding_not_the_predicted_one(
+    tmp_path, monkeypatch
+):
+    """Spec section 3.4's reference is the ENCODER embedding at t.
+
+    Made unambiguous by giving the head a different width from the encoder: the
+    encoder emits 1 feature and the head 7, so the arrays actually handed to
+    `filtering_comparison` say which of the two was compared. The companion
+    test below shows why the distinction changes the VERDICT and not just the
+    shapes."""
+    paths = _write_episodes(tmp_path, [20, 25])
+    captured = {}
+
+    real_comparison = probe_module.filtering_comparison
+
+    def recording_comparison(lat_tr, emb_tr, lat_va, emb_va, tgt_tr, tgt_va):
+        captured.update(embedding_train=emb_tr, embedding_val=emb_va,
+                        latent_train=lat_tr)
+        return real_comparison(lat_tr, emb_tr, lat_va, emb_va, tgt_tr, tgt_va)
+
+    monkeypatch.setattr(probe_module, "filtering_comparison", recording_comparison)
+    filtering_report(_FakeModel(head_width=7), paths[:1], paths[1:], None,
+                     torch.device("cpu"), context=2, horizon=3)
+
+    assert captured["embedding_train"].shape[1] == 1, (
+        "the filtering comparison was handed a 7-wide array -- that is the "
+        "head's PREDICTED embedding, not the raw encoder embedding the gate "
+        "criterion is defined against"
+    )
+    assert captured["embedding_val"].shape[1] == 1
+    # And it really is the encoder's output: the tag encoder emits the frame
+    # index verbatim, so the first training window reads 1, 2, 3, 4, 5.
+    np.testing.assert_allclose(captured["embedding_train"][:5, 0],
+                               np.arange(1, 6.0), atol=1e-4)
+    # The two episodes have different lengths, so the row counts say which
+    # split each argument came from: a train/val swap is visible right here.
+    assert captured["embedding_train"].shape[0] == 20, "train got the val rows"
+    assert captured["embedding_val"].shape[0] == 25, "val got the train rows"
+    assert captured["latent_train"].shape[0] == 20
+
+
+def test_filtering_report_verdict_is_false_when_the_latent_is_just_the_frame(
+    tmp_path,
+):
+    """The behavioural half of the raw-vs-predicted question.
+
+    `_PassThroughRSSM` makes the latent EXACTLY the current frame's encoder
+    embedding -- `h` inert, no history whatsoever. The honest verdict is then
+    `False`: the latent adds nothing over the frame's own encoding, which is
+    precisely what this diagnostic exists to detect.
+
+    Compared against the head's PREDICTED embedding instead, the same inert
+    model reports `True`, because `_DeadHeads` throws the information away and
+    the latent trivially beats it. That mutation flips the gate criterion from
+    a correct failure to a false pass, and no shape assertion is involved --
+    which is why the reference has to be the encoder embedding.
+    """
+    paths = _write_episodes(tmp_path, [20, 25])
+    model = _FakeModel(rssm=_PassThroughRSSM())
+    model.heads = _DeadHeads(width=3)
+
+    out = filtering_report(model, paths[:1], paths[1:], None, torch.device("cpu"),
+                           context=2, horizon=3)
+
+    assert out["latent_r2"] == pytest.approx(out["embedding_r2"], abs=1e-9), (
+        "the latent IS the encoder embedding here, so the two probes must be "
+        "the same probe -- a different number means a different array was probed"
+    )
+    assert out["latent_beats_embedding"] is False, (
+        "an inert `h` was reported as carrying history"
+    )
+
+
+def test_filtering_report_gathers_at_the_callers_context_and_horizon(monkeypatch):
+    """The filtering probe must be measured at the window the rollout evaluates
+    at, for the same reason `fit_probes` forwards them: a latent filtered from
+    50 steps of context is a different distribution from one filtered from 5,
+    and the whole claim is about how much history `h` accumulates."""
+    seen = []
+
+    def fake_gather(model, paths, backbone, device, context=5, horizon=45,
+                    limit=20, seed=0):
+        seen.append({"context": context, "horizon": horizon, "limit": limit,
+                     "seed": seed})
+        rng = np.random.default_rng(len(seen))
+        return {"latent": rng.normal(size=(80, 3)),
+                "embedding": rng.normal(size=(80, 3)),
+                "encoder_embedding": rng.normal(size=(80, 3)),
+                "targets": rng.normal(size=(80, 4))}
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", fake_gather)
+    filtering_report(object(), ["a"], ["b"], None, torch.device("cpu"),
+                     context=7, horizon=11, limit=3, seed=5)
+
+    assert [c["context"] for c in seen] == [7, 7], "context was not forwarded"
+    assert [c["horizon"] for c in seen] == [11, 11], "horizon was not forwarded"
+    assert [c["limit"] for c in seen] == [3, 3], "limit was not forwarded"
+    assert seen[0]["seed"] == 5, "the caller's seed must fix the training gather"
+    assert seen[1]["seed"] != seen[0]["seed"], (
+        "the validation gather must draw its own posterior samples, not replay "
+        "the training split's"
+    )
+
+
+def test_filtering_report_defaults_are_the_spec_values():
+    """`scripts/eval_rollout.py` passes context/horizon/seed but relies on the
+    bare default for `limit`, and a future caller may rely on all of them. The
+    window must be the rollout's own (5 + 45), or the criterion is reported at
+    a filtering depth the study never evaluates at."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(filtering_report).parameters.items()
+    }
+    assert defaults["context"] == 5
+    assert defaults["horizon"] == 45
+    assert defaults["limit"] == 20
+    assert defaults["seed"] == 0
+
+
+def test_filtering_report_fits_on_the_train_rows_and_scores_on_the_val_rows(
+    monkeypatch,
+):
+    """Gathering the two splits separately is not enough -- the TRAIN arrays
+    have to be the ones handed to the fit.
+
+    `filtering_comparison` takes six arrays and the train/val pairs are
+    interchangeable at the type level, so passing `val[...]` in the train
+    position gathers correctly and still fits each probe on the very rows it is
+    then scored on. Measured, that mutation survived every other test in this
+    file: `test_filtering_report_does_not_gather_train_and_val_together` only
+    inspects the gather CALLS, and the fake data the key/verdict tests use is
+    predictable enough that a leaked fit reaches the same verdict.
+
+    Caught empirically. On fully unrelated features and targets, with more
+    features (20) than validation rows (5), an honest fit-on-train probe cannot
+    score well on the held-out rows, while a leaked fit-on-val probe memorises
+    them: measured here at R^2 0.9997 against -0.246 -- the exact leak the
+    equivalent guard on `filtering_comparison` itself pins one level down.
+    """
+    rng = np.random.default_rng(0)
+    n_train, n_val, p = 200, 5, 20
+
+    def fake_gather(model, paths, backbone, device, **kwargs):
+        k = n_train if paths == ["train"] else n_val
+        return {"latent": rng.normal(size=(k, p)),
+                "embedding": rng.normal(size=(k, p)),
+                "encoder_embedding": rng.normal(size=(k, p)),
+                "targets": rng.normal(size=(k, 4))}
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", fake_gather)
+    out = filtering_report(object(), ["train"], ["val"], None, torch.device("cpu"))
+
+    assert out["latent_r2"] < 0.5, (
+        f"latent_r2={out['latent_r2']:.4f} on pure noise -- the probe was fit "
+        "on the rows it is scored on"
+    )
+    assert out["embedding_r2"] < 0.5, (
+        f"embedding_r2={out['embedding_r2']:.4f} on pure noise -- the probe was "
+        "fit on the rows it is scored on"
     )

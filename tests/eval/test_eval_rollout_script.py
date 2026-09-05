@@ -198,3 +198,126 @@ def test_band_report_flags_degeneracy_by_relative_size_not_absolute_size():
         ang=[1.0], pers_ang=[10_000.0], floor_ang=[9_995.0],  # band=5, relative=5e-4
     )
     assert script.band_report(result, "angle")["steps_degenerate"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Gate criterion 4 (spec section 4.4). `filtering_comparison` was implemented
+# and unit-tested but called from NOTHING in src/ or scripts/, so the criterion
+# could not be produced at all. These pin that `main` produces it.
+# ---------------------------------------------------------------------------
+
+import sys  # noqa: E402
+import types  # noqa: E402
+
+import torch  # noqa: E402
+
+
+def test_print_filtering_reports_all_three_gate_numbers(capsys):
+    """The criterion is the verdict AND the two R^2 values behind it: a verdict
+    printed alone cannot be checked, and a near-tie is a different finding from
+    a rout."""
+    script.print_filtering(
+        {"latent_r2": 0.4231, "embedding_r2": 0.1197, "latent_beats_embedding": True}
+    )
+    out = capsys.readouterr().out
+    assert "latent_r2=+0.4231" in out
+    assert "embedding_r2=+0.1197" in out
+    assert "latent_beats_embedding=True" in out
+    assert "WARNING" not in out
+
+
+def test_print_filtering_warns_only_when_the_latent_loses(capsys):
+    """A False verdict means `h` is inert -- a specific, actionable bug -- and
+    must not scroll past as one more number among many."""
+    script.print_filtering(
+        {"latent_r2": 0.10, "embedding_r2": 0.30, "latent_beats_embedding": False}
+    )
+    out = capsys.readouterr().out
+    assert "latent_beats_embedding=False" in out
+    assert "WARNING" in out and "no history" in out
+
+
+def _stub_main_dependencies(monkeypatch, calls: list, filtering: dict):
+    """Replace everything `main` touches outside the filtering call itself."""
+    result = _result(
+        pos=[1.0, 1.0], pers_pos=[2.0, 2.0], floor_pos=[0.0, 0.0],
+        ang=[1.0, 1.0], pers_ang=[2.0, 2.0], floor_ang=[0.0, 0.0],
+    )
+    model = types.SimpleNamespace(
+        to=lambda device: model, load_state_dict=lambda sd: None, eval=lambda: None
+    )
+    buffer = types.SimpleNamespace(episode_paths=lambda: ["e0", "e1", "e2"])
+    probe = {"ridge": 1e3, "r2": 0.3}
+
+    monkeypatch.setattr(script, "get_device", lambda prefer: torch.device("cpu"))
+    monkeypatch.setattr(script, "WorldModel", lambda cfg: model)
+    monkeypatch.setattr(
+        script.torch, "load",
+        lambda path, map_location=None, weights_only=True: {
+            "arm": "random_vit", "state_dict": {}
+        },
+    )
+    monkeypatch.setattr(script, "ReplayBuffer", lambda data, **kw: buffer)
+    monkeypatch.setattr(
+        script, "episode_split", lambda paths, **kw: (["t0", "t1"], ["v0"])
+    )
+    monkeypatch.setattr(script, "encoder_backbone", lambda encoder: "BACKBONE")
+    monkeypatch.setattr(script, "fit_probes", lambda *a, **k: (probe, probe))
+    monkeypatch.setattr(script, "evaluate_rollout", lambda *a, **k: result)
+
+    def recording_filtering_report(*args, **kwargs):
+        calls.append((args, kwargs))
+        return filtering
+    monkeypatch.setattr(script, "filtering_report", recording_filtering_report)
+
+
+def test_main_produces_the_filtering_gate_criterion(monkeypatch, capsys):
+    """THE wiring guard. Without this nothing in src/ or scripts/ calls
+    `filtering_report`, and spec section 4's fourth criterion simply cannot be
+    produced -- a state the whole suite was green in.
+
+    It also pins HOW it is called: TRAIN paths first and VAL paths second (a
+    swap silently fits the probe on the episodes it is scored on) and the
+    rollout's own context/horizon/seed rather than the function's defaults (the
+    criterion would otherwise be measured at a filtering depth the study never
+    evaluates at)."""
+    calls = []
+    _stub_main_dependencies(
+        monkeypatch, calls,
+        {"latent_r2": 0.42, "embedding_r2": 0.11, "latent_beats_embedding": True},
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "eval_rollout.py", "--arm", "random_vit", "--checkpoint", "ckpt.pt",
+        "--device", "cpu", "--context", "7", "--horizon", "11", "--seed", "3",
+    ])
+
+    script.main()
+    out = capsys.readouterr().out
+
+    assert "latent_beats_embedding" in out, "the gate criterion was never printed"
+    assert len(calls) == 1, "filtering_report was not called exactly once"
+    args, kwargs = calls[0]
+    assert args[1] == ["t0", "t1"], "train paths must be the second argument"
+    assert args[2] == ["v0"], "val paths must be the third argument"
+    assert kwargs["context"] == 7, "the rollout's context was not forwarded"
+    assert kwargs["horizon"] == 11, "the rollout's horizon was not forwarded"
+    assert kwargs["seed"] == 3, "the rollout's seed was not forwarded"
+
+
+def test_main_warns_when_the_filtering_criterion_fails(monkeypatch, capsys):
+    """A False verdict is a real finding about the model. It must reach the
+    operator's terminal, not be swallowed because the run 'succeeded'."""
+    calls = []
+    _stub_main_dependencies(
+        monkeypatch, calls,
+        {"latent_r2": 0.05, "embedding_r2": 0.31, "latent_beats_embedding": False},
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "eval_rollout.py", "--arm", "random_vit", "--checkpoint", "ckpt.pt",
+        "--device", "cpu",
+    ])
+
+    script.main()
+    out = capsys.readouterr().out
+    assert "latent_beats_embedding=False" in out
+    assert "WARNING" in out

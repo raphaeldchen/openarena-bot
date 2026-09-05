@@ -8,7 +8,7 @@ import torch
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import episode_split
-from mbfps.eval.probe import fit_probes
+from mbfps.eval.probe import filtering_report, fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.summary import DEGENERATE, METRICS, metric_summary
 from mbfps.models.encoders import encoder_backbone
@@ -48,6 +48,26 @@ def print_report(result, reports: dict) -> None:
             print(f"WARNING: {metric} band is numerically degenerate at "
                   f"{r['steps_degenerate']}/{r['n_steps']} steps; the ratio is unstable "
                   "there and the raw curves should be read directly.")
+
+
+def print_filtering(filtering: dict) -> None:
+    """Print spec section 4's fourth gate criterion.
+
+    A `False` verdict is a RESULT, not a failure of the harness: it says the
+    posterior latent explains the privileged state no better than the raw
+    encoding of the same frame does, and since the posterior has already seen
+    that frame, the only thing it could have added is history. So `False`
+    means the deterministic state `h` is carrying none -- which is exactly the
+    actionable bug this diagnostic exists to surface, and is reported rather
+    than tuned away.
+    """
+    print("\n--- filtering probe (spec section 4, criterion 4) ---")
+    print(f"latent_r2={filtering['latent_r2']:+.4f} "
+          f"embedding_r2={filtering['embedding_r2']:+.4f}")
+    print(f"latent_beats_embedding={filtering['latent_beats_embedding']}")
+    if not filtering["latent_beats_embedding"]:
+        print("WARNING: the deterministic state h adds nothing over the ENCODER "
+              "embedding of the same frame -- it is carrying no history.")
 
 
 def main() -> None:
@@ -114,6 +134,17 @@ def main() -> None:
         )
     reports = {m: metric_summary(result, m) for m in METRICS}
     print_report(result, reports)
+
+    # Gate criterion 4. Fit on TRAIN windows and scored on VAL windows, at the
+    # rollout's own context/horizon and seed -- the same reasons those are
+    # forwarded to `fit_probes` apply here, and a probe fit and scored on one
+    # pool would make the criterion vacuous.
+    print_filtering(
+        filtering_report(
+            model, train, val, backbone, device,
+            context=args.context, horizon=args.horizon, seed=args.seed,
+        )
+    )
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

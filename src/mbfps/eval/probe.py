@@ -191,12 +191,37 @@ def gather_probe_data(
     prevent. What is matched here is the filtering DEPTH, which is what the
     three references actually share.
 
-    Returns `{"latent": (N, LATENT), "embedding": (N, EMBED), "targets": (N, 4)}`
-    with rows aligned; `embedding` is the model's PREDICTED embedding, i.e.
-    `heads(latent)["embedding"]`, because that is the space the rollout scores
-    all three references in. Seeds the global RNG, because the posterior
-    samples and reproducibility must come from the seed rather than from
-    taking the categorical mode.
+    Returns four row-aligned arrays:
+
+    - `"latent"` `(N, LATENT)` -- the posterior latent.
+    - `"embedding"` `(N, EMBED)` -- the model's PREDICTED embedding, i.e.
+      `heads(latent)["embedding"]`.
+    - `"encoder_embedding"` `(N, ENC)` -- the RAW encoder output for the same
+      frames, before the RSSM and before the head.
+    - `"targets"` `(N, 4)`.
+
+    THE TWO EMBEDDINGS ARE NOT REDUNDANT AND MUST NOT BE COLLAPSED INTO ONE.
+    They answer different questions, and each is the wrong array for the
+    other's:
+
+    - The rollout band scores model, persistence and floor *after* the
+      embedding head, so `fit_probes` fits the band's probe on `"embedding"`.
+      Fitting that probe on the raw encoder output instead is a distribution
+      mismatch, measured destroying the signal: band below 2 SE at 18 of 45
+      horizon steps against 2 of 45, and `gap_closed` at horizon 45 moving
+      -7.26 -> -0.78 on one unchanged checkpoint.
+    - The filtering comparison (spec section 3.4, gate criterion section 4.4)
+      asks whether the posterior latent adds anything over what the CURRENT
+      FRAME alone provides -- and the only thing it can add is history. Its
+      reference therefore has to be `"encoder_embedding"`, the frame's own
+      encoding. Comparing the latent against the model's *predicted* embedding
+      would instead ask whether the latent beats its own head's
+      reconstruction, which a latent can win while carrying no history at all,
+      so the gate criterion would be satisfiable without the property it
+      exists to certify. See `filtering_report`.
+
+    Seeds the global RNG, because the posterior samples and reproducibility
+    must come from the seed rather than from taking the categorical mode.
     """
     from mbfps.eval.rollout import source_for
 
@@ -207,7 +232,7 @@ def gather_probe_data(
 
     torch.manual_seed(seed)
     need = context + horizon
-    latents, embeddings, targets = [], [], []
+    latents, embeddings, encoder_embeddings, targets = [], [], [], []
 
     for path in list(paths)[:limit]:
         episode = load_episode(path)
@@ -238,6 +263,9 @@ def gather_probe_data(
             embeddings.append(
                 model.heads(latent)["embedding"][0].float().cpu().numpy()
             )
+            # The same `window` rows the latents were filtered from, so the
+            # raw encoder embedding is aligned with the latent frame for frame.
+            encoder_embeddings.append(window[0].float().cpu().numpy())
             # `latent[k]` describes frame `start + 1 + k`, so the target starts
             # at `start + 1`. Losing that `+1` shifts every window by one frame
             # and still fits perfectly, because both sides stay linear in the
@@ -257,6 +285,7 @@ def gather_probe_data(
     return {
         "latent": np.concatenate(latents),
         "embedding": np.concatenate(embeddings),
+        "encoder_embedding": np.concatenate(encoder_embeddings),
         "targets": np.concatenate(targets),
     }
 
@@ -363,6 +392,11 @@ def filtering_comparison(
     The posterior has already seen frame t, so it cannot add information about t
     over the embedding of t. What it can add is history, carried in the
     deterministic state `h`. If it does not win here, `h` is inert.
+
+    `embedding_train`/`embedding_val` must be the RAW ENCODER embedding of frame
+    t -- `gather_probe_data`'s `"encoder_embedding"`, not its `"embedding"`.
+    The data-processing argument above is what makes a win here mean "history",
+    and it only holds against the frame's own encoding. See `filtering_report`.
     """
     # Ridge SELECTED on the validation split for each probe independently --
     # one probe's optimum is not the other's, and forcing a shared value would
@@ -376,3 +410,59 @@ def filtering_comparison(
         "embedding_r2": embedding_r2,
         "latent_beats_embedding": bool(latent_r2 > embedding_r2),
     }
+
+
+def filtering_report(
+    model,
+    train_paths,
+    val_paths,
+    backbone,
+    device,
+    context: int = 5,
+    horizon: int = 45,
+    limit: int = 20,
+    seed: int = 0,
+) -> dict:
+    """Spec section 4, gate criterion 4: does the deterministic state carry history?
+
+    Returns `{"latent_r2", "embedding_r2", "latent_beats_embedding"}`. Nothing
+    else in the harness produces this criterion, so if this is not called it
+    cannot be reported at all.
+
+    The reference is the RAW ENCODER embedding, `gather_probe_data`'s
+    `"encoder_embedding"` -- spec section 3.4: "compared against a probe on the
+    encoder embedding at t". That choice is the whole argument, not a detail.
+    The posterior has already seen frame t, so by the data-processing
+    inequality it cannot add information about t over the ENCODING of t; the
+    only thing it can add is memory of earlier frames. Against the model's own
+    PREDICTED embedding (`"embedding"`, what the rollout band is scored in) the
+    question becomes "does the latent beat its own head's reconstruction of
+    itself", which a latent can win with `h` completely inert -- the head is
+    lossy and the latent is its input. A win there would prove nothing about
+    history, so the gate criterion would be satisfiable without the property it
+    exists to certify. `gather_probe_data` returns both arrays for exactly this
+    reason; see its docstring before merging them.
+
+    Train and validation windows are gathered SEPARATELY, and under the
+    rollout's own context protocol, so neither probe is fit on rows it is
+    scored on. Measured on the leaking version, the same comparison ran from
+    R^2 -0.246 to 0.9997 -- with more features than validation rows a probe
+    memorises the split it is scored on and the criterion becomes vacuous.
+
+    The two gathers get different seeds so the posterior samples on the
+    validation split are independent draws rather than a replay of the training
+    split's; `seed` is still what fixes both, so the report is reproducible.
+    """
+    # Keyword-passed on purpose: `context` and `horizon` are adjacent ints of
+    # the same type, so a positional call would survive them being swapped.
+    train = gather_probe_data(model, train_paths, backbone, device,
+                              context=context, horizon=horizon,
+                              limit=limit, seed=seed)
+    val = gather_probe_data(model, val_paths, backbone, device,
+                            context=context, horizon=horizon,
+                            limit=limit, seed=seed + 1)
+    return filtering_comparison(
+        train["latent"], train["encoder_embedding"],
+        val["latent"], val["encoder_embedding"],
+        train["targets"], val["targets"],
+    )
