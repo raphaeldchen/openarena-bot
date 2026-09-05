@@ -120,12 +120,16 @@ def evaluate_rollout(
 
     for path in val_paths:
         episode = load_episode(path)
-        # A fast path, not a correctness gate: the window loop below is already
-        # empty for any episode of length <= need. This skips loading the
-        # feature cache for an episode that could contribute nothing. (Mutation
-        # testing confirms it: weakening this to `< need` changes no output,
-        # because the only length the two disagree on is exactly `need`, where
-        # `range(0, 0, need)` yields no windows either way.)
+        # Not a pure fast path: at episode.length == need exactly, the window
+        # loop below is NOT empty. `range(0, episode.length - need + 1, need)`
+        # = `range(0, 1, need)` yields ONE legal window (start=0, reading
+        # `source[0 : need + 1]` -- exactly the T+1 rows on hand). This guard
+        # deliberately excludes that window rather than admitting it; a
+        # weaker `< need` check would let it through instead, and
+        # `gather_probe_data` must drop it too to keep the probe fit under
+        # the identical protocol -- see
+        # test_gather_probe_data_windows_match_the_rollouts_length_guard_exactly
+        # in tests/eval/test_probe.py.
         if episode.length < need + 1:
             continue
         source = source_for(model, path, episode, feature_backbone)

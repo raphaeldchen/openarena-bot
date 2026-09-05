@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 import pytest
 
@@ -765,7 +767,10 @@ def test_fit_probes_rejects_an_empty_episode_list():
 # the study's headline ratio divides by.
 # ---------------------------------------------------------------------------
 
+import mbfps.eval.probe as probe_module  # noqa: E402
+import mbfps.eval.rollout as rollout_module  # noqa: E402
 from mbfps.eval.probe import gather_probe_data  # noqa: E402
+from mbfps.eval.rollout import evaluate_rollout  # noqa: E402
 
 
 class _DepthRSSM(nn.Module):
@@ -781,6 +786,21 @@ class _DepthRSSM(nn.Module):
         already = 0.0 if state is None else float(state[0][0, 0])
         depth = already + torch.arange(1, t + 1, dtype=torch.float32).view(1, t, 1)
         return _packed(depth.expand(b, t, 1).contiguous())
+
+
+class _ObserveImagineRSSM(nn.Module):
+    """A pass-through posterior plus a trivial one-step-per-action dynamics
+    model -- just enough structure for BOTH `gather_probe_data` (`observe`
+    only) and `evaluate_rollout` (`observe` and `imagine`) to run on the same
+    fixture, so the two can be compared directly on identical episodes."""
+
+    def observe(self, embeddings, actions, state=None):
+        return _packed(embeddings)
+
+    def imagine(self, actions, state):
+        h0 = state[0]
+        steps = torch.arange(1, actions.shape[1] + 1, dtype=h0.dtype).view(1, -1, 1)
+        return _packed(h0.unsqueeze(1) + steps)
 
 
 class _RecordingRSSM(nn.Module):
@@ -933,3 +953,154 @@ def test_fit_probes_forwards_the_rollout_context_to_the_gathering(tmp_path):
     probe, _ = fit_probes(_FakeModel(rssm=_DepthRSSM()), paths, None,
                           torch.device("cpu"), context=1, horizon=1, ridge=1e-8)
     assert probe["mean"][0] == pytest.approx(1.5), "need was not 1+1=2"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up: five mutations that survived the full 444-test suite
+# because nothing pinned the new functions' defaults, matched their window
+# guard against `evaluate_rollout`'s, or checked that the fit/selection split
+# is genuinely disjoint. See .superpowers/sdd/task-2-report.md.
+# ---------------------------------------------------------------------------
+
+
+def test_fit_probes_defaults_are_the_spec_values():
+    """context=5, horizon=45, select_episodes=4 are the production defaults.
+    `scripts/eval_rollout.py` passes `context`/`horizon` explicitly but NEVER
+    passes `select_episodes` -- it relies entirely on the bare default to
+    enable ridge selection. A silently changed default here changes probe
+    behaviour (and therefore every downstream rollout number) for every real
+    caller without any caller noticing."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(fit_probes).parameters.items()
+    }
+    assert defaults["context"] == 5
+    assert defaults["horizon"] == 45
+    assert defaults["select_episodes"] == 4
+
+
+def test_gather_probe_data_defaults_are_the_spec_values():
+    """context=5, horizon=45 must match `evaluate_rollout`'s own defaults.
+    `fit_probes` always forwards its caller's context/horizon here, but a
+    bare `gather_probe_data(...)` call -- from a future diagnostic script, or
+    from a test that forgets to pass them -- must land on the SAME window the
+    rollout evaluates, not on whatever this function's own default happens to
+    be."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(gather_probe_data).parameters.items()
+    }
+    assert defaults["context"] == 5
+    assert defaults["horizon"] == 45
+
+
+def test_fit_probes_bare_call_runs_ridge_selection_under_the_default_select_episodes(
+    tmp_path,
+):
+    """`scripts/eval_rollout.py` never passes `select_episodes`; it relies on
+    the bare default to enable selection. If that default silently became 0,
+    `spare = len(used) - select_episodes` would make `select_episodes <= 0`
+    true for every real call, and every production rollout would silently
+    fall back to the untuned ridge=1e3 (measured held-out R^2 0.16 against a
+    ceiling of 0.42) instead of a genuinely selected ridge -- with the full
+    suite still green, because no existing test drives `fit_probes` through a
+    bare call under the production defaults.
+
+    `"r2"` is present in the returned dict ONLY when selection actually ran
+    (see `fit_probe`), so its presence is the direct behavioural signal --
+    checking the numeric default alone (above) would not distinguish "0" from
+    some other wrong-but-nonzero default that happens to still select.
+    """
+    # >= need + 1 = 5 + 45 + 1 = 51 transitions, under the DEFAULT
+    # context/horizon -- this exercises the real bare-call path, not a
+    # shortened fixture. Five episodes so spare = 5 - default(4) = 1.
+    lengths = [51, 52, 53, 54, 55]
+    paths = _write_episodes(tmp_path, lengths)
+
+    latent_probe, embedding_probe = fit_probes(
+        _FakeModel(), paths, None, torch.device("cpu")
+    )
+    assert "r2" in latent_probe, "ridge selection did not run under the bare defaults"
+    assert "r2" in embedding_probe
+
+
+def test_gather_probe_data_windows_match_the_rollouts_length_guard_exactly(
+    tmp_path, monkeypatch
+):
+    """`episode.length == need` is the ONE length where `evaluate_rollout`'s
+    guard (`< need + 1`) and a weakened `< need` guard disagree: the weaker
+    guard admits a window the rollout skips, reintroducing exactly the
+    protocol divergence this task exists to close. Rather than hardcoding
+    which side is "right", this compares the two functions directly on the
+    identical episode and requires them to agree on how many windows it
+    contributes -- whatever that number is.
+    """
+    context, horizon = 2, 3
+    need = context + horizon
+    paths = _write_episodes(tmp_path, [need])  # exactly `need` transitions
+
+    model = _FakeModel(rssm=_ObserveImagineRSSM())
+    probe = fit_probe(np.zeros((2, 1)), np.zeros((2, 4)), ridge=1.0)
+
+    seen = []
+    real_probe_targets = rollout_module.probe_targets
+    monkeypatch.setattr(
+        rollout_module,
+        "probe_targets",
+        lambda privileged, keys: seen.append(privileged) or real_probe_targets(privileged, keys),
+    )
+    try:
+        evaluate_rollout(
+            model, paths, probe, context=context, horizon=horizon,
+            device=torch.device("cpu"),
+        )
+    except ValueError as error:
+        assert "no validation window" in str(error)
+    rollout_windows = len(seen)
+
+    try:
+        data = gather_probe_data(
+            model, paths, None, torch.device("cpu"), context=context, horizon=horizon
+        )
+        gather_windows = data["latent"].shape[0] // need
+    except ValueError as error:
+        assert "no probe window" in str(error)
+        gather_windows = 0
+
+    assert gather_windows == rollout_windows, (
+        f"gather_probe_data produced {gather_windows} windows at "
+        f"episode.length == need, but evaluate_rollout produced {rollout_windows} "
+        "for the identical episode -- the two window guards have diverged"
+    )
+
+
+def test_fit_probes_selection_and_fit_paths_are_disjoint(tmp_path, monkeypatch):
+    """A recording wrapper around `gather_probe_data` pins the actual PATH
+    LISTS `fit_probes` hands to each half of the split. `used[spare:]` is the
+    exact complement of `used[:spare]`; an off-by-one (`used[spare - 1:]`)
+    would put one episode on BOTH sides, so the ridge would be selected
+    partly on data it was also fit on. The existing coverage
+    (`test_fit_probes_selects_the_ridge_on_episodes_it_did_not_fit_on`) only
+    checks the fit side's standardisation mean and does not notice an extra
+    episode leaking into the selection side, so this checks path identity
+    directly instead."""
+    lengths = [20, 25, 30, 35, 40]
+    paths = _write_episodes(tmp_path, lengths)
+
+    calls = []
+    real_gather = probe_module.gather_probe_data
+
+    def recording_gather(model, ps, backbone, device, *args, **kwargs):
+        calls.append(list(ps))
+        return real_gather(model, ps, backbone, device, *args, **kwargs)
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", recording_gather)
+
+    _fit(paths, select_episodes=1)
+
+    assert len(calls) == 2, "expected exactly one fit-side and one selection-side gather"
+    fit_paths, select_paths = calls
+    assert set(fit_paths).isdisjoint(select_paths), (
+        f"fit paths {fit_paths} and selection paths {select_paths} overlap -- "
+        "the ridge would be selected on data it was also fit on"
+    )
