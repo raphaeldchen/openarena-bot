@@ -92,3 +92,36 @@ def test_each_head_mlp_has_two_hidden_layers_of_512(head_name):
     assert linears[0].out_features == 512
     assert linears[1].in_features == 512
     assert linears[1].out_features == 512
+
+
+def test_default_seed_is_pinned_to_zero():
+    """`seed: int = 0` is a load-bearing default, not just a convenience value.
+
+    Nothing above builds `WorldModelHeads()` with the default and compares it
+    against an explicit `seed=0` build -- every existing test either checks
+    only shapes or passes `seed=0` explicitly, so a silent default-seed bump
+    (e.g. to 1) would change every downstream trained weight without any test
+    noticing. Byte-identical parameters are the only proof the default is 0.
+    """
+    default_params = list(WorldModelHeads().parameters())
+    explicit_params = list(WorldModelHeads(seed=0).parameters())
+    assert len(default_params) == len(explicit_params)
+    for default_p, explicit_p in zip(default_params, explicit_params):
+        torch.testing.assert_close(default_p, explicit_p, rtol=0, atol=0)
+
+
+def test_all_parameters_and_outputs_are_float32():
+    """Pins fp32 end-to-end, not just incidentally via a dtype-mismatch crash.
+
+    A head cast entirely to float64 (parameters *and* forward outputs staying
+    internally consistent) would never raise a RuntimeError against float32
+    inputs and would slip past every other test in this file.
+    """
+    heads = WorldModelHeads()
+    for param in heads.parameters():
+        assert param.dtype == torch.float32
+
+    out = heads(torch.randn(B, T, LATENT_DIM))
+    assert out["embedding"].dtype == torch.float32
+    assert out["reward"].dtype == torch.float32
+    assert out["continue_logit"].dtype == torch.float32
