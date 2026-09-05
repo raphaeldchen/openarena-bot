@@ -7,15 +7,33 @@ A rollout error is meaningless in isolation, so every error is bracketed:
                          physically interpretable: the agent never moved, so
                          the error IS the true displacement.
   RSSM                -- the model under test, imagining from actions alone.
-  encoder floor (lower) -- probe the encoder embedding of the REAL frame at
-                         each step. The best any dynamics model could reach
-                         given this encoder, and what separates "the dynamics
-                         model is weak" from "the encoder already discarded
-                         this information".
+  encoder floor (lower) -- run the POSTERIOR (`RSSM.observe`, warm-started
+                         from the context's state) on the REAL future frames,
+                         then push its output through the SAME embedding head
+                         used by the other two arms. Not a bare probe of the
+                         encoder's own embedding: all three references must
+                         share one pipeline (encode -> RSSM -> embedding head)
+                         and be scored by one probe, or the band measures a
+                         probe/pipeline mismatch instead of the encoder's
+                         actual information content -- this is the lower
+                         bound on what any dynamics model could reach given
+                         this encoder, and what separates "the dynamics model
+                         is weak" from "the encoder already discarded this
+                         information".
 
 The cross-arm number is `gap_closed`, the dimensionless fraction of that band
 the model closes. Arms have different encoders and therefore different floors,
 so a raw error is not comparable between them and this ratio is.
+
+WARNING, measured directly: on an untrained model with a noise probe
+(random_vit before any training) the persistence-to-floor band can be ~1e-4
+map units wide -- numerically degenerate despite being positive -- and
+`gap_closed` on that band has been observed returning values like 125.2, 9.06,
+and -0.68 at adjacent horizon steps. `gap_closed`'s own non-positive-band
+guard does not catch this, because the band genuinely IS positive; it is just
+too narrow to divide by safely. Any consumer that aggregates these curves
+(a mean, a plot, a pass/fail gate) must be NaN-aware AND must report the band
+width alongside the ratio -- the ratio alone is not trustworthy without it.
 """
 
 from dataclasses import dataclass
@@ -111,7 +129,12 @@ def evaluate_rollout(
         if episode.length < need + 1:
             continue
         source = source_for(model, path, episode, feature_backbone)
-        for start in range(0, episode.length - need, need):
+        # `start = episode.length - need` is a LEGAL window: it reads
+        # `privileged[...start+need]` and `obs[...start+need]`, both in range
+        # for a T+1-row array. `range(0, episode.length - need, need)` would
+        # exclude it whenever `episode.length % need == 0`, silently dropping
+        # the final window. The `+ 1` restores it.
+        for start in range(0, episode.length - need + 1, need):
             window = slice(start, start + need + 1)
             # `window` spans need+1 frames; drop the FIRST one so
             # embeddings[k] is the frame actions[k] led to, matching the

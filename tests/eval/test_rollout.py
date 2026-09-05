@@ -168,6 +168,34 @@ class DriftingModel(OracleModel):
         self.rssm = _DriftingRSSM()
 
 
+class _StatefulRSSM(nn.Module):
+    """Unlike `_OracleRSSM` (which ignores `state` entirely), this filter's
+    `observe` output genuinely depends on the incoming `state`: it folds
+    `state[0]` into every output step, the way a real posterior carries its
+    belief forward instead of starting cold. That is what makes dropping
+    `state=state` from the floor's `observe` call an OBSERVABLE difference
+    here, unlike against `_OracleRSSM` or against an untrained real model
+    (where the effect measures ~1e-4, indistinguishable from noise)."""
+
+    def observe(self, embeddings, actions, state=None):
+        base = embeddings[..., :1]
+        carry = torch.zeros_like(base[:, :1, :]) if state is None else state[0].unsqueeze(1)
+        h = base + carry
+        return {"h": h, "z": h, "latent": torch.cat([h, h], dim=-1)}
+
+    def imagine(self, actions, state):
+        h0 = state[0]
+        steps = torch.arange(1, actions.shape[1] + 1, dtype=h0.dtype).view(1, -1, 1)
+        tag = h0.unsqueeze(1) + steps
+        return {"h": tag, "z": tag, "latent": torch.cat([tag, tag], dim=-1)}
+
+
+class StatefulModel(OracleModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rssm = _StatefulRSSM()
+
+
 def oracle_probe(episode: Episode) -> dict:
     """The exact linear map from a frame tag to that frame's privileged state."""
     tags = np.arange(episode.privileged.shape[0], dtype=np.float64)[:, None]
@@ -242,6 +270,38 @@ def test_the_floor_is_conditioned_on_the_real_frames_not_on_the_imagination(tmp_
     )
 
 
+def test_the_floor_resumes_the_context_state_instead_of_starting_cold(tmp_path):
+    """The floor must be the SAME filter that produced the context's state,
+    continuing from where it left off -- not a fresh posterior started from a
+    zero belief. Dropping `state=state` from
+    `model.rssm.observe(embeddings[:, context:], actions[:, context:], state=state)`
+    would do exactly that, and it is invisible against `_OracleRSSM` (which
+    ignores `state`) or against an untrained real model (measured delta
+    ~1.3e-4). `_StatefulRSSM` makes `observe` genuinely depend on `state`.
+
+    With a single window starting at 0, the context's own last posterior
+    state works out to exactly CONTEXT (map-index tag units), since the
+    context call itself always starts cold (`state=None`) and its last
+    output is simply the tag of the last context frame. A floor that resumes
+    that state is offset from the truth by CONTEXT map-index units at every
+    horizon step -- a constant position error of CONTEXT * STEP. A floor
+    started cold (state dropped) would carry no such offset and score exactly
+    zero, indistinguishable from
+    `test_the_encoder_floor_is_exact_when_it_sees_the_real_future_frame`."""
+    length = CONTEXT + HORIZON + 1  # exactly one window, starting at 0
+    episode = synthetic_episode(length=length)
+    path = tmp_path / f"ep_000000_len{length:05d}.npz"
+    save_episode(episode, path)
+    result = evaluate_rollout(
+        StatefulModel(), [path], oracle_probe(episode),
+        context=CONTEXT, horizon=HORIZON, device=torch.device("cpu"),
+    )
+    expected = CONTEXT * STEP
+    np.testing.assert_allclose(
+        result.floor_position, np.full(HORIZON, expected), rtol=1e-4, atol=1e-6
+    )
+
+
 def test_persistence_error_is_exactly_the_true_displacement(oracle):
     """The module docstring's claim, checked: persistence holds the last context
     state, so its error IS how far the agent really travelled. One step of
@@ -291,6 +351,34 @@ def test_every_window_contributes_and_windows_do_not_overlap(oracle, monkeypatch
     run_oracle(oracle)
     # length 20, need 8 -> range(0, 12, 8) = [0, 8]
     assert len(seen) == 2
+
+
+def test_the_final_window_is_included_when_length_is_an_exact_multiple_of_need(
+    tmp_path, monkeypatch
+):
+    """`start = episode.length - need` is a LEGAL window -- it reads
+    `privileged[...start+need]` and `obs[...start+need]`, both in range for a
+    T+1-row array -- but `range(0, episode.length - need, need)` excludes it
+    whenever `episode.length % need == 0`. Checked with a length that is
+    exactly `2 * need`, where the broken bound gives only the start=0 window
+    and the correct bound (`- need + 1`) also gives start=need."""
+    need = CONTEXT + HORIZON
+    length = 2 * need
+    episode = synthetic_episode(length=length)
+    path = tmp_path / f"ep_000000_len{length:05d}.npz"
+    save_episode(episode, path)
+    seen = []
+    real = rollout_module.probe_targets
+    monkeypatch.setattr(
+        rollout_module,
+        "probe_targets",
+        lambda privileged, keys: seen.append(privileged) or real(privileged, keys),
+    )
+    evaluate_rollout(
+        OracleModel(), [path], oracle_probe(episode),
+        context=CONTEXT, horizon=HORIZON, device=torch.device("cpu"),
+    )
+    assert len(seen) == 2, "the window starting at episode.length - need was dropped"
 
 
 def test_all_three_references_are_probed_with_the_very_same_probe(oracle, monkeypatch):
@@ -345,24 +433,33 @@ def test_imagine_is_driven_by_the_post_context_actions_alone(oracle, monkeypatch
 
 
 def test_the_reported_curve_is_the_mean_over_every_window(tmp_path):
-    """Not the first window, and not a sum. Two episodes: one the probe predicts
-    exactly, one whose pos_x is displaced by a constant 100 map units, giving
-    per-window errors of 0 and 100. The reported curve must be 50."""
-    exact = synthetic_episode()
-    displaced = synthetic_episode()
+    """The mean, not the first window and not the median. Four single-window
+    episodes -- three the probe predicts exactly, one whose pos_x is displaced
+    by a constant 100 map units -- give per-window errors of 0, 0, 0, 100. The
+    mean of those is 25; the median is 0.
+
+    Deliberately NOT 0, 0, 100, 100 (mean == median == 50 there): that fixture
+    let `np.median` masquerade as `np.mean` and survive mutation testing.
+    Each episode is sized to contribute exactly one window, so the four
+    values above are exactly the four numbers averaged, not four windows
+    diluted by more of the same."""
+    length = CONTEXT + HORIZON + 1  # exactly one window per episode
+    exact = synthetic_episode(length=length)
+    displaced = synthetic_episode(length=length)
     displaced.privileged = displaced.privileged.copy()
     displaced.privileged[:, 1] += 100.0
+    episodes = [exact, exact, exact, displaced]
     paths = []
-    for index, episode in enumerate((exact, displaced)):
-        path = tmp_path / f"ep_{index:06d}_len{T_SYNTHETIC:05d}.npz"
+    for index, episode in enumerate(episodes):
+        path = tmp_path / f"ep_{index:06d}_len{length:05d}.npz"
         save_episode(episode, path)
         paths.append(path)
     result = evaluate_rollout(
         OracleModel(), paths, oracle_probe(exact),
         context=CONTEXT, horizon=HORIZON, device=torch.device("cpu"),
     )
-    np.testing.assert_allclose(result.rssm_position, np.full(HORIZON, 50.0), atol=1e-5)
-    np.testing.assert_allclose(result.floor_position, np.full(HORIZON, 50.0), atol=1e-5)
+    np.testing.assert_allclose(result.rssm_position, np.full(HORIZON, 25.0), atol=1e-5)
+    np.testing.assert_allclose(result.floor_position, np.full(HORIZON, 25.0), atol=1e-5)
 
 
 def test_all_three_references_are_emitted_by_the_embedding_head(tmp_path, monkeypatch):
