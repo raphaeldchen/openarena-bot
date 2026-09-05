@@ -227,17 +227,85 @@ def test_print_filtering_reports_all_three_gate_numbers(capsys):
 
 
 def test_print_filtering_warns_only_when_the_latent_loses(capsys):
-    """A False verdict means `h` is inert -- a specific, actionable bug -- and
-    must not scroll past as one more number among many."""
+    """A False verdict is a specific, actionable finding and must not scroll
+    past as one more number among many."""
     script.print_filtering(
         {"latent_r2": 0.10, "embedding_r2": 0.30, "latent_beats_embedding": False}
     )
     out = capsys.readouterr().out
     assert "latent_beats_embedding=False" in out
-    assert "WARNING" in out and "no history" in out
+    assert "WARNING" in out and "criterion 4 fails" in out
 
 
-def _stub_main_dependencies(monkeypatch, calls: list, filtering: dict):
+def test_print_filtering_warning_does_not_claim_the_deterministic_state_is_empty(
+    capsys,
+):
+    """The warning used to say `h` "is carrying no history". It does not follow.
+
+    Criterion 4 compares `h` plus a 32x32 categorical `z` -- at most 160 bits --
+    against 2048 continuous encoder floats, so it can fail on the bottleneck
+    alone. Measured on the 20k checkpoint `h` on its own scores +0.1508 and its
+    retrodiction of earlier frames RISES with lag (+0.1508 / +0.1587 / +0.1878 /
+    +0.2124 / +0.2272 at lag 0/1/5/10/20) while the current frame's own falls
+    (+0.3287 -> +0.2870). `h` holds a smeared memory; what the criterion shows
+    is only that it adds nothing over the current frame.
+
+    This line ships in every study run, so the overstatement would be printed
+    nine times. It must say what is measured and send the reader to the test
+    that answers the sharper question."""
+    script.print_filtering(
+        {"latent_r2": 0.1193, "embedding_r2": 0.3287, "latent_beats_embedding": False}
+    )
+    out = capsys.readouterr().out
+    assert "no history" not in out, (
+        "the warning still asserts `h` carries no history -- criterion 4 does "
+        "not establish that"
+    )
+    assert "carrying none" not in out
+    assert "does not improve on the raw ENCODER embedding" in out
+    assert "does NOT establish that h is empty" in out
+    assert "filtering_gain" in out, (
+        "the warning does not point the reader at the bottleneck-free test"
+    )
+
+
+def test_print_filtering_gain_reports_the_gain_and_its_interval(capsys):
+    """The sign alone is not the finding. A gain of -0.02 whose interval
+    straddles zero says "no measurable contribution"; one that excludes zero
+    says the deterministic state is actively diluting the frame's own encoding.
+    Both R^2 are printed too, because a gain is a difference of levels and the
+    levels say whether the probe is measuring anything at all."""
+    script.print_filtering_gain({
+        "gain": -0.0208, "joint_r2": 0.3079, "embedding_r2": 0.3287,
+        "ci_low": -0.0377, "ci_high": -0.0042, "confidence": 0.95,
+        "n_scored_windows": 189, "ridge_selected": True,
+    })
+    out = capsys.readouterr().out
+    assert "gain=-0.0208" in out
+    assert "95% CI [-0.0377, -0.0042]" in out
+    assert "joint_r2=+0.3079" in out
+    assert "embedding_r2=+0.3287" in out
+    assert "windows=189" in out
+    assert "ridge_selected=True" in out
+
+
+def test_print_filtering_gain_warns_only_when_the_interval_excludes_zero(capsys):
+    """A negative point estimate whose interval covers zero is "not measurable",
+    not "measured to be harmful", and the two must not print the same line."""
+    straddling = {
+        "gain": -0.0208, "joint_r2": 0.3079, "embedding_r2": 0.3287,
+        "ci_low": -0.0377, "ci_high": 0.0091, "confidence": 0.95,
+        "n_scored_windows": 189, "ridge_selected": True,
+    }
+    script.print_filtering_gain(straddling)
+    assert "WARNING" not in capsys.readouterr().out
+
+    script.print_filtering_gain({**straddling, "ci_high": -0.0042})
+    assert "WARNING" in capsys.readouterr().out
+
+
+def _stub_main_dependencies(monkeypatch, calls: list, filtering: dict,
+                            gain_calls: list | None = None):
     """Replace everything `main` touches outside the filtering call itself."""
     result = _result(
         pos=[1.0, 1.0], pers_pos=[2.0, 2.0], floor_pos=[0.0, 0.0],
@@ -269,6 +337,14 @@ def _stub_main_dependencies(monkeypatch, calls: list, filtering: dict):
         calls.append((args, kwargs))
         return filtering
     monkeypatch.setattr(script, "filtering_report", recording_filtering_report)
+
+    def recording_filtering_gain(*args, **kwargs):
+        if gain_calls is not None:
+            gain_calls.append((args, kwargs))
+        return {"gain": -0.0208, "joint_r2": 0.3079, "embedding_r2": 0.3287,
+                "ci_low": -0.0377, "ci_high": -0.0042, "confidence": 0.95,
+                "n_scored_windows": 189, "ridge_selected": True}
+    monkeypatch.setattr(script, "filtering_gain", recording_filtering_gain)
 
 
 def test_main_produces_the_filtering_gate_criterion(monkeypatch, capsys):
@@ -321,3 +397,39 @@ def test_main_warns_when_the_filtering_criterion_fails(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "latent_beats_embedding=False" in out
     assert "WARNING" in out
+
+
+def test_main_produces_the_filtering_gain_beside_criterion_4(monkeypatch, capsys):
+    """THE wiring guard for the fair test.
+
+    Criterion 4 alone cannot say whether it failed on an inert `h` or on the
+    categorical bottleneck, and nothing else in `src/` or `scripts/` calls
+    `filtering_gain`, so without this the sharper question is never asked in a
+    study run. It is reported BESIDE criterion 4, never instead of it, and at
+    the same paths/context/horizon/seed -- the gain is only readable against
+    criterion 4 if both were measured on the same windows."""
+    calls, gain_calls = [], []
+    _stub_main_dependencies(
+        monkeypatch, calls,
+        {"latent_r2": 0.1193, "embedding_r2": 0.3287, "latent_beats_embedding": False},
+        gain_calls=gain_calls,
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "eval_rollout.py", "--arm", "random_vit", "--checkpoint", "ckpt.pt",
+        "--device", "cpu", "--context", "7", "--horizon", "11", "--seed", "3",
+    ])
+
+    script.main()
+    out = capsys.readouterr().out
+
+    assert "latent_beats_embedding=False" in out, "criterion 4 was dropped"
+    assert "gain=-0.0208" in out, "the fair test was never reported"
+    assert len(gain_calls) == 1, "filtering_gain was not called exactly once"
+    args, kwargs = gain_calls[0]
+    assert args[1] == ["t0", "t1"], "train paths must be the second argument"
+    assert args[2] == ["v0"], "val paths must be the third argument"
+    assert kwargs["context"] == 7 and kwargs["horizon"] == 11
+    assert kwargs["seed"] == 3, (
+        "the rollout's seed was not forwarded, so the gain is scored on a "
+        "different draw from criterion 4"
+    )

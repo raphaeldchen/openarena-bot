@@ -397,6 +397,14 @@ def filtering_comparison(
     t -- `gather_probe_data`'s `"encoder_embedding"`, not its `"embedding"`.
     The data-processing argument above is what makes a win here mean "history",
     and it only holds against the frame's own encoding. See `filtering_report`.
+
+    BOTH REPORTED R^2 ARE OPTIMISTICALLY BIASED AND MUST NOT BE QUOTED AS CLEAN
+    HELD-OUT NUMBERS. The ridge is selected on the very rows the probe is then
+    scored on, so each value is a max over the five `RIDGES` on the scored
+    split, not a single held-out score. The bias is symmetric -- both probes get
+    the same five-way maximum on the same rows -- so the COMPARISON, which is
+    all gate criterion 4 asks for, stays fair. The levels do not. `filtering_gain`
+    selects on a third split and is the function to quote a level from.
     """
     # Ridge SELECTED on the validation split for each probe independently --
     # one probe's optimum is not the other's, and forcing a shared value would
@@ -465,4 +473,257 @@ def filtering_report(
         train["latent"], train["encoder_embedding"],
         val["latent"], val["encoder_embedding"],
         train["targets"], val["targets"],
+    )
+
+
+def _block_bootstrap_ci(
+    joint_predicted: np.ndarray,
+    embedding_predicted: np.ndarray,
+    targets: np.ndarray,
+    window: int,
+    resamples: int,
+    confidence: float,
+    seed: int,
+) -> tuple[float, float]:
+    """Percentile interval for the gain, resampling WHOLE WINDOWS.
+
+    The resampling unit is the window, not the row. A window is `window`
+    consecutive frames of one episode -- 50 in the production setting -- and
+    consecutive Doom frames are near-duplicates, so a row-level bootstrap counts
+    ~50 correlated observations as 50 independent ones and returns an interval
+    several times too narrow. The windows are exactly the blocks
+    `gather_probe_data` cuts, on a stride of their own length, so they are the
+    coarsest unit the scored array actually contains.
+
+    The probes are held FIXED across resamples. This is an interval on the
+    scored sample -- how much the gain would move on a different draw of
+    evaluation windows -- not on the whole fit/select/score pipeline.
+    """
+    if window < 1:
+        raise ValueError(f"window must be at least 1 row, got {window}")
+    n_rows = targets.shape[0]
+    if n_rows % window:
+        raise ValueError(
+            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
+            "the block bootstrap would mix parts of two windows into one block"
+        )
+    if resamples < 1:
+        raise ValueError(f"resamples must be at least 1, got {resamples}")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must be in (0, 1), got {confidence}")
+
+    blocks = np.arange(n_rows).reshape(n_rows // window, window)
+    generator = np.random.default_rng(seed)
+    draws = np.empty(resamples, dtype=np.float64)
+    for i in range(resamples):
+        picked = generator.integers(0, blocks.shape[0], size=blocks.shape[0])
+        rows = blocks[picked].reshape(-1)
+        draws[i] = _mean_r2(joint_predicted[rows], targets[rows]) - _mean_r2(
+            embedding_predicted[rows], targets[rows]
+        )
+    tail = 100.0 * (1.0 - confidence) / 2.0
+    return float(np.percentile(draws, tail)), float(np.percentile(draws, 100.0 - tail))
+
+
+def _gain_from_splits(
+    fit: dict,
+    select: dict | None,
+    score: dict,
+    h_dim: int,
+    window: int,
+    resamples: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> dict:
+    """The array-level half of `filtering_gain`; see that docstring for the why.
+
+    `fit`, `select` and `score` are three DISJOINT `gather_probe_data` dicts.
+    The weights come from `fit`, the ridge is selected on `select`, and the
+    reported R^2 and the interval come from `score` -- so, unlike
+    `filtering_comparison`, no part of the number on the scored rows was tuned
+    on those rows. `select=None` skips selection entirely and takes
+    `fit_probe`'s default penalty; that is unbiased too, just weaker.
+    """
+    def features(split: dict) -> tuple[np.ndarray, np.ndarray]:
+        embedding = np.asarray(split["encoder_embedding"], dtype=np.float64)
+        latent = np.asarray(split["latent"], dtype=np.float64)
+        if not 1 <= h_dim <= latent.shape[1]:
+            raise ValueError(
+                f"h_dim={h_dim} does not index a {latent.shape[1]}-wide latent"
+            )
+        # `latent` is `cat([h, z])` -- h FIRST, per RSSM.observe. Slicing the
+        # tail instead reads the stochastic state and answers a different
+        # question with the same shapes.
+        deterministic = latent[:, :h_dim]
+        return np.concatenate([embedding, deterministic], axis=1), embedding
+
+    joint_fit, embedding_fit = features(fit)
+    joint_score, embedding_score = features(score)
+    targets_fit, targets_score = fit["targets"], score["targets"]
+
+    if select is None:
+        joint_probe = fit_probe(joint_fit, targets_fit)
+        embedding_probe = fit_probe(embedding_fit, targets_fit)
+    else:
+        joint_select, embedding_select = features(select)
+        targets_select = select["targets"]
+        joint_probe = fit_probe(joint_fit, targets_fit, joint_select, targets_select)
+        embedding_probe = fit_probe(
+            embedding_fit, targets_fit, embedding_select, targets_select
+        )
+
+    joint_predicted = apply_probe(joint_probe, joint_score)
+    embedding_predicted = apply_probe(embedding_probe, embedding_score)
+    joint_r2 = _mean_r2(joint_predicted, targets_score)
+    embedding_r2 = _mean_r2(embedding_predicted, targets_score)
+    low, high = _block_bootstrap_ci(
+        joint_predicted, embedding_predicted, targets_score,
+        window=window, resamples=resamples, confidence=confidence, seed=seed,
+    )
+    return {
+        "gain": joint_r2 - embedding_r2,
+        "joint_r2": joint_r2,
+        "embedding_r2": embedding_r2,
+        "ci_low": low,
+        "ci_high": high,
+        "confidence": confidence,
+        "n_scored_windows": targets_score.shape[0] // window,
+        "ridge_selected": select is not None,
+        "joint_ridge": joint_probe["ridge"],
+        "embedding_ridge": embedding_probe["ridge"],
+    }
+
+
+def filtering_gain(
+    model,
+    train_paths,
+    val_paths,
+    backbone,
+    device,
+    context: int = 5,
+    horizon: int = 45,
+    limit: int = 20,
+    seed: int = 0,
+    h_dim: int | None = None,
+    select_episodes: int = 20,
+    resamples: int = 1000,
+    confidence: float = 0.95,
+) -> dict:
+    """The bottleneck-free companion to gate criterion 4.
+
+        gain = R2([e_t (+) h_t] -> s_t)  -  R2([e_t] -> s_t)
+
+    `e_t` is the raw encoder embedding of frame t and `h_t` is the RSSM's
+    deterministic state, `latent[:, :h_dim]`. Both arms are handed the same
+    `e_t`, so the question is only whether appending `h` buys anything the
+    current frame does not already provide. A positive gain says `h` carries
+    something about the privileged state that frame t alone does not.
+
+    WHY THIS EXISTS BESIDE criterion 4 RATHER THAN INSTEAD OF IT. Criterion 4
+    asks whether a probe on the posterior latent beats a probe on `e_t`. That is
+    what the spec defines and it is the criterion the gate reports. But its two
+    arms are not matched: the latent is `h` plus a 32x32 categorical `z` -- at
+    most 160 bits -- while `e_t` is 2048 continuous floats, so a model can carry
+    real history in `h` and still lose on the bottleneck alone. Failing
+    criterion 4 is therefore not by itself evidence that `h` is inert. Here the
+    raw embedding appears in BOTH arms, so the bottleneck cancels and what is
+    left is the incremental contribution of `h`. The two are complementary and
+    the gate keeps reporting criterion 4 unchanged.
+
+    THE THREE SPLITS ARE THE POINT. `filtering_comparison` selects its ridge on
+    the rows it then scores, which is fair between its two probes but leaves
+    both levels optimistically biased. A gain is a DIFFERENCE OF LEVELS, and the
+    two feature sets have different widths (2048 against 2048 + h_dim), so a
+    five-way maximum taken on the scored rows favours the wider one and would
+    manufacture a positive gain out of the selection alone. So: weights from the
+    training windows, ridge selected on FURTHER training episodes held out from
+    those, and the reported R^2 and interval from the validation windows, which
+    neither the weights nor the selection ever saw.
+
+    The selection episodes come from BEYOND `limit`, not out of the fit set, so
+    the weights are fit on the same `limit` episodes criterion 4 fits on and the
+    two diagnostics differ only in where the ridge came from. The scored split is
+    gathered at `seed + 1`, the same draw `filtering_report` scores criterion 4
+    on, so both describe the same rows. The selection split takes `seed + 2`.
+
+    `select_episodes` DEFAULTS LARGE BECAUSE SELECTION NOISE DOMINATES THIS
+    STATISTIC. `RIDGES` is a decade grid and the scored R^2 moves ~0.10 between
+    adjacent decades, which is several times the gain being measured. Measured
+    on the 20k checkpoint, fit on 20 episodes and scored on 20:
+
+        joint      1e-1 -0.0807  1e1 +0.0510  1e3 +0.3079  1e5 +0.2583  1e7 +0.0228
+        embedding  1e-1 +0.1587  1e1 +0.2099  1e3 +0.3287  1e5 +0.2258  1e7 +0.0072
+
+    Both arms peak at 1e3 and the gain there is -0.0208. A 4-episode selection
+    split picks 1e5 for both and reports +0.0325 -- the SIGN FLIPS on a one-step
+    selection error. A 20-episode selection split picks 1e3 for both and recovers
+    -0.0208. Shrinking this parameter to save a gather does not make the number
+    noisier, it makes it wrong.
+
+    Returns `{"gain", "joint_r2", "embedding_r2", "ci_low", "ci_high",
+    "confidence", "n_scored_windows", "ridge_selected", "joint_ridge",
+    "embedding_ridge"}`. The interval is a window-level block bootstrap; see
+    `_block_bootstrap_ci` for why the block is the window.
+
+    Args:
+        model: a `WorldModel` (or anything duck-typed like one).
+        train_paths: episodes to fit the weights and select the ridge on. The
+            first `limit` fit the weights; the next `select_episodes` select
+            the ridge.
+        val_paths: episodes to score on. Must not overlap `train_paths`.
+        backbone: cached-feature backbone name, or None for the pixel arm.
+        device: where to run the encoder and RSSM.
+        context: real frames filtered from a zero state, per window.
+        horizon: steps after the context, per window. `context + horizon` is
+            also the bootstrap's block length, because it is the window
+            `gather_probe_data` cuts.
+        limit: episodes for the fit split, and for the scored split.
+        seed: fixes the posterior samples and the bootstrap draws.
+        h_dim: width of the deterministic state. Read from
+            `model.rssm.cfg.h_dim` when None; pass it explicitly for models
+            that do not carry an `RSSMConfig`.
+        select_episodes: training episodes AFTER the first `limit` that select
+            the ridge. A training pool with nothing beyond `limit` falls back to
+            `fit_probe`'s default penalty for both feature sets -- weaker, and
+            `ridge_selected` says so, but still never selected on the scored
+            rows. See the paragraph above before lowering it.
+        resamples: bootstrap draws.
+        confidence: interval mass, e.g. 0.95.
+    """
+    if h_dim is None:
+        h_dim = getattr(getattr(getattr(model, "rssm", None), "cfg", None), "h_dim", None)
+        if h_dim is None:
+            raise ValueError(
+                "h_dim could not be read from model.rssm.cfg.h_dim; pass it "
+                "explicitly -- guessing the split of `latent` into (h, z) would "
+                "silently probe the wrong half"
+            )
+
+    used = list(train_paths)
+    fit_paths = used[:limit]
+    if not fit_paths:
+        raise ValueError("no training episodes to fit the gain probes on")
+    # Selection comes from the training pool BEYOND `limit`, so the weights are
+    # fit on the same episodes criterion 4 fits on. Held out at EPISODE
+    # granularity, like `fit_probes` and like the train/val split itself:
+    # consecutive frames are near-duplicates, so a row-wise split would put the
+    # same scene on both sides and every ridge would look equal.
+    select_paths = used[limit:limit + select_episodes] if select_episodes > 0 else []
+
+    gather = lambda ps, s: gather_probe_data(  # noqa: E731
+        model, ps, backbone, device,
+        context=context, horizon=horizon, limit=len(ps), seed=s,
+    )
+
+    fit = gather(fit_paths, seed)
+    select = gather(select_paths, seed + 2) if select_paths else None
+
+    score = gather_probe_data(
+        model, val_paths, backbone, device,
+        context=context, horizon=horizon, limit=limit, seed=seed + 1,
+    )
+    return _gain_from_splits(
+        fit, select, score,
+        h_dim=h_dim, window=context + horizon,
+        resamples=resamples, confidence=confidence, seed=seed,
     )

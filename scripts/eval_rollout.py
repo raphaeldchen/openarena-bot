@@ -8,7 +8,7 @@ import torch
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import episode_split
-from mbfps.eval.probe import filtering_report, fit_probes
+from mbfps.eval.probe import filtering_gain, filtering_report, fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.summary import DEGENERATE, METRICS, metric_summary
 from mbfps.models.encoders import encoder_backbone
@@ -53,21 +53,59 @@ def print_report(result, reports: dict) -> None:
 def print_filtering(filtering: dict) -> None:
     """Print spec section 4's fourth gate criterion.
 
-    A `False` verdict is a RESULT, not a failure of the harness: it says the
-    posterior latent explains the privileged state no better than the raw
-    encoding of the same frame does, and since the posterior has already seen
-    that frame, the only thing it could have added is history. So `False`
-    means the deterministic state `h` is carrying none -- which is exactly the
-    actionable bug this diagnostic exists to surface, and is reported rather
-    than tuned away.
+    A `False` verdict is a RESULT, not a failure of the harness: the posterior
+    latent explains the privileged state no better than the raw encoding of the
+    same frame does. It is reported rather than tuned away.
+
+    THE WARNING STATES ONLY WHAT THE COMPARISON SUPPORTS. It used to say the
+    deterministic state `h` "is carrying no history", and that is more than the
+    criterion measures. Criterion 4 puts `h` plus a 32x32 categorical `z` -- at
+    most 160 bits -- against 2048 continuous encoder floats, so it can fail on
+    the bottleneck alone. Measured on the 20k checkpoint, `h` on its own scores
+    +0.1508 and its RETRODICTION of earlier frames RISES with lag (+0.1508 /
+    +0.1587 / +0.1878 / +0.2124 / +0.2272 at lag 0/1/5/10/20) while the current
+    frame's own falls (+0.3287 -> +0.2870): `h` holds a smeared memory. What it
+    cannot do is add anything over the current frame, which is what this
+    criterion tests. `filtering_gain` asks the sharper question with the
+    bottleneck removed.
     """
     print("\n--- filtering probe (spec section 4, criterion 4) ---")
     print(f"latent_r2={filtering['latent_r2']:+.4f} "
           f"embedding_r2={filtering['embedding_r2']:+.4f}")
     print(f"latent_beats_embedding={filtering['latent_beats_embedding']}")
     if not filtering["latent_beats_embedding"]:
-        print("WARNING: the deterministic state h adds nothing over the ENCODER "
-              "embedding of the same frame -- it is carrying no history.")
+        print("WARNING: the posterior latent does not improve on the raw ENCODER "
+              "embedding of the same frame, so criterion 4 fails. That is what "
+              "this criterion tests; it does NOT establish that h is empty -- the "
+              "latent's categorical z is a far narrower channel than the 2048-d "
+              "embedding, so the comparison can fail on the bottleneck alone. See "
+              "the filtering_gain block below, which puts the raw embedding in "
+              "both arms.")
+
+
+def print_filtering_gain(gain: dict) -> None:
+    """Print the bottleneck-free companion to criterion 4.
+
+    `gain = R2([e + h] -> s) - R2([e] -> s)`: the raw encoder embedding is in
+    BOTH arms, so what is left is whatever the deterministic state adds over the
+    current frame. Unlike criterion 4's two R^2 -- each a max over five ridges
+    taken on the rows it is scored on -- these levels are selected on a third
+    split, so the number is quotable as well as comparable.
+
+    The interval is printed because the sign alone is not the finding: a gain of
+    -0.02 whose interval straddles zero says "no measurable contribution", while
+    one that excludes zero says the deterministic state is actively diluting the
+    frame's own encoding, and those are different results about the model.
+    """
+    print("\n--- filtering gain (encoder embedding in BOTH arms) ---")
+    print(f"gain={gain['gain']:+.4f} "
+          f"{gain['confidence']:.0%} CI [{gain['ci_low']:+.4f}, {gain['ci_high']:+.4f}]")
+    print(f"joint_r2={gain['joint_r2']:+.4f} embedding_r2={gain['embedding_r2']:+.4f} "
+          f"windows={gain['n_scored_windows']} ridge_selected={gain['ridge_selected']}")
+    if gain["ci_high"] < 0.0:
+        print("WARNING: the deterministic state h does not add to the current "
+              "frame's own encoding -- the gain is negative and its interval "
+              "excludes zero, so h's contribution here is not merely unmeasured.")
 
 
 def main() -> None:
@@ -141,6 +179,16 @@ def main() -> None:
     # pool would make the criterion vacuous.
     print_filtering(
         filtering_report(
+            model, train, val, backbone, device,
+            context=args.context, horizon=args.horizon, seed=args.seed,
+        )
+    )
+
+    # The fair companion, reported beside criterion 4 and never instead of it.
+    # Same paths, same context/horizon/seed, so its scored windows are the very
+    # rows criterion 4 was scored on and the two can be read against each other.
+    print_filtering_gain(
+        filtering_gain(
             model, train, val, backbone, device,
             context=args.context, horizon=args.horizon, seed=args.seed,
         )

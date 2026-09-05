@@ -1371,3 +1371,400 @@ def test_filtering_report_fits_on_the_train_rows_and_scores_on_the_val_rows(
         f"embedding_r2={out['embedding_r2']:.4f} on pure noise -- the probe was "
         "fit on the rows it is scored on"
     )
+
+
+# ---------------------------------------------------------------------------
+# filtering_gain -- the fair companion to gate criterion 4.
+#
+#     gain = R2([e_t (+) h_t] -> s_t) - R2([e_t] -> s_t)
+#
+# Criterion 4 pits `h` plus a 32x32 categorical `z` (at most 160 bits) against
+# 2048 continuous encoder floats, so it can fail on the bottleneck rather than
+# on an inert `h`. Here the raw embedding is in BOTH arms, the bottleneck
+# cancels, and what is left is whatever `h` adds over the current frame.
+# Criterion 4 itself is unchanged -- this is reported beside it, never instead.
+#
+# The three splits are the point. `filtering_comparison` selects its ridge on
+# the rows it scores; that is symmetric, so its COMPARISON is fair, but a gain
+# is a DIFFERENCE OF LEVELS between feature sets of different widths, and a
+# five-way maximum taken on the scored rows favours the wider one. So the
+# weights, the selection and the scoring are three disjoint splits here.
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+from mbfps.eval.probe import (  # noqa: E402
+    _block_bootstrap_ci,
+    _gain_from_splits,
+    filtering_gain,
+)
+
+GAIN_WINDOW = 5
+"""Block length for the array-level tests. Production is context+horizon=50."""
+
+
+def _split(latent: np.ndarray, embedding: np.ndarray, targets: np.ndarray) -> dict:
+    """The three keys `_gain_from_splits` reads out of a gathered dict."""
+    return {"latent": latent, "encoder_embedding": embedding, "targets": targets}
+
+
+def _history_case(n: int, seed: int):
+    """`e` is the CURRENT frame, the first half of `latent` is a LAGGED copy.
+
+    The target depends only on the lag, and the driving signal is i.i.d., so the
+    current frame says nothing about it: the only way to score here is to read
+    the deterministic half. The second half of `latent` stands in for `z` and is
+    pure noise, and it is the same width as the first, so slicing the wrong end
+    is shape-valid and has to be caught by the NUMBER.
+    """
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=n)
+    lag = np.roll(signal, 1)
+    embedding = signal[:, None] * np.ones((1, 3)) + 0.01 * rng.normal(size=(n, 3))
+    deterministic = lag[:, None] * np.ones((1, 2)) + 0.01 * rng.normal(size=(n, 2))
+    stochastic = rng.normal(size=(n, 2))
+    latent = np.concatenate([deterministic, stochastic], axis=1)
+    targets = np.column_stack([lag] * 4) * 3.0 + 0.05 * rng.normal(size=(n, 4))
+    return latent, embedding, targets
+
+
+def test_filtering_gain_is_positive_when_h_carries_history_the_frame_lacks():
+    """The direction the diagnostic exists to detect.
+
+    A latent whose deterministic half remembers the previous frame must show a
+    gain over the current frame's own encoding, and the interval must clear
+    zero -- otherwise the statistic could not distinguish a real contribution
+    from noise on any checkpoint."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    fit, select, score = slice(0, 200), slice(200, 400), slice(400, 600)
+    out = _gain_from_splits(
+        _split(latent[fit], embedding[fit], targets[fit]),
+        _split(latent[select], embedding[select], targets[select]),
+        _split(latent[score], embedding[score], targets[score]),
+        h_dim=2, window=GAIN_WINDOW, resamples=300, seed=0,
+    )
+    assert out["gain"] > 0.5, f"a lag-carrying h showed no gain ({out['gain']:+.4f})"
+    assert out["ci_low"] > 0.0, "the interval covers zero on an unmistakable gain"
+    assert out["gain"] == pytest.approx(out["joint_r2"] - out["embedding_r2"])
+
+
+def test_filtering_gain_reads_the_deterministic_head_of_the_latent():
+    """`latent` is `cat([h, z])` -- h FIRST, per `RSSM.observe`.
+
+    `latent[:, :h_dim]` -> `latent[:, h_dim:]` is a byte-for-byte
+    length-preserving edit that keeps every shape valid and silently probes the
+    stochastic state instead. Here the two halves are the same width and only
+    the FIRST carries the history, so the counterfactual below proves the slice
+    is load-bearing rather than assuming it."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    fit, select, score = slice(0, 200), slice(200, 400), slice(400, 600)
+
+    def gain_for(array):
+        return _gain_from_splits(
+            _split(array[fit], embedding[fit], targets[fit]),
+            _split(array[select], embedding[select], targets[select]),
+            _split(array[score], embedding[score], targets[score]),
+            h_dim=2, window=GAIN_WINDOW, resamples=100, seed=0,
+        )["gain"]
+
+    swapped = np.concatenate([latent[:, 2:], latent[:, :2]], axis=1)
+    assert gain_for(swapped) < 0.05, (
+        "the case is not discriminating -- the stochastic half scores too, so "
+        "this test could not tell the two slices apart"
+    )
+    assert gain_for(latent) > 0.5, "the stochastic tail was probed, not h"
+
+
+def test_filtering_gain_puts_the_raw_embedding_in_both_arms():
+    """The whole reason this is immune to the bottleneck.
+
+    Dropping `e` from the joint arm turns the statistic back into
+    "latent versus embedding" -- criterion 4 with extra steps. With `h` pure
+    noise and `e` explaining the target almost perfectly, the honest joint arm
+    must land ON the embedding arm; a latent-only joint arm collapses to about
+    zero and the gain to about -1."""
+    rng = np.random.default_rng(5)
+    weights = rng.normal(size=(5, 4)) * 4.0
+
+    def case(n, seed):
+        g = np.random.default_rng(seed)
+        embedding = g.normal(size=(n, 5))
+        latent = g.normal(size=(n, 6))          # h is pure noise here
+        return latent, embedding, embedding @ weights + 0.05 * g.normal(size=(n, 4))
+
+    out = _gain_from_splits(
+        _split(*case(300, 1)), _split(*case(300, 2)),
+        _split(*case(40 * GAIN_WINDOW, 3)),
+        h_dim=3, window=GAIN_WINDOW, resamples=200, seed=0,
+    )
+    assert out["embedding_r2"] > 0.9, "the case is not discriminating"
+    assert out["joint_r2"] == pytest.approx(out["embedding_r2"], abs=0.02), (
+        f"joint_r2={out['joint_r2']:.4f} against embedding_r2="
+        f"{out['embedding_r2']:.4f} -- the joint arm is not seeing the raw "
+        "encoder embedding, so the bottleneck is back in the comparison"
+    )
+
+
+def _clean_split(n: int, seed: int, weights: np.ndarray):
+    """Features that genuinely predict the targets: a LIGHT ridge wins here."""
+    g = np.random.default_rng(seed)
+    embedding = g.normal(size=(n, weights.shape[0]))
+    latent = g.normal(size=(n, 8))
+    return latent, embedding, embedding @ weights + 0.01 * g.normal(size=(n, 4))
+
+
+def _junk_split(n: int, seed: int, p_embedding: int):
+    """Features unrelated to the targets: only the HEAVIEST ridge wins here."""
+    g = np.random.default_rng(seed)
+    return (g.normal(size=(n, 8)), g.normal(size=(n, p_embedding)),
+            g.normal(size=(n, 4)) * 5.0)
+
+
+def test_filtering_gain_selects_the_ridge_off_the_rows_it_scores():
+    """ITEM 1's requirement, and the reason there are three splits.
+
+    `filtering_comparison` selects on the very rows it scores. That is fair
+    between its two probes, but the gain subtracts levels across feature sets
+    of DIFFERENT widths (2048 against 2048 + h_dim), so a five-way maximum
+    taken on the scored rows favours the wider arm and can manufacture a
+    positive gain out of the selection alone.
+
+    Engineered so the two selections disagree decisively: the selection split
+    carries a real relationship (a light ridge wins), while the scored split is
+    pure noise (only the heaviest ridge, which shrinks to the intercept, wins).
+    An honest selection reports the light ridge; selecting on the scored rows
+    reports 1e7. The counterfactual is computed here, so the case is proved
+    discriminating rather than assumed."""
+    weights = np.random.default_rng(0).normal(size=(6, 4)) * 4.0
+    fit = _split(*_clean_split(300, 1, weights))
+    select = _split(*_clean_split(300, 2, weights))
+    score = _split(*_junk_split(40 * GAIN_WINDOW, 3, p_embedding=6))
+
+    honest = _gain_from_splits(fit, select, score, h_dim=4,
+                               window=GAIN_WINDOW, resamples=100, seed=0)
+    biased = _gain_from_splits(fit, score, score, h_dim=4,
+                               window=GAIN_WINDOW, resamples=100, seed=0)
+
+    heaviest = RIDGES[-1]
+    assert biased["joint_ridge"] == heaviest and biased["embedding_ridge"] == heaviest, (
+        "the case is not discriminating -- selecting on the scored rows picks "
+        "the same ridge as selecting honestly"
+    )
+    assert honest["joint_ridge"] != heaviest, (
+        f"joint ridge {honest['joint_ridge']:g} is the scored split's own "
+        "optimum -- the ridge was selected on the rows it is scored on"
+    )
+    assert honest["embedding_ridge"] != heaviest
+    assert honest["ridge_selected"] is True
+
+
+def test_filtering_gain_fits_the_weights_off_the_rows_it_scores():
+    """Selecting honestly is not enough -- the WEIGHTS must be held out too.
+
+    `features(fit)` -> `features(score)` is a one-token edit that keeps the
+    honest selection split in place. Caught empirically: the fit split here is
+    unrelated to its targets while the scored split is perfectly explained by
+    its features, so an honest probe cannot score on the scored rows at all
+    (measured -0.014) and a probe fit on them reaches 1.0."""
+    weights = np.random.default_rng(0).normal(size=(6, 4)) * 4.0
+    fit = _split(*_junk_split(300, 1, p_embedding=6))
+    select = _split(*_clean_split(300, 2, weights))
+    score = _split(*_clean_split(40 * GAIN_WINDOW, 3, weights))
+
+    out = _gain_from_splits(fit, select, score, h_dim=4,
+                            window=GAIN_WINDOW, resamples=100, seed=0)
+    assert out["joint_r2"] < 0.5, (
+        f"joint_r2={out['joint_r2']:.4f} -- the weights came from the rows the "
+        "probe is scored on"
+    )
+    assert out["embedding_r2"] < 0.5
+
+
+def _heterogeneous_windows(n_windows: int, window: int):
+    """Windows where the joint arm wins on half and loses on the other half.
+
+    Rows inside one window share the arm that is winning, which is the
+    within-block correlation a block bootstrap exists to respect.
+    """
+    rng = np.random.default_rng(3)
+    targets = rng.normal(size=(n_windows * window, 4)) * 2.0
+    joint_wins = np.repeat(np.arange(n_windows) % 2 == 0, window)[:, None]
+    joint = targets + np.where(joint_wins, 0.2, 3.0) * rng.normal(size=targets.shape)
+    embedding = targets + np.where(joint_wins, 3.0, 0.2) * rng.normal(size=targets.shape)
+    return joint, embedding, targets
+
+
+def test_block_bootstrap_resamples_windows_not_rows():
+    """The block must be the WINDOW.
+
+    A window is 50 consecutive frames of one episode in production, and
+    consecutive Doom frames are near-duplicates. Resampling rows treats ~50
+    correlated observations as 50 independent ones: measured on this fixture
+    the row-level interval is 4x too narrow, which would turn "no measurable
+    contribution" into a confident claim."""
+    joint, embedding, targets = _heterogeneous_windows(40, 25)
+    kwargs = dict(resamples=800, confidence=0.95, seed=0)
+    block_low, block_high = _block_bootstrap_ci(joint, embedding, targets,
+                                                window=25, **kwargs)
+    row_low, row_high = _block_bootstrap_ci(joint, embedding, targets,
+                                            window=1, **kwargs)
+    assert (block_high - block_low) > 2.0 * (row_high - row_low), (
+        f"window-level width {block_high - block_low:.4f} is not materially "
+        f"wider than the row-level {row_high - row_low:.4f} -- the bootstrap is "
+        "resampling rows, so the interval ignores the within-window correlation"
+    )
+
+
+def test_block_bootstrap_widens_with_the_confidence_level():
+    """`confidence` must reach the percentiles. Hardcoding 2.5/97.5 -- or using
+    one tail for both ends -- leaves every other assertion here green."""
+    joint, embedding, targets = _heterogeneous_windows(40, 25)
+    widths = []
+    for confidence in (0.50, 0.95, 0.99):
+        low, high = _block_bootstrap_ci(joint, embedding, targets, window=25,
+                                        resamples=800, confidence=confidence,
+                                        seed=0)
+        assert low < high, f"the interval is inverted at confidence={confidence}"
+        widths.append(high - low)
+    assert widths[0] < widths[1] < widths[2], f"widths did not widen: {widths}"
+
+
+def test_block_bootstrap_rejects_rows_that_are_not_whole_windows():
+    """A partial trailing block would mix two windows into one resampling unit,
+    silently breaking the exchangeability the interval rests on."""
+    joint, embedding, targets = _heterogeneous_windows(10, 5)
+    with pytest.raises(ValueError, match="whole number"):
+        _block_bootstrap_ci(joint[:47], embedding[:47], targets[:47], window=5,
+                            resamples=10, confidence=0.95, seed=0)
+
+
+def test_gain_rejects_an_h_dim_that_does_not_index_the_latent():
+    """A wrong `h_dim` probes the wrong slice with no shape error to show for
+    it, so it is rejected at the boundary rather than silently truncated."""
+    latent, embedding, targets = _history_case(100, seed=0)
+    split = _split(latent, embedding, targets)
+    with pytest.raises(ValueError, match="h_dim"):
+        _gain_from_splits(split, None, split, h_dim=99, window=GAIN_WINDOW,
+                          resamples=10, seed=0)
+
+
+def _fake_gain_gather(seen: list, rows: int = 100):
+    def fake_gather(model, paths, backbone, device, context=5, horizon=45,
+                    limit=20, seed=0):
+        seen.append({"paths": list(paths), "seed": seed, "context": context,
+                     "horizon": horizon, "limit": limit})
+        rng = np.random.default_rng(len(seen))
+        return {"latent": rng.normal(size=(rows, 6)),
+                "embedding": rng.normal(size=(rows, 3)),
+                "encoder_embedding": rng.normal(size=(rows, 3)),
+                "targets": rng.normal(size=(rows, 4))}
+    return fake_gather
+
+
+def test_filtering_gain_gathers_three_disjoint_splits_and_scores_criterion_4s_rows(
+    monkeypatch,
+):
+    """The split structure IS the fix, so it is pinned at the call level.
+
+    The fit and selection episodes must be disjoint (or the selection is not
+    held out from the weights), neither may be a validation episode (or the
+    reported level is not held out at all), and the scored gather must use the
+    same `seed + 1` draw `filtering_report` scores criterion 4 on -- otherwise
+    the two diagnostics describe different rows and cannot be read against each
+    other, which is the entire reason this is reported beside criterion 4."""
+    seen = []
+    monkeypatch.setattr(probe_module, "gather_probe_data", _fake_gain_gather(seen))
+    train = [f"t{i}" for i in range(6)]
+    out = filtering_gain(object(), train, ["v0", "v1"], None, torch.device("cpu"),
+                         context=2, horizon=3, limit=4, seed=5,
+                         h_dim=3, select_episodes=2, resamples=20)
+
+    fit, select, score = seen
+    assert fit["paths"] == train[:4], (
+        "the fit split is not the first `limit` episodes -- it must be the same "
+        "set criterion 4 fits on, or the levels are not comparable"
+    )
+    assert select["paths"] == train[4:6], (
+        "the selection episodes were not taken from beyond `limit`; carving "
+        "them out of the fit set shrinks the weights' training data instead"
+    )
+    assert not set(fit["paths"]) & set(select["paths"])
+    assert score["paths"] == ["v0", "v1"], "the scored split is not the val episodes"
+    assert score["seed"] == 6, (
+        "the scored gather must draw at seed+1, the same draw filtering_report "
+        "scores criterion 4 on"
+    )
+    assert {fit["seed"], select["seed"]} == {5, 7}, "the three gathers must differ"
+    assert [c["context"] for c in seen] == [2, 2, 2]
+    assert [c["horizon"] for c in seen] == [3, 3, 3]
+    # The block length is the rollout's own window, so 100 rows is 20 blocks.
+    assert out["n_scored_windows"] == 20, (
+        "the bootstrap block is not context+horizon -- it must be the window "
+        "gather_probe_data actually cuts"
+    )
+
+
+def test_filtering_gain_reads_h_dim_from_the_models_rssm(monkeypatch):
+    """Production must not have to restate the model's own width. The pass-
+    through fakes elsewhere carry no `RSSMConfig`, so this is the path the real
+    `WorldModel` takes."""
+    seen = []
+    monkeypatch.setattr(probe_module, "gather_probe_data", _fake_gain_gather(seen))
+    model = types.SimpleNamespace(
+        rssm=types.SimpleNamespace(cfg=types.SimpleNamespace(h_dim=4))
+    )
+    out = filtering_gain(model, ["t0", "t1", "t2"], ["v0"], None,
+                         torch.device("cpu"), context=2, horizon=3, limit=2,
+                         select_episodes=1, resamples=20)
+    assert isinstance(out["gain"], float)
+
+    with pytest.raises(ValueError, match="h_dim"):
+        filtering_gain(object(), ["t0", "t1", "t2"], ["v0"], None,
+                       torch.device("cpu"), context=2, horizon=3, limit=2,
+                       select_episodes=1, resamples=20)
+
+
+def test_filtering_gain_falls_back_to_a_fixed_ridge_when_nothing_can_be_spared(
+    monkeypatch,
+):
+    """A training pool with nothing past `limit` has no selection split. The
+    fallback is `fit_probe`'s default penalty -- weaker, but still never
+    selected on the rows the gain is reported from -- and it says so in the
+    result rather than quietly reverting to the biased selection."""
+    seen = []
+    monkeypatch.setattr(probe_module, "gather_probe_data", _fake_gain_gather(seen))
+    out = filtering_gain(object(), ["t0"], ["v0"], None, torch.device("cpu"),
+                         context=2, horizon=3, h_dim=3, limit=1,
+                         select_episodes=4, resamples=20)
+    assert out["ridge_selected"] is False
+    assert out["joint_ridge"] == 1e3 and out["embedding_ridge"] == 1e3
+    assert len(seen) == 2, "a selection split was gathered with nothing to spare"
+    assert [c["paths"] for c in seen] == [["t0"], ["v0"]]
+
+
+def test_filtering_gain_defaults_are_the_spec_values():
+    """The gain is only comparable with criterion 4 if it is measured at the
+    rollout's own window; `resamples` and `confidence` are what the recorded
+    interval means.
+
+    `select_episodes` is pinned at 20 because SELECTION NOISE DOMINATES THIS
+    STATISTIC, and nothing else in this file can catch a shrink. `RIDGES` is a
+    decade grid and the scored R^2 moves ~0.10 between adjacent decades --
+    several times the gain being measured. Measured on the 20k checkpoint, both
+    arms peak at 1e3 and the gain there is -0.0208; a 4-episode selection split
+    picks 1e5 for both and reports +0.0325, so the SIGN FLIPS on a one-step
+    selection error. A 20-episode split recovers -0.0208."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(filtering_gain).parameters.items()
+    }
+    assert defaults["context"] == 5
+    assert defaults["horizon"] == 45
+    assert defaults["limit"] == 20
+    assert defaults["seed"] == 0
+    assert defaults["confidence"] == 0.95
+    assert defaults["resamples"] == 1000
+    assert defaults["select_episodes"] == 20, (
+        "a smaller selection split does not make the gain noisier, it makes it "
+        "wrong -- measured, 4 episodes flip the sign"
+    )
