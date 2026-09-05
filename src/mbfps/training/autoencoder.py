@@ -23,7 +23,7 @@ from mbfps.data.prefetch import Prefetcher
 from mbfps.models.decoders import PixelDecoder, reconstruction_loss
 from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.utils.config import Config
-from mbfps.utils.device import get_device
+from mbfps.utils.device import get_device, to_device  # noqa: F401 -- re-exported
 from mbfps.utils.seeding import seed_everything, seeded_init
 
 
@@ -57,14 +57,6 @@ class AutoencoderModel(nn.Module):
             features = batch["features"]
             source = features.reshape(-1, *features.shape[-2:])
         return self.decoder(self.encoder(source)), target
-
-
-def to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    out = {}
-    for key, value in batch.items():
-        if isinstance(value, np.ndarray) and key in ("obs", "features"):
-            out[key] = torch.from_numpy(value).to(device)
-    return out
 
 
 def train_autoencoder(
