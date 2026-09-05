@@ -44,6 +44,14 @@ from mbfps.eval.study import (
 JOB_ARM = "random_vit"      # the arm the shared `record` fixture runs at
 OTHER_ARM = "cnn"           # a second arm run below, so `"arm": job.arm` is
                             # not satisfied by hardcoding the first one
+THIRD_ARM = "frozen_ssl"    # THE ONLY ARM WHOSE NAME IS NOT ITS BACKBONE'S.
+                            # `random_vit` reads the `random_vit` cache and
+                            # `cnn` reads pixels, so on those two arms alone
+                            # `backbone = encoder_backbone(cfg.encoder) ->
+                            # backbone = job.arm` is a numerical no-op. This
+                            # arm reads `dinov2`, and running it here is what
+                            # makes that mutation visible at all.
+THIRD_ARM_BACKBONE = "dinov2"
 JOB_SEED = 1                # NOT SPLIT_SEED (0): `"split_seed": job.seed`
                             # is indistinguishable from the truth at seed 0
 JOB_KW = dict(steps=5, seq_len=4, context=2, horizon=3, device="cpu")
@@ -142,6 +150,42 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
     # job.arm -> "arm": "random_vit"` mislabels all nine records and passes.
     assert JOB_ARM != OTHER_ARM
     assert {JOB_ARM, OTHER_ARM} <= set(ARMS)
+
+    # THE SAME SPECIES ONE LEVEL DOWN, and the reason THIRD_ARM exists.
+    #
+    # `run_job` derives the feature cache from the CONFIG
+    # (`encoder_backbone(cfg.encoder)`), never from the arm name, and
+    # `mbfps/models/encoders.py` says why: "the arm name and the backbone name
+    # are deliberately not assumed equal". But on the two arms this file used
+    # to run, they ARE equal or irrelevant -- `random_vit`'s cache is called
+    # `random_vit` and `cnn` reads pixels -- so `backbone = job.arm` was a
+    # numerical no-op and survived the whole suite. In the study it sends
+    # `frozen_ssl` to a cache that does not exist and kills all three of that
+    # arm's seeds at `FileNotFoundError` hours in.
+    #
+    # So all three arms are run below, and the coincidence that hid the
+    # mutation is asserted here by name rather than left to be rediscovered.
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.utils.config import get_config
+
+    assert len({JOB_ARM, OTHER_ARM, THIRD_ARM}) == 3
+    assert {JOB_ARM, OTHER_ARM, THIRD_ARM} == set(ARMS), (
+        "every arm the study runs must be exercised here; the one that is "
+        "missing is the one whose backbone mapping is unguarded")
+    backbones = {
+        arm: encoder_backbone(get_config(arm, device="cpu", seed=JOB_SEED).encoder)
+        for arm in ARMS
+    }
+    assert backbones[THIRD_ARM] == THIRD_ARM_BACKBONE, backbones
+    assert backbones[THIRD_ARM] != THIRD_ARM, (
+        f"{THIRD_ARM!r} no longer reads a cache under a different name, so "
+        "`backbone = job.arm` is invisible everywhere in this suite again")
+    assert backbones[JOB_ARM] == JOB_ARM, (
+        "this coincidence is the whole reason the third arm is needed: on "
+        f"{JOB_ARM!r} the arm name and the backbone name are the same string")
+    assert backbones[OTHER_ARM] is None, (
+        f"{OTHER_ARM!r} reads pixels, so the backbone it is handed is unused "
+        "and cannot discriminate either")
 
 
 # --------------------------------------------------------------------------
@@ -714,6 +758,57 @@ def test_a_checkpoint_wrong_in_the_seed_alone_is_refused(
         "see WHICH half of the guard fired")
 
 
+def test_a_checkpoint_that_does_not_fit_the_model_is_refused(
+    tmp_path, small_buffer, monkeypatch
+):
+    """`load_state_dict(..., strict=False)` -- the partial form of the defect
+    the value comparison above closes.
+
+    That comparison only walks the keys the checkpoint and the model SHARE, so
+    it is silent about a key the checkpoint does not carry. Under
+    `strict=False` a checkpoint whose keys no longer match the architecture --
+    a renamed submodule, an arch change between the training run and the
+    evaluation -- loads whatever it can and leaves the rest RANDOMLY
+    INITIALISED, with nothing raised and the arm/seed guard still swearing the
+    right checkpoint was used. The record then describes a half-trained
+    network.
+
+    The checkpoint here is labelled for this exact job and its weights are a
+    real state dict for this arm, with ONE tensor removed. Under `strict=True`
+    that raises; under `strict=False` `run_job` completes and this test goes
+    red on DID NOT RAISE.
+    """
+    dropped: dict = {}
+
+    def fake_train(cfg, buffer, out_dir, log_every=100):
+        import torch
+
+        from mbfps.training.world_model import WorldModel
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        state = WorldModel(cfg).state_dict()
+        dropped["key"] = sorted(state)[0]
+        del state[dropped["key"]]
+        torch.save(
+            {"arm": cfg.arm, "seed": cfg.train.seed, "state_dict": state},
+            out_dir / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt",
+        )
+        return {"steps": 3, "seconds": 1.0, "loss": [0.0],
+                "kl_rate_above_free_bits": 0.0, "kl_dyn_max": 0.0}
+
+    monkeypatch.setattr(study, "train_world_model", fake_train)
+
+    with pytest.raises(RuntimeError, match="Missing key") as excinfo:
+        run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+
+    # Check-it-can-fail: the removed tensor is a real, learned parameter of
+    # this architecture, so under `strict=False` it would sit at its fresh
+    # initialisation through every evaluation in the record.
+    assert dropped["key"], "the stand-in trainer never saved a checkpoint"
+    assert dropped["key"] in str(excinfo.value), (
+        "the loader must name the tensor the checkpoint could not supply")
+
+
 # ---------------------------------------------------------------------------
 # Review follow-up: the twelve confirmed findings of task 4's review. The
 # record itself was right; its VALUES, its DEFAULTS and its returned FORM were
@@ -871,6 +966,32 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
     real_world_model = study.WorldModel
     seen: dict = {}
     models: list = []
+    forwarded: dict = {}
+
+    # Where the device sits in each evaluation call. `evaluate_rollout` takes
+    # it by keyword; the other four take it positionally.
+    device_argument = {
+        "fit_probes": 3,
+        "reward_accuracy": 3,
+        "filtering_report": 4,
+        "filtering_gain": 4,
+        "evaluate_rollout": "device",
+    }
+
+    def forward_spy(name, where):
+        real = getattr(study, name)
+
+        def wrapper(*args, **kwargs):
+            forwarded[name] = (
+                kwargs.get(where) if isinstance(where, str)
+                else (args[where] if len(args) > where else kwargs.get("device"))
+            )
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(study, name, wrapper)
+
+    for name, where in device_argument.items():
+        forward_spy(name, where)
 
     def config_spy(arm, **overrides):
         seen["cfg_device"] = overrides.get("device")
@@ -952,6 +1073,26 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
         "rather than the one get_device returned for the job's --device; on a "
         "CUDA-less machine both are CPU, so no tensor can show it "
         f"(asked for {seen['device']}, got {load_kwargs.get('map_location')})")
+
+    # AND THE FIVE CALL SITES THAT FORWARD THE DEVICE ONWARD, which the two
+    # checks above stopped short of. Every one of `fit_probes`,
+    # `reward_accuracy`, `evaluate_rollout`, `filtering_report` and
+    # `filtering_gain` is handed a device, and `torch_device ->
+    # torch.device("cpu")` at any of them was invisible: `get_device(prefer=
+    # "cuda")` already IS cpu on this machine, so no tensor and no number can
+    # tell the two apart HERE. On the rented box it fits the probe, scores the
+    # reward, runs the headline rollout or computes gate criterion 4 on CPU
+    # tensors against a CUDA model -- a RuntimeError mid-study, or a silent
+    # CPU evaluation, after the training hours are already paid. The identity
+    # check above is what makes this bite on a CUDA-less machine too.
+    assert set(forwarded) == set(device_argument), (
+        f"not every evaluation was observed: {sorted(forwarded)}")
+    for name, got in forwarded.items():
+        assert got is seen["device"], (
+            f"{name} was handed a device run_job built for itself rather than "
+            "the one get_device returned for the job's --device; both are CPU "
+            f"here, so only object identity can see it (asked for "
+            f"{seen['device']}, got {got})")
 
 
 def test_the_evaluated_model_is_the_trained_one_and_is_in_eval_mode(
@@ -1249,16 +1390,30 @@ def test_the_record_reports_the_training_history_it_was_given(
     A tail of `[1.0] * 20` only caught WIDENING: narrowing to `[-1:]` or
     `[-2:]` has the same mean as `[-20:]` when every value in the tail is
     equal, so the assertion could not see it and both mutants survived. With
-    twenty distinct values the four means are all different -- last 20 = 10.5,
-    last two = 19.5, last one = 20.0, whole history = 40.33 -- so any resizing
+    twenty distinct values the four means are all different, so any resizing
     of the slice moves the number.
+
+    THE REDUCER OVER THE WINDOW IS PINNED TOO, and it was not. The tail used
+    to be `[1.0 .. 20.0]`, whose mean AND median are both exactly 10.5, so
+    `np.mean -> np.median` was a numerical no-op and survived -- the same
+    fixture-coincidence species as `steps == horizon` above, one function
+    deeper. `loss_last20` is the study's convergence number in all nine
+    records and on a skewed tail the two statistics are ~27% apart. So the
+    tail below is deliberately SKEWED: mean 14.5 against median 10.5, and the
+    guard asserts that separation rather than trusting it.
     """
     real_train = study.train_world_model
-    tail = [float(i) for i in range(1, 21)]         # mean 10.5, last 20.0
+    # Skewed on purpose: mean 14.5, median 10.5, last two 59.5, last one 100.0,
+    # whole history 43.0 -- five different answers to "the training loss".
+    tail = [float(i) for i in range(1, 20)] + [100.0]
     assert len({float(np.mean(tail)), float(np.mean(tail[-2:])),
                 float(tail[-1])}) == 3, (
         "a constant tail makes the loss_last20 assertion blind to a narrowed "
         "window, which is the mutation this test exists to kill")
+    assert float(np.mean(tail)) != float(np.median(tail)), (
+        "the tail's mean and median coincide, so `np.mean -> np.median` over "
+        "the window is a numerical no-op and the assertion below cannot see "
+        "it -- which is exactly the state this fixture was found in")
 
     def doctored(cfg, buffer, out_dir, log_every=100):
         history = real_train(cfg, buffer, out_dir=out_dir, log_every=log_every)
@@ -1275,7 +1430,10 @@ def test_the_record_reports_the_training_history_it_was_given(
     assert result["kl_rate_above_free_bits"] == pytest.approx(0.25)
     assert result["kl_dyn_max"] == pytest.approx(7.5)
     assert result["steps_per_second"] == pytest.approx(250.0)
-    assert result["loss_last20"] == pytest.approx(10.5)
+    assert result["loss_last20"] == pytest.approx(float(np.mean(tail)))
+    assert result["loss_last20"] == pytest.approx(14.5)
+    assert result["loss_last20"] != pytest.approx(float(np.median(tail))), (
+        "the reported convergence number is the window's MEDIAN, not its mean")
 
 
 def test_the_record_carries_the_probe_settings_it_measured_with(
@@ -1513,3 +1671,517 @@ def test_a_zero_dimensional_numpy_value_is_written_as_a_scalar(tmp_path):
     assert written[NONFINITE_KEY]["n"] == "nan"
     assert strict_loads((tmp_path / "r.json").read_text()) == written
 
+
+
+# ---------------------------------------------------------------------------
+# Task 4, FINAL ROUND. The 19 Critical/Important findings of the last audit,
+# plus the four Minors Task 5's argparse-based driver will hand strings to.
+#
+# Every one of these mutations was confirmed to leave 529/529 green. What they
+# have in common is that the record still has the right SHAPE: the right keys,
+# the right types, plausible magnitudes. Nine JSON files are the study's only
+# artifact, so a field that is silently wrong is worse than one that is absent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("arm", [JOB_ARM, OTHER_ARM, THIRD_ARM])
+def test_every_evaluation_reads_the_cache_the_arms_encoder_actually_uses(
+    tmp_path, small_buffer, monkeypatch, arm
+):
+    """WHICH FEATURE CACHE the five evaluations read had no assertion at all.
+
+    Two mutations of one line, both green across the whole suite:
+
+      * `backbone = "dinov2"`. Demonstrated live on the real data: the
+        record's `filtering.criterion_4.latent_beats_embedding` flips
+        False -> True (latent_r2 -1.06e-05 -> +1.15e-03), so GATE CRITERION 4
+        WOULD BE REPORTED AS PASSED in all nine records, off the wrong arm's
+        cached features, and every curve and band moves with it.
+
+      * `backbone = job.arm` -- the exact hazard `mbfps/models/encoders.py`
+        documents ("the arm name and the backbone name are deliberately not
+        assumed equal"). It was invisible by pure fixture coincidence:
+        `random_vit`'s arm name IS its backbone name and `cnn` reads pixels,
+        and those were the only two arms this file ever ran. `frozen_ssl`, the
+        one arm where they differ, is the treatment arm of the study, and all
+        three of its seeds would die at
+        `FileNotFoundError('.features_frozen_ssl.npy')` hours in -- after the
+        training time is paid, on the unattended box.
+
+    So this runs ALL THREE ARMS and pins the backbone that reached each of the
+    five evaluation calls. On `frozen_ssl` the mutation cannot even complete:
+    the cache it names does not exist, which is precisely the study-box
+    failure, reproduced here in two seconds.
+    """
+    from mbfps.data.loader import feature_suffix
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.utils.config import get_config
+
+    expected = encoder_backbone(get_config(arm, device="cpu", seed=JOB_SEED).encoder)
+    assert expected == {JOB_ARM: JOB_ARM, OTHER_ARM: None,
+                        THIRD_ARM: THIRD_ARM_BACKBONE}[arm], (
+        f"{arm!r} no longer reads the cache this test was written against")
+
+    # Check-it-can-fail, part one: a hardcoded "dinov2" is the WRONG answer
+    # for two of the three arms, and `job.arm` is the wrong answer for two of
+    # the three as well -- so between them the parametrisation moves.
+    if arm != THIRD_ARM:
+        assert expected != THIRD_ARM_BACKBONE, (
+            "a hardcoded dinov2 backbone is indistinguishable from the truth "
+            f"on {arm!r}")
+    if arm != JOB_ARM:
+        assert expected != arm, (
+            f"the arm name and the backbone name coincide on {arm!r}, so "
+            "`backbone = job.arm` is invisible here")
+
+    # Check-it-can-fail, part two: for a feature arm, reading the OTHER cache
+    # is a real numerical change, not a relabelling.
+    if expected is not None:
+        other_backbone = JOB_ARM if expected == THIRD_ARM_BACKBONE \
+            else THIRD_ARM_BACKBONE
+        episode = small_buffer.episode_paths()[0]
+        mine = np.load(episode.with_suffix(feature_suffix(expected)))
+        theirs = np.load(episode.with_suffix(feature_suffix(other_backbone)))
+        assert mine.shape == theirs.shape and not np.array_equal(mine, theirs), (
+            "the two feature caches hold identical data in this fixture, so "
+            "reading the wrong one is a numerical no-op and nothing below "
+            "guards anything")
+
+    seen: dict = {}
+    backbone_argument = {
+        "fit_probes": 2,
+        "reward_accuracy": 2,
+        "filtering_report": 3,
+        "filtering_gain": 3,
+        "evaluate_rollout": "feature_backbone",
+    }
+
+    def spy(name, where):
+        real = getattr(study, name)
+
+        def wrapper(*args, **kwargs):
+            seen[name] = (kwargs.get(where) if isinstance(where, str)
+                          else args[where])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(study, name, wrapper)
+
+    for name, where in backbone_argument.items():
+        spy(name, where)
+
+    run_job(StudyJob(arm, JOB_SEED), small_buffer, tmp_path, **JOB_KW)
+
+    assert set(seen) == set(backbone_argument), (
+        f"not every evaluation was observed: {sorted(seen)}")
+    for name, got in seen.items():
+        assert got == expected, (
+            f"{name} was pointed at the {got!r} feature cache while {arm!r}'s "
+            f"encoder consumes {expected!r} -- every number this evaluation "
+            "produces describes another arm's inputs")
+
+
+def test_reward_accuracy_scores_the_reward_head_against_the_recorded_reward(
+    small_buffer, monkeypatch
+):
+    """TWO Critical mutations at one call, both green across the suite.
+
+      * `_summarise_reward(predicted, true)` -> `(true, predicted)`. Measured
+        on three real `my_way_home` episodes: `is_degenerate` True -> False,
+        `r2` NaN -> -47.11, `n_reward_events` 0 -> 1574; only `mse` survives,
+        because it is symmetric. `is_degenerate` is the field that exists to
+        stop a reader quoting a four-digit MSE over a near-constant target,
+        and it INVERTS in all nine records.
+        `test_degeneracy_is_a_property_of_the_target_not_the_prediction` pins
+        `_summarise_reward` itself; nothing pinned the ORDER at the one call
+        site that feeds it.
+
+      * `model.heads(...)["reward"]` -> `["continue_logit"]`. The two heads
+        have the same (B, T) shape, so no guard fires. Measured on real
+        episodes the MSE goes 0.00258653 -> 0.00186895 -- a 28% BETTER-looking
+        number for a head that never predicts reward.
+
+    Both are killed by naming, for each argument, the tensor it must be.
+    """
+    import torch
+
+    from mbfps.data.episode import load_episode
+    from mbfps.eval.study import reward_accuracy
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.models.heads import WorldModelHeads
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    cfg = get_config(JOB_ARM, device="cpu", seed=JOB_SEED)
+    model = WorldModel(cfg)
+    model.eval()
+    paths = small_buffer.episode_paths()[:2]
+
+    head_outputs: list[dict] = []
+    real_forward = WorldModelHeads.forward
+
+    def forward_spy(self, latent):
+        out = real_forward(self, latent)
+        head_outputs.append(out)
+        return out
+
+    summarised: dict = {}
+    real_summarise = study._summarise_reward
+
+    def summarise_spy(*args, **kwargs):
+        summarised["args"] = args
+        return real_summarise(*args, **kwargs)
+
+    monkeypatch.setattr(WorldModelHeads, "forward", forward_spy)
+    monkeypatch.setattr(study, "_summarise_reward", summarise_spy)
+
+    reward_accuracy(model, paths, encoder_backbone(cfg.encoder),
+                    torch.device("cpu"), limit=2)
+
+    assert len(head_outputs) == len(paths), (
+        f"expected one head call per episode, saw {len(head_outputs)}")
+    assert "args" in summarised, "_summarise_reward was never called"
+    assert len(summarised["args"]) == 2, (
+        "the summary is called positionally; this test reads the order off "
+        "those two positions")
+    got_predicted, got_true = summarised["args"]
+
+    reward_head = np.concatenate(
+        [out["reward"][0].float().cpu().numpy() for out in head_outputs])
+    continue_head = np.concatenate(
+        [out["continue_logit"][0].float().cpu().numpy() for out in head_outputs])
+    recorded = np.concatenate([load_episode(p).rewards for p in paths])
+
+    # Check-it-can-fail, three ways: the reward head and the continue head
+    # really disagree, the prediction and the target really disagree, and the
+    # two arguments have the SAME SHAPE, so exchanging them raises nothing.
+    assert reward_head.shape == continue_head.shape
+    assert not np.allclose(reward_head, continue_head), (
+        "the reward head and the continue head agree on this fixture, so "
+        "reading the wrong one is invisible to the assertion below")
+    assert reward_head.shape == recorded.shape
+    assert not np.allclose(reward_head, recorded), (
+        "the prediction equals the target here, so exchanging the two "
+        "arguments of _summarise_reward is a no-op and cannot be seen")
+
+    assert np.array_equal(got_predicted, reward_head), (
+        "reward accuracy did not summarise the REWARD head's output; the "
+        "continue head has the same shape and yields a plausible, better "
+        "looking MSE for a head that never predicts reward")
+    assert not np.array_equal(got_predicted, continue_head)
+    assert np.array_equal(got_true, recorded), (
+        "the episode's recorded reward is not the second argument -- with the "
+        "two exchanged, `is_degenerate` becomes a property of the model's "
+        "predictions instead of the target and inverts in all nine records")
+
+
+def test_reward_accuracys_own_inputs_are_placed_on_the_device_it_was_given(
+    small_buffer, monkeypatch
+):
+    """The two per-episode input tensors, and the reason the study box dies.
+
+    `torch.as_tensor(source).to(device)` -> `torch.as_tensor(source)`, and the
+    same one line down for the actions, are byte-identical to pristine on CPU
+    -- and every test in this suite runs `device="cpu"`, so 529/529 stayed
+    green. Demonstrated on MPS, standing in for the rented CUDA box:
+    `RuntimeError: Tensor for argument input is on cpu but expected on mps`.
+    On the GPU box every job dies inside `reward_accuracy` AFTER paying its
+    training hours -- 8.3 h for the pixel arm -- and the 33-hour unattended run
+    produces nothing at all.
+
+    The device test for `run_job` pins `.to()` and `map_location=` by OBJECT
+    IDENTITY, which is what lets a device guard bite on a CUDA-less machine.
+    The same trick reaches these two statements through a spy on
+    `torch.Tensor.to`: the device object this test hands `reward_accuracy` is
+    not equal-but-fresh, it is THE object, and nothing the mutation can
+    construct satisfies `is`.
+    """
+    import torch
+
+    from mbfps.eval.study import reward_accuracy
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    device = torch.device("cpu")
+    # Check-it-can-fail: an equal-but-freshly-built device -- exactly what a
+    # hardcoding mutation constructs -- is NOT this object, on this machine,
+    # where both of them are plain CPU.
+    fresh = torch.device(device.type)
+    assert fresh == device and fresh is not device, (
+        "object identity can no longer tell a hardcoded device from the one "
+        "the caller passed, so this test would pass on the GPU-box regression")
+
+    cfg = get_config(JOB_ARM, device="cpu", seed=JOB_SEED)
+    model = WorldModel(cfg)
+    model.eval()
+
+    placed: list = []
+    real_to = torch.Tensor.to
+
+    def to_spy(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("device")
+        if isinstance(target, torch.device):
+            placed.append((self.dtype, target))
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to_spy)
+    reward_accuracy(model, small_buffer.episode_paths()[:1],
+                    encoder_backbone(cfg.encoder), device, limit=1)
+    monkeypatch.undo()
+
+    assert len(placed) == 2, (
+        "reward_accuracy places exactly two tensors per episode -- the encoder "
+        "input and the action sequence. Seeing "
+        f"{len(placed)} means one of them was left where numpy put it, which "
+        f"is a RuntimeError on any non-CPU device: {placed}")
+    dtypes = [dtype for dtype, _ in placed]
+    assert torch.int64 in dtypes, (
+        "the action tensor never reached a device: `.unsqueeze(0).to(device)` "
+        "-> `.unsqueeze(0)`")
+    assert any(dtype != torch.int64 for dtype in dtypes), (
+        "the encoder input never reached a device: "
+        "`torch.as_tensor(source).to(device)` -> `torch.as_tensor(source)`")
+    for dtype, target in placed:
+        assert target is device, (
+            f"the {dtype} input was moved to a device reward_accuracy built "
+            "for itself rather than the one it was handed; both are CPU here, "
+            f"so only object identity can see it (got {target})")
+
+
+def test_reward_accuracy_is_reproducible_from_its_own_seed(small_buffer):
+    """`observe` SAMPLES from the posterior, so the RNG really moves the number.
+
+    Two mutations, both green:
+
+      * `torch.manual_seed(seed)` -> `torch.manual_seed(0)`. All three seeds of
+        an arm then draw the same posterior sample stream, criterion 3's
+        seed-to-seed spread is understated, and the three seeds stop being
+        independent replicates for that field -- which is the only thing the
+        3-seed design buys.
+      * the line deleted outright. Reward accuracy then depends on whatever
+        RNG state training and the probe fit happen to leave behind, so
+        re-running a cell need not reproduce its own record -- while the
+        driver resumes off these records precisely because a cell is supposed
+        to be reproducible.
+
+    The first assertion kills the hardcode; the second kills the deletion, and
+    is only meaningful because the first has shown the stream matters.
+    """
+    import torch
+
+    from mbfps.eval.study import reward_accuracy
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    cfg = get_config(JOB_ARM, device="cpu", seed=JOB_SEED)
+    model = WorldModel(cfg)
+    model.eval()
+    backbone = encoder_backbone(cfg.encoder)
+    paths = small_buffer.episode_paths()[:2]
+
+    def score(seed):
+        return reward_accuracy(model, paths, backbone, torch.device("cpu"),
+                               limit=2, seed=seed)["mse"]
+
+    at_one, at_two = score(1), score(2)
+    assert at_one != at_two, (
+        "two different seeds produce the same reward MSE, so the posterior is "
+        "not being sampled here and neither assertion in this test can fail "
+        "-- `torch.manual_seed(seed) -> torch.manual_seed(0)` would be a no-op")
+
+    # Check-it-can-fail for the DELETION: the two ambient states below really
+    # are different streams, so a reward_accuracy that did not reseed would
+    # return two different numbers for one seed.
+    torch.manual_seed(999)
+    ambient_a = torch.rand(1).item()
+    torch.manual_seed(12345)
+    ambient_b = torch.rand(1).item()
+    assert ambient_a != ambient_b, "the two ambient RNG states coincide"
+
+    torch.manual_seed(999)
+    from_ambient_a = score(1)
+    torch.manual_seed(12345)
+    from_ambient_b = score(1)
+    assert from_ambient_a == from_ambient_b == at_one, (
+        "the reward MSE moved with the AMBIENT RNG state, so this cell is not "
+        "reproducible from its own seed: re-running it would not reproduce "
+        "its own record, and the driver resumes off exactly that promise")
+
+
+def test_the_reward_event_count_rounds_the_array_and_the_median_onto_one_grid():
+    """`rounded` and the median it is compared against must share a grid.
+
+    Two mutations, both green, both giving the same measured outcome on the
+    real 59,511-step `my_way_home` reward stream: `n_reward_events` 21 ->
+    59,511, i.e. EVERY STEP counted as a reward event.
+
+      * `np.round(np.median(true), 6)` -> `np.median(true)`;
+      * `np.round(true, 6)` -> `np.round(true, 12)`.
+
+    The mechanism is the same in both: `my_way_home`'s living penalty is a
+    float32 -0.0004, which widens to -0.00039999998989515007 in float64, so
+    the rounded array and the unrounded (or finer-rounded) median stop being
+    equal and every step differs from the modal value. The count that makes
+    criterion 3 readable -- "six steps carry the goal" -- reports the exact
+    opposite finding, at a magnitude nobody would flag as impossible.
+
+    `test_the_reward_rounding_resolves_a_fine_grained_target` pins the decimals
+    DOWNWARD only (6 -> 0), on a synthetic float64 grid where both roundings
+    agree, so it cannot see either of these.
+    """
+    living_penalty = np.float32(-0.0004)
+    true = np.full(1000, living_penalty, dtype=np.float32)
+    true[:3] = 1.0                                  # three goal events
+
+    # Check-it-can-fail: the float32 penalty is NOT representable on the
+    # 6-decimal grid, which is the entire mechanism. On a target where the two
+    # agree, both mutations are numerical no-ops.
+    widened = np.asarray(true, dtype=np.float64)
+    assert float(np.median(widened)) != float(np.round(np.median(widened), 6)), (
+        "this target's modal value survives the float64 widening unchanged, "
+        "so dropping the median's rounding is invisible here")
+    assert float(np.round(widened, 12)[10]) != float(np.round(np.median(widened), 6)), (
+        "a 12-decimal grid agrees with the 6-decimal median on this target, "
+        "so widening the array's rounding is invisible here")
+
+    out = _summarise_reward(np.zeros(1000, dtype=np.float64), true)
+    assert out["n_reward_events"] == 3, (
+        "the event count is not counting reward EVENTS: with the array and "
+        "the median rounded onto different grids every step differs from the "
+        "modal value and the count becomes the step count")
+    assert out["n_reward_events"] != out["n_steps"]
+    assert out["is_degenerate"] is True
+
+
+def test_the_written_record_keeps_its_strings_and_its_booleans(
+    record, written, tmp_path
+):
+    """`_sanitise`'s fallback `return value` -> `return None`, green across the
+    whole suite AND across the suite with this file excluded.
+
+    NO TEST READS A STRING OUT OF THE SANITISED PROJECTION: every assertion on
+    `written` or on `strict_loads(text)` is a self-comparison, or is about a
+    number or a None. Measured on a record of the real shape, the mutation
+    writes `"arm": null` and every held-out episode name as `null`. Task 6
+    GROUPS THE NINE FILES BY `arm`, so all three arms' results become
+    indistinguishable, and the episode audit trail that makes "all nine cells
+    were scored on the same episodes" checkable is erased.
+
+    The bool branch is pinned here too. `isinstance(value, (bool, np.bool_))`
+    -> `(np.bool_,)` lets a Python bool fall through to the int branch:
+    measured, `latent_beats_embedding` False -> 0, `ridge_selected` True -> 1,
+    `is_degenerate` True -> 1. Gate criterion 4's own verdict changes JSON
+    TYPE in all nine files, and any aggregation using `is True`, a schema
+    check or a strict type assertion reads it wrong.
+    `test_numpy_scalars_are_written_as_plain_json` only ever passes `np.bool_`.
+    """
+    text = job_record_path(tmp_path, JOB).read_text()
+    parsed = strict_loads(text)
+
+    # Check-it-can-fail: these fields carry real strings in the live record,
+    # so `None` in the projection is a genuine difference, not a re-encoding.
+    assert isinstance(record["arm"], str) and record["arm"]
+    assert record["episodes"]["val"] and record["episodes"]["train"]
+
+    assert written["arm"] == JOB_ARM and isinstance(written["arm"], str), (
+        f"the arm label reached the file as {written['arm']!r}; Task 6 groups "
+        "the nine records by this field, so all three arms would be one group")
+    assert parsed["arm"] == JOB_ARM, "the same, read back off disk"
+    for split in ("train", "val"):
+        assert written["episodes"][split] == record["episodes"][split]
+        assert parsed["episodes"][split] == record["episodes"][split]
+        assert all(isinstance(name, str) and name.endswith(".npz")
+                   for name in written["episodes"][split]), (
+            f"the held-out episode names were erased from the {split} list; "
+            "the record's audit trail is what makes 'all nine cells were "
+            "scored on the same episodes' checkable rather than assumed")
+
+    # Booleans, in the record's own fields rather than in a synthetic dict.
+    for section, field in (("reward", "is_degenerate"),
+                           ("probe", "latent_ridge_selected"),
+                           ("probe", "embedding_ridge_selected")):
+        live = record[section][field]
+        assert isinstance(live, bool), (section, field, type(live))
+        assert written[section][field] is live, (
+            f"{section}.{field} left the sanitiser as "
+            f"{written[section][field]!r} rather than a JSON boolean")
+    verdict = record["filtering"]["criterion_4"]["latent_beats_embedding"]
+    assert isinstance(verdict, bool), (
+        "gate criterion 4's verdict is no longer a Python bool, so the "
+        "assertion below cannot see the int coercion it exists for")
+    assert written["filtering"]["criterion_4"]["latent_beats_embedding"] is verdict
+    assert parsed["filtering"]["criterion_4"]["latent_beats_embedding"] is verdict
+
+
+def test_the_sanitiser_passes_strings_and_python_bools_through_unchanged(tmp_path):
+    """The same two branches, at unit scale and with the JSON text inspected.
+
+    `written["b"] is True` is the form that bites: `isinstance(1, int)` and
+    `1 == True` are both true, so a `== True` assertion would pass on the
+    integer the bool branch's mutation produces.
+    """
+    written = write_record(tmp_path / "r.json", {
+        "arm": "frozen_ssl",
+        "episodes": {"val": ["ep004.npz", "ep005.npz"]},
+        "yes": True, "no": False,
+        "one": 1, "zero": 0,
+    })
+    text = (tmp_path / "r.json").read_text()
+
+    assert written["arm"] == "frozen_ssl"
+    assert written["episodes"]["val"] == ["ep004.npz", "ep005.npz"]
+    assert '"arm": "frozen_ssl"' in text
+    assert "ep004.npz" in text
+
+    assert written["yes"] is True and written["no"] is False
+    assert '"yes": true' in text and '"no": false' in text
+    # The ints are untouched, which is what makes the two branches distinct.
+    assert written["one"] == 1 and written["one"] is not True
+    assert written["zero"] == 0 and written["zero"] is not False
+
+
+def test_the_out_dir_and_the_record_path_accept_the_strings_argparse_gives(
+    tmp_path, small_buffer
+):
+    """Task 5's driver is built on `argparse`, so `--out-dir` arrives as a STR.
+
+    Four coercions were unpinned, and the first is the one that would bite on
+    the driver's very first action:
+
+      * `job_record_path`: `Path(out_dir) / ...` -> `out_dir / ...`. THIS IS
+        THE RESUME PATH. The driver calls it to decide whether an 8.3-hour
+        cell has already been run, before anything else happens, and on a str
+        it raises `TypeError: unsupported operand type(s) for /: 'str' and
+        'str'`.
+      * `run_job`: `out_dir = Path(out_dir)` deleted -> `out_dir.mkdir` on a
+        str.
+      * `write_record`: `path = Path(path)` deleted -> `path.parent` on a str.
+      * `load_record`: `Path(path).read_text()` -> `path.read_text()`.
+
+    Every existing test passes `tmp_path`, which is already a `Path`, so all
+    four were invisible. Each mutation raises here.
+    """
+    out_dir = str(tmp_path / "study")
+
+    path = job_record_path(out_dir, JOB)
+    assert isinstance(path, Path)
+    assert path.parent == Path(out_dir)
+    assert path.name == f"result_{JOB_ARM}_seed{JOB_SEED}.json"
+    # The resume decision the driver makes before it spends any GPU time.
+    assert not path.exists()
+
+    result = run_job(JOB, small_buffer, out_dir, **JOB_KW)
+
+    assert path.is_file(), "the record was not written where the driver looks"
+    assert job_record_path(out_dir, JOB).exists(), (
+        "the resume check would re-run a cell that has already been paid for")
+
+    restored = load_record(str(path))
+    assert restored["arm"] == result["arm"] == JOB_ARM
+    assert restored["seed"] == JOB_SEED
+
+    elsewhere = tmp_path / "made" / "up" / "r.json"
+    write_record(str(elsewhere), {"x": 1.0, "y": float("nan")})
+    assert elsewhere.is_file(), "write_record did not create the parent chain"
+    assert load_record(str(elsewhere))["x"] == 1.0
