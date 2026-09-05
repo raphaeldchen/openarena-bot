@@ -4,111 +4,50 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import episode_split
 from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
+from mbfps.eval.summary import DEGENERATE, METRICS, metric_summary
 from mbfps.models.encoders import encoder_backbone
 from mbfps.training.world_model import WorldModel
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
 
-DEGENERATE_FRACTION = 1e-3
-"""Below this share of the persistence error, a POSITIVE band is still junk.
-
-`gap_closed` already returns NaN for a non-positive band, but a band that is
-positive and merely tiny divides just fine and returns nonsense: measured on an
-untrained model with a noise probe, a band ~1e-4 map units wide produced 125.2,
-9.06 and -0.68 at adjacent horizon steps. Real data puts the band around 0.6%
-of the error magnitude, so 0.1% is comfortably below the healthy regime while
-still catching the degenerate one.
-"""
+# Thin alias so the script reads naturally; the maths lives in the library
+# because Task 4's study job needs the identical computation.
+band_report = metric_summary
 
 
-def band_report(result) -> dict:
-    """Everything needed to judge whether `gap_closed` means anything here.
-
-    A bare `gap_closed` is not reportable on its own -- the ratio's denominator
-    is the persistence-to-floor band, and when that band collapses the ratio
-    stops carrying information without ever raising. So the width travels with
-    the ratio, always.
-    """
-    band = result.persistence_position - result.floor_position
-    ratio = result.position_gap_closed()
-    relative = np.divide(
-        band,
-        result.persistence_position,
-        out=np.full_like(band, np.nan),
-        where=result.persistence_position > 0,
-    )
-    degenerate = (band > 0) & (relative < DEGENERATE_FRACTION)
-    return {
-        "band": band,
-        "relative": relative,
-        "ratio": ratio,
-        "n_nonpositive": int((band <= 0).sum()),
-        "n_degenerate": int(degenerate.sum()),
-        "n_finite": int(np.isfinite(ratio).sum()),
-        "n_steps": int(len(band)),
-    }
-
-
-def print_report(result, report: dict) -> None:
-    ratio, band = report["ratio"], report["band"]
-    print(
-        f"position_error_final   rssm={result.rssm_position[-1]:9.2f} "
-        f"persistence={result.persistence_position[-1]:9.2f} "
-        f"floor={result.floor_position[-1]:9.2f}  (Doom map units)"
-    )
-    print(
-        f"angle_error_final_deg  rssm={result.rssm_angle[-1]:6.2f} "
-        f"persistence={result.persistence_angle[-1]:6.2f} "
-        f"floor={result.floor_angle[-1]:6.2f}"
-    )
-    print(f"position_gap_closed_final={ratio[-1]:.4f}")
-    print(f"angle_gap_closed_final={result.angle_gap_closed()[-1]:.4f}")
-
-    # The WHOLE curve, not just its last point. The band is narrow and can
-    # invert at some horizons and not others, so a single final value hides
-    # both the shape and the NaNs.
-    print(
-        f"band_width  min={band.min():.3f} median={np.median(band):.3f} "
-        f"max={band.max():.3f}"
-    )
-    print(
-        f"band_as_fraction_of_persistence  min={np.nanmin(report['relative']):.5f} "
-        f"median={np.nanmedian(report['relative']):.5f} "
-        f"max={np.nanmax(report['relative']):.5f}"
-    )
-    print(
-        f"steps_with_floor_above_persistence={report['n_nonpositive']}/"
-        f"{report['n_steps']}"
-    )
-    print(
-        f"steps_with_degenerate_positive_band={report['n_degenerate']}/"
-        f"{report['n_steps']}  (band < {DEGENERATE_FRACTION:g} x persistence)"
-    )
-    print(
-        f"gap_closed  finite={report['n_finite']}/{report['n_steps']} "
-        f"mean={np.nanmean(ratio):+.4f} min={np.nanmin(ratio):+.4f} "
-        f"max={np.nanmax(ratio):+.4f}"
-    )
-
-    if not np.isfinite(ratio).any():
-        print(
-            "WARNING: gap_closed is NaN at every horizon step -- the band is "
-            "non-positive throughout, so this metric says nothing here. Report "
-            "raw errors instead (spec 9, open question 1)."
-        )
-    elif report["n_degenerate"]:
-        print(
-            f"WARNING: {report['n_degenerate']} horizon steps have a positive but "
-            "numerically degenerate band. gap_closed divides by it without "
-            "complaint and the resulting ratio is not trustworthy at those steps."
-        )
+def print_report(result, reports: dict) -> None:
+    """Print both metrics with identical guards."""
+    units = {"position": "Doom map units", "angle": "degrees"}
+    for metric in METRICS:
+        r = reports[metric]
+        print(f"\n--- {metric} ({units[metric]}) ---")
+        print(f"{metric}_final          rssm={r['final_model']:9.2f} "
+              f"persistence={r['final_persistence']:9.2f} floor={r['final_floor']:9.2f}")
+        print(f"{metric}_band_width     min={r['band_min']:9.3f} "
+              f"median={r['band_median']:9.3f} max={r['band_max']:9.3f}")
+        print(f"{metric}_band_relative  min={r['relative_min']:.5f} "
+              f"median={r['relative_median']:.5f} max={r['relative_max']:.5f}")
+        print(f"{metric}_steps_with_floor_above_persistence="
+              f"{r['steps_floor_above_persistence']}/{r['n_steps']}")
+        print(f"{metric}_steps_with_degenerate_positive_band="
+              f"{r['steps_degenerate']}/{r['n_steps']}  (band < {DEGENERATE} x persistence)")
+        print(f"{metric}_gap_closed     finite={r['gap_finite']}/{r['n_steps']} "
+              f"mean={r['gap_mean']:+.4f} min={r['gap_min']:+.4f} max={r['gap_max']:+.4f} "
+              f"final={r['gap_final']:+.4f}")
+        if r["gap_finite"] == 0:
+            print(f"WARNING: {metric} gap_closed is NaN at every horizon step -- the band "
+                  "is non-positive throughout, so this metric says nothing here. Report "
+                  "the raw curves instead.")
+        elif r["steps_degenerate"]:
+            print(f"WARNING: {metric} band is numerically degenerate at "
+                  f"{r['steps_degenerate']}/{r['n_steps']} steps; the ratio is unstable "
+                  "there and the raw curves should be read directly.")
 
 
 def main() -> None:
@@ -166,7 +105,8 @@ def main() -> None:
             f"probe_{name:<9} ridge={probe['ridge']:<9g} "
             f"selection_r2={'n/a' if r2 is None else f'{r2:.4f}'}"
         )
-    print_report(result, band_report(result))
+    reports = {m: metric_summary(result, m) for m in METRICS}
+    print_report(result, reports)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
