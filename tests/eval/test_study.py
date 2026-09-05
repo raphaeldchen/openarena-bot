@@ -25,7 +25,39 @@ from mbfps.eval.study import (
     write_record,
 )
 
-JOB_KW = dict(steps=3, seq_len=4, context=2, horizon=3, device="cpu")
+# ---------------------------------------------------------------------------
+# The fixture's parameters, PAIRWISE DISTINCT BY CONSTRUCTION.
+#
+# Four mutations survived one round of review and they were not four bugs:
+# they were one. Two of the values below used to coincide -- `steps == horizon
+# == 3`, `job.seed == SPLIT_SEED == 0`, `job.seed == context == 2` -- so an
+# assertion comparing them read the SAME NUMBER on both sides and could not
+# fail, however carefully it was written. Exchanging the two quantities in
+# `study.py` was then a numerical no-op and the suite stayed green.
+#
+# So the values are chosen once, here, so that no two of them are equal, and
+# `test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous`
+# below asserts that property itself. Reintroducing a collision fails THAT
+# test loudly instead of silently hollowing out everything downstream.
+# ---------------------------------------------------------------------------
+JOB_ARM = "random_vit"      # the arm the shared `record` fixture runs at
+OTHER_ARM = "cnn"           # a second arm run below, so `"arm": job.arm` is
+                            # not satisfied by hardcoding the first one
+JOB_SEED = 1                # NOT SPLIT_SEED (0): `"split_seed": job.seed`
+                            # is indistinguishable from the truth at seed 0
+JOB_KW = dict(steps=5, seq_len=4, context=2, horizon=3, device="cpu")
+JOB = StudyJob(JOB_ARM, JOB_SEED)
+
+#: Every scalar the record echoes or forwards, by the name it is known by.
+#: All six must differ; see the invariant test.
+PAIRWISE_DISTINCT_PARAMETERS = {
+    "steps": JOB_KW["steps"],
+    "seq_len": JOB_KW["seq_len"],
+    "context": JOB_KW["context"],
+    "horizon": JOB_KW["horizon"],
+    "job.seed": JOB_SEED,
+    "SPLIT_SEED": SPLIT_SEED,
+}
 
 GAIN_KEYS = {
     "gain", "joint_r2", "embedding_r2", "ci_low", "ci_high", "confidence",
@@ -54,13 +86,61 @@ def record(tmp_path, small_buffer):
     This is the LIVE record `run_job` returns -- real NaNs, no `nonfinite`
     map. `written` below is the same job's on-disk projection.
     """
-    return run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+    return run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
 
 @pytest.fixture
 def written(record):
     """What the file holds for the same job: sanitised, with the token map."""
     return to_json_record(record)
+
+
+# --------------------------------------------------------------------------
+# the fixture itself: the guard that kills the SPECIES, not the instance
+# --------------------------------------------------------------------------
+
+def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous():
+    """Every assertion in this module that says "field X carries quantity Y"
+    can only fail if Y differs from the other quantities X might have been
+    filled from. That is a property of the FIXTURE, not of the assertion, and
+    it has been violated four times on this one file:
+
+      * `steps == horizon == 3`, so `evaluate_rollout(horizon=horizon)` ->
+        `horizon=steps` changed nothing and the curve-length assertions passed;
+      * `job.seed == SPLIT_SEED == 0`, so `"split_seed": SPLIT_SEED` ->
+        `job.seed` changed nothing -- while in the real study it would give
+        each seed a DIFFERENT held-out set and the nine cells would stop being
+        comparable;
+      * `job.seed == context == 2`, so exchanging the `seed=` and `context=`
+        keyword values at the evaluation call sites was invisible;
+      * both probes selecting the same ridge, so reporting each under the
+        other's name was invisible.
+
+    Each was fixed as an instance and the species came back. This test is the
+    guard on the species: if any two of the parameters below are ever made
+    equal again, THIS fails loudly and by name, instead of quietly turning the
+    assertions that depend on them into tautologies.
+    """
+    from mbfps.utils.config import ARMS
+
+    collisions = {
+        value: sorted(name for name, other in PAIRWISE_DISTINCT_PARAMETERS.items()
+                      if other == value)
+        for value in set(PAIRWISE_DISTINCT_PARAMETERS.values())
+        if list(PAIRWISE_DISTINCT_PARAMETERS.values()).count(value) > 1
+    }
+    assert not collisions, (
+        "these fixture parameters collide, so every assertion that tells one "
+        "of them from the other is now a tautology and a mutation exchanging "
+        f"them survives the suite: {collisions}")
+    assert len(set(PAIRWISE_DISTINCT_PARAMETERS.values())) == 6, (
+        "all six parameters must still be listed and compared")
+
+    # The arm is categorical rather than numeric, and has the same failure
+    # mode: while every `run_job` call in the file uses one arm, `"arm":
+    # job.arm -> "arm": "random_vit"` mislabels all nine records and passes.
+    assert JOB_ARM != OTHER_ARM
+    assert {JOB_ARM, OTHER_ARM} <= set(ARMS)
 
 
 # --------------------------------------------------------------------------
@@ -100,8 +180,33 @@ def test_record_carries_everything_the_gate_needs(record):
                     "steps_floor_above_persistence", "steps_degenerate",
                     "gap_finite"):
             assert key in record[metric], f"{metric} is missing {key!r}"
-    assert record["arm"] == "random_vit"
-    assert record["seed"] == 0
+    assert record["arm"] == JOB_ARM
+    assert record["seed"] == JOB_SEED
+
+
+def test_the_record_is_labelled_with_the_arm_the_job_asked_for(
+    tmp_path, small_buffer
+):
+    """`"arm": job.arm -> "arm": "random_vit"` survived the whole suite for
+    one reason only: every `run_job` call in this file ran `random_vit`, so
+    the hardcoded string was always the right answer. On the study box it
+    MISLABELS ALL NINE RECORDS -- Task 6 groups by this field, and three arms'
+    results would be read as one arm's, with no way to tell after the fact.
+
+    So this runs a SECOND arm. The assertion below can only pass if the label
+    followed the job."""
+    assert OTHER_ARM != JOB_ARM, (
+        "both jobs run the same arm, so a hardcoded arm label passes")
+
+    other = run_job(StudyJob(OTHER_ARM, JOB_SEED), small_buffer, tmp_path,
+                    **JOB_KW)
+
+    assert other["arm"] == OTHER_ARM
+    assert other["seed"] == JOB_SEED
+    # The checkpoint is named after the arm too, and the record is written
+    # beside it: a record labelled with the wrong arm would still be found.
+    assert OTHER_ARM in job_record_path(tmp_path,
+                                        StudyJob(OTHER_ARM, JOB_SEED)).name
 
 
 def test_the_angle_summary_is_not_a_copy_of_the_position_summary(record):
@@ -161,7 +266,7 @@ def test_the_written_file_is_the_returned_records_json_projection(
     differ between them, or a caller reasoning about the returned record is
     reasoning about a different object from the one Task 6 aggregates.
     """
-    path = job_record_path(tmp_path, StudyJob("random_vit", 0))
+    path = job_record_path(tmp_path, JOB)
     assert path.is_file()
     assert strict_loads(path.read_text()) == written
     assert NONFINITE_KEY not in record, "the returned record is the live one"
@@ -247,7 +352,7 @@ def test_a_degenerate_record_is_written_as_valid_json(record, written, tmp_path)
     """`gap_final` is NaN by `metric_summary`'s contract whenever the band is
     non-positive, and this fixture's band IS non-positive. `json.dump` writes a
     bare `NaN` token for it, which is not JSON."""
-    path = job_record_path(tmp_path, StudyJob("random_vit", 0))
+    path = job_record_path(tmp_path, JOB)
     text = path.read_text()
     assert "NaN" not in text and "Infinity" not in text
     strict_loads(text)      # raises via _reject if a bare token survived
@@ -265,7 +370,7 @@ def test_an_undefined_gap_is_never_read_back_as_zero(record, written, tmp_path):
     of a real band. Averaging the first as the second across nine cells pulls
     the aggregate toward "no better than persistence" using cells that measured
     nothing at all."""
-    restored = load_record(job_record_path(tmp_path, StudyJob("random_vit", 0)))
+    restored = load_record(job_record_path(tmp_path, JOB))
     for dotted in written[NONFINITE_KEY]:
         section, field = dotted.split(".", 1)
         assert written[section][field] is None
@@ -355,8 +460,8 @@ def test_two_runs_of_the_same_job_agree(tmp_path, small_buffer):
     every non-finite to `None` (equal to itself) and records WHICH token it
     was in the map, so `nan` and `inf` still cannot pass for one another.
     """
-    first = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "a", **JOB_KW)
-    second = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "b", **JOB_KW)
+    first = run_job(JOB, small_buffer, tmp_path / "a", **JOB_KW)
+    second = run_job(JOB, small_buffer, tmp_path / "b", **JOB_KW)
     a, b = to_json_record(first), to_json_record(second)
     assert a[NONFINITE_KEY] == b[NONFINITE_KEY]
     assert a[NONFINITE_KEY], "this fixture's band is degenerate; the map must be live"
@@ -365,23 +470,37 @@ def test_two_runs_of_the_same_job_agree(tmp_path, small_buffer):
 
 
 def test_different_seeds_give_different_results(tmp_path, small_buffer):
-    a = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "a", **JOB_KW)
-    b = run_job(StudyJob("random_vit", 1), small_buffer, tmp_path / "b", **JOB_KW)
+    other_seed = JOB_SEED + 1
+    a = run_job(JOB, small_buffer, tmp_path / "a", **JOB_KW)
+    b = run_job(StudyJob(JOB_ARM, other_seed), small_buffer, tmp_path / "b",
+                **JOB_KW)
     assert a["curves"]["rssm_position"] != b["curves"]["rssm_position"]
-    assert a["seed"] == 0 and b["seed"] == 1
+    assert a["seed"] == JOB_SEED and b["seed"] == other_seed
 
 
 def test_the_held_out_episodes_do_not_move_with_the_job_seed(tmp_path, small_buffer):
-    """`train_world_model` splits at seed 0. Splitting the evaluation at the
-    JOB's seed would hand seed 1 a held-out set its own training run trained on,
-    and the nine cells would no longer be scored on the same episodes."""
-    a = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "a", **JOB_KW)
-    b = run_job(StudyJob("random_vit", 1), small_buffer, tmp_path / "b", **JOB_KW)
+    """`train_world_model` splits at SPLIT_SEED. Splitting the evaluation at
+    the JOB's seed would hand each seed a held-out set its own training run
+    trained on, and the nine cells would no longer be scored on the same
+    episodes.
+
+    Both jobs run at a seed that is NOT SPLIT_SEED. At the job seed 0 this
+    test used to run at, `"split_seed": SPLIT_SEED -> job.seed` reported the
+    same 0 either way and the last assertion could not fail -- while in the
+    study it would silently give each of the three seeds a different held-out
+    set."""
+    seeds = (JOB_SEED, JOB_SEED + 1)
+    assert SPLIT_SEED not in seeds, (
+        "a job seed equal to SPLIT_SEED makes `split_seed: job.seed` "
+        "indistinguishable from the truth")
+    a = run_job(StudyJob(JOB_ARM, seeds[0]), small_buffer, tmp_path / "a", **JOB_KW)
+    b = run_job(StudyJob(JOB_ARM, seeds[1]), small_buffer, tmp_path / "b", **JOB_KW)
     assert a["episodes"]["val"] == b["episodes"]["val"] != []
     assert a["episodes"]["train"] == b["episodes"]["train"] != []
     assert len(a["episodes"]["val"]) + len(a["episodes"]["train"]) == 6
     assert not set(a["episodes"]["val"]) & set(a["episodes"]["train"])
-    assert a["split_seed"] == SPLIT_SEED == 0
+    assert a["split_seed"] == b["split_seed"] == SPLIT_SEED == 0
+    assert (a["seed"], b["seed"]) == seeds
 
 
 def test_every_evaluation_runs_at_the_jobs_seed_and_the_jobs_window(
@@ -393,14 +512,22 @@ def test_every_evaluation_runs_at_the_jobs_seed_and_the_jobs_window(
     different filtering depth from the rollout it is applied to is a
     distribution mismatch worth ~25 map units of position error.
 
-    The job seed is 7, not 2: `JOB_KW["context"]` is 2, so at seed 2 the
-    `seed=` and `context=` assertions below both read 2 and exchanging the two
-    keyword VALUES at the call sites was a no-op this test could not see --
-    the same coincidence-of-fixture-values that hid the probe-ridge swap."""
+    The job seed is 7, distinct from EVERY other parameter this job runs at:
+    at seed 2 the `seed=` and `context=` assertions below both read 2 and
+    exchanging the two keyword VALUES at the call sites was a no-op this test
+    could not see -- the same coincidence-of-fixture-values that hid the
+    probe-ridge swap. `steps` is in the guard too: `horizon=horizon ->
+    horizon=steps` in the `evaluate_rollout` call is invisible while the two
+    are equal, which is exactly how that mutation survived."""
+    seed = 7
     seen: dict[str, dict] = {}
-    assert 7 not in (JOB_KW["context"], JOB_KW["horizon"], JOB_KW["seq_len"]), (
-        "the job seed must not coincide with any window value, or a seed/"
-        "window exchange at the call sites is invisible here")
+    assert seed not in PAIRWISE_DISTINCT_PARAMETERS.values(), (
+        "the job seed must not coincide with steps, seq_len, context, horizon "
+        "or SPLIT_SEED, or an exchange of the matching pair of keyword values "
+        f"at the call sites is invisible here: {PAIRWISE_DISTINCT_PARAMETERS}")
+    assert JOB_KW["steps"] != JOB_KW["horizon"], (
+        "`evaluate_rollout(horizon=steps)` reads the same number as "
+        "`horizon=horizon` while these two coincide")
 
     def spy(name):
         real = getattr(study, name)
@@ -415,18 +542,80 @@ def test_every_evaluation_runs_at_the_jobs_seed_and_the_jobs_window(
                  "filtering_report", "filtering_gain", "episode_split"):
         spy(name)
 
-    run_job(StudyJob("random_vit", 7), small_buffer, tmp_path, **JOB_KW)
+    run_job(StudyJob(JOB_ARM, seed), small_buffer, tmp_path, **JOB_KW)
 
     for name in ("fit_probes", "reward_accuracy", "evaluate_rollout",
                  "filtering_report", "filtering_gain"):
         assert name in seen, f"{name} was never called"
-        assert seen[name]["seed"] == 7, f"{name} did not get the job's seed"
+        assert seen[name]["seed"] == seed, f"{name} did not get the job's seed"
     for name in ("fit_probes", "evaluate_rollout", "filtering_report",
                  "filtering_gain"):
         assert seen[name]["context"] == JOB_KW["context"], name
         assert seen[name]["horizon"] == JOB_KW["horizon"], name
     # The split is the one exception, and deliberately so.
     assert seen["episode_split"]["seed"] == SPLIT_SEED
+
+
+def test_each_evaluation_gets_the_episode_set_it_is_supposed_to_get(
+    tmp_path, small_buffer, monkeypatch
+):
+    """WHICH episodes reach each call had NO assertion at all, so exchanging
+    `train_paths` and `val_paths` in the `filtering_gain` call survived the
+    whole suite in silence -- it is not even a vacuous assertion, it is a
+    missing one.
+
+    Exchanged, the filtering probe is FIT on the episodes it then SCORES. That
+    exact leak was measured in this project taking R^2 from -0.246 to 0.9997,
+    so gate criterion 4's companion diagnostic would report a near-perfect
+    number in all nine records and the gate would read as passed.
+
+    `filtering_report` -- criterion 4 itself -- takes the same two arguments in
+    the same order at the neighbouring call site and had the same exposure, so
+    it is pinned here too, along with the three single-set calls: the probe is
+    fit on TRAIN, the rollout and the reward are scored on VAL."""
+    from mbfps.data.split import VAL_FRACTION, episode_split
+
+    train_paths, val_paths = episode_split(
+        small_buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED
+    )
+    train, val = [p.name for p in train_paths], [p.name for p in val_paths]
+    assert train and val and train != val, (
+        "train and val name the same episodes here, so exchanging the two "
+        "arguments would be invisible to every assertion below")
+
+    seen: dict[str, tuple] = {}
+
+    def spy(name):
+        real = getattr(study, name)
+
+        def wrapper(*args, **kwargs):
+            seen[name] = args
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(study, name, wrapper)
+
+    for name in ("fit_probes", "reward_accuracy", "evaluate_rollout",
+                 "filtering_report", "filtering_gain"):
+        spy(name)
+
+    run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+
+    def names(name, position):
+        assert name in seen, f"{name} was never called"
+        return [Path(p).name for p in seen[name][position]]
+
+    for name in ("filtering_report", "filtering_gain"):
+        assert names(name, 1) == train, (
+            f"{name} was FIT on the held-out episodes it then scores -- the "
+            "leak that takes this diagnostic's R^2 from -0.246 to 0.9997")
+        assert names(name, 2) == val, (
+            f"{name} scored on the episodes the probe was fit on")
+    assert names("fit_probes", 1) == train, (
+        "the probe was fit on the held-out episodes")
+    assert names("evaluate_rollout", 1) == val, (
+        "the rollout was scored on episodes the model trained on")
+    assert names("reward_accuracy", 1) == val, (
+        "reward accuracy was scored on episodes the model trained on")
 
 
 def test_a_checkpoint_from_another_job_is_refused(tmp_path, small_buffer, monkeypatch):
@@ -446,7 +635,7 @@ def test_a_checkpoint_from_another_job_is_refused(tmp_path, small_buffer, monkey
 
     monkeypatch.setattr(study, "train_world_model", fake_train)
     with pytest.raises(ValueError, match="not this job's"):
-        run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+        run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
 
 # ---------------------------------------------------------------------------
@@ -551,23 +740,29 @@ def test_the_record_reports_the_window_and_budget_the_job_ran_at(
     survived: the record is the study's only audit trail for the numbers each
     cell ran at, and every one of them was write-only.
 
-    Run at FOUR DISTINCT values rather than the shared `record` fixture:
-    `JOB_KW` has `steps=3` and `horizon=3`, so exchanging those two fields in
-    the record is a numerical no-op and all four assertions below pass on a
-    record that misreports both. Four distinct values make every pairwise
-    exchange visible."""
-    distinct = dict(steps=5, seq_len=4, context=2, horizon=3, device="cpu")
-    assert len({v for k, v in distinct.items() if k != "device"}) == 4, (
+    Every value it reports is distinct from every other, by construction --
+    that is what `PAIRWISE_DISTINCT_PARAMETERS` and its invariant test are
+    for. While `steps` and `horizon` were both 3, exchanging those two fields
+    was a numerical no-op and all four assertions below passed on a record
+    that misreported both. The same holds for `split_seed`: at a job seed of
+    0, `"split_seed": SPLIT_SEED -> job.seed` reported the right number by
+    accident."""
+    assert len(set(PAIRWISE_DISTINCT_PARAMETERS.values())) == 6, (
         "two of these coincide, so exchanging the matching pair of record "
         "fields would be invisible to this test")
+    assert JOB_SEED != SPLIT_SEED, (
+        "`split_seed: job.seed` reads the same number as the truth here")
 
-    record = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path,
-                     **distinct)
+    record = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
-    assert record["steps"] == distinct["steps"]
-    assert record["seq_len"] == distinct["seq_len"]
-    assert record["context"] == distinct["context"]
-    assert record["horizon"] == distinct["horizon"]
+    assert record["steps"] == JOB_KW["steps"]
+    assert record["seq_len"] == JOB_KW["seq_len"]
+    assert record["context"] == JOB_KW["context"]
+    assert record["horizon"] == JOB_KW["horizon"]
+    assert record["seed"] == JOB_SEED
+    # The split seed is a CONSTANT, not the job's seed: it is what makes all
+    # nine cells hold out the same episodes. Under `job.seed` each seed gets
+    # its own split and the nine cells stop being comparable.
     assert record["split_seed"] == SPLIT_SEED
     assert record["seconds"] > 0.0
 
@@ -581,7 +776,20 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
     A study launched with `--device cuda` that silently trains on CPU is a
     33-hour loss. Run at a device string that is NOT the one a mutation would
     hardcode; `get_device` falls back to CPU wherever CUDA is absent, so this
-    stays a CPU test."""
+    stays a CPU test.
+
+    The evaluation model's placement is checked on the ARGUMENT that reached
+    `.to()`, not on the resulting parameters' device. Reading the parameters
+    made the guard MACHINE-DEPENDENT and therefore useless here:
+    `.to(torch_device) -> .to(torch.device("cpu"))` survived, because
+    `get_device(prefer="cuda")` already IS cpu on a CUDA-less machine, so the
+    tensors were where they were expected either way. That guard could only
+    start guarding on the GPU box -- the one place nobody is watching it. The
+    object `get_device` returned is a distinct object from any freshly built
+    `torch.device`, so requiring THAT object at the call site fails on a
+    hardcoded device on any machine, CUDA or not."""
+    import torch
+
     real_get_config = study.get_config
     real_get_device = study.get_device
     real_world_model = study.WorldModel
@@ -594,10 +802,19 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
 
     def device_spy(prefer="mps"):
         seen["prefer"] = prefer
-        return real_get_device(prefer=prefer)
+        seen["device"] = real_get_device(prefer=prefer)
+        return seen["device"]
 
     def model_spy(cfg):
         model = real_world_model(cfg)
+        real_to = model.to
+
+        def to_spy(*args, **kwargs):
+            seen.setdefault("moved_to", []).append(
+                args[0] if args else kwargs.get("device"))
+            return real_to(*args, **kwargs)
+
+        model.to = to_spy
         models.append(model)
         return model
 
@@ -605,7 +822,7 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
     monkeypatch.setattr(study, "get_device", device_spy)
     monkeypatch.setattr(study, "WorldModel", model_spy)
 
-    run_job(StudyJob("random_vit", 0), small_buffer, tmp_path,
+    run_job(JOB, small_buffer, tmp_path,
             **dict(JOB_KW, device="cuda"))
 
     assert seen["cfg_device"] == "cuda", (
@@ -615,8 +832,19 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
         "the job's device never reached get_device, so the evaluation ran on "
         "whatever get_device defaults to")
     assert models, "run_job never built the evaluation model"
-    expected = real_get_device(prefer="cuda")
-    assert next(models[0].parameters()).device.type == expected.type
+    assert seen.get("moved_to"), "run_job never placed the evaluation model"
+    # Check-it-can-fail: an equal-but-freshly-built device -- exactly what a
+    # hardcoding mutation constructs -- is NOT the object `get_device`
+    # returned, on this machine, where both of them are plain CPU.
+    hardcoded = torch.device(seen["device"].type)
+    assert hardcoded == seen["device"] and hardcoded is not seen["device"], (
+        "this assertion cannot tell a hardcoded device from the requested "
+        "one, so it would pass on a machine-independent regression")
+    assert seen["moved_to"][0] is seen["device"], (
+        "the evaluation model was moved to a device run_job built for itself "
+        "rather than the one get_device returned for the job's --device; on a "
+        "CUDA-less machine both are CPU and the model's own parameters cannot "
+        f"show it (asked for {seen['device']}, got {seen['moved_to'][0]})")
 
 
 def test_the_evaluation_holds_out_exactly_what_training_held_out(
@@ -647,7 +875,7 @@ def test_the_evaluation_holds_out_exactly_what_training_held_out(
     monkeypatch.setattr(study, "episode_split", study_spy)
     monkeypatch.setattr(wm, "episode_split", wm_spy)
 
-    run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+    run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
     assert seen["training"], "train_world_model never split"
     assert seen["study"], "run_job never split"
@@ -713,7 +941,7 @@ def test_the_record_reports_the_training_history_it_was_given(
         return history
 
     monkeypatch.setattr(study, "train_world_model", doctored)
-    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+    result = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
     assert result["kl_rate_above_free_bits"] == pytest.approx(0.25)
     assert result["kl_dyn_max"] == pytest.approx(7.5)
@@ -752,7 +980,7 @@ def test_the_record_carries_the_probe_settings_it_measured_with(
         return latent, embedding
 
     monkeypatch.setattr(study, "fit_probes", spy)
-    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+    result = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
     probe = result["probe"]
     assert set(probe) == {
@@ -804,7 +1032,7 @@ def test_the_record_carries_the_whole_reward_report(
         return seen["out"]
 
     monkeypatch.setattr(study, "reward_accuracy", spy)
-    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+    result = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
 
     assert set(result["reward"]) == {
         "mse", "baseline_mse", "r2", "n_steps", "n_reward_events",
