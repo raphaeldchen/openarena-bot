@@ -297,11 +297,19 @@ loader, frozen-feature cache. Each episode is tagged with the policy that produc
 
 **Done when:** a target transition count is collected within a bounded wall-clock time; the loader's
 batches/sec is benchmarked; a round-trip test proves stored data equals collected data; the feature cache
-produces byte-identical features on repeat encoding of the same frame; and a **state-visitation histogram**
-over `privileged_state` is produced per policy, showing that `scripted` reaches regions `random` does not.
+produces byte-identical features on repeat encoding of the same frame **within a process on a given
+device** — CPU and MPS outputs for the same frame differ in roughly 3% of float16 elements, so **the cache
+must be generated once on one device and reused for every experimental arm**, never regenerated per arm or
+mixed across devices within one dataset; and a **state-visitation histogram**
+over `privileged_state` is produced per policy, showing that `scripted` covers substantially more ground
+per episode than `random` (125.0 cells/episode vs 86.7, a 1.441x ratio) — not that it reaches regions
+`random` can never reach at all: on a small, fixed maze like `my_way_home`, the two policies' aggregate
+footprints across many episodes converge to nearly the same set of cells (scripted adds only +2.6% over
+random's aggregate reach).
 
-*The visitation histogram is a diagnostic, not a gate — its purpose is to make coverage gaps visible before
-M3 rather than inferring them from a degraded rollout at M4.*
+*The visitation histogram is a gate, not just a diagnostic — `scripts/coverage_report.py` exits non-zero
+when the per-episode-reach ratio fails to clear the required margin, so coverage gaps are caught here
+rather than inferred from a degraded rollout at M4.*
 
 ### M2 — Representation, standalone
 Train encoder + decoder alone on M1 data. **No recurrence yet.**

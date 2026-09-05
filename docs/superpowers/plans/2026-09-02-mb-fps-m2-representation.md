@@ -1,0 +1,2885 @@
+# MB-FPS M2: Representation and the Shared Data Path — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the three arms' encoders and decoders, train each as a standalone autoencoder on the M1 dataset, and produce the side-by-side reconstruction grids that gate M2 — plus the obs-optional, feature-capable data path that M3 will also depend on.
+
+**Architecture:** A config system selects one of three arms, which differ **only** in `encoders.py`. Arm 1 learns a CNN over pixels; Arms 2 and 3 apply a small learned bottleneck to cached features from a frozen backbone (pretrained DINOv2, or a randomly-initialised ViT of identical architecture). All three emit a 2048-dimensional embedding from byte-identical 112x112 frames. A decoder reconstructs pixels for Arm 1 and provides visualisation-only reconstructions for Arms 2 and 3.
+
+**Tech Stack:** Python 3.12, PyTorch 2.13 (MPS), HuggingFace Transformers 5.16, NumPy 2.x, matplotlib, pytest.
+
+**Spec:** `docs/superpowers/specs/2026-09-01-mb-fps-design.md` (sections 3.1-3.5, milestone M2)
+**Predecessor:** `docs/superpowers/plans/2026-09-01-mb-fps-m0-m1-env-and-data.md` (complete; 155 tests passing)
+
+---
+
+## Measured facts this plan is designed around
+
+Every number below was measured on this machine against the committed code and dataset. Do not re-derive them, and do not write code that contradicts them.
+
+### Dataset (frozen, produced by M1)
+
+| | |
+|---|---|
+| Episodes | 122 (`data/my_way_home/`), 119 usable at `seq_len=64` |
+| Transitions | 59,511 total; 51,901 distinct T=64 window offsets |
+| Obs per episode | 526 frames of 112x112x3 uint8 (~19.8 MB) |
+| DINOv2 features per episode | `(526, 64, 384)` float16 (~25.9 MB) |
+| Feature cache total | 2.93 GB |
+
+### Training throughput on MPS (batch 16, seq 64)
+
+| Operation | MPS | CPU | Note |
+|---|---|---|---|
+| CNN encoder fwd+bwd, 1024 frames | 649 ms | 3233 ms | MPS 5.0x faster |
+| GRU unroll, T=64, H=512 | 42.3 ms | 46.6 ms | **MPS gives ~nothing** — 64 sequential small kernels |
+| MLP head, 1024 x 1024 | 3.2 ms | 5.1 ms | |
+| **Arm 1 full step** (CNN + pixel decoder + RSSM) | **1546 ms** | | 0.65 steps/s |
+| **Arm 2/3 full step** (bottleneck + RSSM, no CNN) | **161 ms** | | 6.22 steps/s |
+
+**The arms differ 9.6x in cost, and Arm 1 is the budget.** A 3-arm x 3-seed study costs 31 h at 20k steps, 78 h at 50k, 156 h at 100k. That decision belongs to the study milestone, not here — M2 and M3 need one model per arm, not nine.
+
+### Data-path costs
+
+| | |
+|---|---|
+| `load_all()` with obs | 2.24 GB resident |
+| Metadata-only load (skip obs) | 0.07 s, 0.04 GB |
+| Memmap all feature files | 0.04 s, 0.04 GB |
+| Feature batch 16x65x64x384 from memmap | 101 ms (51 MB) |
+
+Loading costs ~6% of an Arm 1 step but ~63% of an Arm 2/3 step, so **prefetching matters only for the fast arms** — Task 3.
+
+### Platform constraint (relaxed 2026-09-02)
+
+The disk previously had 2.3 GB free against a 2.93 GB feature cache, which would have forced one cache at a time. **Space has since been freed: 20 GB available.** Both caches (5.86 GB total) now fit simultaneously, so arms 2 and 3 can be cached once and kept.
+
+The `--backbone` flag and the `require_free_bytes` guard in Task 4 are still built: caching is the one operation here that can fill a disk, and failing before writing beats dying halfway and leaving a partial cache that loads as a `FileNotFoundError` on some episodes but not others. The guard stays; the one-at-a-time *workflow* is no longer needed.
+
+---
+
+## Global Constraints
+
+- **Python 3.12** in `.venv/`. Every Python and pytest invocation uses `.venv/bin/python`.
+- **fp32 for compute; float16 only for cached features on disk.** No autocast on MPS.
+- **All arms consume byte-identical 112x112x3 uint8 frames.** 112 = 8 x 14, giving DINOv2 an exact 8x8 patch grid.
+- **All arms emit a 2048-dimensional embedding.** Resolution and embedding width are controlled; only the representation differs.
+- **`encoders.py` is the ONLY module that differs between arms.** If an arm requires editing `decoders.py`, `rssm.py`, or a trainer, the comparison is no longer controlled — apply the change to all three arms or not at all.
+- **`privileged_state` is evaluation-only** and must never reach a training tensor. `SequenceLoader.sample()` defaults `include_privileged=False`; keep it that way.
+- **The feature cache must be generated once on one device.** CPU and MPS DINOv2 outputs differ in ~3% of float16 elements, so regenerating per arm would silently break input equality.
+- **`my_way_home` coverage is near-saturated at 61 episodes per policy.** More episodes of the same two policies will not add state coverage; do not "improve" results by collecting more.
+- Package is `mbfps`; source under `src/`.
+
+---
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| `src/mbfps/utils/config.py` | Frozen dataclass configs; one field selects the arm |
+| `configs/base.yaml` | Shared hyperparameters |
+| `configs/arm_cnn.yaml`, `arm_frozen_ssl.yaml`, `arm_random_vit.yaml` | Per-arm overrides (encoder only) |
+| `src/mbfps/data/loader.py` (modify) | `load_obs` / `load_features` flags; memmapped feature windows |
+| `src/mbfps/data/prefetch.py` | Background batch prefetching |
+| `src/mbfps/data/features.py` (modify) | `--backbone` selection, random-ViT support, disk guard |
+| `src/mbfps/models/encoders.py` | `CNNEncoder`, `BottleneckEncoder` — the only arm-varying module |
+| `src/mbfps/models/decoders.py` | `PixelDecoder` (Arm 1 training + all-arm visualisation) |
+| `src/mbfps/training/autoencoder.py` | M2 standalone autoencoder training loop |
+| `scripts/cache_features.py` | Cache features for a chosen backbone over an existing buffer |
+| `scripts/train_autoencoder.py` | M2 training entry point |
+| `scripts/reconstruction_grid.py` | M2 exit-gate artifact |
+
+### Deliberate deviation from the spec: Python configs, not YAML
+
+Spec section 4 lists `configs/base.yaml` plus three per-arm YAML files. This plan uses frozen dataclasses in `src/mbfps/utils/config.py` instead. (`pyyaml` 6.0.3 is installed, so this is a choice, not a limitation.)
+
+Reason: the study's validity rests on every arm sharing identical settings except the encoder. With YAML, a typo in one arm's file — `batch_size: 61` instead of `16`, or a key that silently does not override anything — produces a broken comparison that still runs and still reports numbers. With a shared base dataclass that arms override **only** in their `encoder` field, accidental divergence is structurally impossible and a typo is an `AttributeError` at import.
+
+This serves the spec's stated intent (a controlled comparison) better than its letter. If a reviewer disagrees, the change is contained to one module.
+
+---
+
+## Task 1: Config system and arm registry
+
+**Files:**
+- Create: `src/mbfps/utils/config.py`
+- Create: `tests/utils/__init__.py`
+- Create: `tests/utils/test_config.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `EncoderConfig(kind: str, embed_dim: int = 2048, cnn_depth: int = 32, patch_dim: int = 384, bottleneck_dim: int = 32)`; `TrainConfig(batch_size: int = 16, seq_len: int = 64, lr: float = 1e-4, steps: int = 20_000, seed: int = 0, device: str = "mps")`; `Config(arm: str, encoder: EncoderConfig, train: TrainConfig, data_root: str = "data/my_way_home")`; `ARMS: tuple[str, ...] = ("cnn", "frozen_ssl", "random_vit")`; `get_config(arm: str, **overrides) -> Config`.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/utils/test_config.py
+import dataclasses
+
+import pytest
+
+from mbfps.utils.config import ARMS, Config, EncoderConfig, TrainConfig, get_config
+
+
+def test_three_arms_are_registered():
+    assert ARMS == ("cnn", "frozen_ssl", "random_vit")
+
+
+def test_each_arm_builds_a_config():
+    for arm in ARMS:
+        cfg = get_config(arm)
+        assert isinstance(cfg, Config)
+        assert cfg.arm == arm
+        assert cfg.encoder.kind == arm
+
+
+def test_unknown_arm_rejected():
+    with pytest.raises(KeyError, match="unknown arm 'nope'"):
+        get_config("nope")
+
+
+def test_unknown_arm_error_lists_valid_arms():
+    with pytest.raises(KeyError, match="cnn"):
+        get_config("nope")
+
+
+def test_all_arms_share_identical_training_settings():
+    """The study's validity depends on this. Arms may differ ONLY in encoder."""
+    trains = {arm: get_config(arm).train for arm in ARMS}
+    first = trains["cnn"]
+    for arm, train in trains.items():
+        assert train == first, f"arm {arm!r} has different training settings"
+
+
+def test_all_arms_share_identical_embed_dim():
+    """Embedding width is controlled; only the representation differs."""
+    dims = {get_config(arm).encoder.embed_dim for arm in ARMS}
+    assert dims == {2048}
+
+
+def test_arms_differ_only_in_encoder_kind():
+    configs = {arm: get_config(arm) for arm in ARMS}
+    encoders = {arm: dataclasses.asdict(c.encoder) for arm, c in configs.items()}
+    baseline = dict(encoders["cnn"])
+    for arm, enc in encoders.items():
+        differing = {k for k in enc if enc[k] != baseline[k]}
+        assert differing <= {"kind"}, f"arm {arm!r} differs beyond kind: {differing}"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: setattr(c.train, "batch_size", 32),
+        lambda c: setattr(c.encoder, "embed_dim", 1024),
+        lambda c: setattr(c, "arm", "other"),
+    ],
+    ids=["train", "encoder", "config"],
+)
+def test_every_config_layer_is_frozen(mutate):
+    """All three layers must be immutable.
+
+    Checking only TrainConfig leaves a real hole: a mutable EncoderConfig
+    would let one arm's embedding width drift at runtime, silently breaking
+    the comparison the whole study rests on.
+    """
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        mutate(get_config("cnn"))
+
+
+def test_overrides_apply_to_train_settings():
+    cfg = get_config("cnn", steps=5, batch_size=2)
+    assert cfg.train.steps == 5
+    assert cfg.train.batch_size == 2
+
+
+def test_override_of_unknown_field_rejected():
+    with pytest.raises(TypeError):
+        get_config("cnn", not_a_field=1)
+
+
+def test_seq_len_default_matches_the_dataset():
+    """119 of 122 episodes support a 64-step window; a larger default would
+    silently discard usable episodes."""
+    assert get_config("cnn").train.seq_len == 64
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/utils/test_config.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.utils.config'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# tests/utils/__init__.py
+```
+
+```python
+# src/mbfps/utils/config.py
+"""Experiment configuration.
+
+The study compares three arms that must differ in exactly one respect: the
+space the model predicts in. Everything else -- batch size, sequence length,
+learning rate, seed, embedding width -- is held identical.
+
+That invariant is enforced structurally rather than by discipline: every arm is
+built from the same `TrainConfig` instance and the same `EncoderConfig`
+defaults, overriding only `kind`. A configuration file format would let one
+arm's settings drift silently; here a stray field is a TypeError at call time.
+"""
+
+import dataclasses
+from dataclasses import dataclass, replace
+
+ARMS: tuple[str, ...] = ("cnn", "frozen_ssl", "random_vit")
+"""The three arms. `cnn` is the baseline, `frozen_ssl` the treatment,
+`random_vit` the control that separates pretraining from target stability."""
+
+
+@dataclass(frozen=True)
+class EncoderConfig:
+    """Encoder settings. `kind` is the ONLY field that may differ across arms."""
+
+    kind: str
+    embed_dim: int = 2048
+    cnn_depth: int = 32
+    patch_dim: int = 384
+    bottleneck_dim: int = 32
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    """Training settings, shared byte-for-byte across all arms."""
+
+    batch_size: int = 16
+    seq_len: int = 64
+    lr: float = 1e-4
+    steps: int = 20_000
+    seed: int = 0
+    device: str = "mps"
+
+
+@dataclass(frozen=True)
+class Config:
+    """A complete experiment configuration."""
+
+    arm: str
+    encoder: EncoderConfig
+    train: TrainConfig
+    data_root: str = "data/my_way_home"
+
+
+def get_config(arm: str, **overrides) -> Config:
+    """Build the configuration for `arm`, applying `overrides` to TrainConfig.
+
+    Args:
+        arm: one of `ARMS`.
+        **overrides: field names of `TrainConfig`.
+
+    Raises:
+        KeyError: if `arm` is not registered.
+        TypeError: if an override names a field `TrainConfig` does not have.
+    """
+    if arm not in ARMS:
+        raise KeyError(f"unknown arm {arm!r}; available: {list(ARMS)}")
+    train = replace(TrainConfig(), **overrides) if overrides else TrainConfig()
+    return Config(arm=arm, encoder=EncoderConfig(kind=arm), train=train)
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/utils/test_config.py -v`
+Expected: 13 passed (the frozen test is parametrised over all three config layers).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/mbfps/utils/config.py tests/utils
+git commit -m "feat: arm configuration with structurally-enforced parity"
+```
+
+---
+
+## Task 2: Obs-optional, feature-capable sequence loading
+
+**Files:**
+- Modify: `src/mbfps/data/loader.py`
+- Modify: `tests/data/test_loader.py`
+
+**Interfaces:**
+- Consumes: `ReplayBuffer` from `mbfps.data.buffer`; `load_episode` from `mbfps.data.episode`.
+- Produces: `SequenceLoader(buffer, batch_size=16, seq_len=64, seed=0, load_obs=True, load_features=False, feature_backbone="dinov2")`. When `load_features=True`, `sample()` adds `features (B, T+1, 64, 384) float16` read from the cache for `feature_backbone`. When `load_obs=False`, `sample()` omits `obs` and the loader never reads pixel data from disk. Also `feature_suffix(backbone: str) -> str`.
+
+**Per-backbone suffixes.** Arms 2 and 3 use different frozen backbones, and both caches now live on disk at once. A single shared filename would let the second caching run silently overwrite the first, leaving both arms training on identical inputs — which would destroy the control without any error. `dinov2` keeps `.features.npy` (the 122 files M1 already wrote); every other backbone gets `.features_<backbone>.npy`.
+
+**Why:** Arms 2 and 3 never touch pixels, yet the current loader eagerly loads every episode's obs — 2.24 GB resident (measured). Metadata-only loading costs 0.07 s and 0.04 GB, and memmapping all 122 feature files costs 0.04 s and 0.04 GB. `.npz` is lazily decompressed per key, so simply not reading `obs` avoids the cost entirely.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/data/test_loader.py`:
+
+```python
+def test_load_obs_false_omits_obs(buffer):
+    loader = SequenceLoader(buffer, batch_size=4, seq_len=16, seed=0, load_obs=False)
+    batch = loader.sample()
+    assert "obs" not in batch
+    assert batch["actions"].shape == (4, 16)
+    assert batch["episode_index"].shape == (4,)
+    assert batch["window_start"].shape == (4,)
+
+
+def test_load_obs_false_still_supports_privileged(buffer):
+    loader = SequenceLoader(buffer, batch_size=4, seq_len=16, seed=0, load_obs=False)
+    batch = loader.sample(include_privileged=True)
+    assert batch["privileged"].shape[0] == 4
+
+
+def test_load_features_requires_cached_files(tmp_path):
+    """A missing cache must fail loudly, not silently train on nothing."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    with pytest.raises(FileNotFoundError, match="no cached features"):
+        SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_features=True)
+
+
+def test_features_window_matches_manual_slice(tmp_path):
+    """The batch must slice the cache at exactly the reported window_start."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2):
+        buf.add(make_episode(t=80, fill=fill))
+    rng = np.random.default_rng(0)
+    for path in buf.episode_paths():
+        feats = rng.random((81, 4, 8)).astype(np.float16)
+        np.save(path.with_suffix(".features.npy"), feats)
+
+    loader = SequenceLoader(
+        buf, batch_size=4, seq_len=16, seed=0, load_obs=False, load_features=True
+    )
+    batch = loader.sample()
+    assert batch["features"].shape == (4, 17, 4, 8)
+    assert batch["features"].dtype == np.float16
+    for i in range(4):
+        idx, start = int(batch["episode_index"][i]), int(batch["window_start"][i])
+        on_disk = np.load(loader.episode_path(idx).with_suffix(".features.npy"))
+        assert np.array_equal(on_disk[start : start + 17], batch["features"][i])
+
+
+def test_features_and_obs_windows_are_aligned(tmp_path):
+    """Both must come from the same episode and the same offset."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=3))
+    feats = np.arange(81 * 4 * 8, dtype=np.float16).reshape(81, 4, 8)
+    np.save(buf.episode_paths()[0].with_suffix(".features.npy"), feats)
+
+    loader = SequenceLoader(
+        buf, batch_size=2, seq_len=16, seed=0, load_obs=True, load_features=True
+    )
+    batch = loader.sample()
+    for i in range(2):
+        start = int(batch["window_start"][i])
+        assert np.array_equal(batch["features"][i], feats[start : start + 17])
+        assert batch["obs"][i].shape == (17, *OBS_SHAPE)
+
+
+def test_feature_suffix_namespaces_non_default_backbones():
+    from mbfps.data.loader import feature_suffix
+
+    assert feature_suffix("dinov2") == ".features.npy"
+    assert feature_suffix("random_vit") == ".features_random_vit.npy"
+
+
+def test_loader_reads_the_requested_backbones_cache(tmp_path):
+    """Two caches coexist; picking the wrong one would silently destroy the
+    control by training arms 2 and 3 on identical inputs."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    path = buf.episode_paths()[0]
+    np.save(path.with_suffix(".features.npy"), np.zeros((81, 4, 8), np.float16))
+    np.save(path.with_suffix(".features_random_vit.npy"), np.ones((81, 4, 8), np.float16))
+
+    for backbone, expected in (("dinov2", 0.0), ("random_vit", 1.0)):
+        loader = SequenceLoader(
+            buf, 2, 16, seed=0, load_obs=False,
+            load_features=True, feature_backbone=backbone,
+        )
+        assert (loader.sample()["features"] == expected).all(), backbone
+
+
+def test_obs_free_loader_does_not_read_pixels(tmp_path, monkeypatch):
+    """Guards the 2.24 GB regression at the point pixels would actually be read.
+
+    Spying on `load_episode` is not enough: the obs-free path never calls it,
+    so that version of this guard passed even when `from_npz` was changed to
+    read `data["obs"]` directly. Intercepting the npz key access catches an
+    obs read from any code path.
+
+    The patch is class-level because Python resolves `__getitem__` on the type,
+    so patching the NpzFile instance would not intercept `data["obs"]`.
+    """
+    from numpy.lib.npyio import NpzFile
+
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+
+    original = NpzFile.__getitem__
+
+    def guarded(self, key):
+        assert key != "obs", "obs must never be read when load_obs=False"
+        return original(self, key)
+
+    monkeypatch.setattr(NpzFile, "__getitem__", guarded)
+    loader = SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=False)
+    assert loader.sample()["actions"].shape == (2, 16)
+
+
+def test_obs_loading_loader_does_read_pixels(tmp_path, monkeypatch):
+    """The complement: proves the guard above can actually fire.
+
+    Without this, a guard that never triggers under any condition would look
+    identical to one that correctly never triggers.
+    """
+    from numpy.lib.npyio import NpzFile
+
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+
+    original = NpzFile.__getitem__
+    seen: list[str] = []
+
+    def spy(self, key):
+        seen.append(key)
+        return original(self, key)
+
+    monkeypatch.setattr(NpzFile, "__getitem__", spy)
+    SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=True)
+    assert "obs" in seen, "load_obs=True should read obs; the spy is not wired up"
+```
+
+You will also need `from mbfps.envs.protocol import OBS_SHAPE` and `from mbfps.data.episode import load_episode` available in the test module; add them if absent.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/data/test_loader.py -v -k "load_obs or features"`
+Expected: FAIL — `SequenceLoader() got an unexpected keyword argument 'load_obs'`
+
+- [ ] **Step 3: Rewrite `src/mbfps/data/loader.py`**
+
+```python
+# src/mbfps/data/loader.py
+"""Sequence sampling for world-model training.
+
+Windows never span an episode boundary: a window that stitched the end of one
+episode to the start of another would teach the RSSM a transition the engine
+can never produce.
+
+Two arms of the study never read pixels at all -- they train on cached features
+from a frozen backbone. Loading obs for them costs 2.24 GB of resident memory
+for nothing (measured), so `load_obs=False` skips it. `.npz` decompresses
+lazily per key, so not reading `obs` genuinely avoids the cost.
+
+Feature files are memmapped rather than loaded: mapping all 122 costs 0.04 s
+and 0.04 GB, versus 2.93 GB to read them.
+"""
+
+import logging
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.episode import load_episode
+
+logger = logging.getLogger(__name__)
+
+_WARN_BYTES = 4_000_000_000
+"""Warn above this resident footprint.
+
+One episode's obs is ~19.8 MB, so the default capacity of 60,000 transitions
+(~122 episodes) sits near 2.24 GB. The threshold is set above that so the
+warning fires only when a run is genuinely at risk on the 16 GB shared budget,
+rather than on every ordinary run.
+"""
+
+_DEFAULT_BACKBONE = "dinov2"
+
+
+def feature_suffix(backbone: str) -> str:
+    """Sibling filename suffix for `backbone`'s cached features.
+
+    `dinov2` keeps the bare `.features.npy` that M1 already wrote, so the
+    existing 122 files stay valid. Every other backbone is namespaced, because
+    two caches now coexist and a shared name would let one silently overwrite
+    the other -- leaving arms 2 and 3 training on identical inputs, with no
+    error to notice.
+    """
+    if backbone == _DEFAULT_BACKBONE:
+        return ".features.npy"
+    return f".features_{backbone}.npy"
+
+
+class SequenceLoader:
+    """Samples `(B, T)` windows from episodes held in a `ReplayBuffer`."""
+
+    def __init__(
+        self,
+        buffer: ReplayBuffer,
+        batch_size: int = 16,
+        seq_len: int = 64,
+        seed: int = 0,
+        load_obs: bool = True,
+        load_features: bool = False,
+        feature_backbone: str = _DEFAULT_BACKBONE,
+    ) -> None:
+        self.buffer = buffer
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.load_obs = load_obs
+        self.load_features = load_features
+        self.feature_backbone = feature_backbone
+        self._rng = np.random.default_rng(seed)
+
+        # Keep paths and episodes index-aligned by construction rather than by
+        # relying on load_all() happening to preserve order.
+        self._paths: list[Path] = buffer.episode_paths()
+        self._episodes = [self._read(p) for p in self._paths]
+
+        self._features: list[np.ndarray | None] = []
+        if load_features:
+            suffix = feature_suffix(feature_backbone)
+            for path in self._paths:
+                feature_path = path.with_suffix(suffix)
+                if not feature_path.is_file():
+                    raise FileNotFoundError(
+                        f"no cached features for {path.name}; expected "
+                        f"{feature_path.name}. Run scripts/cache_features.py "
+                        f"--backbone {feature_backbone} first."
+                    )
+                self._features.append(np.load(feature_path, mmap_mode="r"))
+
+        if load_obs:
+            total = sum(ep.obs.nbytes for ep in self._episodes)
+            if total > _WARN_BYTES:
+                logger.warning(
+                    "SequenceLoader holds %d episodes (%.2f GB) resident in RAM. "
+                    "Episodes are loaded eagerly at construction. Pass "
+                    "load_obs=False for arms that train on cached features.",
+                    len(self._episodes),
+                    total / 1e9,
+                )
+
+    def _read(self, path: Path):
+        """Load one episode, skipping its obs array when pixels are not needed."""
+        if self.load_obs:
+            return load_episode(path)
+        return _EpisodeMeta.from_npz(path)
+
+    def episode_path(self, index: int) -> Path:
+        """File backing the episode a batch's `episode_index` refers to.
+
+        Use it to locate the sibling feature cache for a window.
+        """
+        return self._paths[index]
+
+    def _usable(self) -> list[int]:
+        return [i for i, ep in enumerate(self._episodes) if ep.length >= self.seq_len]
+
+    def sample(self, include_privileged: bool = False) -> dict[str, Any]:
+        """Sample one batch.
+
+        Args:
+            include_privileged: include ground-truth engine state. EVALUATION
+                PROBES ONLY -- passing True in a training loop invalidates the
+                study. Defaults to False so the safe path needs no thought.
+
+        Raises:
+            ValueError: if no episode is at least `seq_len` transitions long.
+        """
+        usable = self._usable()
+        if not usable:
+            raise ValueError(
+                f"no episodes long enough for seq_len={self.seq_len}; "
+                f"buffer holds {len(self._episodes)} episodes"
+            )
+
+        obs, actions, rewards = [], [], []
+        terminated, truncated, privileged, features = [], [], [], []
+        indices, starts = [], []
+
+        for _ in range(self.batch_size):
+            idx = int(self._rng.choice(usable))
+            ep = self._episodes[idx]
+            start = int(self._rng.integers(0, ep.length - self.seq_len + 1))
+            end = start + self.seq_len
+            actions.append(ep.actions[start:end])
+            rewards.append(ep.rewards[start:end])
+            terminated.append(ep.terminated[start:end])
+            truncated.append(ep.truncated[start:end])
+            indices.append(idx)
+            starts.append(start)
+            if self.load_obs:
+                obs.append(ep.obs[start : end + 1])
+            if self.load_features:
+                features.append(np.asarray(self._features[idx][start : end + 1]))
+            if include_privileged:
+                privileged.append(ep.privileged[start : end + 1])
+
+        batch: dict[str, Any] = {
+            "actions": np.stack(actions).astype(np.int32),
+            "rewards": np.stack(rewards).astype(np.float32),
+            "terminated": np.stack(terminated).astype(bool),
+            "truncated": np.stack(truncated).astype(bool),
+            "episode_index": np.asarray(indices, dtype=np.int32),
+            "window_start": np.asarray(starts, dtype=np.int32),
+        }
+        if self.load_obs:
+            batch["obs"] = np.stack(obs).astype(np.uint8)
+        if self.load_features:
+            batch["features"] = np.stack(features)
+        if include_privileged:
+            batch["privileged"] = np.stack(privileged).astype(np.float32)
+        return batch
+
+
+class _EpisodeMeta:
+    """An episode with everything except its obs array.
+
+    `np.load` on an npz returns a lazy handle, so the pixel data is never
+    decompressed when only these fields are read.
+    """
+
+    __slots__ = (
+        "actions", "rewards", "terminated", "truncated",
+        "privileged", "privileged_keys", "policy_name", "seed", "scenario",
+    )
+
+    @classmethod
+    def from_npz(cls, path: Path) -> "_EpisodeMeta":
+        meta = cls()
+        with np.load(path) as data:
+            meta.actions = data["actions"]
+            meta.rewards = data["rewards"]
+            meta.terminated = data["terminated"]
+            meta.truncated = data["truncated"]
+            meta.privileged = data["privileged"]
+            meta.privileged_keys = tuple(data["privileged_keys"].tolist())
+            meta.policy_name = str(data["policy_name"])
+            meta.seed = int(data["seed"])
+            meta.scenario = str(data["scenario"])
+        return meta
+
+    @property
+    def length(self) -> int:
+        return int(self.actions.shape[0])
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/data/test_loader.py -v`
+Expected: 24 passed (15 existing plus the 9 added here).
+
+- [ ] **Step 5: Verify the memory claim on the real dataset**
+
+```bash
+.venv/bin/python -c "
+import resource
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.loader import SequenceLoader
+rss = lambda: resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1e9
+buf = ReplayBuffer('data/my_way_home', capacity_transitions=10**9)
+ld = SequenceLoader(buf, 16, 64, 0, load_obs=False, load_features=True)
+print(f'obs-free + features loader RSS: {rss():.2f} GB')
+b = ld.sample()
+print('keys:', sorted(b)); print('features:', b['features'].shape, b['features'].dtype)
+print(f'after one batch: {rss():.2f} GB   (eager-obs baseline was 2.24 GB)'
+)"
+```
+
+Expected: RSS well under 1 GB, `obs` absent from the keys, `features` of shape `(16, 65, 64, 384)` float16. Record the number in the commit message.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/mbfps/data/loader.py tests/data/test_loader.py
+git commit -m "feat: obs-optional and feature-capable sequence loading"
+```
+
+---
+
+## Task 3: Background prefetching
+
+**Files:**
+- Create: `src/mbfps/data/prefetch.py`
+- Create: `tests/data/test_prefetch.py`
+
+**Interfaces:**
+- Consumes: `SequenceLoader` from `mbfps.data.loader`.
+- Produces: `Prefetcher(loader, depth: int = 2)` — an iterable yielding batches produced on a background thread; `close() -> None` (idempotent); supports the context-manager protocol.
+
+**Why:** A feature batch costs 101 ms to read (51 MB from memmap) while an Arm 2/3 training step costs 161 ms — so unoverlapped loading adds ~63% to the fast arms. Arm 1's step is 1546 ms, where the same 101 ms is ~6%, so this exists for the SSL arms. NumPy releases the GIL during the copy, so a thread suffices; no process pool is needed.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/data/test_prefetch.py
+import numpy as np
+import pytest
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.episode import Episode
+from mbfps.data.loader import SequenceLoader
+from mbfps.data.prefetch import Prefetcher
+from mbfps.envs.protocol import OBS_SHAPE
+
+KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
+
+
+def make_episode(t: int, fill: int) -> Episode:
+    return Episode(
+        obs=np.full((t + 1, *OBS_SHAPE), fill, dtype=np.uint8),
+        actions=np.zeros(t, dtype=np.int32),
+        rewards=np.zeros(t, dtype=np.float32),
+        terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
+        privileged=np.zeros((t + 1, len(KEYS)), dtype=np.float32),
+        privileged_keys=KEYS,
+        policy_name="random",
+        seed=fill,
+        scenario="my_way_home",
+    )
+
+
+@pytest.fixture
+def buffer(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2, 3):
+        buf.add(make_episode(t=80, fill=fill))
+    return buf
+
+
+def test_yields_the_requested_number_of_batches(buffer):
+    loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    with Prefetcher(loader, depth=2) as pf:
+        batches = [next(iter(pf)) for _ in range(3)]
+    assert len(batches) == 3
+    assert all(b["actions"].shape == (2, 16) for b in batches)
+
+
+def test_batches_match_direct_sampling_in_order(buffer):
+    """Prefetching must not change what the loader would have produced."""
+    direct_loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=7)
+    expected = [direct_loader.sample() for _ in range(4)]
+
+    pf_loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=7)
+    with Prefetcher(pf_loader, depth=2) as pf:
+        it = iter(pf)
+        got = [next(it) for _ in range(4)]
+
+    for i, (a, b) in enumerate(zip(expected, got)):
+        assert np.array_equal(a["obs"], b["obs"]), f"batch {i} differs"
+        assert np.array_equal(a["episode_index"], b["episode_index"])
+        assert np.array_equal(a["window_start"], b["window_start"])
+
+
+def test_close_is_idempotent(buffer):
+    """Two closes must leave the same observable state as one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+    pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+
+
+def test_reuse_after_close_reports_closure_not_death(buffer):
+    """A deliberately closed prefetcher must not look like a crashed one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    with pytest.raises(RuntimeError, match="closed and cannot be reused"):
+        next(iter(pf))
+
+
+def test_context_manager_closes_the_thread(buffer):
+    import threading
+
+    before = threading.active_count()
+    with Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1) as pf:
+        next(iter(pf))
+    assert threading.active_count() == before, "worker thread outlived the context"
+
+
+def test_worker_exception_propagates_to_the_consumer(buffer):
+    """A failing loader must raise here, not hang the consumer forever."""
+
+    class _Broken(SequenceLoader):
+        def sample(self, include_privileged: bool = False):
+            raise RuntimeError("loader exploded")
+
+    with Prefetcher(_Broken(buffer, 2, 16, seed=0), depth=1) as pf:
+        with pytest.raises(RuntimeError, match="loader exploded"):
+            next(iter(pf))
+
+
+def test_depth_must_be_positive(buffer):
+    with pytest.raises(ValueError, match="depth must be at least 1"):
+        Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=0)
+
+
+def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
+    """A hang is a worse failure than an exception.
+
+    If the worker dies without delivering its error -- which a lost exception
+    guard in `_work` would cause -- the consumer must notice the dead thread
+    and raise, rather than blocking forever on an empty queue.
+    """
+    import mbfps.data.prefetch as prefetch_module
+
+    monkeypatch.setattr(prefetch_module, "_POLL_SECONDS", 0.05)
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    try:
+        pf._stop.set()          # stop the worker cleanly
+        pf._thread.join(timeout=2.0)
+        assert not pf._thread.is_alive(), "worker did not stop"
+        while not pf._queue.empty():
+            pf._queue.get_nowait()
+        # The thread is now dead but nobody called close(): clear the flag so
+        # `_stop.is_set()` reflects "not closed" again, isolating the
+        # dead-thread branch from the closed-state branch added for the
+        # reuse-after-close fix.
+        pf._stop.clear()
+        with pytest.raises(RuntimeError, match="prefetch worker died"):
+            next(iter(pf))
+    finally:
+        pf.close()
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/data/test_prefetch.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.data.prefetch'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# src/mbfps/data/prefetch.py
+"""Overlap batch loading with computation.
+
+Reading a feature batch costs ~101 ms (51 MB from memmap) while an SSL-arm
+training step costs ~161 ms, so serial loading adds ~63% to the arms that are
+otherwise fast. A single background thread is enough: NumPy releases the GIL
+while copying, so the read genuinely overlaps the forward/backward pass.
+
+The pixel arm sees ~6% overhead from the same read and does not need this, but
+using one path for every arm keeps the arms comparable.
+"""
+
+import queue
+import threading
+from typing import Any, Iterator
+
+from mbfps.data.loader import SequenceLoader
+
+_POLL_SECONDS = 0.5
+"""How long the consumer waits before checking whether the worker is alive.
+
+Blocking indefinitely on the queue would turn a dead worker into a hang. A
+hang is worse than an exception: it stalls CI with no diagnostic. Removing
+`_work`'s exception guard was verified to produce exactly that.
+"""
+
+
+class Prefetcher:
+    """Yields batches from `loader`, produced on a background thread.
+
+    This is an infinite stream over `loader.sample()`: there is no
+    end-of-data condition, and `__iter__` never returns on its own. The only
+    way to stop consuming is to stop calling `next()` and `close()` the
+    prefetcher (or exit the `with` block); a closed `Prefetcher` cannot be
+    reused.
+    """
+
+    def __init__(self, loader: SequenceLoader, depth: int = 2) -> None:
+        if depth < 1:
+            raise ValueError(f"depth must be at least 1, got {depth}")
+        self._loader = loader
+        self._queue: queue.Queue = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._work, daemon=True)
+        self._thread.start()
+
+    def _work(self) -> None:
+        try:
+            while not self._stop.is_set():
+                batch = self._loader.sample()
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(batch, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the consumer
+            # Deliver the failure rather than dying silently and leaving the
+            # consumer blocked on an empty queue forever.
+            self._queue.put(exc)
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        while True:
+            if self._stop.is_set():
+                raise RuntimeError(
+                    "Prefetcher has been closed and cannot be reused; "
+                    "construct a new one"
+                )
+            try:
+                item = self._queue.get(timeout=_POLL_SECONDS)
+            except queue.Empty:
+                if self._stop.is_set():
+                    raise RuntimeError(
+                        "Prefetcher has been closed and cannot be reused; "
+                        "construct a new one"
+                    ) from None
+                if not self._thread.is_alive():
+                    raise RuntimeError(
+                        "prefetch worker died without reporting an error; "
+                        "the queue is empty and the thread is gone"
+                    ) from None
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    def close(self) -> None:
+        """Stop the worker thread. Safe to call more than once."""
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        # Drain so a worker blocked on put() can observe the stop flag.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=2.0)
+
+    def __enter__(self) -> "Prefetcher":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/data/test_prefetch.py -v`
+Expected: 8 passed.
+
+- [ ] **Step 5: Measure the overlap on the real dataset**
+
+```bash
+.venv/bin/python -c "
+import time
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.loader import SequenceLoader
+from mbfps.data.prefetch import Prefetcher
+buf = ReplayBuffer('data/my_way_home', capacity_transitions=10**9)
+mk = lambda: SequenceLoader(buf, 16, 64, 0, load_obs=False, load_features=True)
+ld = mk(); ld.sample()
+t0 = time.perf_counter()
+for _ in range(10): ld.sample()
+serial = (time.perf_counter()-t0)/10
+with Prefetcher(mk(), depth=2) as pf:
+    it = iter(pf); next(it)
+    t0 = time.perf_counter()
+    for _ in range(10): next(it)
+    pre = (time.perf_counter()-t0)/10
+print(f'serial   : {serial*1000:6.1f} ms/batch')
+print(f'prefetch : {pre*1000:6.1f} ms/batch')
+"
+```
+
+Expected: the prefetched figure is substantially lower than serial when a consumer is doing work between batches. Note that this microbenchmark has no compute to hide behind, so the gain here will be modest — record both numbers; the real benefit shows up in Task 7's training loop.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/mbfps/data/prefetch.py tests/data/test_prefetch.py
+git commit -m "feat: background batch prefetching to overlap I/O with compute"
+```
+
+---
+
+## Task 4: Backbone-parameterised feature caching
+
+**Files:**
+- Modify: `src/mbfps/data/features.py`
+- Modify: `src/mbfps/data/buffer.py` (eviction must clear every backbone's cache)
+- Modify: `tests/data/test_features.py`
+- Modify: `tests/data/test_buffer.py`
+- Create: `scripts/cache_features.py`
+
+**Interfaces:**
+- Consumes: `get_device` from `mbfps.utils.device`; `OBS_SHAPE`; `ReplayBuffer`.
+- Produces: `BACKBONES: tuple[str, ...] = ("dinov2", "random_vit")`; `build_backbone(kind: str, seed: int = 0) -> torch.nn.Module`; `FeatureExtractor(backbone: str = "dinov2", device: str = "mps", seed: int = 0)` retaining `encode` and the `N_PATCHES` / `FEATURE_DIM` constants; `require_free_bytes(path: Path, needed: int) -> None`; `cache_episode_features(ep_path, extractor, batch_size=32) -> Path` — now writes to the suffix for `extractor.backbone`, so two caches coexist without colliding.
+
+**Two constraints this task exists to satisfy:**
+
+1. **Arm 3 needs its own cached features.** It is Arm 2 with a randomly-initialised backbone of identical architecture. Verified: `AutoModel.from_config(AutoConfig.from_pretrained("facebook/dinov2-small"))` under a fixed seed yields the same `(N, 65, 384)` shape, 22.1M frozen parameters, and bit-identical weights on repeat.
+2. **The disk has 2.3 GB free and one cache is 2.93 GB.** Two caches will not fit. The workflow is therefore: cache one backbone, train that arm, delete the cache, cache the next. `require_free_bytes` must fail *before* writing rather than filling the disk and dying partway.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/data/test_features.py`:
+
+```python
+def test_backbones_registered():
+    from mbfps.data.features import BACKBONES
+
+    assert BACKBONES == ("dinov2", "random_vit")
+
+
+def test_unknown_backbone_rejected():
+    from mbfps.data.features import build_backbone
+
+    with pytest.raises(KeyError, match="unknown backbone 'nope'"):
+        build_backbone("nope")
+
+
+@pytest.mark.slow
+def test_random_vit_has_the_same_output_shape_as_dinov2():
+    """Arm 3 must be Arm 2 with different weights, not a different shape."""
+    ext = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    frames = np.random.default_rng(0).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert ext.encode(frames).shape == (2, N_PATCHES, FEATURE_DIM)
+
+
+@pytest.mark.slow
+def test_random_vit_is_reproducible_from_its_seed():
+    a = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
+    b = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
+    frames = np.random.default_rng(1).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert np.array_equal(a.encode(frames), b.encode(frames))
+
+
+@pytest.mark.slow
+def test_random_vit_differs_from_dinov2():
+    """If these matched, Arm 3 would not be a control at all."""
+    rnd = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    pre = FeatureExtractor(backbone="dinov2", device="cpu")
+    frames = np.random.default_rng(2).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert not np.allclose(
+        rnd.encode(frames).astype(np.float32),
+        pre.encode(frames).astype(np.float32),
+        atol=1e-2,
+    )
+
+
+@pytest.mark.slow
+def test_different_seeds_give_different_random_backbones():
+    a = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
+    b = FeatureExtractor(backbone="random_vit", device="cpu", seed=1)
+    frames = np.random.default_rng(3).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
+    assert not np.array_equal(a.encode(frames), b.encode(frames))
+
+
+def test_require_free_bytes_passes_when_space_available(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    require_free_bytes(tmp_path, 1)
+
+
+def test_require_free_bytes_raises_when_space_insufficient(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    with pytest.raises(OSError, match="needs .* free"):
+        require_free_bytes(tmp_path, 10**15)
+
+
+def test_require_free_bytes_message_names_both_numbers(tmp_path):
+    from mbfps.data.features import require_free_bytes
+
+    with pytest.raises(OSError) as excinfo:
+        require_free_bytes(tmp_path, 10**15)
+    message = str(excinfo.value)
+    assert "GB" in message and "available" in message
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/data/test_features.py -v -k "backbone or random_vit or free_bytes"`
+Expected: FAIL with `ImportError: cannot import name 'BACKBONES'`
+
+- [ ] **Step 3: Modify `src/mbfps/data/features.py`**
+
+Replace the `FeatureExtractor.__init__` and add the new module-level helpers. Keep `encode`, `cache_episode_features`, `N_PATCHES`, `FEATURE_DIM`, and the ImageNet constants exactly as they are.
+
+```python
+import shutil
+from pathlib import Path
+
+from transformers import AutoConfig, AutoModel
+
+BACKBONES: tuple[str, ...] = ("dinov2", "random_vit")
+"""Frozen backbones. `dinov2` is the treatment arm's pretrained encoder;
+`random_vit` is the control -- identical architecture, random weights, which is
+what separates "pretraining helps" from "a stationary target helps"."""
+
+_MODEL_NAME = "facebook/dinov2-small"
+
+
+def build_backbone(kind: str, seed: int = 0) -> "torch.nn.Module":
+    """Construct a frozen backbone.
+
+    Args:
+        kind: one of `BACKBONES`.
+        seed: RNG seed for `random_vit`. Ignored for `dinov2`, whose weights
+            are fixed. Verified: the same seed reproduces bit-identical weights.
+
+    Raises:
+        KeyError: if `kind` is not registered.
+    """
+    if kind not in BACKBONES:
+        raise KeyError(f"unknown backbone {kind!r}; available: {list(BACKBONES)}")
+    if kind == "dinov2":
+        return AutoModel.from_pretrained(_MODEL_NAME)
+    torch.manual_seed(seed)
+    return AutoModel.from_config(AutoConfig.from_pretrained(_MODEL_NAME))
+
+
+def require_free_bytes(path: Path, needed: int) -> None:
+    """Fail before writing if `path`'s filesystem cannot hold `needed` bytes.
+
+    The DINOv2 cache for the M1 dataset is 2.93 GB and this machine has had as
+    little as 2.3 GB free, so a caching run can plausibly fill the disk. Failing
+    up front beats dying halfway and leaving a partial cache that later loads
+    as a FileNotFoundError on some episodes but not others.
+
+    Raises:
+        OSError: if free space is less than `needed`.
+    """
+    free = shutil.disk_usage(Path(path)).free
+    if free < needed:
+        raise OSError(
+            f"caching needs {needed / 1e9:.2f} GB free at {path}, "
+            f"but only {free / 1e9:.2f} GB is available"
+        )
+```
+
+Change `FeatureExtractor.__init__` to:
+
+```python
+    def __init__(
+        self, backbone: str = "dinov2", device: str = "mps", seed: int = 0
+    ) -> None:
+        self.backbone = backbone
+        self.device = get_device(prefer=device)
+        self.model = build_backbone(backbone, seed=seed).to(self.device).eval()
+        for param in self.model.parameters():
+            param.requires_grad_(False)
+```
+
+- [ ] **Step 3b: Route writes and eviction through the per-backbone suffix**
+
+Two places in the committed code hardcode `.features.npy` and must now use `feature_suffix`, or the second cache will overwrite the first and eviction will orphan it.
+
+In `src/mbfps/data/features.py`, `cache_episode_features` currently ends with:
+
+```python
+    out_path = ep_path.with_suffix(".features.npy")
+```
+
+Replace it with:
+
+```python
+    from mbfps.data.loader import feature_suffix
+
+    out_path = ep_path.with_suffix(feature_suffix(extractor.backbone))
+```
+
+and update its docstring to say the filename is namespaced by backbone.
+
+In `src/mbfps/data/buffer.py`, `_evict` currently unlinks one fixed name:
+
+```python
+            path.with_suffix(".features.npy").unlink(missing_ok=True)
+```
+
+Replace it with a glob over every cache variant, so a second backbone's features cannot outlive their episode:
+
+```python
+            for cache in path.parent.glob(f"{path.stem}.features*.npy"):
+                cache.unlink(missing_ok=True)
+```
+
+Add to `tests/data/test_buffer.py`:
+
+```python
+def test_eviction_removes_every_backbones_feature_cache(tmp_path):
+    """Two caches coexist; evicting only one orphans the other forever."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=25)
+    first = buf.add(make_episode(10, seed=1))
+    caches = [
+        first.with_suffix(".features.npy"),
+        first.with_suffix(".features_random_vit.npy"),
+    ]
+    for cache in caches:
+        np.save(cache, np.zeros((11, 4, 8), dtype=np.float16))
+    buf.add(make_episode(10, seed=2))
+    buf.add(make_episode(10, seed=3))
+    assert not first.is_file()
+    for cache in caches:
+        assert not cache.is_file(), f"{cache.name} outlived its episode"
+```
+
+Run: `.venv/bin/python -m pytest tests/data/test_buffer.py -v`
+Expected: 16 passed (15 existing plus this one).
+
+The routing fix above has no test covering `cache_episode_features` itself --
+the only existing test that touches it, `test_cache_episode_features_writes_sibling_file`,
+uses the default `dinov2` backbone, whose suffix is identical whether or not
+the fix is applied. Left uncovered, a regression back to a hardcoded
+`.features.npy` would leave the whole suite green while the `random_vit`
+caching run silently overwrote the `dinov2` cache -- collapsing the control
+arm into the treatment arm with no error anywhere. Close that gap:
+
+Add to `tests/data/test_features.py` (needs `Episode` and `save_episode` from
+`mbfps.data.episode`, and `OBS_SHAPE` from `mbfps.envs.protocol`, imported in
+the test module):
+
+```python
+def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
+    """Two caches must never collide.
+
+    A hardcoded suffix here would make the random_vit run overwrite dinov2's
+    cache, leaving arms 2 and 3 training on identical inputs with no error
+    anywhere -- the control silently becomes a copy of the treatment. Verified
+    by mutation: with the suffix hardcoded, the rest of the suite stays green.
+    """
+
+    class _StubExtractor:
+        backbone = "random_vit"
+
+        def encode(self, frames):
+            return np.zeros((len(frames), N_PATCHES, FEATURE_DIM), dtype=np.float16)
+
+    keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
+    episode = Episode(
+        obs=np.zeros((4, *OBS_SHAPE), dtype=np.uint8),
+        actions=np.zeros(3, dtype=np.int32),
+        rewards=np.zeros(3, dtype=np.float32),
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
+        privileged=np.zeros((4, len(keys)), dtype=np.float32),
+        privileged_keys=keys,
+        policy_name="random",
+        seed=0,
+        scenario="my_way_home",
+    )
+    path = tmp_path / "ep_000000_len00003.npz"
+    save_episode(episode, path)
+
+    # A pre-existing dinov2 cache that must survive untouched.
+    dinov2_cache = path.with_suffix(".features.npy")
+    np.save(dinov2_cache, np.full((4, N_PATCHES, FEATURE_DIM), 7, dtype=np.float16))
+
+    out_path = cache_episode_features(path, _StubExtractor())
+
+    assert out_path.name.endswith(".features_random_vit.npy"), out_path.name
+    assert out_path.is_file()
+    assert dinov2_cache.is_file(), "the dinov2 cache was deleted"
+    assert np.load(dinov2_cache)[0, 0, 0] == 7, "the dinov2 cache was overwritten"
+    assert np.load(out_path).shape == (4, N_PATCHES, FEATURE_DIM)
+```
+
+Run: `.venv/bin/python -m pytest tests/data/test_features.py -k backbones_own_suffix -v`
+Expected: 1 passed.
+
+- [ ] **Step 4: Write the caching script**
+
+```python
+# scripts/cache_features.py
+"""Cache frozen-backbone features for every episode in a buffer.
+
+Run once per backbone. Because one cache is ~2.93 GB and this machine has had
+as little as 2.3 GB free, the workflow is one cache at a time:
+
+    cache_features.py --backbone dinov2      # train arm 2
+    cache_features.py --backbone dinov2 --clear
+    cache_features.py --backbone random_vit  # train arm 3
+
+Features must be generated once on one device: CPU and MPS outputs differ in
+~3% of float16 elements, so mixing them would silently break the input
+equality the study depends on.
+"""
+
+import argparse
+import time
+from pathlib import Path
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.features import (
+    BACKBONES,
+    FEATURE_DIM,
+    N_PATCHES,
+    FeatureExtractor,
+    cache_episode_features,
+    require_free_bytes,
+)
+from mbfps.data.loader import feature_suffix
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
+    parser.add_argument("--backbone", choices=BACKBONES, default="dinov2")
+    parser.add_argument("--device", default="mps")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--clear", action="store_true", help="delete existing caches and exit"
+    )
+    args = parser.parse_args()
+
+    buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+    paths = buffer.episode_paths()
+    if not paths:
+        raise SystemExit(f"no episodes found in {args.data}")
+
+    if args.clear:
+        removed = 0
+        for path in paths:
+            feature_path = path.with_suffix(feature_suffix(args.backbone))
+            if feature_path.is_file():
+                feature_path.unlink()
+                removed += 1
+        print(f"removed={removed} {args.backbone} feature files from {args.data}")
+        return
+
+    frames = sum(ep.length + 1 for ep in buffer.load_all())
+    needed = frames * N_PATCHES * FEATURE_DIM * 2  # float16
+    print(f"episodes={len(paths)} frames={frames} needs={needed / 1e9:.2f} GB")
+    require_free_bytes(args.data, needed)
+
+    extractor = FeatureExtractor(
+        backbone=args.backbone, device=args.device, seed=args.seed
+    )
+    start = time.perf_counter()
+    for i, path in enumerate(paths, start=1):
+        cache_episode_features(path, extractor)
+        if i % 20 == 0 or i == len(paths):
+            print(f"[{i}/{len(paths)}] elapsed={time.perf_counter() - start:.0f}s")
+
+    elapsed = time.perf_counter() - start
+    print(f"backbone={args.backbone} device={args.device} seed={args.seed}")
+    print(f"features_cached={len(paths)} elapsed_s={elapsed:.0f}")
+    print(f"frames_per_second={frames / elapsed:.0f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/data/test_features.py -v`
+Expected: 19 passed (9 existing, plus the 9 added in Step 1 -- the block above
+adds nine tests, not eight, so the pre-existing total here was 18, not the 17
+this step previously stated -- plus the 1 added in Step 3b to close the
+filename-routing gap).
+
+Also confirm the existing M1 cache still loads: `.venv/bin/python -c "from mbfps.data.loader import feature_suffix; print(feature_suffix('dinov2'))"` must print `.features.npy`, matching the 122 files already on disk.
+
+- [ ] **Step 6: Verify the disk guard on the real filesystem**
+
+```bash
+.venv/bin/python -c "
+from pathlib import Path
+from mbfps.data.features import require_free_bytes
+import shutil
+free = shutil.disk_usage('.').free
+print(f'free: {free/1e9:.2f} GB')
+require_free_bytes(Path('.'), 1000)
+print('small request: OK')
+try:
+    require_free_bytes(Path('.'), free * 2)
+    print('FAIL: oversized request was allowed')
+except OSError as e:
+    print('oversized request correctly refused:', e)
+"
+```
+
+Expected: the small request passes and the oversized one raises with both numbers named.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/mbfps/data/features.py src/mbfps/data/buffer.py tests/data/test_features.py tests/data/test_buffer.py scripts/cache_features.py
+git commit -m "feat: backbone-parameterised feature caching with a disk guard"
+```
+
+---
+
+## Task 5: Encoders for all three arms
+
+**Files:**
+- Create: `src/mbfps/models/__init__.py`
+- Create: `src/mbfps/models/encoders.py`
+- Create: `tests/models/__init__.py`
+- Create: `tests/models/test_encoders.py`
+
+**Interfaces:**
+- Consumes: `EncoderConfig` from `mbfps.utils.config`; `OBS_SHAPE`.
+- Produces: `CNNEncoder(cfg: EncoderConfig)` mapping `(N, 112, 112, 3)` uint8 to `(N, 2048)` float32; `BottleneckEncoder(cfg: EncoderConfig)` mapping `(N, 64, 384)` float32 to `(N, 2048)` float32; `build_encoder(cfg: EncoderConfig) -> nn.Module`; `encoder_input_kind(cfg: EncoderConfig) -> str` returning `"obs"` or `"features"`.
+
+**This is the only module that differs between arms.** If a later task needs to special-case an arm anywhere else, the comparison has stopped being controlled.
+
+**Recorded parameter counts.** The spec's section 3.1 estimates "~4M (encoder + decoder)" for Arm 1 and "~0.2M (bottleneck)" for Arms 2/3. Both estimates are wrong; measured values for the architecture the spec *describes* are:
+
+| | spec estimate | measured |
+|---|---|---|
+| Arm 1 conv stack | | 0.690 M |
+| Arm 1 `Linear(12544 -> 2048)` | | 25.692 M |
+| Arm 1 encoder (conv + projection) | | **26.382 M** |
+| Arm 1 decoder | | **26.393 M** |
+| Arm 1 encoder + decoder | ~4 M | **52.775 M** |
+| Arm 2/3 bottleneck `Linear(384 -> 32)` | ~0.2 M | **0.012 M** |
+
+The `~4M` figure came from DreamerV3's native 64x64 configuration, whose projection is `Linear(4096, 1024)` = 4.195 M, and was not recomputed for 112x112 with a 2048-wide embedding. **Implement the architecture the spec describes, not the parameter count it estimates.** Shrinking the baseline to be cheaper would be tuning it down, which biases the study toward the treatment — the opposite of what a baseline is for.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/models/test_encoders.py
+import pytest
+import torch
+
+from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.models.encoders import (
+    BottleneckEncoder,
+    CNNEncoder,
+    build_encoder,
+    encoder_backbone,
+    encoder_input_kind,
+)
+from mbfps.utils.config import ARMS, EncoderConfig
+
+
+def cfg(kind: str) -> EncoderConfig:
+    return EncoderConfig(kind=kind)
+
+
+def n_params(module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def test_cnn_encoder_output_shape():
+    enc = CNNEncoder(cfg("cnn"))
+    obs = torch.randint(0, 256, (4, *OBS_SHAPE), dtype=torch.uint8)
+    assert enc(obs).shape == (4, 2048)
+
+
+def test_cnn_encoder_output_is_float32():
+    enc = CNNEncoder(cfg("cnn"))
+    obs = torch.randint(0, 256, (2, *OBS_SHAPE), dtype=torch.uint8)
+    assert enc(obs).dtype == torch.float32
+
+
+def test_cnn_encoder_accepts_uint8_without_manual_conversion():
+    """The loader hands out uint8; the encoder owns normalisation."""
+    enc = CNNEncoder(cfg("cnn"))
+    obs = torch.full((2, *OBS_SHAPE), 255, dtype=torch.uint8)
+    assert torch.isfinite(enc(obs)).all()
+
+
+def test_cnn_encoder_normalises_and_reorders_its_input(monkeypatch):
+    """Pins the uint8 -> centred-unit-range conversion and the NCHW reorder.
+
+    Shape/dtype/finiteness assertions cannot catch a missing /255: SiLU and
+    Linear stay finite at any input scale, so a 255x units bug would surface
+    only as a model that refuses to converge. Verified by mutation -- removing
+    the normalisation left all other encoder tests green.
+    """
+    enc = CNNEncoder(cfg("cnn"))
+    seen: dict[str, torch.Tensor] = {}
+    original = enc.conv.forward
+
+    def spy(x):
+        seen["x"] = x.detach().clone()
+        return original(x)
+
+    monkeypatch.setattr(enc.conv, "forward", spy)
+
+    enc(torch.full((2, *OBS_SHAPE), 255, dtype=torch.uint8))
+    assert seen["x"].shape == (2, 3, 112, 112), "input must be NCHW float"
+    assert seen["x"].dtype == torch.float32
+    assert seen["x"].max().item() == pytest.approx(0.5, abs=1e-6), (
+        "uint8 255 must map to +0.5"
+    )
+
+    enc(torch.zeros((2, *OBS_SHAPE), dtype=torch.uint8))
+    assert seen["x"].min().item() == pytest.approx(-0.5, abs=1e-6), (
+        "uint8 0 must map to -0.5"
+    )
+
+    enc(torch.full((2, *OBS_SHAPE), 128, dtype=torch.uint8))
+    assert seen["x"].mean().item() == pytest.approx(128 / 255 - 0.5, abs=1e-6)
+
+
+def test_bottleneck_encoder_output_shape():
+    enc = BottleneckEncoder(cfg("frozen_ssl"))
+    feats = torch.randn(4, 64, 384)
+    assert enc(feats).shape == (4, 2048)
+
+
+def test_bottleneck_flattens_patch_grid_to_embed_dim():
+    """64 patches x 32 bottleneck dims = 2048, matching the CNN arm exactly."""
+    c = cfg("frozen_ssl")
+    assert 64 * c.bottleneck_dim == c.embed_dim
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_build_encoder_returns_something_for_every_arm(arm):
+    assert build_encoder(cfg(arm)) is not None
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_every_arm_emits_the_same_embedding_width(arm):
+    c = cfg(arm)
+    enc = build_encoder(c)
+    if encoder_input_kind(c) == "obs":
+        x = torch.randint(0, 256, (3, *OBS_SHAPE), dtype=torch.uint8)
+    else:
+        x = torch.randn(3, 64, 384)
+    assert enc(x).shape == (3, 2048)
+
+
+def test_input_kind_is_obs_for_cnn_and_features_for_ssl_arms():
+    assert encoder_input_kind(cfg("cnn")) == "obs"
+    assert encoder_input_kind(cfg("frozen_ssl")) == "features"
+    assert encoder_input_kind(cfg("random_vit")) == "features"
+
+
+def test_unknown_arm_rejected():
+    with pytest.raises(KeyError, match="unknown encoder kind 'nope'"):
+        build_encoder(EncoderConfig(kind="nope"))
+
+
+def test_each_arm_maps_to_its_own_backbone():
+    """The control arm must not read the treatment arm's cache.
+
+    Arm name and backbone name are not the same string for `frozen_ssl`, so a
+    naive identity mapping would send it to a cache that does not exist.
+    """
+    assert encoder_backbone(cfg("cnn")) is None
+    assert encoder_backbone(cfg("frozen_ssl")) == "dinov2"
+    assert encoder_backbone(cfg("random_vit")) == "random_vit"
+
+
+def test_feature_arms_map_to_distinct_backbones():
+    """If these collided, arms 2 and 3 would be the same experiment."""
+    assert encoder_backbone(cfg("frozen_ssl")) != encoder_backbone(cfg("random_vit"))
+
+
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_ssl_arms_build_the_identical_module(arm):
+    """Arm 3 is Arm 2 with different cached inputs -- nothing else.
+
+    Driven through `build_encoder` rather than the class constructor, so a
+    broken routing table is caught here rather than incidentally by a shape
+    assertion elsewhere. Compares module type and state-dict keys as well as
+    shapes, because a per-arm weight-init branch would leave shapes identical
+    while changing behaviour.
+    """
+    reference = build_encoder(cfg("frozen_ssl"))
+    built = build_encoder(cfg(arm))
+
+    assert type(built) is type(reference), "arms got different module types"
+    assert n_params(built) == n_params(reference)
+    assert [tuple(p.shape) for p in built.parameters()] == [
+        tuple(p.shape) for p in reference.parameters()
+    ]
+    assert built.state_dict().keys() == reference.state_dict().keys()
+
+
+def test_ssl_arms_build_value_identical_modules():
+    """Structural checks cannot see a per-arm weight-init branch.
+
+    Under the same seed both arms must produce bit-identical parameters. A
+    branch like `if cfg.kind == "random_vit": nn.init.zeros_(...)` leaves every
+    type, shape and state-dict key identical while changing behaviour -- and
+    would confound the very comparison the study is built on. Verified by
+    mutation: the structural parity test passes under exactly that change.
+    """
+    torch.manual_seed(0)
+    reference = build_encoder(cfg("frozen_ssl"))
+    torch.manual_seed(0)
+    control = build_encoder(cfg("random_vit"))
+
+    ref_params = dict(reference.named_parameters())
+    ctl_params = dict(control.named_parameters())
+    assert ref_params.keys() == ctl_params.keys()
+    for name, ref in ref_params.items():
+        assert torch.equal(ref, ctl_params[name]), (
+            f"parameter {name!r} differs between the treatment and control arms; "
+            "their encoders must be identical apart from their cached inputs"
+        )
+
+
+def test_recorded_parameter_counts():
+    """Pins the measured counts so a silent architecture change is visible.
+
+    The spec's own estimates (~4M encoder+decoder, ~0.2M bottleneck) are wrong;
+    these are the measured values for the architecture it describes.
+    """
+    assert n_params(CNNEncoder(cfg("cnn"))) == 26_382_304
+    assert n_params(BottleneckEncoder(cfg("frozen_ssl"))) == 12_320
+
+
+def test_cnn_gradients_flow_to_every_parameter():
+    enc = CNNEncoder(cfg("cnn"))
+    obs = torch.randint(0, 256, (2, *OBS_SHAPE), dtype=torch.uint8)
+    enc(obs).square().mean().backward()
+    missing = [n for n, p in enc.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient reached: {missing}"
+
+
+def test_bottleneck_gradients_flow_to_every_parameter():
+    enc = BottleneckEncoder(cfg("frozen_ssl"))
+    enc(torch.randn(2, 64, 384)).square().mean().backward()
+    missing = [n for n, p in enc.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient reached: {missing}"
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/models/test_encoders.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.models'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# src/mbfps/models/__init__.py
+```
+
+```python
+# tests/models/__init__.py
+```
+
+```python
+# src/mbfps/models/encoders.py
+"""Encoders -- the ONLY module that differs between the study's three arms.
+
+Arm 1 learns a CNN over pixels. Arms 2 and 3 apply a small learned bottleneck
+to features from a frozen backbone, cached at collection time so no vision
+transformer runs during training.
+
+All three emit a 2048-dimensional embedding from byte-identical 112x112 frames,
+so resolution and embedding width are controlled and only the representation
+differs. If any other module ever needs to know which arm is running, the
+comparison has stopped being controlled.
+"""
+
+import torch
+import torch.nn as nn
+
+from mbfps.utils.config import EncoderConfig
+
+_SPATIAL = 7
+"""112 / 2^4 = 7, the spatial size after four stride-2 convolutions."""
+
+_N_PATCHES = 64
+"""112 / 14 = 8, so a patch-14 backbone yields an 8x8 = 64 patch grid."""
+
+
+class CNNEncoder(nn.Module):
+    """Learned convolutional encoder over raw pixels (Arm 1).
+
+    Takes uint8 straight from the loader and owns its own normalisation, so no
+    caller has to remember to scale. Four stride-2 convolutions reduce
+    112x112 to 7x7x256 = 12544, then a linear projection gives the shared
+    2048-dimensional embedding.
+    """
+
+    def __init__(self, cfg: EncoderConfig) -> None:
+        super().__init__()
+        channels, layers = 3, []
+        for multiple in (1, 2, 4, 8):
+            out = cfg.cnn_depth * multiple
+            layers += [nn.Conv2d(channels, out, 4, stride=2, padding=1), nn.SiLU()]
+            channels = out
+        self.conv = nn.Sequential(*layers)
+        self.project = nn.Linear(channels * _SPATIAL * _SPATIAL, cfg.embed_dim)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Map `(N, 112, 112, 3)` uint8 to `(N, embed_dim)` float32."""
+        x = obs.to(torch.float32).div(255.0).sub(0.5).permute(0, 3, 1, 2)
+        return self.project(self.conv(x).flatten(1))
+
+
+class BottleneckEncoder(nn.Module):
+    """Learned per-patch bottleneck over frozen-backbone features (Arms 2, 3).
+
+    The backbone never updates, so its features are cached once at collection
+    time and this module is the only trained part of the encoder path. A ViT's
+    patch grid is far wider than the shared embedding (64 x 384 = 24576), so a
+    per-patch linear reduces each patch to `bottleneck_dim` and the grid is
+    flattened to exactly `embed_dim`.
+
+    Arms 2 and 3 build the identical module; only the cached inputs differ.
+    """
+
+    def __init__(self, cfg: EncoderConfig) -> None:
+        super().__init__()
+        if _N_PATCHES * cfg.bottleneck_dim != cfg.embed_dim:
+            raise ValueError(
+                f"{_N_PATCHES} patches x bottleneck_dim {cfg.bottleneck_dim} "
+                f"must equal embed_dim {cfg.embed_dim}"
+            )
+        self.bottleneck = nn.Linear(cfg.patch_dim, cfg.bottleneck_dim)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Map `(N, 64, 384)` to `(N, embed_dim)` float32."""
+        return self.bottleneck(features.to(torch.float32)).flatten(1)
+
+
+def encoder_input_kind(cfg: EncoderConfig) -> str:
+    """Whether this arm's encoder consumes `"obs"` or cached `"features"`."""
+    return "obs" if cfg.kind == "cnn" else "features"
+
+
+_ARM_BACKBONE: dict[str, str | None] = {
+    "cnn": None,
+    "frozen_ssl": "dinov2",
+    "random_vit": "random_vit",
+}
+"""Which cached feature set each arm reads. None means the arm reads pixels.
+
+The arm name and the backbone name are deliberately not assumed equal:
+`frozen_ssl` reads the `dinov2` cache. Deriving one from the other by string
+identity would silently send the treatment arm to a cache that does not exist.
+"""
+
+
+def encoder_backbone(cfg: EncoderConfig) -> str | None:
+    """Backbone whose cached features this arm consumes, or None for pixels.
+
+    Raises:
+        KeyError: if `cfg.kind` is not a registered arm.
+    """
+    if cfg.kind not in _ARM_BACKBONE:
+        raise KeyError(f"unknown encoder kind {cfg.kind!r}")
+    return _ARM_BACKBONE[cfg.kind]
+
+
+def build_encoder(cfg: EncoderConfig) -> nn.Module:
+    """Construct the encoder for `cfg.kind`.
+
+    Raises:
+        KeyError: if `cfg.kind` is not a registered arm.
+    """
+    if cfg.kind == "cnn":
+        return CNNEncoder(cfg)
+    if cfg.kind in ("frozen_ssl", "random_vit"):
+        return BottleneckEncoder(cfg)
+    raise KeyError(f"unknown encoder kind {cfg.kind!r}")
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/models/test_encoders.py -v`
+Expected: 22 passed (several are parametrised over the three arms; the
+structural arm-parity check runs once per SSL arm, so this test block yields
+more cases than a naive count of `def test_` functions would suggest. The
+structural and value-level arm-parity tests are deliberately separate: the
+structural test (type, parameter count, shapes, state-dict keys) cannot see a
+per-arm weight-init branch that changes values without changing shape, which
+is exactly what the value-level test exists to catch).
+
+`encoder_backbone` is the sanctioned single point of arm-to-cache routing,
+alongside `encoder_input_kind`: any caller that needs a `SequenceLoader`'s
+`feature_backbone` must derive it from here, never from `cfg.kind` directly,
+because the arm name and the backbone name are not the same string for
+`frozen_ssl`.
+
+If `test_recorded_parameter_counts` fails, do **not** adjust the constant to match — the architecture has drifted from the spec's description. Compare your conv channel progression and projection width against section 3.2 before changing anything.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/mbfps/models tests/models
+git commit -m "feat: CNN and bottleneck encoders emitting a shared 2048-d embedding"
+```
+
+---
+
+## Task 6: Pixel decoder
+
+**Files:**
+- Create: `src/mbfps/models/decoders.py`
+- Create: `tests/models/test_decoders.py`
+
+**Interfaces:**
+- Consumes: `EncoderConfig`; `OBS_SHAPE`.
+- Produces: `PixelDecoder(in_dim: int, depth: int = 32)` mapping `(N, in_dim)` float32 to `(N, 112, 112, 3)` float32 in [0, 1]; `reconstruction_loss(pred: Tensor, target_obs: Tensor) -> Tensor`.
+
+**One decoder serves two purposes.** For Arm 1 it is part of the trained model — reconstruction is the objective that shapes the latent. For Arms 2 and 3 it is a *visualisation* decoder: it makes the feature-space embedding viewable so M2's comparison grid can be drawn, and in a later milestone it will be trained separately and kept out of the RL path so pretty pictures cannot become an experimental confound. `in_dim` is a parameter because M3 will feed it a concatenated recurrent state rather than a bare embedding.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/models/test_decoders.py
+import pytest
+import torch
+
+from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.models.decoders import PixelDecoder, reconstruction_loss
+
+
+def test_output_shape_matches_observation_shape():
+    dec = PixelDecoder(in_dim=2048)
+    assert dec(torch.randn(4, 2048)).shape == (4, *OBS_SHAPE)
+
+
+def test_output_is_float32_in_unit_range():
+    dec = PixelDecoder(in_dim=2048)
+    out = dec(torch.randn(4, 2048) * 10.0)
+    assert out.dtype == torch.float32
+    assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+def test_in_dim_is_configurable_for_later_recurrent_use():
+    """M3 feeds a concatenated recurrent state, not a bare embedding."""
+    dec = PixelDecoder(in_dim=1536)
+    assert dec(torch.randn(2, 1536)).shape == (2, *OBS_SHAPE)
+
+
+def test_wrong_input_width_raises():
+    dec = PixelDecoder(in_dim=2048)
+    with pytest.raises(RuntimeError, match="2048"):
+        dec(torch.randn(2, 1024))
+
+
+def test_gradients_flow_to_every_parameter():
+    dec = PixelDecoder(in_dim=2048)
+    dec(torch.randn(2, 2048)).square().mean().backward()
+    missing = [n for n, p in dec.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient reached: {missing}"
+
+
+def test_reconstruction_loss_is_zero_for_a_perfect_match():
+    target = torch.randint(0, 256, (2, *OBS_SHAPE), dtype=torch.uint8)
+    perfect = target.to(torch.float32) / 255.0
+    assert reconstruction_loss(perfect, target).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_reconstruction_loss_is_positive_for_a_mismatch():
+    target = torch.zeros((2, *OBS_SHAPE), dtype=torch.uint8)
+    pred = torch.ones((2, *OBS_SHAPE), dtype=torch.float32)
+    assert reconstruction_loss(pred, target).item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_reconstruction_loss_accepts_uint8_targets_directly():
+    """The loader hands out uint8; the loss owns the conversion."""
+    target = torch.randint(0, 256, (2, *OBS_SHAPE), dtype=torch.uint8)
+    pred = torch.rand((2, *OBS_SHAPE))
+    assert torch.isfinite(reconstruction_loss(pred, target))
+
+
+def test_reconstruction_loss_rejects_an_unnormalised_float_target():
+    """A float target in [0, 255] is a units bug, not a valid input.
+
+    Guarding on dtype alone let this through silently, inflating the loss by
+    ~255^2 -- which reads as a diverging model rather than a scaling mistake.
+    """
+    pred = torch.rand((2, *OBS_SHAPE))
+    target = torch.rand((2, *OBS_SHAPE)) * 255.0
+    with pytest.raises(ValueError, match="expected \\[0, 1\\]"):
+        reconstruction_loss(pred, target)
+
+
+def test_reconstruction_loss_accepts_a_normalised_float_target():
+    """The complement: a correctly-scaled float target must still work."""
+    target = torch.rand((2, *OBS_SHAPE))
+    assert reconstruction_loss(target, target).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_reconstruction_loss_accepts_an_empty_target():
+    """The max() guard must not crash on a zero-element tensor."""
+    empty = torch.zeros((0, *OBS_SHAPE))
+    assert torch.isfinite(reconstruction_loss(empty, empty))
+
+
+def test_recorded_parameter_count():
+    """Pins the measured count so an architecture drift is visible."""
+    n = sum(p.numel() for p in PixelDecoder(in_dim=2048).parameters())
+    assert n == 26_392_547
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/models/test_decoders.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.models.decoders'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# src/mbfps/models/decoders.py
+"""Pixel decoder.
+
+For the pixel arm this is part of the trained model: reconstruction is the
+objective that shapes the latent. For the feature arms it is a visualisation
+decoder that makes a feature-space embedding viewable, so the arms can be
+compared side by side at all.
+
+`in_dim` is a parameter rather than a constant because a later milestone feeds
+this a concatenated recurrent state instead of a bare embedding.
+"""
+
+import torch
+import torch.nn as nn
+
+_SPATIAL = 7
+"""Matches the encoder: four stride-2 steps between 7x7 and 112x112."""
+
+
+class PixelDecoder(nn.Module):
+    """Maps a latent vector back to a 112x112x3 image in [0, 1]."""
+
+    def __init__(self, in_dim: int, depth: int = 32) -> None:
+        super().__init__()
+        channels = depth * 8
+        self.project = nn.Linear(in_dim, channels * _SPATIAL * _SPATIAL)
+        self._channels = channels
+        layers = []
+        for multiple in (4, 2, 1):
+            out = depth * multiple
+            layers += [
+                nn.ConvTranspose2d(channels, out, 4, stride=2, padding=1),
+                nn.SiLU(),
+            ]
+            channels = out
+        layers.append(nn.ConvTranspose2d(channels, 3, 4, stride=2, padding=1))
+        self.deconv = nn.Sequential(*layers)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        """Map `(N, in_dim)` to `(N, 112, 112, 3)` float32 in [0, 1]."""
+        x = self.project(latent).view(-1, self._channels, _SPATIAL, _SPATIAL)
+        image = torch.sigmoid(self.deconv(x))
+        return image.permute(0, 2, 3, 1)
+
+
+def reconstruction_loss(pred: torch.Tensor, target_obs: torch.Tensor) -> torch.Tensor:
+    """Mean squared error between a prediction in [0, 1] and an image target.
+
+    A `uint8` target is normalised here so no caller has to remember to scale.
+    A float target must already be in [0, 1]; one still in [0, 255] is rejected
+    rather than silently used, because that produces a ~255^2 loss inflation
+    that looks like a diverging model rather than a units bug. Checking the
+    dtype alone missed exactly that case.
+
+    Raises:
+        ValueError: if a float target contains values above 1.
+    """
+    if target_obs.dtype == torch.uint8:
+        target = target_obs.to(pred.dtype) / 255.0
+    else:
+        target = target_obs.to(pred.dtype)
+        if target.numel() and float(target.max()) > 1.0 + 1e-4:
+            raise ValueError(
+                f"float target has max {float(target.max()):.4f}, expected [0, 1]. "
+                "Pass a uint8 tensor to have it normalised, or normalise before "
+                "calling."
+            )
+    diff = (pred - target).square()
+    # `.mean()` on a zero-element tensor is NaN (0 / 0), not 0 -- guard it the
+    # same way the units check above guards `.max()`, so an empty batch stays
+    # a valid, finite loss rather than silently poisoning a running average.
+    return diff.mean() if diff.numel() else diff.sum()
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/models/test_decoders.py -v`
+Expected: 12 passed.
+
+If `test_recorded_parameter_count` fails, print the count and check the channel progression against the encoder's before editing the constant — the two are deliberate mirrors.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/mbfps/models/decoders.py tests/models/test_decoders.py
+git commit -m "feat: pixel decoder shared by the trained and visualisation paths"
+```
+
+---
+
+## Task 7: Standalone autoencoder trainer
+
+**Files:**
+- Create: `src/mbfps/training/__init__.py`
+- Create: `src/mbfps/training/autoencoder.py`
+- Create: `tests/training/__init__.py`
+- Create: `tests/training/test_autoencoder.py`
+- Create: `scripts/train_autoencoder.py`
+
+**Interfaces:**
+- Consumes: `Config`, `get_config`; `build_encoder`, `encoder_input_kind`; `PixelDecoder`, `reconstruction_loss`; `SequenceLoader`; `Prefetcher`; `ReplayBuffer`; `get_device`; `seed_everything`.
+- Produces: `AutoencoderModel(cfg: Config)` with `.encoder`, `.decoder`, `.input_kind`, and `forward(batch: dict) -> tuple[Tensor, Tensor]` returning `(reconstruction, target_obs)`; `to_device(batch: dict, device: torch.device) -> dict` (public: Task 8's grid script uses it too); `train_autoencoder(cfg: Config, buffer: ReplayBuffer, out_dir: Path, log_every: int = 100) -> dict[str, Any]` returning a history dict with `"loss"`, `"steps"`, `"seconds"`, `"arm"`.
+
+**No recurrence yet.** This is M2's whole point: most world-model bugs are representation bugs, and a broken autoencoder is far easier to see in a reconstruction grid than to infer from a degraded rollout. Adding the RSSM before this passes would mean debugging two things at once.
+
+All three arms train encoder-then-decoder against the same pixel target, so their reconstruction grids are directly comparable. Arm 1 trains its CNN; Arms 2 and 3 train only their bottleneck, because the backbone is frozen and its features are cached.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/training/test_autoencoder.py
+import numpy as np
+import pytest
+import torch
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.episode import Episode
+from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.training.autoencoder import AutoencoderModel, train_autoencoder
+from mbfps.utils.config import get_config
+
+KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
+
+
+def make_episode(t: int, fill: int) -> Episode:
+    return Episode(
+        obs=np.full((t + 1, *OBS_SHAPE), fill, dtype=np.uint8),
+        actions=np.zeros(t, dtype=np.int32),
+        rewards=np.zeros(t, dtype=np.float32),
+        terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
+        privileged=np.zeros((t + 1, len(KEYS)), dtype=np.float32),
+        privileged_keys=KEYS,
+        policy_name="random",
+        seed=fill,
+        scenario="my_way_home",
+    )
+
+
+@pytest.fixture
+def buffer(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(0)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        # Cache both backbones: frozen_ssl reads dinov2, random_vit reads its
+        # own suffixed cache, and a fixture that caches only one would hide
+        # exactly the bug this file now tests for (the two arms colliding).
+        for suffix in (".features.npy", ".features_random_vit.npy"):
+            feats = rng.random((41, 64, 384)).astype(np.float16)
+            np.save(path.with_suffix(suffix), feats)
+    return buf
+
+
+def tiny(arm: str):
+    return get_config(arm, steps=3, batch_size=2, seq_len=8, device="cpu")
+
+
+def test_cnn_model_reconstructs_to_observation_shape(buffer):
+    cfg = tiny("cnn")
+    model = AutoencoderModel(cfg)
+    batch = {"obs": torch.randint(0, 256, (2, 9, *OBS_SHAPE), dtype=torch.uint8)}
+    recon, target = model(batch)
+    assert recon.shape == target.shape
+    assert recon.shape[-3:] == OBS_SHAPE
+
+
+def test_ssl_model_consumes_features_and_reconstructs_pixels(buffer):
+    cfg = tiny("frozen_ssl")
+    model = AutoencoderModel(cfg)
+    batch = {
+        "obs": torch.randint(0, 256, (2, 9, *OBS_SHAPE), dtype=torch.uint8),
+        "features": torch.randn(2, 9, 64, 384, dtype=torch.float16),
+    }
+    recon, target = model(batch)
+    assert recon.shape == target.shape
+
+
+def test_ssl_model_ignores_obs_as_input(buffer):
+    """Feature arms must not sneak pixels into the encoder path."""
+    cfg = tiny("frozen_ssl")
+    model = AutoencoderModel(cfg)
+    feats = torch.randn(2, 9, 64, 384, dtype=torch.float16)
+    a = model({"obs": torch.zeros(2, 9, *OBS_SHAPE, dtype=torch.uint8),
+               "features": feats})[0]
+    b = model({"obs": torch.full((2, 9, *OBS_SHAPE), 255, dtype=torch.uint8),
+               "features": feats})[0]
+    assert torch.allclose(a, b), "reconstruction changed with obs; features arm leaked pixels"
+
+
+@pytest.mark.parametrize("arm", ["cnn", "frozen_ssl", "random_vit"])
+def test_training_runs_and_returns_history(buffer, arm):
+    history = train_autoencoder(tiny(arm), buffer, out_dir=None)
+    assert history["arm"] == arm
+    assert history["steps"] == 3
+    assert len(history["loss"]) == 3
+    assert all(np.isfinite(history["loss"]))
+
+
+def test_training_reduces_loss_on_a_trivial_dataset(buffer):
+    """Every episode is a constant colour, so a working model must fit it fast."""
+    history = train_autoencoder(
+        get_config("cnn", steps=60, batch_size=2, seq_len=4, device="cpu", lr=1e-3),
+        buffer,
+        out_dir=None,
+    )
+    first, last = np.mean(history["loss"][:5]), np.mean(history["loss"][-5:])
+    assert last < first * 0.6, f"loss barely moved: {first:.4f} -> {last:.4f}"
+
+
+def test_ssl_arm_trains_only_its_bottleneck(buffer):
+    """The frozen backbone must contribute no trainable parameters."""
+    model = AutoencoderModel(tiny("frozen_ssl"))
+    trainable = sum(p.numel() for p in model.encoder.parameters() if p.requires_grad)
+    assert trainable == 12_320
+
+
+def test_checkpoint_written_when_out_dir_given(buffer, tmp_path):
+    out = tmp_path / "run"
+    train_autoencoder(tiny("cnn"), buffer, out_dir=out)
+    assert (out / "autoencoder_cnn.pt").is_file()
+
+
+def test_same_seed_reproduces_the_loss_curve(buffer):
+    a = train_autoencoder(tiny("cnn"), buffer, out_dir=None)
+    b = train_autoencoder(tiny("cnn"), buffer, out_dir=None)
+    assert np.allclose(a["loss"], b["loss"]), "training is not reproducible from its seed"
+
+
+def test_different_seeds_give_different_curves(buffer):
+    a = train_autoencoder(get_config("cnn", steps=3, batch_size=2, seq_len=8,
+                                     device="cpu", seed=0), buffer, out_dir=None)
+    b = train_autoencoder(get_config("cnn", steps=3, batch_size=2, seq_len=8,
+                                     device="cpu", seed=1), buffer, out_dir=None)
+    assert not np.allclose(a["loss"], b["loss"])
+
+
+def test_pixel_arm_trains_without_any_feature_cache(tmp_path):
+    """The pixel arm must work on a dataset that was never feature-cached.
+
+    The shared `buffer` fixture caches features for every arm, so a trainer
+    that always requested them stays green there. This buffer has no cache at
+    all, so requesting features raises FileNotFoundError in the loader.
+    Verified by mutation: forcing load_features=True passed all other tests.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    assert not list(tmp_path.glob("*.features*.npy")), "fixture must have no cache"
+
+    history = train_autoencoder(tiny("cnn"), buf, out_dir=None)
+    assert history["arm"] == "cnn"
+    assert history["steps"] == 3
+
+
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_feature_arms_require_a_cache(tmp_path, arm):
+    """The complement: proves the test above is not vacuous.
+
+    If the trainer never requested features for any arm, the test above would
+    pass for the wrong reason. These arms must fail loudly without a cache.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+
+    with pytest.raises(FileNotFoundError, match="no cached features"):
+        train_autoencoder(tiny(arm), buf, out_dir=None)
+
+
+def test_random_vit_arm_will_not_silently_read_the_dinov2_cache(tmp_path):
+    """The bug this guards: without an explicit backbone the loader defaults to
+    dinov2, so the control arm trained on the treatment arm's features with no
+    error at all. Here only a dinov2 cache exists, so the random_vit arm must
+    fail rather than quietly use it.
+    """
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(0)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    with pytest.raises(FileNotFoundError, match="features_random_vit"):
+        train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+
+
+def test_random_vit_arm_reads_its_own_cache(tmp_path):
+    """The complement: with the right cache present it must train normally."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    rng = np.random.default_rng(1)
+    for fill in (10, 60, 110):
+        buf.add(make_episode(t=40, fill=fill))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(".features_random_vit.npy"),
+                rng.random((41, 64, 384)).astype(np.float16))
+
+    history = train_autoencoder(tiny("random_vit"), buf, out_dir=None)
+    assert history["arm"] == "random_vit"
+    assert history["steps"] == 3
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `.venv/bin/python -m pytest tests/training/test_autoencoder.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'mbfps.training'`
+
+- [ ] **Step 3: Write the implementation**
+
+```python
+# src/mbfps/training/__init__.py
+```
+
+```python
+# tests/training/__init__.py
+```
+
+```python
+# src/mbfps/training/autoencoder.py
+"""Standalone autoencoder training -- milestone M2.
+
+No recurrence. Most world-model bugs are representation bugs, and a broken
+autoencoder is obvious in a reconstruction grid but hard to infer from a
+degraded rollout, so this stage is validated before dynamics are added.
+
+All three arms reconstruct the same pixel target, which is what makes their
+grids comparable. The pixel arm trains its CNN; the feature arms train only
+their bottleneck, because the backbone is frozen and already cached.
+"""
+
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.loader import SequenceLoader
+from mbfps.data.prefetch import Prefetcher
+from mbfps.models.decoders import PixelDecoder, reconstruction_loss
+from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
+from mbfps.utils.config import Config
+from mbfps.utils.device import get_device
+from mbfps.utils.seeding import seed_everything
+
+
+class AutoencoderModel(nn.Module):
+    """Encoder plus pixel decoder, with no recurrent state."""
+
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.input_kind = encoder_input_kind(cfg.encoder)
+        self.encoder = build_encoder(cfg.encoder)
+        self.decoder = PixelDecoder(
+            in_dim=cfg.encoder.embed_dim, depth=cfg.encoder.cnn_depth
+        )
+
+    def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return `(reconstruction, pixel_target)`, both `(N, 112, 112, 3)`.
+
+        The pixel target is always obs. The encoder *input* is obs only for the
+        pixel arm; the feature arms read cached features and never see pixels.
+        """
+        target = batch["obs"]
+        target = target.reshape(-1, *target.shape[-3:])
+        if self.input_kind == "obs":
+            source = target
+        else:
+            features = batch["features"]
+            source = features.reshape(-1, *features.shape[-2:])
+        return self.decoder(self.encoder(source)), target
+
+
+def to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    out = {}
+    for key, value in batch.items():
+        if isinstance(value, np.ndarray) and key in ("obs", "features"):
+            out[key] = torch.from_numpy(value).to(device)
+    return out
+
+
+def train_autoencoder(
+    cfg: Config,
+    buffer: ReplayBuffer,
+    out_dir: Path | None,
+    log_every: int = 100,
+) -> dict[str, Any]:
+    """Train one arm's autoencoder and return its loss history.
+
+    Args:
+        cfg: the arm's configuration.
+        buffer: the frozen M1 dataset.
+        out_dir: where to write a checkpoint, or None to skip writing.
+        log_every: print a progress line this often.
+
+    Returns:
+        A history dict with `"arm"`, `"steps"`, `"loss"` (per-step floats),
+        and `"seconds"`.
+    """
+    seed_everything(cfg.train.seed)
+    device = get_device(prefer=cfg.train.device)
+    model = AutoencoderModel(cfg).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=cfg.train.lr)
+
+    needs_features = model.input_kind == "features"
+    backbone = encoder_backbone(cfg.encoder)
+    loader = SequenceLoader(
+        buffer,
+        batch_size=cfg.train.batch_size,
+        seq_len=cfg.train.seq_len,
+        seed=cfg.train.seed,
+        load_obs=True,  # always: obs is the reconstruction target for every arm
+        load_features=needs_features,
+        feature_backbone=backbone or "dinov2",
+    )
+
+    losses: list[float] = []
+    start = time.perf_counter()
+    with Prefetcher(loader, depth=2) as prefetcher:
+        stream = iter(prefetcher)
+        for step in range(cfg.train.steps):
+            batch = to_device(next(stream), device)
+            optimiser.zero_grad()
+            reconstruction, target = model(batch)
+            loss = reconstruction_loss(reconstruction, target)
+            loss.backward()
+            optimiser.step()
+            losses.append(float(loss.detach().cpu()))
+            if log_every and (step + 1) % log_every == 0:
+                recent = float(np.mean(losses[-log_every:]))
+                print(f"[{cfg.arm}] step {step + 1}/{cfg.train.steps} loss={recent:.5f}")
+
+    elapsed = time.perf_counter() - start
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"arm": cfg.arm, "state_dict": model.state_dict()},
+            out_dir / f"autoencoder_{cfg.arm}.pt",
+        )
+    return {
+        "arm": cfg.arm,
+        "steps": cfg.train.steps,
+        "loss": losses,
+        "seconds": elapsed,
+    }
+```
+
+- [ ] **Step 4: Write the training entry point**
+
+```python
+# scripts/train_autoencoder.py
+"""Train one arm's standalone autoencoder (milestone M2)."""
+
+import argparse
+import json
+from pathlib import Path
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.training.autoencoder import train_autoencoder
+from mbfps.utils.config import ARMS, get_config
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
+    parser.add_argument("--out", type=Path, default=Path("runs/m2"))
+    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="mps")
+    args = parser.parse_args()
+
+    cfg = get_config(
+        args.arm,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        seed=args.seed,
+        device=args.device,
+    )
+    buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+    history = train_autoencoder(cfg, buffer, out_dir=args.out)
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / f"history_{args.arm}.json").write_text(json.dumps(history))
+    first = sum(history["loss"][:20]) / min(20, len(history["loss"]))
+    last = sum(history["loss"][-20:]) / min(20, len(history["loss"]))
+    print(f"arm={args.arm} steps={history['steps']} elapsed_s={history['seconds']:.0f}")
+    print(f"steps_per_second={history['steps'] / history['seconds']:.2f}")
+    print(f"loss_first20={first:.5f} loss_last20={last:.5f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/training/test_autoencoder.py -v`
+Expected: 16 passed (`test_training_runs_and_returns_history` is parametrised over the
+three arms; `test_feature_arms_require_a_cache` over the two feature arms;
+`test_random_vit_arm_will_not_silently_read_the_dinov2_cache` and
+`test_random_vit_arm_reads_its_own_cache` pin the loader's `feature_backbone`
+routing so the control arm can never again silently read the treatment arm's
+cache).
+
+`test_training_reduces_loss_on_a_trivial_dataset` is the one that matters: every episode is a single constant colour, so any working autoencoder fits it quickly. If it fails, the model is broken — do not raise the threshold to make it pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/mbfps/training tests/training scripts/train_autoencoder.py
+git commit -m "feat: standalone autoencoder training for all three arms"
+```
+
+---
+
+## Task 8: M2 exit gate — train all three arms and produce the comparison grid
+
+**Files:**
+- Create: `scripts/reconstruction_grid.py`
+- Modify: `docs/superpowers/plans/2026-09-02-mb-fps-m2-representation.md` (record measured numbers)
+
+**Interfaces:**
+- Consumes: everything from Tasks 1-7.
+- Produces: `runs/m2/reconstruction_<arm>.png` and `runs/m2/reconstruction_all_arms.png`. No new library API.
+
+This is the M2 exit gate: **reconstructions are visually recognisable, loss has plateaued, and a side-by-side grid exists for all three arms.**
+
+**Disk workflow.** With 20 GB free, both caches coexist (5.86 GB total) and nothing needs clearing:
+
+```
+arm 1: needs no cache          -> train -> grid
+arm 2: dinov2 (already cached) -> train -> grid
+arm 3: cache random_vit        -> train -> grid
+```
+
+Check free space before the `random_vit` run. `cache_features.py` refuses if the result will not fit, which is intended behaviour, not a bug to work around.
+
+- [x] **Step 1: Write the grid script**
+
+```python
+# scripts/reconstruction_grid.py
+"""Render original-vs-reconstruction pairs for a trained arm (milestone M2)."""
+
+import argparse
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+
+from mbfps.data.buffer import ReplayBuffer  # noqa: E402
+from mbfps.data.loader import SequenceLoader  # noqa: E402
+from mbfps.models.encoders import encoder_backbone  # noqa: E402
+from mbfps.training.autoencoder import AutoencoderModel, to_device  # noqa: E402
+from mbfps.utils.config import ARMS, get_config  # noqa: E402
+from mbfps.utils.device import get_device  # noqa: E402
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
+    parser.add_argument("--run", type=Path, default=Path("runs/m2"))
+    parser.add_argument("--samples", type=int, default=6)
+    parser.add_argument("--device", default="mps")
+    args = parser.parse_args()
+
+    cfg = get_config(args.arm, batch_size=args.samples, seq_len=1, device=args.device)
+    device = get_device(prefer=args.device)
+    model = AutoencoderModel(cfg).to(device)
+    checkpoint = torch.load(
+        args.run / f"autoencoder_{args.arm}.pt", map_location=device
+    )
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+
+    buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+    backbone = encoder_backbone(cfg.encoder)
+    loader = SequenceLoader(
+        buffer,
+        batch_size=args.samples,
+        seq_len=1,
+        seed=0,
+        load_obs=True,
+        load_features=model.input_kind == "features",
+        feature_backbone=backbone or "dinov2",
+    )
+    with torch.no_grad():
+        reconstruction, target = model(to_device(loader.sample(), device))
+
+    recon = reconstruction.cpu().numpy()
+    orig = target.cpu().numpy().astype(np.float32) / 255.0
+    mse = float(((recon - orig) ** 2).mean())
+
+    n = args.samples
+    fig, axes = plt.subplots(2, n, figsize=(2.2 * n, 4.8), squeeze=False)
+    for i in range(n):
+        axes[0][i].imshow(np.clip(orig[i], 0, 1))
+        axes[1][i].imshow(np.clip(recon[i], 0, 1))
+        for row in (0, 1):
+            axes[row][i].set_xticks([])
+            axes[row][i].set_yticks([])
+    axes[0][0].set_ylabel("original", fontsize=11)
+    axes[1][0].set_ylabel("reconstruction", fontsize=11)
+    fig.suptitle(f"arm={args.arm}   pixel MSE={mse:.5f}", fontsize=13)
+    fig.tight_layout()
+
+    args.run.mkdir(parents=True, exist_ok=True)
+    out_path = args.run / f"reconstruction_{args.arm}.png"
+    fig.savefig(out_path, dpi=110)
+    print(f"figure={out_path}")
+    print(f"arm={args.arm} pixel_mse={mse:.5f} samples={n}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### Why M2 uses `--seq-len 1`
+
+`seq_len` exists for the RSSM's temporal unroll in a later milestone. **This milestone has no recurrence**, so the sequence dimension does nothing here except multiply the effective batch: `batch_size x (seq_len + 1)` frames go through the decoder every step. At the world-model default of 16 x 65 that is 1040 frames at 112x112x3 per step, for a per-frame autoencoder that gains nothing from them.
+
+Measured on this machine, decoder forward+backward alone:
+
+| frames/step | ms/step | config |
+|---|---|---|
+| 1040 | 1720 | `--batch-size 16 --seq-len 64` |
+| 144 | 279 | `--batch-size 16 --seq-len 8` |
+| **32** | **74** | `--batch-size 16 --seq-len 1` |
+
+So `--seq-len 1` is **23x cheaper per step with no loss of validity**, and it is applied identically to all three arms, so parity is unaffected. Step counts are raised to keep the number of frames seen comparable.
+
+Also pass `-u` to Python: `print()` to a redirected file is block-buffered, so without it a long run shows an empty log and looks hung when it is progressing normally.
+
+- [x] **Step 2: Train and render Arm 1 (no feature cache needed)**
+
+```bash
+.venv/bin/python -u scripts/train_autoencoder.py --arm cnn --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_cnn.log
+.venv/bin/python scripts/reconstruction_grid.py --arm cnn
+```
+
+Record `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`. Arm 1 adds its CNN encoder on top of the decoder cost, so expect roughly 5-8 steps/s and a few minutes for 4000 steps — not the 35-50 minutes an earlier draft of this plan predicted from the 1040-frame configuration.
+
+- [x] **Step 3: Cache DINOv2 features, train and render Arm 2, then clear**
+
+```bash
+ls data/my_way_home/*.features.npy | wc -l    # expect 122 already present
+.venv/bin/python -u scripts/train_autoencoder.py --arm frozen_ssl --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_frozen_ssl.log
+.venv/bin/python scripts/reconstruction_grid.py --arm frozen_ssl
+```
+
+The DINOv2 cache from M1 is already on disk, so no caching run is needed here. Record the same four numbers. Expected far faster than Arm 1 — no CNN in the loop.
+
+- [x] **Step 4: Cache the random-ViT features and do Arm 3**
+
+The `random_vit` cache must live alongside the DINOv2 one, so it needs its own filename suffix — otherwise caching it would silently overwrite Arm 2's features and both arms would train on the same inputs, quietly destroying the control. `cache_features.py` writes `.features.npy` for `dinov2` and `.features_random_vit.npy` for `random_vit`; `SequenceLoader` selects by the same rule.
+
+```bash
+df -h . | tail -1                                    # confirm space before caching
+.venv/bin/python scripts/cache_features.py --backbone random_vit --seed 0
+ls data/my_way_home/*.features.npy | wc -l           # 122, dinov2, untouched
+ls data/my_way_home/*.features_random_vit.npy | wc -l  # 122, new
+.venv/bin/python -u scripts/train_autoencoder.py --arm random_vit --steps 4000 --seq-len 1 --out runs/m2 2>&1 | tee runs/m2/train_random_vit.log
+.venv/bin/python scripts/reconstruction_grid.py --arm random_vit
+```
+
+If `cache_features.py` refuses on free space, free more or reduce the dataset; do not disable the guard.
+
+- [x] **Step 5: Combine into the side-by-side grid**
+
+```bash
+.venv/bin/python -c "
+import matplotlib; matplotlib.use('Agg')
+import matplotlib.pyplot as plt, matplotlib.image as mpimg
+from pathlib import Path
+arms = ['cnn','frozen_ssl','random_vit']
+run = Path('runs/m2')
+fig, axes = plt.subplots(len(arms), 1, figsize=(14, 5*len(arms)), squeeze=False)
+for ax, arm in zip(axes[:,0], arms):
+    ax.imshow(mpimg.imread(run/f'reconstruction_{arm}.png')); ax.axis('off')
+fig.tight_layout(); out = run/'reconstruction_all_arms.png'; fig.savefig(out, dpi=110)
+print('figure=', out)
+"
+```
+
+- [x] **Step 6: Evaluate the M2 gate**
+
+The gate is qualitative by design — the spec asks for *visually recognisable* reconstructions. Open `runs/m2/reconstruction_all_arms.png` and check, for each arm:
+
+1. Reconstructions show recognisable maze structure (walls, corridors, floor/ceiling boundaries), not uniform mush.
+2. `loss_last20` is well below `loss_first20` and the curve has flattened. If it is still falling steeply at 2000 steps, train longer before judging.
+3. All three arms rendered.
+
+Record the three `pixel_mse` values. **Expect Arm 1 to reconstruct best** — it optimises pixels through a 26.4M-parameter encoder, while the feature arms reconstruct from a 12,320-parameter bottleneck over frozen features. A worse pixel MSE for the SSL arms is *not* a failure of this gate; the study's question is whether that representation predicts dynamics better, which M3 answers. Note the numbers and move on.
+
+- [x] **Step 7: Record the measured numbers in this plan**
+
+Add a "## M2 results" section to this file containing the three arms' `steps_per_second`, `loss_first20`, `loss_last20`, and `pixel_mse`, plus the wall-clock for each run. The next plan sizes its training runs from these.
+
+- [x] **Step 8: Run the full suite and commit**
+
+```bash
+.venv/bin/python -m pytest -q
+git add scripts/reconstruction_grid.py docs/superpowers/plans/2026-09-02-mb-fps-m2-representation.md
+git commit -m "feat: M2 exit gate -- reconstruction grids for all three arms"
+```
+
+`runs/` and `data/` are gitignored; do not commit figures or the dataset.
+
+---
+
+## Exit criteria for this plan
+
+- [x] `pytest` fully green, with the counts each task states.
+- [x] All three arms train without error and their loss curves flatten.
+- [x] `runs/m2/reconstruction_all_arms.png` exists and shows recognisable structure for each arm.
+- [x] The three `pixel_mse` values and per-arm `steps_per_second` are recorded in this file.
+- [x] `SequenceLoader(load_obs=False)` verified to keep resident memory well under the 2.24 GB eager baseline.
+- [x] Both feature caches on disk at the end under distinct suffixes (122 `.features.npy` + 122 `.features_random_vit.npy`), so M3 inherits both and needs no re-caching. *(Superseded the original "one cache, not two" criterion when commit 2c4bec0 relaxed the disk constraint; that commit rewrote the workflow but missed this line.)*
+
+## M2 results
+
+All three arms trained to **20,000 steps** at `--seq-len 1` on the frozen 122-episode
+`my_way_home` dataset. Checkpoints and per-arm grids in `runs/m2_long/`; the combined
+figure is `runs/m2/reconstruction_all_arms.png`.
+
+Canonical numbers are the **post-fix** run in `runs/m2_fixed/`, which is reproducible from
+HEAD (decoder-parity fix and feature standardisation both applied):
+
+| arm | steps/s | wall (active) | loss_first20 | loss_last20 | reduction | pixel MSE |
+|---|---|---|---|---|---|---|
+| `cnn` | 6.95 | 2878 s | 0.12048 | 0.00115 | 105x | 0.00116 +/- 0.00003 |
+| `frozen_ssl` | 13.18 | 1517 s | 0.11598 | 0.00184 | 63x | 0.00182 +/- 0.00005 |
+| `random_vit` | 13.42 | 1491 s | 0.11074 | 0.00081 | 137x | **0.00081 +/- 0.00002** |
+
+`pixel_mse` is the mean over **2560 frames** (40 draws x 32 samples), not the frames the
+grid script prints in its title. Draws are seeded identically across arms, so the
+comparison is paired on identical frames.
+
+**The paired t-statistics originally recorded here (|t| = 29-34) have been withdrawn.**
+`eval_reconstruction.py` loads one checkpoint per arm and varies only the loader seed, so
+each arm's draws sample a *fixed* population mean over frames. The paired difference is a
+constant of those two checkpoints while `sem` shrinks as `1/sqrt(draws)`, so |t| grows
+without bound with `--draws` and carries no effect-size meaning. The statistic validly says
+*these two checkpoints differ on this dataset*; it does **not** support *this arm is better
+than that one*, which requires multiple training seeds per arm. Only the means and their
+frame-sampling SEMs above are descriptive; between-arm inference is deferred to the
+multi-seed study.
+
+**These are training-set reconstructions.** `SequenceLoader` draws from all 122 episodes and
+M2 has no held-out split. That is acceptable for this gate, which asks whether a
+representation *can* encode the observation, not whether it generalises. M3 must not reuse
+these numbers as generalisation evidence.
+
+### Gate evaluation
+
+1. **Recognisable maze structure** - PASS for all three arms. Walls, corridor geometry,
+   floor/ceiling boundaries, the ceiling grate, individually placed wall torches, and
+   doorway alcoves are all reconstructed in the correct positions. Reconstructions are
+   blurry, which is the expected signature of an MSE objective: it predicts the conditional
+   mean and suppresses high-frequency detail.
+2. **Loss flattened** - PASS for all three. Final-10% relative improvement is 4.10% (`cnn`),
+   3.46% (`frozen_ssl`), 4.16% (`random_vit`), down from 15-19% quarter-over-quarter.
+3. **All three arms rendered** - PASS.
+
+### 4,000 steps was not enough, and the first reading was an artifact
+
+The plan's Steps 2-4 specified 4000 steps. At that budget the numbers were:
+
+| arm | loss_last20 @4k | pixel MSE @4k (n=6) |
+|---|---|---|
+| `cnn` | 0.00315 | 0.00448 |
+| `frozen_ssl` | 0.00350 | 0.00451 |
+| `random_vit` | 0.00202 | 0.00269 |
+
+`cnn` reconstructed only colour and coarse layout, with no recognisable geometry, and would
+have failed criterion 1. That is an **optimisation-speed artifact, not a representation
+result**: at equal *steps* the pixel arm fits a 26,382,304-parameter encoder from scratch
+while the feature arms fit only a 12,320-parameter bottleneck over frozen, cached features.
+Equal steps is not equal work. Step 6 of this task anticipated exactly this - *"If it is
+still falling steeply at 2000 steps, train longer before judging"* - so all three arms were
+re-run to 20k, which is the table above.
+
+### The plan's prediction was wrong, and the reason matters
+
+This task predicted *"Expect Arm 1 to reconstruct best."* At equal 20k steps it does not.
+The ordering is `random_vit` (0.00081) < `cnn` (0.00116) < `frozen_ssl` (0.00161).
+
+Two mechanisms could produce this, and **M2 does not distinguish them**:
+
+**(a) An uncontrolled scale confound.** `BottleneckEncoder.forward` feeds cached features
+straight into `nn.Linear` with only a dtype cast - no standardisation. Measured on the real
+caches, DINOv2 features have mean +0.0566 / std 2.3559 / absmax 22.86, while random_vit
+features have mean -0.0000 / std 1.0000 / absmax 4.66. The treatment and control arms
+therefore present inputs differing 2.36x in scale to identically-initialised layers trained
+at the same learning rate, so they differ in optimisation conditioning as well as in
+representation. This is a defect in the controlled comparison, not a property of the
+backbones, and it must be resolved before any arm ranking is credible.
+
+**(b) Information preservation.** Independently of (a):
+
+- A **randomly initialised ViT** is close to a random projection of image patches, which
+  approximately preserves distances and therefore retains nearly all pixel information. The
+  bottleneck is a shared per-patch linear map (384 -> 32, applied across 64 patches = 2048),
+  so much of that information is linearly recoverable.
+- **DINOv2** is trained for semantic invariance. It deliberately discards appearance detail -
+  texture, exact colour, lighting - which is precisely what pixel MSE measures. Being worst
+  here is consistent with being the most abstract.
+- The **CNN** must learn a lossy 2048-d code from scratch under the same step budget.
+
+So pixel reconstruction error may well be *anti-correlated* with semantic abstraction - but
+until the scale confound in (a) is removed, (b) remains a hypothesis this milestone has not
+tested. **This gate does not rank the arms for the study's purpose.** The study's question is whether
+a representation predicts *dynamics* better, which M3 answers via open-loop rollout error and
+the linear probe to `privileged_state`. Reading `random_vit` as "the best encoder" from this
+table would invert the actual finding.
+
+### Throughput for sizing M3
+
+The feature arms run at **1.96x** the pixel arm's rate (13.15-13.17 vs 6.71 steps/s), far
+short of the 9.6x this plan's carried constraint predicted from the 1546 vs 161 ms/step
+measurement. That earlier figure was taken at `--seq-len 64`, where the decoder dominates; at
+`--seq-len 1` the fixed per-step overhead is a much larger share. **M3 should re-measure
+rather than inherit the 9.6x.** At 20k steps a 3-arm x 3-seed study is roughly
+(2982 + 1521 + 1519) x 3 = 5.0 h of active compute, not the 31 h the constraint predicted.
+
+**Wall-clock was 2.3x active compute on this machine.** `time.perf_counter()` on macOS uses
+`mach_absolute_time()`, whose timebase halts during system sleep, so `steps_per_second` above
+measures active compute and is trustworthy. The host has `pmset sleep 1` (a one-minute idle
+timer) and logged a `Thermal Emergency Sleep` during the `cnn` run; `caffeinate -i` was
+insufficient (it asserts only `PreventUserIdleSystemSleep`) and `caffeinate -dimsu` restored
+full throughput, 1.41 -> 15.00 steps/s. Any unattended M3 run needs the stronger assertion,
+and the thermal event argues for putting the multi-seed study on the cloud budget.
+
+### The scale confound was real, and it was flattering DINOv2
+
+Standardisation gave a clean natural experiment, because the earlier unstandardised run is
+still on record. Re-running all three arms at 20k under the fixed code:
+
+| arm | unstandardised | standardised | change |
+|---|---|---|---|
+| `cnn` | 0.00116 | 0.00116 | none |
+| `frozen_ssl` | 0.00161 | 0.00182 | **worse by 0.00021** |
+| `random_vit` | 0.00081 | 0.00081 | none |
+
+**The confound existed but ran the opposite way to the hypothesis.** Equalising scale did not
+close `frozen_ssl`'s gap - it widened it. DINOv2's 2.36x larger features were producing
+proportionally larger gradients into the bottleneck, acting as a higher effective learning
+rate; removing that advantage cost it accuracy. So the arm ordering
+`random_vit` < `cnn` < `frozen_ssl` is *robust* to the confound, and explanation (b),
+information preservation, survives the test that could have falsified it.
+
+Two internal consistency checks support reading the table this way:
+
+- **`random_vit` is unchanged to five decimals**, as predicted before the run: its cached
+  features already have per-token std 1.0000 with coefficient of variation 0.000, so
+  LayerNorm is very nearly the identity for that arm. A change here would have meant the
+  normalisation was doing something other than rescaling.
+- **`cnn` is unchanged**, and it has no bottleneck, so standardisation cannot touch it. Its
+  decoder initialisation *did* change, and the result did not move - which shows the
+  decoder-parity fix has no measurable effect on outcome at this scale, and therefore
+  isolates `frozen_ssl`'s degradation to standardisation alone.
+
+`loss_first20` rose for every arm (e.g. `cnn` 0.10690 -> 0.12048) because the decoder now
+starts from different weights; only the converged values are comparable across the two runs.
+
+**This still does not rank the arms.** One training seed each: the caveat on the withdrawn
+t-statistics applies unchanged. What the re-run establishes is narrower and worth stating
+precisely - the pixel-reconstruction ordering is not an artifact of feature scale.
+
+### Whole-branch review findings (2026-09-03)
+
+A six-dimension review with adversarial verification (47 agents) raised 20 findings, 9 of
+which survived refutation, plus 5 gaps from a completeness critic. The critic's findings
+were the most damaging, and all were verified directly before acting on them.
+
+**Fixed in this branch:**
+
+1. **The shared decoder was not arm-invariant.** `seed_everything` runs once and
+   `AutoencoderModel` builds the encoder first, so decoder weights were drawn from a global
+   RNG the encoder had already advanced -- by 26,382,304 draws for `cnn` against 12,320 for
+   the bottleneck arms. Measured: `cnn`'s decoder started from different weights than the
+   feature arms'. This is an arm-parity violation *outside* `encoders.py`, the one module
+   allowed to differ. Fixed by forking the RNG and seeding decoder construction from the
+   arm-invariant train seed; pinned by `test_decoder_initialises_identically_for_every_arm`
+   and a companion test that the seed still controls it.
+2. **The exit-gate figure showed half its sample.** A `seq_len=1` window carries two frames,
+   so the batch held `2 * --samples` rows; the plot walked rows `0..samples-1`, rendering
+   the first three windows twice each as consecutive-frame near-duplicates and dropping
+   windows 3-5 entirely -- while the captioned MSE covered all 12. The grids were regenerated
+   showing six distinct windows; **all three arms still pass the structure criterion.**
+3. **Eleven mutations that the committed suite could not catch.** See the table below.
+4. **The recorded t-statistics were withdrawn** (see above).
+
+**Mutation results.** Each mutation was applied to a pristine `git archive HEAD` export and
+run against the committed tests and the new ones:
+
+| mutation | committed suite | with new tests |
+|---|---|---|
+| `truncated` sliced from `ep.terminated` | passes | caught |
+| `actions` sliced from fixed offset 0 | passes | caught |
+| `rewards` sliced from fixed offset 0 | passes | caught |
+| `terminated` forced all-False | passes | caught |
+| decoder built from post-encoder RNG | passes | caught |
+| decoder seed hardcoded | passes | caught |
+| `.square()` -> `.abs()` in the loss | passes | caught |
+| encoder output multiplied by 0 | passes | caught (all 3 arms) |
+| feature-cache chunk stride off-by-one | passes | caught |
+| feature-cache chunks concatenated reversed | passes | caught |
+| feature-cache chunk drops last frame | passes | caught |
+
+The `terminated`/`truncated` swap is the most consequential: it is the exact defect that
+breaks time-limit bootstrapping, in the module that will feed the M3 world model, and the
+committed suite asserted only shape and dtype on those four arrays. Every fixture filled
+them with zeros, so nothing could distinguish them.
+
+**A caution about the mutation evidence itself.** The first run of this harness reported
+that every mutation was caught -- including deliberately fatal ones. The package is
+installed editable, so `import mbfps` resolved to the real working tree and the mutated
+export was never loaded. The reviewer's own evidence ("192 passed" against a `git archive`
+export) is invalid for the same reason. The findings were nevertheless real, confirmed once
+the harness ran with `PYTHONPATH` pointing at the export and a deliberately fatal mutation
+was used as a self-check. **A mutation harness that cannot fail proves nothing; verify it
+against a mutation you know must fail before trusting any result from it.**
+
+**Open, not fixed -- requires a decision and a re-run:**
+
+- **The feature-scale confound (a) above.** Standardising the cached features before the
+  bottleneck changes the experiment and invalidates the current checkpoints, so it is left
+  for M3 to decide alongside its own design.
+- **Single seed per arm.** No between-arm claim is supportable until the multi-seed study
+  runs. At the measured 1.96x ratio, 3 arms x 3 seeds at 20k steps is ~5 h of active compute.
+
+**Logged, not fixed (minor):** `eval_reconstruction.py` rebuilds the whole `SequenceLoader`
+inside its per-draw loop, re-reading the dataset on every draw; and neither eval script
+verifies `checkpoint["arm"]` against the arm it was asked for, so a mismatched checkpoint
+would load silently between the two structurally identical feature arms.
+
+## Deferred to the next plan (M3)
+
+The RSSM, KL balancing with free bits, reward and continue heads, the world-model trainer, open-loop rollout evaluation with an error-versus-horizon curve, and the linear probe from latent to `privileged_state`.
+
+## Carried constraints
+
+- **The study, not this plan, is the compute decision.** Measured: Arm 1 costs 1546 ms/step against 161 ms for the SSL arms — 9.6x. A 3-arm x 3-seed study is 31 h at 20k steps and 156 h at 100k, which is what the cloud budget was reserved for.
+- **Both feature caches coexist** (5.86 GB of the 20 GB free), under distinct suffixes so neither can overwrite the other. The next plan inherits both and needs no re-caching.
+- **Generate features once, on one device.** CPU and MPS differ in ~3% of float16 elements.
+- **`my_way_home` coverage is near-saturated** at 61 episodes per policy; more of the same data will not add coverage.

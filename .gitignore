@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+/data/
 runs/
 checkpoints/
 *.npz
 *.pt
 .DS_Store
+.superpowers/
+*.egg-info/
+_vizdoom.ini

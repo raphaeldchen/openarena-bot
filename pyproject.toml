@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mbfps"
+version = "0.1.0"
+description = "Model-Based First-Person Shooter Agent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch>=2.4",
+    "vizdoom>=1.3.0",
+    "gymnasium>=1.0",
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "transformers>=4.44",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["slow: downloads model weights or runs a long benchmark"]

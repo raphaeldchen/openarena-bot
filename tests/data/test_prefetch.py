@@ -1,0 +1,132 @@
+import numpy as np
+import pytest
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.episode import Episode
+from mbfps.data.loader import SequenceLoader
+from mbfps.data.prefetch import Prefetcher
+from mbfps.envs.protocol import OBS_SHAPE
+
+KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
+
+
+def make_episode(t: int, fill: int) -> Episode:
+    return Episode(
+        obs=np.full((t + 1, *OBS_SHAPE), fill, dtype=np.uint8),
+        actions=np.zeros(t, dtype=np.int32),
+        rewards=np.zeros(t, dtype=np.float32),
+        terminated=np.zeros(t, dtype=bool),
+        truncated=np.zeros(t, dtype=bool),
+        privileged=np.zeros((t + 1, len(KEYS)), dtype=np.float32),
+        privileged_keys=KEYS,
+        policy_name="random",
+        seed=fill,
+        scenario="my_way_home",
+    )
+
+
+@pytest.fixture
+def buffer(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for fill in (1, 2, 3):
+        buf.add(make_episode(t=80, fill=fill))
+    return buf
+
+
+def test_yields_the_requested_number_of_batches(buffer):
+    loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    with Prefetcher(loader, depth=2) as pf:
+        batches = [next(iter(pf)) for _ in range(3)]
+    assert len(batches) == 3
+    assert all(b["actions"].shape == (2, 16) for b in batches)
+
+
+def test_batches_match_direct_sampling_in_order(buffer):
+    """Prefetching must not change what the loader would have produced."""
+    direct_loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=7)
+    expected = [direct_loader.sample() for _ in range(4)]
+
+    pf_loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=7)
+    with Prefetcher(pf_loader, depth=2) as pf:
+        it = iter(pf)
+        got = [next(it) for _ in range(4)]
+
+    for i, (a, b) in enumerate(zip(expected, got)):
+        assert np.array_equal(a["obs"], b["obs"]), f"batch {i} differs"
+        assert np.array_equal(a["episode_index"], b["episode_index"])
+        assert np.array_equal(a["window_start"], b["window_start"])
+
+
+def test_close_is_idempotent(buffer):
+    """Two closes must leave the same observable state as one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+    pf.close()
+    assert not pf._thread.is_alive()
+    assert pf._stop.is_set()
+
+
+def test_reuse_after_close_reports_closure_not_death(buffer):
+    """A deliberately closed prefetcher must not look like a crashed one."""
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    next(iter(pf))
+    pf.close()
+    with pytest.raises(RuntimeError, match="closed and cannot be reused"):
+        next(iter(pf))
+
+
+def test_context_manager_closes_the_thread(buffer):
+    import threading
+
+    before = threading.active_count()
+    with Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1) as pf:
+        next(iter(pf))
+    assert threading.active_count() == before, "worker thread outlived the context"
+
+
+def test_worker_exception_propagates_to_the_consumer(buffer):
+    """A failing loader must raise here, not hang the consumer forever."""
+
+    class _Broken(SequenceLoader):
+        def sample(self, include_privileged: bool = False):
+            raise RuntimeError("loader exploded")
+
+    with Prefetcher(_Broken(buffer, 2, 16, seed=0), depth=1) as pf:
+        with pytest.raises(RuntimeError, match="loader exploded"):
+            next(iter(pf))
+
+
+def test_depth_must_be_positive(buffer):
+    with pytest.raises(ValueError, match="depth must be at least 1"):
+        Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=0)
+
+
+def test_dead_worker_raises_instead_of_hanging(buffer, monkeypatch):
+    """A hang is a worse failure than an exception.
+
+    If the worker dies without delivering its error -- which a lost exception
+    guard in `_work` would cause -- the consumer must notice the dead thread
+    and raise, rather than blocking forever on an empty queue.
+    """
+    import mbfps.data.prefetch as prefetch_module
+
+    monkeypatch.setattr(prefetch_module, "_POLL_SECONDS", 0.05)
+    pf = Prefetcher(SequenceLoader(buffer, 2, 16, seed=0), depth=1)
+    try:
+        pf._stop.set()          # stop the worker cleanly
+        pf._thread.join(timeout=2.0)
+        assert not pf._thread.is_alive(), "worker did not stop"
+        while not pf._queue.empty():
+            pf._queue.get_nowait()
+        # The thread is now dead but nobody called close(): clear the flag so
+        # `_stop.is_set()` reflects "not closed" again, isolating the
+        # dead-thread branch from the closed-state branch added for the
+        # reuse-after-close fix.
+        pf._stop.clear()
+        with pytest.raises(RuntimeError, match="prefetch worker died"):
+            next(iter(pf))
+    finally:
+        pf.close()
