@@ -3060,6 +3060,54 @@ parameters remain approved for Plan 4.
 
 ---
 
+## 20,000-step result — the 2,000-step reading was undertraining, not a design fault
+
+Task 12 measured, at 2,000 steps, that position was decodable from the encoder embedding but
+NOT from the RSSM latent, so all three rollout references collapsed to within 2% and
+`gap_closed` measured noise. The final review localised the mechanism and named the decisive
+experiment: re-measure the decomposition at the config default and see whether the residual
+collapses (budget) or holds (objective). Run at 20,000 steps, `random_vit`, seq_len 32,
+7.38 steps/s, 2709 s:
+
+| space | held-out R^2 @2,000 | held-out R^2 @20,000 |
+|---|---|---|
+| encoder embedding `E` | +0.3278 | +0.3219 |
+| head prediction `P` (what the rollout probes) | +0.0011 | **+0.3208** |
+| residual `E - P` | +0.3221 | +0.2711 |
+| **posterior latent `[h.z]`** | **-0.0058** | **+0.2466** |
+
+The head's share of the embedding it is trained on fell from 0.774 to 0.533 while its
+position R^2 rose from 0.001 to 0.321 — it stopped fitting the cheap high-variance
+directions and started carrying the content. **The embedding-MSE objective does put position
+in the latent; it simply needs more than 2,000 steps.** No objective change is required.
+
+The band becomes interpretable at the same time:
+
+| | @2,000 | @20,000 |
+|---|---|---|
+| median band width | 5.65 | **55.25** |
+| band as a fraction of persistence (median) | ~0.02 | **0.241** |
+| horizon steps with floor above persistence | 2/45 | **0/45** |
+| horizon steps with a degenerate positive band | — | **0/45** |
+| `gap_closed` finite | 43/45 | **45/45** |
+
+**This retires the final review's Important #4.** That finding said the exit criterion
+"rollout harness emits all three curves with no NaN and `floor <= persistence`" was false and
+should be rewritten. At 20,000 steps it holds exactly — 0/45 inversions, 45/45 finite. The
+criterion was right; the 2,000-step model was too weak to satisfy it.
+
+`kl_rate_above_free_bits = 0.9725`, so the measured `KL_FREE_BITS = 0.20` behaves as
+intended: the dynamics prior received gradient on 97% of steps, against the governing spec's
+inherited 1.0 which was measured giving 1 step in 9.
+
+Still open, and the M3 gate's actual question: `gap_closed` at horizon 45 is **-0.887**
+(mean -0.383, max +0.0131), so the model does not yet beat persistence at the full horizon,
+though it does at some. Whether the real seq_len=64 config and three seeds clear zero is what
+Plan 4 measures.
+
+---
+
+
 ## Task 12 results
 
 Measured 2026-09-04 on the M1 dataset (122 episodes, 98 train / 24 val), fp32,
