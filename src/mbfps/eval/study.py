@@ -22,6 +22,7 @@ policy and `load_record` for the inverse.
 
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -248,11 +249,40 @@ def write_record(path: Path, record: dict) -> dict:
     non-finite value ever escapes the sanitiser, this raises instead of writing
     a bare `NaN` token that the aggregation step would only discover nine runs
     and thirty GPU-hours later.
+
+    THE WRITE IS ATOMIC, and that is a requirement of the driver rather than a
+    nicety. `scripts/run_study.py` decides whether an 8.3-hour cell has already
+    been paid for by reading this file, so the file must only ever exist in two
+    states: absent, or a complete record. A plain `write_text` truncates the
+    destination first and then streams; a process killed in between -- the
+    overnight run's laptop lid, an OOM kill, a Ctrl-C landing inside the write
+    -- leaves a prefix at the real path. Most prefixes fail to parse and the
+    driver would re-run that cell, which is merely expensive; the dangerous one
+    is a prefix that happens to parse and re-runs nothing. So the bytes go to a
+    temporary file beside the destination and `os.replace` swaps it in, which
+    is atomic within a directory: a reader sees the old record or the new one,
+    never half of either. The temporary is removed on any failure so a crashed
+    write leaves no litter for the aggregation's glob to find.
+
+    This defends against the PROCESS dying, not the machine. Surviving power
+    loss would need an `fsync` of the file and of the directory; the study runs
+    on a rented box we do not expect to lose mid-write, and the cost of being
+    wrong about that is one re-run cell, caught by the driver's completeness
+    check.
     """
     clean = to_json_record(record)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(clean, indent=2, allow_nan=False))
+    text = json.dumps(clean, indent=2, allow_nan=False)
+    # The pid keeps two processes writing the same cell from sharing one
+    # temporary; the leading dot and the suffix keep it out of a `*.json` glob.
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return clean
 
 
