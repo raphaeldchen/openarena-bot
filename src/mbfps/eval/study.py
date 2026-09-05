@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from mbfps.data.buffer import ReplayBuffer
-from mbfps.data.split import episode_split
+from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.probe import filtering_gain, filtering_report, fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.summary import METRICS, metric_summary
@@ -178,10 +178,23 @@ def _sanitise(value: Any, path: str, found: dict[str, str]) -> Any:
     their dotted path is recorded in `found`.
     """
     if isinstance(value, dict):
-        return {
-            str(k): _sanitise(v, f"{path}.{k}" if path else str(k), found)
-            for k, v in value.items()
-        }
+        clean = {}
+        for k, v in value.items():
+            key = str(k)
+            if "." in key:
+                where = path or "<root>"
+                raise ValueError(
+                    f"record key {key!r} under {where} contains a '.'; the non-finite "
+                    "map addresses fields by dotted path, so this key would alias a "
+                    "real nested field and load_record would write a NaN over it"
+                )
+            clean[key] = _sanitise(v, f"{path}.{key}" if path else key, found)
+        return clean
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        # A 0-d array is a scalar, not a sequence: the list branch below raises
+        # `iteration over a 0-d array` on it, which would be a write-time crash
+        # after the GPU hours rather than a value coerced.
+        value = value[()]
     if isinstance(value, (list, tuple, np.ndarray)):
         return [
             _sanitise(v, f"{path}.{i}" if path else str(i), found)
@@ -217,6 +230,11 @@ def to_json_record(record: dict) -> dict:
     would lose NaN-versus-infinity; the map keeps it, and `load_record`
     restores the exact float.
     """
+    if NONFINITE_KEY in record:
+        raise ValueError(
+            f"record already carries a top-level {NONFINITE_KEY!r} key; the map is "
+            "written under that name and would silently discard it"
+        )
     found: dict[str, str] = {}
     clean = _sanitise(record, "", found)
     clean[NONFINITE_KEY] = found
@@ -272,11 +290,19 @@ def _probe_summary(latent_probe: dict, embedding_probe: dict) -> dict:
     A band that looks degenerate because the probe is noise is a different
     finding from one that is degenerate because the model sits on its floor,
     and across nine runs only these numbers tell the two apart.
+
+    `*_ridge_selected` mirrors the gain block's flag and exists because
+    `fit_probe` only returns an `r2` when a selection split was used. Without
+    it, "selection was skipped" and "the selection R^2 was undefined" are both
+    a bare `null` in the file, and an aggregation that reads nine of these
+    through `np.array(..., dtype=float)` turns both into NaN.
     """
     return {
         "latent_ridge": float(latent_probe["ridge"]),
+        "latent_ridge_selected": "r2" in latent_probe,
         "latent_selection_r2": latent_probe.get("r2"),
         "embedding_ridge": float(embedding_probe["ridge"]),
+        "embedding_ridge_selected": "r2" in embedding_probe,
         "embedding_selection_r2": embedding_probe.get("r2"),
     }
 
@@ -291,11 +317,23 @@ def run_job(
     horizon: int = 45,
     device: str = "mps",
 ) -> dict:
-    """Train, evaluate, and write one result record. Returns the record.
+    """Train, evaluate, and write one result record. Returns the LIVE record.
 
-    The returned dict IS the file's content -- already sanitised, so a caller
-    comparing two jobs compares what the aggregation will actually read rather
-    than a richer in-memory object that happens to differ from it.
+    THE RETURNED DICT IS NOT THE FILE'S CONTENT. It carries the real
+    non-finite floats; the file carries `null` plus the map that inverts it.
+    The difference is load-bearing: `scripts/run_study.py` prints
+    `f"...{record['position']['gap_final']:+.4f}"` after every job, and
+    `gap_final` is NaN by contract whenever the band is non-positive. A float
+    NaN formats as `+nan` and compares False against 0, so the driver survives
+    a degenerate cell -- while the sanitised `None` raises
+    `unsupported format string passed to NoneType.__format__`, AFTER the record
+    is safely on disk, killing the loop and leaving the other eight cells of an
+    unattended overnight run unstarted.
+
+    A caller that wants what the aggregation will read should apply
+    `to_json_record` to this, or re-read the file with `load_record`. That is
+    also how two jobs are compared for equality: NaN is not equal to itself,
+    so the comparison has to happen in the sanitised projection.
 
     `context` and `horizon` are forwarded to the probe fit, the rollout AND
     both filtering diagnostics. They must not be allowed to default apart: the
@@ -311,7 +349,7 @@ def run_job(
     started = time.perf_counter()
     history = train_world_model(cfg, buffer, out_dir=out_dir)
     train_paths, val_paths = episode_split(
-        buffer.episode_paths(), val_fraction=0.2, seed=SPLIT_SEED
+        buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED
     )
     backbone = encoder_backbone(cfg.encoder)
 
@@ -393,4 +431,5 @@ def run_job(
         },
     }
     assert set(METRICS) <= set(record), "every metric summary must be recorded"
-    return write_record(job_record_path(out_dir, job), record)
+    write_record(job_record_path(out_dir, job), record)
+    return record

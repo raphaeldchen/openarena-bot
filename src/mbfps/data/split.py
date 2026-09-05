@@ -14,9 +14,21 @@ from pathlib import Path
 
 import numpy as np
 
+VAL_FRACTION = 0.2
+"""The held-out share, shared by training and evaluation rather than duplicated.
+
+`train_world_model` and `mbfps.eval.study.run_job` must split IDENTICALLY, or
+the evaluation scores a model on episodes it trained on. The seed half of that
+coupling already has a name (`study.SPLIT_SEED`); this is the other half. It was
+a bare `0.2` literal at both call sites, and a drift in either one is invisible
+to every test that only checks the two sides are disjoint and sum to the whole:
+at 0.4 the fixture's held-out set grows from ['ep003'] to ['ep002', 'ep003'] and
+'ep002' is an episode training saw.
+"""
+
 
 def episode_split(
-    paths: list[Path], val_fraction: float = 0.2, seed: int = 0
+    paths: list[Path], val_fraction: float = VAL_FRACTION, seed: int = 0
 ) -> tuple[list[Path], list[Path]]:
     """Partition `paths` into (train, val).
 

@@ -4,6 +4,7 @@ Nine of these records are the entire output of a 30-GPU-hour study, so every
 test here is about a field that is silently wrong rather than absent.
 """
 
+import inspect
 import json
 import math
 from pathlib import Path
@@ -48,8 +49,18 @@ def strict_loads(text: str):
 
 @pytest.fixture
 def record(tmp_path, small_buffer):
-    """One completed job. ~2 s, so the assertions below share it."""
+    """One completed job. ~2 s, so the assertions below share it.
+
+    This is the LIVE record `run_job` returns -- real NaNs, no `nonfinite`
+    map. `written` below is the same job's on-disk projection.
+    """
     return run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+
+@pytest.fixture
+def written(record):
+    """What the file holds for the same job: sanitised, with the token map."""
+    return to_json_record(record)
 
 
 # --------------------------------------------------------------------------
@@ -139,12 +150,22 @@ def test_the_curves_are_as_long_as_the_horizon(record):
     assert record["position"]["n_steps"] == JOB_KW["horizon"]
 
 
-def test_the_record_is_exactly_what_was_written(record, tmp_path):
-    """The returned record IS the file. A caller comparing two jobs must be
-    comparing what the aggregation will actually read."""
+def test_the_written_file_is_the_returned_records_json_projection(
+    record, written, tmp_path
+):
+    """The file is `to_json_record(returned)` -- not the returned dict itself.
+
+    The returned dict keeps its real NaNs (see
+    `test_the_returned_record_does_not_crash_the_studys_own_driver`); the file
+    is its lossy projection plus the map that inverts it. Nothing else may
+    differ between them, or a caller reasoning about the returned record is
+    reasoning about a different object from the one Task 6 aggregates.
+    """
     path = job_record_path(tmp_path, StudyJob("random_vit", 0))
     assert path.is_file()
-    assert strict_loads(path.read_text()) == record
+    assert strict_loads(path.read_text()) == written
+    assert NONFINITE_KEY not in record, "the returned record is the live one"
+    assert set(written) == set(record) | {NONFINITE_KEY}
 
 
 # --------------------------------------------------------------------------
@@ -222,7 +243,7 @@ def test_reward_summary_refuses_arrays_it_cannot_compare():
 # the NaN policy
 # --------------------------------------------------------------------------
 
-def test_a_degenerate_record_is_written_as_valid_json(record, tmp_path):
+def test_a_degenerate_record_is_written_as_valid_json(record, written, tmp_path):
     """`gap_final` is NaN by `metric_summary`'s contract whenever the band is
     non-positive, and this fixture's band IS non-positive. `json.dump` writes a
     bare `NaN` token for it, which is not JSON."""
@@ -230,21 +251,24 @@ def test_a_degenerate_record_is_written_as_valid_json(record, tmp_path):
     text = path.read_text()
     assert "NaN" not in text and "Infinity" not in text
     strict_loads(text)      # raises via _reject if a bare token survived
-    assert record[NONFINITE_KEY], "this fixture's band is degenerate by design"
-    assert record["angle"]["gap_final"] is None
-    assert record[NONFINITE_KEY]["angle.gap_final"] == "nan"
+    assert written[NONFINITE_KEY], "this fixture's band is degenerate by design"
+    assert written["angle"]["gap_final"] is None
+    assert written[NONFINITE_KEY]["angle.gap_final"] == "nan"
+    # The map's own key is a cross-task contract: Task 6 reads nine of these
+    # files and looks the map up by this literal name.
+    assert "nonfinite" in strict_loads(text)
 
 
-def test_an_undefined_gap_is_never_read_back_as_zero(record, tmp_path):
+def test_an_undefined_gap_is_never_read_back_as_zero(record, written, tmp_path):
     """The distinction the policy exists to keep. NaN gap_final means the band
     was non-positive so the ratio is undefined; 0.0 means the model closed none
     of a real band. Averaging the first as the second across nine cells pulls
     the aggregate toward "no better than persistence" using cells that measured
     nothing at all."""
     restored = load_record(job_record_path(tmp_path, StudyJob("random_vit", 0)))
-    for dotted in record[NONFINITE_KEY]:
+    for dotted in written[NONFINITE_KEY]:
         section, field = dotted.split(".", 1)
-        assert record[section][field] is None
+        assert written[section][field] is None
         assert restored[section][field] != 0.0
         assert not math.isfinite(restored[section][field])
     assert restored["position"]["n_steps"] == record["position"]["n_steps"]
@@ -323,14 +347,21 @@ def test_to_json_record_leaves_the_input_alone():
 # --------------------------------------------------------------------------
 
 def test_two_runs_of_the_same_job_agree(tmp_path, small_buffer):
-    """The whole study rests on this: same arm, same seed, same numbers."""
+    """The whole study rests on this: same arm, same seed, same numbers.
+
+    Compared through `to_json_record`, NOT on the live dicts: `run_job` now
+    returns real NaNs and `nan != nan`, so a direct `==` on two identical
+    degenerate records would report them as different. The projection maps
+    every non-finite to `None` (equal to itself) and records WHICH token it
+    was in the map, so `nan` and `inf` still cannot pass for one another.
+    """
     first = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "a", **JOB_KW)
     second = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path / "b", **JOB_KW)
-    assert first["position"] == second["position"]
-    assert first["angle"] == second["angle"]
-    assert first["curves"] == second["curves"]
-    assert first["filtering"] == second["filtering"]
-    assert first["reward"] == second["reward"]
+    a, b = to_json_record(first), to_json_record(second)
+    assert a[NONFINITE_KEY] == b[NONFINITE_KEY]
+    assert a[NONFINITE_KEY], "this fixture's band is degenerate; the map must be live"
+    for section in ("position", "angle", "curves", "filtering", "reward", "probe"):
+        assert a[section] == b[section], section
 
 
 def test_different_seeds_give_different_results(tmp_path, small_buffer):
@@ -408,3 +439,462 @@ def test_a_checkpoint_from_another_job_is_refused(tmp_path, small_buffer, monkey
     monkeypatch.setattr(study, "train_world_model", fake_train)
     with pytest.raises(ValueError, match="not this job's"):
         run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up: the twelve confirmed findings of task 4's review. The
+# record itself was right; its VALUES, its DEFAULTS and its returned FORM were
+# unguarded, and a mutation of each survived the whole suite. Each test below
+# names the mutation it kills. See .superpowers/sdd/task-4-report.md.
+# ---------------------------------------------------------------------------
+
+
+def test_the_returned_record_does_not_crash_the_studys_own_driver(record):
+    """`scripts/run_study.py`'s per-job print, verbatim, on a degenerate cell.
+
+    `run_job` used to return `write_record`'s SANITISED output, so
+    `record["position"]["gap_final"]` was `None` rather than NaN and the
+    driver's own format spec raised
+    `unsupported format string passed to NoneType.__format__` -- AFTER the
+    record was safely on disk. Cell one survived, the loop died, and the other
+    eight jobs of an unattended overnight run never started. A float NaN
+    formats as `+nan` and compares False, so the driver rides through.
+
+    The formatting happens FIRST and unguarded, so a regression raises here
+    exactly as it would in the driver rather than being reported as a failed
+    type assertion. `+nan` in the rendered line is then what proves this
+    fixture really is the degenerate case the bug needs.
+    """
+    line = (f"  steps/s={record['steps_per_second']:.2f} "
+            f"kl_rate={record['kl_rate_above_free_bits']:.3f} "
+            f"position_gap_final={record['position']['gap_final']:+.4f} "
+            f"band_median={record['position']['band_median']:.2f}")
+    assert "position_gap_final=+nan" in line, (
+        "this fixture's position band is degenerate by design; without a "
+        "non-finite gap_final this test cannot see the bug it exists for")
+    gap = record["position"]["gap_final"]
+    assert (gap > 0) is False, "the driver's gate arithmetic must not raise either"
+    assert isinstance(gap, float) and math.isnan(gap)
+
+
+# --------------------------------------------------------------------------
+# the values the nine cells will actually run at
+# --------------------------------------------------------------------------
+
+def test_run_job_defaults_are_the_spec_values():
+    """The driver calls `run_job(job, buffer, out, steps=..., seq_len=...,
+    device=...)` and passes NEITHER context NOR horizon, so these defaults ARE
+    the study's filtering depth and rollout length (spec line 68: condition on
+    5 real frames, then imagine 45). `context: int = 5 -> 1` and
+    `horizon: int = 45 -> 12` each survived the whole suite, because every test
+    passes JOB_KW explicitly. `device: str = "mps" -> "cpu"` survived for the
+    same reason and would silently take a rented GPU out of the run."""
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(run_job).parameters.items()
+    }
+    assert defaults["steps"] == 20_000
+    assert defaults["seq_len"] == 64
+    assert defaults["context"] == 5
+    assert defaults["horizon"] == 45
+    assert defaults["device"] == "mps"
+
+
+def test_reward_accuracy_defaults_are_the_spec_values():
+    """`run_job` never passes `limit`, so 20 is what the nine cells score at."""
+    from mbfps.eval.study import reward_accuracy
+
+    defaults = {
+        name: parameter.default
+        for name, parameter in inspect.signature(reward_accuracy).parameters.items()
+    }
+    assert defaults["limit"] == 20
+    assert defaults["seed"] == 0
+
+
+def test_the_reward_limit_default_bounds_a_bare_call(small_buffer):
+    """The default was not merely unpinned, it was UNREACHABLE: the one
+    validation episode of this fixture scores identically at limit 1, 2 and 20.
+    This calls `reward_accuracy` with no `limit` over three episodes, so
+    `limit -> 1` truncates the target and the step count moves."""
+    import torch
+
+    from mbfps.eval.study import reward_accuracy
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+    from mbfps.data.episode import load_episode
+
+    cfg = get_config("random_vit", device="cpu", seed=0)
+    model = WorldModel(cfg)
+    model.eval()
+    paths = small_buffer.episode_paths()[:3]
+    expected = sum(len(load_episode(p).rewards) for p in paths)
+    out = reward_accuracy(model, paths, encoder_backbone(cfg.encoder),
+                          torch.device("cpu"))
+    assert out["n_steps"] == expected, (
+        "the bare default must score all three episodes, not a truncation")
+
+
+def test_the_record_reports_the_window_and_budget_the_job_ran_at(record):
+    """`"steps": 0`, `"seq_len": 0`, `"context": 0` and `"seconds": 0.0` all
+    survived: the record is the study's only audit trail for the numbers each
+    cell ran at, and every one of them was write-only."""
+    assert record["steps"] == JOB_KW["steps"]
+    assert record["seq_len"] == JOB_KW["seq_len"]
+    assert record["context"] == JOB_KW["context"]
+    assert record["horizon"] == JOB_KW["horizon"]
+    assert record["split_seed"] == SPLIT_SEED
+    assert record["seconds"] > 0.0
+
+
+def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
+    tmp_path, small_buffer, monkeypatch
+):
+    """Three device mutations survived -- the default, `get_device(prefer="cpu")`
+    and `get_config(..., device="cpu")` -- because every test in this file runs
+    at device="cpu", so no assertion could tell "honoured" from "hardcoded".
+    A study launched with `--device cuda` that silently trains on CPU is a
+    33-hour loss. Run at a device string that is NOT the one a mutation would
+    hardcode; `get_device` falls back to CPU wherever CUDA is absent, so this
+    stays a CPU test."""
+    real_get_config = study.get_config
+    real_get_device = study.get_device
+    real_world_model = study.WorldModel
+    seen: dict = {}
+    models: list = []
+
+    def config_spy(arm, **overrides):
+        seen["cfg_device"] = overrides.get("device")
+        return real_get_config(arm, **overrides)
+
+    def device_spy(prefer="mps"):
+        seen["prefer"] = prefer
+        return real_get_device(prefer=prefer)
+
+    def model_spy(cfg):
+        model = real_world_model(cfg)
+        models.append(model)
+        return model
+
+    monkeypatch.setattr(study, "get_config", config_spy)
+    monkeypatch.setattr(study, "get_device", device_spy)
+    monkeypatch.setattr(study, "WorldModel", model_spy)
+
+    run_job(StudyJob("random_vit", 0), small_buffer, tmp_path,
+            **dict(JOB_KW, device="cuda"))
+
+    assert seen["cfg_device"] == "cuda", (
+        "the job's device never reached the training config, so train_world_model "
+        "trained wherever TrainConfig defaults to")
+    assert seen["prefer"] == "cuda", (
+        "the job's device never reached get_device, so the evaluation ran on "
+        "whatever get_device defaults to")
+    assert models, "run_job never built the evaluation model"
+    expected = real_get_device(prefer="cuda")
+    assert next(models[0].parameters()).device.type == expected.type
+
+
+def test_the_evaluation_holds_out_exactly_what_training_held_out(
+    tmp_path, small_buffer, monkeypatch
+):
+    """The other half of the SPLIT_SEED coupling. The seed was factored out
+    with a docstring about this exact hazard; the FRACTION stayed a duplicated
+    literal in both modules, and `val_fraction=0.2 -> 0.4` in study.py alone
+    left the suite green while the evaluation scored on episodes the model had
+    trained on ('ep002' moves into the held-out set at 0.4). This runs both
+    call sites in one process and requires them to agree on the shared
+    constant."""
+    import mbfps.training.world_model as wm
+    from mbfps.data.split import VAL_FRACTION
+
+    seen: dict[str, list] = {"study": [], "training": []}
+    real_study_split = study.episode_split
+    real_wm_split = wm.episode_split
+
+    def study_spy(paths, val_fraction, seed):
+        seen["study"].append(val_fraction)
+        return real_study_split(paths, val_fraction, seed)
+
+    def wm_spy(paths, val_fraction, seed):
+        seen["training"].append(val_fraction)
+        return real_wm_split(paths, val_fraction, seed)
+
+    monkeypatch.setattr(study, "episode_split", study_spy)
+    monkeypatch.setattr(wm, "episode_split", wm_spy)
+
+    run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+    assert seen["training"], "train_world_model never split"
+    assert seen["study"], "run_job never split"
+    assert seen["study"] == seen["training"], (
+        "the evaluation split at a different fraction from the one training "
+        "used, so it scored on episodes the model saw")
+    assert seen["study"] == [pytest.approx(VAL_FRACTION)]
+    assert VAL_FRACTION == pytest.approx(0.2)
+
+
+def test_the_record_names_the_held_out_episodes_not_the_training_ones(
+    record, small_buffer
+):
+    """Exchanging the two comprehensions survived the whole suite: the only
+    test on this field checked that the lists are stable across seeds, disjoint
+    and sum to six, and all three stay true under a swap. Swapped, the record
+    positively asserts the model was scored on the episodes it trained on and
+    an auditor reading nine of them finds nothing wrong."""
+    from mbfps.data.split import VAL_FRACTION, episode_split
+
+    train_paths, val_paths = episode_split(
+        small_buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED
+    )
+    assert len(val_paths) != len(train_paths), (
+        "a 3/3 split would make the swap invisible to this test")
+    assert record["episodes"]["val"] == [p.name for p in val_paths]
+    assert record["episodes"]["train"] == [p.name for p in train_paths]
+
+
+def test_the_record_reports_the_training_history_it_was_given(
+    tmp_path, small_buffer, monkeypatch
+):
+    """Four surviving mutations at once, all in fields nothing asserted on:
+    the KL rate and the KL peak exchanged (`kl_rate < 0.5` is what tells the
+    gate a run trained no dynamics prior, and the peak read as a rate means
+    something else entirely), `loss_last20`'s `[-20:]` widened to the whole
+    history (invisible at steps=3, a convergence number replaced by a training
+    average at 20,000), and `steps / seconds` inverted."""
+    real_train = study.train_world_model
+
+    def doctored(cfg, buffer, out_dir, log_every=100):
+        history = real_train(cfg, buffer, out_dir=out_dir, log_every=log_every)
+        history["steps"] = 1000
+        history["seconds"] = 4.0
+        history["loss"] = [100.0] * 10 + [1.0] * 20
+        history["kl_rate_above_free_bits"] = 0.25
+        history["kl_dyn_max"] = 7.5
+        return history
+
+    monkeypatch.setattr(study, "train_world_model", doctored)
+    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+    assert result["kl_rate_above_free_bits"] == pytest.approx(0.25)
+    assert result["kl_dyn_max"] == pytest.approx(7.5)
+    assert result["steps_per_second"] == pytest.approx(250.0)
+    assert result["loss_last20"] == pytest.approx(1.0)
+
+
+def test_the_record_carries_the_probe_settings_it_measured_with(
+    tmp_path, small_buffer, monkeypatch
+):
+    """`_probe_summary` could return `{}`, drop an r2 to None, or report each
+    probe's ridge under the other's name, all with a green suite -- no test
+    looked inside `record["probe"]` at all. It is the block that tells "the
+    band is degenerate because the probe is noise" from "the model sits on its
+    floor"."""
+    real_fit = study.fit_probes
+    seen: dict = {}
+
+    def spy(*args, **kwargs):
+        latent, embedding = real_fit(*args, **kwargs)
+        seen["latent"], seen["embedding"] = latent, embedding
+        return latent, embedding
+
+    monkeypatch.setattr(study, "fit_probes", spy)
+    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+    probe = result["probe"]
+    assert set(probe) == {
+        "latent_ridge", "latent_ridge_selected", "latent_selection_r2",
+        "embedding_ridge", "embedding_ridge_selected", "embedding_selection_r2",
+    }
+    assert seen["latent"]["r2"] != seen["embedding"]["r2"], (
+        "the two probes scored identically here, so a latent/embedding swap "
+        "would be invisible to this test")
+    assert probe["latent_ridge"] == seen["latent"]["ridge"]
+    assert probe["latent_selection_r2"] == seen["latent"]["r2"]
+    assert probe["embedding_ridge"] == seen["embedding"]["ridge"]
+    assert probe["embedding_selection_r2"] == seen["embedding"]["r2"]
+    assert probe["latent_ridge_selected"] is True
+    assert probe["embedding_ridge_selected"] is True
+
+
+def test_probe_summary_says_whether_a_selection_r2_exists():
+    """`fit_probe` only returns an `r2` when a selection split was used, so a
+    bare `null` in the file meant EITHER "selection was skipped" or "the R^2
+    was undefined" -- and an aggregation reading nine of these as floats turns
+    both into NaN. The flag mirrors the gain block's own `ridge_selected`."""
+    from mbfps.eval.study import _probe_summary
+
+    summary = _probe_summary({"ridge": 1.0}, {"ridge": 10.0, "r2": 0.5})
+    assert summary["latent_ridge_selected"] is False
+    assert summary["latent_selection_r2"] is None
+    assert summary["embedding_ridge_selected"] is True
+    assert summary["embedding_selection_r2"] == 0.5
+
+
+def test_the_record_carries_the_whole_reward_report(
+    tmp_path, small_buffer, monkeypatch
+):
+    """`"reward": reward` reduced to `{"mse": reward["mse"]}` survived: the
+    gate test only asserted `"reward" in record`. A bare MSE over this
+    scenario's near-constant target reads as four-digit precision and means
+    nothing without its baseline, its event count and its degeneracy flag."""
+    real_reward = study.reward_accuracy
+    seen: dict = {}
+
+    def spy(*args, **kwargs):
+        seen["out"] = real_reward(*args, **kwargs)
+        return seen["out"]
+
+    monkeypatch.setattr(study, "reward_accuracy", spy)
+    result = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path, **JOB_KW)
+
+    assert set(result["reward"]) == {
+        "mse", "baseline_mse", "r2", "n_steps", "n_reward_events",
+        "is_degenerate",
+    }
+    for key, value in seen["out"].items():
+        got = result["reward"][key]
+        if isinstance(value, float) and math.isnan(value):
+            assert math.isnan(got), key
+        else:
+            assert got == value, key
+
+
+# --------------------------------------------------------------------------
+# reward-accuracy semantics
+# --------------------------------------------------------------------------
+
+def test_degeneracy_is_a_property_of_the_target_not_the_prediction(record):
+    """Computing the modal share over the PREDICTIONS survived: every existing
+    case passes `predicted == true`, or a constant prediction against a
+    degenerate target, so the two agree by accident. The dangerous direction is
+    a model that collapses to a constant -- it would report is_degenerate on
+    all nine cells and a reader would blame `my_way_home`'s reward rather than
+    the arm's reward head, which is the confusion the flag exists to prevent."""
+    on_a_constant_target = _summarise_reward(
+        np.arange(50, dtype=float), np.zeros(50))
+    assert on_a_constant_target["is_degenerate"] is True
+
+    on_a_varied_target = _summarise_reward(
+        np.zeros(50), np.arange(50, dtype=float))
+    assert on_a_varied_target["is_degenerate"] is False
+
+    assert isinstance(record["reward"]["is_degenerate"], bool)
+
+
+def test_the_degeneracy_threshold_is_bracketed_on_both_sides():
+    """0.99 was pinned only from above: the three existing cases sit at modal
+    shares 1.0, 0.998 and 0.02, so ANY threshold in (0.02, 0.998] classified
+    them identically and `0.99 -> 0.50` passed. Lowered, every arm is flagged
+    degenerate and criterion 3 is suppressed across all nine cells."""
+    assert study.DEGENERATE_REWARD_FRACTION == 0.99
+
+    under = np.zeros(1000)
+    under[:11] = np.arange(1, 12, dtype=float)          # modal share 0.989
+    assert _summarise_reward(np.zeros(1000), under)["is_degenerate"] is False
+
+    over = np.zeros(1000)
+    over[:9] = np.arange(1, 10, dtype=float)            # modal share 0.991
+    assert _summarise_reward(np.zeros(1000), over)["is_degenerate"] is True
+
+
+def test_the_reward_rounding_resolves_a_fine_grained_target():
+    """`np.round(true, 6)` feeds both the modal share and the event count, and
+    `-> np.round(true, 0)` survived because both existing targets are on an
+    integer scale. `my_way_home`'s living penalty is -0.0004: at 0 decimals
+    every step collapses onto the modal value and the goal events vanish."""
+    fine = np.arange(51, dtype=float) * 1e-4
+    out = _summarise_reward(fine.copy(), fine)
+    assert out["is_degenerate"] is False, (
+        "a 1e-4 grid must not be rounded into a single constant value")
+    assert out["n_reward_events"] == 50
+
+
+def test_reward_accuracy_pairs_each_action_with_the_frame_it_led_to(
+    small_buffer, monkeypatch
+):
+    """The third hand-rolled copy of `WorldModel.embed`'s action-time
+    convention, and the only one with no test. `[:, 1:] -> [:, :-1]` survived:
+    both slices have length T so the shape guard cannot see it, and a value
+    pin cannot either -- measured, the two differ in the 6th significant digit
+    of the MSE on this fixture and are bit-identical for the `cnn` arm. So
+    compare the embeddings actually handed to `observe` against `model.embed`,
+    which is where the convention is defined."""
+    import torch
+
+    from mbfps.data.episode import load_episode
+    from mbfps.eval.rollout import source_for
+    from mbfps.eval.study import reward_accuracy
+    from mbfps.models.encoders import encoder_backbone
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    cfg = get_config("random_vit", device="cpu", seed=0)
+    model = WorldModel(cfg)
+    model.eval()
+    backbone = encoder_backbone(cfg.encoder)
+    path = small_buffer.episode_paths()[0]
+
+    captured: dict = {}
+    real_observe = model.rssm.observe
+
+    def spy(embeddings, actions):
+        captured["embeddings"] = embeddings.detach().clone()
+        captured["actions"] = actions.detach().clone()
+        return real_observe(embeddings, actions)
+
+    monkeypatch.setattr(model.rssm, "observe", spy)
+    reward_accuracy(model, [path], backbone, torch.device("cpu"), limit=1)
+
+    episode = load_episode(path)
+    source = torch.as_tensor(source_for(model, path, episode, backbone))
+    with torch.no_grad():
+        window = {"obs": source.unsqueeze(0), "features": source.unsqueeze(0)}
+        causal = model.embed(window)                       # embeddings[:, 1:]
+        acausal = model.encoder(source).unsqueeze(0)[:, :-1]
+
+    assert not torch.equal(causal, acausal), (
+        "this episode's consecutive frames encode identically, so it cannot "
+        "tell the causal slice from the acausal one and the assertion below "
+        "would pass under either")
+    assert torch.equal(captured["embeddings"], causal), (
+        "reward_accuracy paired each action with the frame it was taken FROM, "
+        "not the frame it led to -- an acausal posterior, and the reward "
+        "accuracy of all nine cells measured against the wrong frame")
+    assert captured["actions"].shape[1] == causal.shape[1]
+
+
+# --------------------------------------------------------------------------
+# the sanitiser's silent-corruption corners
+# --------------------------------------------------------------------------
+
+def test_a_dotted_record_key_is_refused_rather_than_aliasing_a_field(tmp_path):
+    """The non-finite map addresses fields by dotted path, so a literal key
+    `"a.b"` beside a real `{"a": {"b": ...}}` aliases it: measured, the real
+    1.0 came back as NaN and the actual NaN stayed None, with nothing raised.
+    No field is shaped like this today; nine JSON files are the whole study
+    output, so the corner raises rather than corrupting a neighbour."""
+    with pytest.raises(ValueError, match="contains a"):
+        write_record(tmp_path / "r.json", {"a.b": float("nan"), "a": {"b": 1.0}})
+
+
+def test_a_record_that_already_owns_the_map_key_is_refused(tmp_path):
+    """`write_record({"nonfinite": {...}})` used to return `{"nonfinite": {}}`
+    -- the caller's data discarded in silence."""
+    with pytest.raises(ValueError, match=NONFINITE_KEY):
+        write_record(tmp_path / "r.json", {NONFINITE_KEY: {"my": "data"}, "x": 1.0})
+
+
+def test_a_zero_dimensional_numpy_value_is_written_as_a_scalar(tmp_path):
+    """`np.ndarray` was matched by the list branch before the scalar branches,
+    so a 0-d array raised `iteration over a 0-d array` -- a write-time crash
+    after the GPU hours rather than a value coerced."""
+    written = write_record(tmp_path / "r.json", {
+        "z": np.array(3.5), "n": np.array(np.nan), "i": np.array(7),
+    })
+    assert written["z"] == 3.5 and isinstance(written["z"], float)
+    assert written["i"] == 7 and isinstance(written["i"], int)
+    assert written["n"] is None
+    assert written[NONFINITE_KEY]["n"] == "nan"
+    assert strict_loads((tmp_path / "r.json").read_text()) == written
+

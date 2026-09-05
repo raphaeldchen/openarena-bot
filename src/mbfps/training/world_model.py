@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
-from mbfps.data.split import episode_split
+from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.models.heads import WorldModelHeads, continue_target
 from mbfps.models.rssm import KL_FREE_BITS, RSSM, RSSMConfig, kl_loss
@@ -118,7 +118,9 @@ def train_world_model(
     # deliberately NOT cfg.train.seed: every arm and every seed must be held out
     # on the same episodes, or the comparison measures which episodes each run
     # happened to get rather than which representation is better.
-    train_paths, _ = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
+    train_paths, _ = episode_split(
+        buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=0
+    )
     loader = SequenceLoader(
         buffer,
         batch_size=cfg.train.batch_size,
