@@ -4,6 +4,7 @@ import pytest
 from mbfps.eval.probe import (
     PROBE_KEYS,
     RIDGES,
+    TARGET_DIM,
     _mean_r2,
     angle_error_degrees,
     apply_probe,
@@ -595,16 +596,24 @@ class _TagEncoder(nn.Module):
         return obs[:, 0, 0, 0].to(torch.float32).unsqueeze(-1)
 
 
+def _packed(latent: torch.Tensor) -> dict:
+    """The real RSSM returns `latent = cat([h, z])` plus `h` and `z` separately,
+    and callers hand `(h[:, -1], z[:, -1])` back as the next window's state.
+    These stubs are one feature wide, so there is nothing to split -- but the
+    keys have to be there or the state handoff cannot be exercised at all."""
+    return {"latent": latent, "h": latent, "z": latent}
+
+
 class _PassThroughRSSM(nn.Module):
     def observe(self, embeddings, actions, state=None):
-        return {"latent": embeddings}
+        return _packed(embeddings)
 
 
 class _NoisyRSSM(nn.Module):
     """A posterior that genuinely SAMPLES, like the real categorical one."""
 
     def observe(self, embeddings, actions, state=None):
-        return {"latent": embeddings + torch.randn_like(embeddings)}
+        return _packed(embeddings + torch.randn_like(embeddings))
 
 
 class _WideningHeads(nn.Module):
@@ -630,6 +639,13 @@ class _FakeModel(nn.Module):
 
 
 def _fit(paths, **kwargs):
+    # context=2, horizon=3 -> a 5-frame window. The production window is
+    # 5+45=50, longer than these fixture episodes; 5 keeps the same frames in
+    # play while still exercising the real windowing. Lengths below are
+    # multiples of 5 so every frame lands inside a complete window and the
+    # "which episodes were fit on" assertions stay exact.
+    kwargs.setdefault("context", 2)
+    kwargs.setdefault("horizon", 3)
     return fit_probes(_FakeModel(**kwargs.pop("model", {})), paths, None,
                       torch.device("cpu"), **kwargs)
 
@@ -679,7 +695,7 @@ def test_fit_probes_is_reproducible_under_a_fixed_seed(tmp_path):
     unless the seed pins them -- and then every downstream error, band and
     gap_closed moves for no reason anyone could trace. Reproducibility comes
     from the seed, never from taking the categorical mode."""
-    paths = _write_episodes(tmp_path, [20, 21])
+    paths = _write_episodes(tmp_path, [20, 25])
     first, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
     second, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
     np.testing.assert_array_equal(first["w"], second["w"])
@@ -689,7 +705,7 @@ def test_fit_probes_seed_actually_drives_the_sampling(tmp_path):
     """Guards the test above from passing vacuously: if the seed were ignored
     (or the model were secretly deterministic) two seeds would agree too, and
     the reproducibility check would prove nothing."""
-    paths = _write_episodes(tmp_path, [20, 21])
+    paths = _write_episodes(tmp_path, [20, 25])
     first, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=0, ridge=1e-8)
     other, _ = _fit(paths, model={"rssm": _NoisyRSSM()}, seed=1, ridge=1e-8)
     assert not np.array_equal(first["w"], other["w"])
@@ -700,7 +716,7 @@ def test_fit_probes_selects_the_ridge_on_episodes_it_did_not_fit_on(tmp_path):
     granularity, because consecutive frames are near-duplicates: a row-wise
     split would put the same scene on both sides and every ridge would score
     the same."""
-    lengths = [20, 21, 22, 23, 40]
+    lengths = [20, 25, 30, 35, 40]
     paths = _write_episodes(tmp_path, lengths)
     latent_probe, _ = _fit(paths, select_episodes=1)
 
@@ -729,3 +745,191 @@ def test_fit_probes_falls_back_when_there_is_nothing_to_spare(tmp_path):
 def test_fit_probes_rejects_an_empty_episode_list():
     with pytest.raises(ValueError, match="no episodes"):
         _fit([])
+
+
+# ---------------------------------------------------------------------------
+# gather_probe_data -- the probe must be fit under the ROLLOUT's own protocol.
+#
+# `evaluate_rollout` gives the RSSM `context` real frames out of a ZERO state
+# and then imagines `horizon` more. Fitting the probe on whole-episode
+# filtering instead hands `h` ~500 steps of history it never has at evaluation
+# time. Measured on the shipped checkpoint, same frames and same probe:
+# position error 222.4 with the long context against 247.5 with the short one.
+#
+# The bias is NOT common-mode across the three references, which is what makes
+# it fatal rather than merely untidy: persistence is frozen at the context step
+# forever while the floor's own context grows to context+horizon, and measured
+# probe error by context length is 317.3 / 223.4 / 213.5 / 215.3 at contexts
+# 1 / 5 / 20 / 50. The floor therefore gains ~8 units from filtering history
+# alone, against a median band width of 55 -- a real bias inside the quantity
+# the study's headline ratio divides by.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.probe import gather_probe_data  # noqa: E402
+
+
+class _DepthRSSM(nn.Module):
+    """Latent == how many frames have been filtered since the last ZERO state.
+
+    That count is the thing at issue. Under the rollout's protocol it can never
+    exceed `context + horizon` and it restarts at 1 for every window; under
+    whole-episode filtering it runs to the episode length.
+    """
+
+    def observe(self, embeddings, actions, state=None):
+        b, t, _ = embeddings.shape
+        already = 0.0 if state is None else float(state[0][0, 0])
+        depth = already + torch.arange(1, t + 1, dtype=torch.float32).view(1, t, 1)
+        return _packed(depth.expand(b, t, 1).contiguous())
+
+
+class _RecordingRSSM(nn.Module):
+    """Records `(length, warm_started)` for every `observe` call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[int, bool]] = []
+
+    def observe(self, embeddings, actions, state=None):
+        self.calls.append((int(embeddings.shape[1]), state is not None))
+        b, t, _ = embeddings.shape
+        return _packed(torch.zeros(b, t, 1))
+
+
+def _gather(paths, rssm=None, head_width: int = 1, **kwargs):
+    kwargs.setdefault("context", 2)
+    kwargs.setdefault("horizon", 3)
+    model = _FakeModel(rssm=rssm, head_width=head_width)
+    return gather_probe_data(model, paths, None, torch.device("cpu"), **kwargs)
+
+
+def test_gather_probe_data_never_filters_more_history_than_the_rollout_does(tmp_path):
+    """THE guard. Every latent the probe is fit on must carry exactly as many
+    steps of filtering history as the latent the probe is later APPLIED to.
+
+    Whole-episode filtering gives `h` ~500 steps; the rollout gives it
+    `context` real frames out of a zero state. Measured on the shipped
+    checkpoint that is a 222.4-vs-247.5 position error on identical frames with
+    an identical probe, and it does not cancel across the three references --
+    persistence stays at the context step while the floor's context grows to
+    `context + horizon`, so the band's own denominator moves.
+    """
+    paths = _write_episodes(tmp_path, [20])
+    data = _gather(paths, rssm=_DepthRSSM(), context=2, horizon=3)
+
+    depths = data["latent"][:, 0]
+    assert depths.max() == 5.0, (
+        f"a latent carried {depths.max():.0f} steps of filtering history, but the "
+        "rollout only ever gives it context+horizon=5 -- the probe is being fit "
+        "on a distribution it is never applied to"
+    )
+    # Four windows over a 20-transition episode, each restarting from zero.
+    np.testing.assert_array_equal(depths, np.tile(np.arange(1, 6.0), 4))
+
+
+def test_gather_probe_data_observes_with_the_rollouts_own_call_protocol(tmp_path):
+    """`context` frames from a ZERO state, then the rest warm-started -- the
+    exact call sequence `evaluate_rollout` makes.
+
+    For a plain recurrence this is equivalent to one call over the window, so
+    this test pins the STRUCTURE rather than a number: the gathering must go on
+    reading as the rollout reads, so that a future change to `observe`'s
+    sequence-boundary behaviour cannot silently separate the two.
+    """
+    paths = _write_episodes(tmp_path, [20])
+    rssm = _RecordingRSSM()
+    _gather(paths, rssm=rssm, context=2, horizon=3)
+
+    assert rssm.calls == [(2, False), (3, True)] * 4, (
+        f"observe was called as {rssm.calls}, not as the rollout calls it: "
+        "context frames from a zero state, then horizon frames warm-started"
+    )
+
+
+def test_gather_probe_data_pairs_each_latent_with_the_frame_its_action_produced(
+    tmp_path,
+):
+    """The `start + 1` in the target slice.
+
+    `embeddings[k]` is frame `start + 1 + k`, so the target must be
+    `privileged[start + 1 + k]`. Losing the `+1` shifts every window by one
+    frame and still fits perfectly -- both sides stay linear in the frame index
+    -- so only the recovered VALUES catch it. The tagged fixture makes the
+    frame index readable straight off the latent, and `pos_x == 10 * index`.
+    """
+    paths = _write_episodes(tmp_path, [20])
+    data = _gather(paths, context=2, horizon=3)
+
+    frame = data["latent"][:, 0]          # _TagEncoder: the latent IS the index
+    np.testing.assert_array_equal(frame, np.arange(1, 21.0))
+    np.testing.assert_allclose(data["targets"][:, 0], DX * frame, atol=1e-4)
+    np.testing.assert_allclose(data["targets"][:, 1], DY * frame, atol=1e-4)
+
+
+def test_gather_probe_data_windows_an_episode_exactly_as_the_rollout_does(tmp_path):
+    """Same stride, same final window. `range(0, length - need + 1, need)`:
+    dropping the `+1` loses the last window whenever `length % need == 0`, and
+    a 20-transition episode at need=5 is exactly that case."""
+    paths = _write_episodes(tmp_path, [10, 13])
+    data = _gather(paths, context=2, horizon=3)
+
+    # ep0 (10 transitions): windows at 0 and 5   -> frames 1..10
+    # ep1 (13 transitions): windows at 0 and 5   -> frames 1..10, 11..13 unused
+    expected = np.concatenate([np.arange(1, 11.0), np.arange(1, 11.0)])
+    np.testing.assert_array_equal(data["latent"][:, 0], expected)
+
+
+def test_gather_probe_data_returns_aligned_rows_under_the_three_documented_keys(
+    tmp_path,
+):
+    """`filtering_report` consumes this dict positionally by key, and pairs
+    `latent` against `embedding` at the SAME timestep. Misaligned rows would
+    compare two different frames and no shape check would notice."""
+    paths = _write_episodes(tmp_path, [20])
+    data = _gather(paths, head_width=7, context=2, horizon=3)
+
+    assert set(data) == {"latent", "embedding", "targets"}
+    assert data["latent"].shape == (20, 1)
+    assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
+    assert data["targets"].shape == (20, TARGET_DIM)
+    # Rows are aligned: the widening head repeats the tag, so column 0 of the
+    # embedding must still be the frame the target describes.
+    np.testing.assert_allclose(data["targets"][:, 0], DX * data["embedding"][:, 0],
+                               atol=1e-4)
+
+
+def test_gather_probe_data_skips_episodes_too_short_for_one_window(tmp_path):
+    """Short episodes are skipped, not truncated into a shorter-context window
+    that would reintroduce the very mismatch this function exists to remove."""
+    paths = _write_episodes(tmp_path, [3, 20])
+    data = _gather(paths, context=2, horizon=3)
+    assert data["latent"].shape[0] == 20, "the 3-transition episode contributed rows"
+
+
+def test_gather_probe_data_rejects_a_dataset_with_no_window_long_enough(tmp_path):
+    paths = _write_episodes(tmp_path, [3])
+    with pytest.raises(ValueError, match="no probe window reached"):
+        _gather(paths, context=2, horizon=3)
+
+
+def test_gather_probe_data_rejects_a_degenerate_context_or_horizon(tmp_path):
+    paths = _write_episodes(tmp_path, [20])
+    with pytest.raises(ValueError, match="context"):
+        _gather(paths, context=0, horizon=3)
+    with pytest.raises(ValueError, match="horizon"):
+        _gather(paths, context=2, horizon=0)
+
+
+def test_fit_probes_forwards_the_rollout_context_to_the_gathering(tmp_path):
+    """`fit_probes` must not gather at its own default while the caller asked
+    for a different context -- that is the original defect one level up."""
+    paths = _write_episodes(tmp_path, [20])
+    probe, _ = fit_probes(_FakeModel(rssm=_DepthRSSM()), paths, None,
+                          torch.device("cpu"), context=2, horizon=3, ridge=1e-8)
+    # _DepthRSSM's latents run 1..need per window, so the standardisation mean
+    # reads back the window length the gathering actually used.
+    assert probe["mean"][0] == pytest.approx(3.0), "need was not 2+3=5"
+
+    probe, _ = fit_probes(_FakeModel(rssm=_DepthRSSM()), paths, None,
+                          torch.device("cpu"), context=1, horizon=1, ridge=1e-8)
+    assert probe["mean"][0] == pytest.approx(1.5), "need was not 1+1=2"

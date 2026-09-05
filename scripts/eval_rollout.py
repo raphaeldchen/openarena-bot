@@ -79,8 +79,15 @@ def main() -> None:
     train, val = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
     backbone = encoder_backbone(cfg.encoder)
 
+    # The probe MUST be fit at the same context/horizon the rollout evaluates
+    # at: it is applied to latents filtered from a zero state for exactly
+    # `context` real frames, and fitting it at a different filtering depth is
+    # a distribution mismatch worth ~25 map units of position error. Passing
+    # the parsed flags rather than the defaults is what keeps the two in step
+    # when a caller overrides them.
     latent_probe, embedding_probe = fit_probes(
-        model, train, backbone, device, seed=args.seed
+        model, train, backbone, device,
+        context=args.context, horizon=args.horizon, seed=args.seed,
     )
     result = evaluate_rollout(
         model,

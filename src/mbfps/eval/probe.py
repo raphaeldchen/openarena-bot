@@ -149,17 +149,132 @@ def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
 
 
 @torch.no_grad()
+def gather_probe_data(
+    model,
+    paths,
+    backbone,
+    device,
+    context: int = 5,
+    horizon: int = 45,
+    limit: int = 20,
+    seed: int = 0,
+) -> dict:
+    """Collect probe data under the ROLLOUT's own window protocol.
+
+    Every window is `context` real frames filtered from a ZERO state followed
+    by `horizon` more, cut from the episode on the same stride
+    `evaluate_rollout` uses -- so no latent here ever carries more filtering
+    history than a latent the probe is later applied to.
+
+    Why this is not cosmetic. Filtering each episode WHOLE, as this used to,
+    gives the deterministic state `h` ~500 steps of history that the rollout
+    never has: the rollout hands it `context` frames out of a zero state. The
+    probe was then fit on one distribution and applied to another. Measured on
+    the shipped 20k checkpoint, same frames and same probe: position error
+    222.4 under whole-episode filtering against 247.5 under the rollout's
+    5-step context.
+
+    And the bias does not cancel across the band. Persistence is frozen at the
+    last context step forever while the floor's own context grows to
+    `context + horizon`, and measured probe error by context length is
+    317.3 / 223.4 / 213.5 / 215.3 at contexts 1 / 5 / 20 / 50 -- so the floor
+    alone gains roughly 8 units from filtering history, against a median band
+    width of 55. That is a real bias inside `gap_closed`'s denominator. It is
+    the same defect class as the real-versus-predicted embedding confound this
+    module already guards, on the context-length axis.
+
+    The future steps are run through `observe` (the posterior on the real
+    frames, warm-started from the context state), not `imagine`. Fitting on
+    IMAGINED latents would tune the readout to the model's own dynamics error
+    and hand the model arm a probe the floor arm never gets -- reintroducing
+    the cross-arm asymmetry that the single-shared-probe rule exists to
+    prevent. What is matched here is the filtering DEPTH, which is what the
+    three references actually share.
+
+    Returns `{"latent": (N, LATENT), "embedding": (N, EMBED), "targets": (N, 4)}`
+    with rows aligned; `embedding` is the model's PREDICTED embedding, i.e.
+    `heads(latent)["embedding"]`, because that is the space the rollout scores
+    all three references in. Seeds the global RNG, because the posterior
+    samples and reproducibility must come from the seed rather than from
+    taking the categorical mode.
+    """
+    from mbfps.eval.rollout import source_for
+
+    if context < 1:
+        raise ValueError(f"context must be at least 1 real frame, got {context}")
+    if horizon < 1:
+        raise ValueError(f"horizon must be at least 1 step, got {horizon}")
+
+    torch.manual_seed(seed)
+    need = context + horizon
+    latents, embeddings, targets = [], [], []
+
+    for path in list(paths)[:limit]:
+        episode = load_episode(path)
+        if episode.length < need + 1:
+            continue
+        source = source_for(model, path, episode, backbone)
+        all_actions = (
+            torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
+        )
+        # The same stride and the same final window as `evaluate_rollout`:
+        # `range(0, length - need, need)` would drop the last window whenever
+        # `length % need == 0`, which is a silent change in what is fit on.
+        for start in range(0, episode.length - need + 1, need):
+            frames = torch.as_tensor(source[start : start + need + 1]).to(device)
+            # Drop the FIRST frame: `embeddings[k]` must be the frame
+            # `actions[k]` led to, per RSSM.observe's action-time convention.
+            window = model.encoder(frames).unsqueeze(0)[:, 1:]
+            actions = all_actions[:, start : start + need]
+
+            observed = model.rssm.observe(window[:, :context], actions[:, :context])
+            state = (observed["h"][:, -1], observed["z"][:, -1])
+            future = model.rssm.observe(
+                window[:, context:], actions[:, context:], state=state
+            )
+            latent = torch.cat([observed["latent"], future["latent"]], dim=1)
+
+            latents.append(latent[0].float().cpu().numpy())
+            embeddings.append(
+                model.heads(latent)["embedding"][0].float().cpu().numpy()
+            )
+            # `latent[k]` describes frame `start + 1 + k`, so the target starts
+            # at `start + 1`. Losing that `+1` shifts every window by one frame
+            # and still fits perfectly, because both sides stay linear in the
+            # frame index -- only the recovered values can catch it.
+            targets.append(
+                probe_targets(
+                    episode.privileged[start + 1 : start + need + 1],
+                    episode.privileged_keys,
+                )
+            )
+
+    if not latents:
+        raise ValueError(
+            f"no probe window reached {need + 1} frames; lower context/horizon "
+            "or check the episode paths"
+        )
+    return {
+        "latent": np.concatenate(latents),
+        "embedding": np.concatenate(embeddings),
+        "targets": np.concatenate(targets),
+    }
+
+
+@torch.no_grad()
 def fit_probes(
     model,
     paths,
     backbone,
     device,
+    context: int = 5,
+    horizon: int = 45,
     limit: int = 20,
     seed: int = 0,
     select_episodes: int = 4,
     ridge: float | None = None,
 ) -> tuple[dict, dict]:
-    """Fit both probes on TRAINING episodes only.
+    """Fit both probes on TRAINING episodes, under the rollout's protocol.
 
     Returns `(latent_probe, embedding_probe)`.
 
@@ -180,8 +295,12 @@ def fit_probes(
       embedding space, so the band spanned two differently-fit probes and
       "dynamics helped" was confounded with "one probe fits better".
 
-    Sampling in `observe` is stochastic, so this seeds the global RNG: without
-    it two identical evaluation runs fit two different probes and every
+    `context` and `horizon` must be the rollout's own, and are forwarded to
+    `gather_probe_data` -- see its docstring for the measured cost of fitting
+    at a different filtering depth from the one the probe is applied at.
+
+    Sampling in `observe` is stochastic, so the gathering seeds the global RNG:
+    without it two identical evaluation runs fit two different probes and every
     downstream number moves. `evaluate_rollout` re-seeds independently, so how
     much RNG is drawn here does not perturb the rollout.
 
@@ -190,6 +309,8 @@ def fit_probes(
         paths: TRAINING episode paths. Passing validation paths would leak.
         backbone: cached-feature backbone name, or None for the pixel arm.
         device: where to run the encoder and RSSM.
+        context: real frames filtered from a zero state, per window.
+        horizon: steps after the context, per window.
         limit: how many episodes to fit on.
         seed: fixes the posterior samples, and so the probe.
         select_episodes: how many of the used episodes are held back to SELECT
@@ -199,44 +320,33 @@ def fit_probes(
             or too few episodes to spare, falls back to `fit_probe`'s default.
         ridge: pin the penalty and skip selection entirely (tests).
     """
-    from mbfps.eval.rollout import source_for
-
-    torch.manual_seed(seed)
-    latents, embeds, targets = [], [], []
-    for path in paths[:limit]:
-        episode = load_episode(path)
-        source = source_for(model, path, episode, backbone)
-        # Drop the FIRST frame, not the last: embeddings[i] must be the frame
-        # actions[i] led to, matching the RSSM.observe convention documented on
-        # WorldModel.embed. The target below shifts the same way, or latents[i]
-        # (now describing frame i+1) would be fit against privileged[i] (frame
-        # i) -- a one-step-misaligned regression that no shape check can see.
-        embeddings = model.encoder(torch.as_tensor(source[1:]).to(device)).unsqueeze(0)
-        actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
-        out = model.rssm.observe(embeddings, actions)
-        latents.append(out["latent"][0].float().cpu().numpy())
-        embeds.append(model.heads(out["latent"])["embedding"][0].float().cpu().numpy())
-        targets.append(probe_targets(episode.privileged[1:], episode.privileged_keys))
-
-    if not latents:
+    used = list(paths)[:limit]
+    if not used:
         raise ValueError("no episodes to fit the probe on; `paths` was empty")
+
+    gather = lambda ps, s: gather_probe_data(  # noqa: E731
+        model, ps, backbone, device, context, horizon, limit=len(ps), seed=s
+    )
 
     # Split at EPISODE granularity, like the train/val split itself. Splitting
     # rows would put frames from one episode on both sides, and consecutive
     # frames are near-duplicates, so the selection set would not be held out in
     # any meaningful sense and every ridge would look equally good.
-    spare = len(latents) - select_episodes
+    spare = len(used) - select_episodes
     if ridge is not None or select_episodes <= 0 or spare < 1:
+        train = gather(used, seed)
         return (
-            fit_probe(np.concatenate(latents), np.concatenate(targets), ridge=ridge),
-            fit_probe(np.concatenate(embeds), np.concatenate(targets), ridge=ridge),
+            fit_probe(train["latent"], train["targets"], ridge=ridge),
+            fit_probe(train["embedding"], train["targets"], ridge=ridge),
         )
 
-    cat = lambda xs: np.concatenate(xs)  # noqa: E731
-    y_fit, y_sel = cat(targets[:spare]), cat(targets[spare:])
+    train = gather(used[:spare], seed)
+    select = gather(used[spare:], seed + 1)
     return (
-        fit_probe(cat(latents[:spare]), y_fit, cat(latents[spare:]), y_sel),
-        fit_probe(cat(embeds[:spare]), y_fit, cat(embeds[spare:]), y_sel),
+        fit_probe(train["latent"], train["targets"],
+                  select["latent"], select["targets"]),
+        fit_probe(train["embedding"], train["targets"],
+                  select["embedding"], select["targets"]),
     )
 
 
