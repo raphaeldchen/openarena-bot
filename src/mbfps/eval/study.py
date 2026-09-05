@@ -1,0 +1,396 @@
+"""One cell of the 3 arms x 3 seeds study.
+
+A job trains one arm at one seed, evaluates it, and emits a JSON-serialisable
+record. The driver in `scripts/run_study.py` is resumable off these records, so
+a job that has already produced one is never re-run -- which matters when the
+pixel arm costs 8.3 h per seed against the feature arms' 1.4 h.
+
+WHAT THIS MODULE DOES NOT DO: recompute anything. The band statistics and the
+degeneracy threshold come from `mbfps.eval.summary`, which
+`scripts/eval_rollout.py` also consumes, so a single run and the nine-cell
+study can never disagree about what "degenerate" means. Re-implementing
+`metric_summary` here would give DEGENERATE two homes and let them drift.
+
+NON-FINITE NUMBERS ARE NORMAL HERE, AND `json.dump` CANNOT WRITE THEM. Both
+`gap_final`/`gap_mean` (NaN by `metric_summary`'s contract whenever the band is
+non-positive) and `reward["r2"]` (NaN when the target has no variance) are
+undefined by design rather than by accident. Python writes those as the bare
+token `NaN`, which is not JSON and which strict parsers reject -- and the
+aggregation step reads nine of these files back. See `write_record` for the
+policy and `load_record` for the inverse.
+"""
+
+import json
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.split import episode_split
+from mbfps.eval.probe import filtering_gain, filtering_report, fit_probes
+from mbfps.eval.rollout import evaluate_rollout
+from mbfps.eval.summary import METRICS, metric_summary
+from mbfps.models.encoders import encoder_backbone
+from mbfps.training.world_model import WorldModel, train_world_model
+from mbfps.utils.config import get_config
+from mbfps.utils.device import get_device
+
+SPLIT_SEED = 0
+"""The episode split seed, fixed and deliberately NOT the job's seed.
+
+`train_world_model` splits at `seed=0`. Evaluating at `job.seed` instead would
+hand seed 1 a different held-out set from the one its own training run held
+out -- i.e. it would evaluate on episodes it trained on -- and the nine cells
+would no longer be scored on the same episodes. The record carries the episode
+names so that this is checkable after the fact rather than assumed.
+"""
+
+NONFINITE_KEY = "nonfinite"
+"""Top-level key of the record's map from field path to non-finite token."""
+
+_TOKENS: dict[str, float] = {
+    "nan": float("nan"),
+    "inf": float("inf"),
+    "-inf": float("-inf"),
+}
+
+
+@dataclass(frozen=True)
+class StudyJob:
+    """One cell of the study: one arm at one seed."""
+
+    arm: str
+    seed: int
+
+
+def job_record_path(out_dir: Path, job: StudyJob) -> Path:
+    """Where this job's record lives.
+
+    BOTH the arm and the seed are in the name. Either one missing collides two
+    of the nine cells onto one file, and because the driver resumes off these
+    files the second cell would not be re-run -- it would be silently reported
+    as the first one's numbers.
+    """
+    return Path(out_dir) / f"result_{job.arm}_seed{job.seed}.json"
+
+
+DEGENERATE_REWARD_FRACTION = 0.99
+"""If this share of steps carry the modal reward, the target is degenerate.
+
+Measured on `my_way_home`: 19,417 of 19,424 steps share the living penalty and
+six carry the goal, so the modal share is 0.9996. A scalar accuracy over that
+is dominated by the constant.
+"""
+
+
+def _summarise_reward(predicted: np.ndarray, true: np.ndarray) -> dict:
+    """Reward error beside the baseline that makes it readable.
+
+    `r2` is NaN when the target has no variance -- reporting 0.0 there would
+    read as "explains nothing" when the truth is "there was nothing to
+    explain". The NaN survives to disk; see `write_record`.
+    """
+    true = np.asarray(true, dtype=np.float64)
+    predicted = np.asarray(predicted, dtype=np.float64)
+    if true.size == 0:
+        raise ValueError("no reward steps to summarise")
+    if predicted.shape != true.shape:
+        raise ValueError(
+            f"predicted {predicted.shape} and true {true.shape} rewards are not "
+            "aligned; a shape mismatch here would broadcast into a meaningless MSE"
+        )
+    denominator = float(((true - true.mean()) ** 2).sum())
+    mse = float(((predicted - true) ** 2).mean())
+    baseline = float(((true - true.mean()) ** 2).mean())
+    rounded = np.round(true, 6)
+    modal_share = float(
+        np.bincount(np.unique(rounded, return_inverse=True)[1]).max() / true.size
+    )
+    return {
+        "mse": mse,
+        "baseline_mse": baseline,
+        "r2": (
+            float("nan")
+            if denominator == 0.0
+            else 1.0 - (mse * true.size) / denominator
+        ),
+        "n_steps": int(true.size),
+        "n_reward_events": int((rounded != np.round(np.median(true), 6)).sum()),
+        "is_degenerate": bool(modal_share >= DEGENERATE_REWARD_FRACTION),
+    }
+
+
+@torch.no_grad()
+def reward_accuracy(
+    model, val_paths, backbone, device, limit: int = 20, seed: int = 0
+) -> dict:
+    """Spec section 4, criterion 3: reward-prediction accuracy per arm.
+
+    Filters each held-out episode and compares the reward head's output against
+    the recorded reward. Reported with its baseline and event count because
+    `my_way_home`'s reward is near-constant -- see DEGENERATE_REWARD_FRACTION.
+    A bare MSE over that target looks precise and means nothing.
+
+    Seeds the global RNG: `observe` samples from the posterior, and
+    reproducibility here comes from the seed, never from taking the mode.
+    """
+    from mbfps.data.episode import load_episode
+    from mbfps.eval.rollout import source_for
+
+    torch.manual_seed(seed)
+    predicted, true = [], []
+    for path in list(val_paths)[:limit]:
+        episode = load_episode(path)
+        source = source_for(model, path, episode, backbone)
+        # Drop the FIRST frame: `embeddings[k]` must be the frame `actions[k]`
+        # led to, per RSSM.observe's action-time convention.
+        embeddings = model.encoder(
+            torch.as_tensor(source).to(device)
+        ).unsqueeze(0)[:, 1:]
+        actions = (
+            torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
+        )
+        out = model.rssm.observe(embeddings, actions)
+        predicted.append(
+            model.heads(out["latent"])["reward"][0].float().cpu().numpy()
+        )
+        true.append(episode.rewards)
+    if not predicted:
+        raise ValueError("no validation episode produced reward predictions")
+    return _summarise_reward(np.concatenate(predicted), np.concatenate(true))
+
+
+def _token(value: float) -> str:
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0.0 else "-inf"
+
+
+def _sanitise(value: Any, path: str, found: dict[str, str]) -> Any:
+    """Recursively make `value` strict-JSON-writable, recording what was lost.
+
+    numpy scalars become Python scalars; non-finite floats become `null` and
+    their dotted path is recorded in `found`.
+    """
+    if isinstance(value, dict):
+        return {
+            str(k): _sanitise(v, f"{path}.{k}" if path else str(k), found)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [
+            _sanitise(v, f"{path}.{i}" if path else str(i), found)
+            for i, v in enumerate(value)
+        ]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+        found[path] = _token(number)
+        return None
+    return value
+
+
+def to_json_record(record: dict) -> dict:
+    """The strict-JSON form of `record`, plus the map that inverts the loss.
+
+    THE POLICY, and why it is not "replace NaN with 0.0". A NaN `gap_final`
+    means the persistence-to-floor band was non-positive, so the fraction of it
+    the model closed is undefined; 0.0 means the model closed none of a real
+    band. Those are different findings about an arm, and the aggregation over
+    nine records averages them -- coercing the first into the second would pull
+    the mean toward "no better than persistence" using cells that measured
+    nothing at all.
+
+    So: a non-finite float is written as `null`, which every strict parser
+    accepts and which no consumer can mistake for a number, and its dotted path
+    is recorded under `NONFINITE_KEY` with the token it came from. `null` alone
+    would lose NaN-versus-infinity; the map keeps it, and `load_record`
+    restores the exact float.
+    """
+    found: dict[str, str] = {}
+    clean = _sanitise(record, "", found)
+    clean[NONFINITE_KEY] = found
+    return clean
+
+
+def write_record(path: Path, record: dict) -> dict:
+    """Write `record` as strict JSON and return exactly what was written.
+
+    `allow_nan=False` is the belt to `to_json_record`'s braces: if any
+    non-finite value ever escapes the sanitiser, this raises instead of writing
+    a bare `NaN` token that the aggregation step would only discover nine runs
+    and thirty GPU-hours later.
+    """
+    clean = to_json_record(record)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(clean, indent=2, allow_nan=False))
+    return clean
+
+
+def load_record(path: Path) -> dict:
+    """Read a record back, restoring the non-finite floats `null` stands for.
+
+    The inverse of `write_record`. Consumers that would rather see `None` can
+    use `json.loads` directly; this is for the aggregation, which needs NaN
+    back so `np.nanmean` can skip the undefined cells instead of counting the
+    `None`s as zeros.
+    """
+    record = json.loads(Path(path).read_text())
+    for dotted, token in record.get(NONFINITE_KEY, {}).items():
+        if token not in _TOKENS:
+            raise ValueError(f"unknown non-finite token {token!r} at {dotted!r}")
+        segments = dotted.split(".")
+        container = record
+        for segment in segments[:-1]:
+            container = (
+                container[int(segment)]
+                if isinstance(container, list)
+                else container[segment]
+            )
+        last = segments[-1]
+        if isinstance(container, list):
+            container[int(last)] = _TOKENS[token]
+        else:
+            container[last] = _TOKENS[token]
+    return record
+
+
+def _probe_summary(latent_probe: dict, embedding_probe: dict) -> dict:
+    """The measuring instrument's own settings.
+
+    A band that looks degenerate because the probe is noise is a different
+    finding from one that is degenerate because the model sits on its floor,
+    and across nine runs only these numbers tell the two apart.
+    """
+    return {
+        "latent_ridge": float(latent_probe["ridge"]),
+        "latent_selection_r2": latent_probe.get("r2"),
+        "embedding_ridge": float(embedding_probe["ridge"]),
+        "embedding_selection_r2": embedding_probe.get("r2"),
+    }
+
+
+def run_job(
+    job: StudyJob,
+    buffer: ReplayBuffer,
+    out_dir: Path,
+    steps: int = 20_000,
+    seq_len: int = 64,
+    context: int = 5,
+    horizon: int = 45,
+    device: str = "mps",
+) -> dict:
+    """Train, evaluate, and write one result record. Returns the record.
+
+    The returned dict IS the file's content -- already sanitised, so a caller
+    comparing two jobs compares what the aggregation will actually read rather
+    than a richer in-memory object that happens to differ from it.
+
+    `context` and `horizon` are forwarded to the probe fit, the rollout AND
+    both filtering diagnostics. They must not be allowed to default apart: the
+    probe is applied to latents filtered from a zero state for exactly
+    `context` frames, and fitting it at a different depth is a distribution
+    mismatch worth ~25 map units of position error.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = get_config(job.arm, steps=steps, seq_len=seq_len, seed=job.seed, device=device)
+    torch_device = get_device(prefer=device)
+
+    started = time.perf_counter()
+    history = train_world_model(cfg, buffer, out_dir=out_dir)
+    train_paths, val_paths = episode_split(
+        buffer.episode_paths(), val_fraction=0.2, seed=SPLIT_SEED
+    )
+    backbone = encoder_backbone(cfg.encoder)
+
+    model = WorldModel(cfg).to(torch_device)
+    checkpoint = torch.load(
+        out_dir / f"world_model_{job.arm}_seed{job.seed}.pt",
+        map_location=torch_device,
+        weights_only=True,
+    )
+    if checkpoint.get("arm") != job.arm or checkpoint.get("seed") != job.seed:
+        raise ValueError(
+            f"checkpoint in {out_dir} is arm={checkpoint.get('arm')!r} "
+            f"seed={checkpoint.get('seed')!r}, not this job's "
+            f"arm={job.arm!r} seed={job.seed!r}"
+        )
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+
+    latent_probe, embedding_probe = fit_probes(
+        model, train_paths, backbone, torch_device,
+        context=context, horizon=horizon, seed=job.seed,
+    )
+    reward = reward_accuracy(
+        model, val_paths, backbone, torch_device, seed=job.seed
+    )
+    result = evaluate_rollout(
+        model, val_paths, embedding_probe,
+        context=context, horizon=horizon, seed=job.seed,
+        device=torch_device, feature_backbone=backbone,
+    )
+    # Gate criterion 4 and its bottleneck-free companion. BOTH are recorded,
+    # never one instead of the other: criterion 4 puts the 160-bit latent
+    # against 2048 encoder floats and can fail on the bottleneck alone, while
+    # the gain puts the raw embedding in both arms. And the gain's SIGN is
+    # ridge-grid dependent -- measured -0.0706, -0.0208 and +0.0325 under three
+    # defensible selection designs, because RIDGES is a decade grid and the
+    # scored R^2 moves ~0.10 per decade while the effect is ~0.02. Recording
+    # which ridge each arm selected is what keeps that sensitivity visible
+    # across nine runs instead of averaging it into an uninterpretable number.
+    criterion_4 = filtering_report(
+        model, train_paths, val_paths, backbone, torch_device,
+        context=context, horizon=horizon, seed=job.seed,
+    )
+    gain = filtering_gain(
+        model, train_paths, val_paths, backbone, torch_device,
+        context=context, horizon=horizon, seed=job.seed,
+    )
+
+    record = {
+        "arm": job.arm,
+        "seed": job.seed,
+        "steps": steps,
+        "seq_len": seq_len,
+        "context": context,
+        "horizon": horizon,
+        "split_seed": SPLIT_SEED,
+        "seconds": float(time.perf_counter() - started),
+        "steps_per_second": float(history["steps"] / history["seconds"]),
+        "kl_rate_above_free_bits": float(history["kl_rate_above_free_bits"]),
+        "kl_dyn_max": float(history["kl_dyn_max"]),
+        "loss_last20": float(np.mean(history["loss"][-20:])),
+        # The held-out episodes by name, so "all nine cells were scored on the
+        # same episodes" is checkable after the fact rather than assumed.
+        "episodes": {
+            "train": [p.name for p in train_paths],
+            "val": [p.name for p in val_paths],
+        },
+        "probe": _probe_summary(latent_probe, embedding_probe),
+        "position": metric_summary(result, "position"),
+        "angle": metric_summary(result, "angle"),
+        "filtering": {"criterion_4": criterion_4, "gain": gain},
+        "reward": reward,
+        "curves": {
+            name: [float(v) for v in getattr(result, name)]
+            for name in (
+                "rssm_position", "persistence_position", "floor_position",
+                "rssm_angle", "persistence_angle", "floor_angle",
+            )
+        },
+    }
+    assert set(METRICS) <= set(record), "every metric summary must be recorded"
+    return write_record(job_record_path(out_dir, job), record)
