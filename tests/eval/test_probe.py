@@ -473,3 +473,69 @@ def test_filtering_comparison_selects_each_probes_ridge_independently():
     forced_r2 = probe_r2(forced, embed_val, targets_val)
 
     assert result["embedding_r2"] > forced_r2
+
+
+def test_filtering_comparison_genuinely_selects_a_ridge_for_each_probe():
+    """Sharing a ridge and eliminating selection entirely are different
+    mutations. `test_filtering_comparison_selects_each_probes_ridge_
+    independently` above catches the latent probe's selected ridge being
+    reused for the embedding probe -- but it does not catch BOTH probes
+    skipping selection and silently using a hardcoded `ridge=1e3` instead,
+    because on that test's data 1e3 already beats the "forced" comparison it
+    makes (measured: the hardcode-both-to-1e3 mutation survives the entire
+    suite, including that test, before this one was added).
+
+    Both spaces here are built from the same underlying `cause` and the same
+    `targets`, so `filtering_comparison`'s shared `targets_train`/
+    `targets_val` contract is respected. Each space's genuinely-best ridge
+    (found independently below by sweeping RIDGES and scoring with
+    `_reference_r2`, not the module's own `_mean_r2`) is engineered to differ
+    from 1e3 AND from the other space's optimum, by a wide held-out R^2
+    margin in both spaces:
+    - `latent`: a clean, low-noise copy of `cause` -- light regularisation
+      (RIDGES[0] = 0.1) wins, and 1e3 already oversmooths it badly.
+    - `embedding`: a noisier, higher-dimensional linear encoding of the same
+      `cause` -- RIDGES[1] = 10 wins, and 1e3 oversmooths it just as badly,
+      by a different margin than the latent space's.
+
+    A genuine, independent per-probe selection reports each space's true
+    optimum. Hardcoding 1e3 for both collapses BOTH reported values toward
+    the (measurably worse) fixed-1e3 score; sharing the latent probe's ridge
+    with the embedding probe collapses only the embedding value, since the
+    two optima are different grid entries -- either mutation is caught here.
+    """
+    rng = np.random.default_rng(11)
+    n_train, n_val, p_lat, p_emb = 30, 100, 3, 60
+
+    cause_train = rng.normal(size=(n_train, p_lat))
+    cause_val = rng.normal(size=(n_val, p_lat))
+    w = rng.normal(size=(p_lat + 1, 4)) * 5.0
+    targets_train = cause_train @ w[:-1] + w[-1] + rng.normal(size=(n_train, 4)) * 0.01
+    targets_val = cause_val @ w[:-1] + w[-1] + rng.normal(size=(n_val, 4)) * 0.01
+
+    latent_train, latent_val = cause_train, cause_val
+
+    mix = rng.normal(size=(p_lat, p_emb))
+    embedding_train = cause_train @ mix + rng.normal(size=(n_train, p_emb))
+    embedding_val = cause_val @ mix + rng.normal(size=(n_val, p_emb))
+
+    def ridge_scores(x, y, xv, yv):
+        return {r: _reference_r2(fit_probe(x, y, ridge=r), xv, yv) for r in RIDGES}
+
+    latent_scores = ridge_scores(latent_train, targets_train, latent_val, targets_val)
+    embedding_scores = ridge_scores(embedding_train, targets_train, embedding_val, targets_val)
+    latent_best = max(latent_scores, key=latent_scores.get)
+    embedding_best = max(embedding_scores, key=embedding_scores.get)
+
+    # Confirm the case is discriminating before trusting it as a guard: the
+    # two optima must differ from each other and from 1e3, by a wide margin.
+    assert latent_best != 1e3 and embedding_best != 1e3
+    assert latent_best != embedding_best
+    assert latent_scores[latent_best] - latent_scores[1e3] > 0.1
+    assert embedding_scores[embedding_best] - embedding_scores[1e3] > 0.1
+
+    result = filtering_comparison(
+        latent_train, embedding_train, latent_val, embedding_val, targets_train, targets_val
+    )
+    assert result["latent_r2"] == pytest.approx(latent_scores[latent_best], abs=1e-6)
+    assert result["embedding_r2"] == pytest.approx(embedding_scores[embedding_best], abs=1e-6)
