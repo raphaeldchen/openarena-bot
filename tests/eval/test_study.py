@@ -7,6 +7,7 @@ test here is about a field that is silently wrong rather than absent.
 import inspect
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -618,24 +619,99 @@ def test_each_evaluation_gets_the_episode_set_it_is_supposed_to_get(
         "reward accuracy was scored on episodes the model trained on")
 
 
-def test_a_checkpoint_from_another_job_is_refused(tmp_path, small_buffer, monkeypatch):
-    """The record is written beside the checkpoint it describes. Loading one
-    from a different arm or seed would attribute another cell's weights to this
-    cell, and the state dict would load cleanly because the architecture is
-    shared across seeds."""
+def _train_saving_a_checkpoint_labelled(arm, seed):
+    """A stand-in trainer whose checkpoint is LABELLED for another cell.
+
+    The file NAME is still this job's -- `run_job` finds it by name -- so the
+    two labels inside are the only thing the guard has to go on. The weights
+    are a real, loadable state dict for the arm actually being run, which is
+    the point: a checkpoint from the wrong SEED of the same arm loads cleanly,
+    so nothing downstream would ever notice the misattribution. With an empty
+    state dict an escaped mutant would die at `load_state_dict` instead, and
+    the test would pass for a reason that has nothing to do with the guard.
+    """
     def fake_train(cfg, buffer, out_dir, log_every=100):
         import torch
+
+        from mbfps.training.world_model import WorldModel
+
         out_dir.mkdir(parents=True, exist_ok=True)
         torch.save(
-            {"arm": "cnn", "seed": 99, "state_dict": {}},
+            {"arm": arm, "seed": seed, "state_dict": WorldModel(cfg).state_dict()},
             out_dir / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt",
         )
         return {"steps": 3, "seconds": 1.0, "loss": [0.0],
                 "kl_rate_above_free_bits": 0.0, "kl_dyn_max": 0.0}
 
-    monkeypatch.setattr(study, "train_world_model", fake_train)
+    return fake_train
+
+
+def test_a_checkpoint_from_another_job_is_refused(tmp_path, small_buffer, monkeypatch):
+    """The record is written beside the checkpoint it describes. Loading one
+    from a different arm or seed would attribute another cell's weights to this
+    cell, and the state dict would load cleanly because the architecture is
+    shared across seeds.
+
+    This case is wrong in BOTH fields, so it cannot tell the two halves of the
+    compound guard apart: either half alone still raises. Dropping either
+    disjunct survived it. The two tests below are the ones that kill those
+    mutants; this one stays because a wholly foreign checkpoint is still worth
+    refusing, not because it discriminates.
+    """
+    monkeypatch.setattr(study, "train_world_model",
+                        _train_saving_a_checkpoint_labelled(OTHER_ARM, 99))
     with pytest.raises(ValueError, match="not this job's"):
         run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+
+
+def test_a_checkpoint_wrong_in_the_arm_alone_is_refused(
+    tmp_path, small_buffer, monkeypatch
+):
+    """Half of the compound guard, exercised ALONE.
+
+    `checkpoint["arm"] != job.arm or checkpoint["seed"] != job.seed` was only
+    ever tested with a checkpoint wrong in both fields (`cnn`/99 against this
+    job's `random_vit`/1), so both disjuncts were true at once and one
+    `pytest.raises` could not say which had fired. Deleting either half left
+    the suite green.
+
+    Here the SEED matches and only the arm is wrong, so the seed disjunct is
+    False and the arm disjunct is the only thing that can raise: under
+    `if checkpoint.get("seed") != job.seed:` alone nothing raises, `run_job`
+    evaluates another arm's weights as this cell, and this test goes red on
+    DID NOT RAISE.
+    """
+    assert OTHER_ARM != JOB_ARM, "the arm must actually be wrong"
+    monkeypatch.setattr(study, "train_world_model",
+                        _train_saving_a_checkpoint_labelled(OTHER_ARM, JOB_SEED))
+    with pytest.raises(ValueError, match="not this job's") as excinfo:
+        run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+    assert f"is arm={OTHER_ARM!r} seed={JOB_SEED!r}" in str(excinfo.value), (
+        "the message must name the checkpoint's own labels, so the reader can "
+        "see WHICH half of the guard fired")
+
+
+def test_a_checkpoint_wrong_in_the_seed_alone_is_refused(
+    tmp_path, small_buffer, monkeypatch
+):
+    """The other half, exercised alone -- and the more dangerous one.
+
+    The arm matches and only the seed is wrong, so the arm disjunct is False.
+    Under `if checkpoint.get("arm") != job.arm:` alone nothing raises. That is
+    precisely the misattribution the guard exists for: the architecture is
+    shared across seeds, so a seed-2 checkpoint loads into the seed-1 cell
+    without a murmur, and two of the nine records would describe the same
+    trained model under different seed labels.
+    """
+    other_seed = JOB_SEED + 1
+    assert other_seed != JOB_SEED, "the seed must actually be wrong"
+    monkeypatch.setattr(study, "train_world_model",
+                        _train_saving_a_checkpoint_labelled(JOB_ARM, other_seed))
+    with pytest.raises(ValueError, match="not this job's") as excinfo:
+        run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+    assert f"is arm={JOB_ARM!r} seed={other_seed!r}" in str(excinfo.value), (
+        "the message must name the checkpoint's own labels, so the reader can "
+        "see WHICH half of the guard fired")
 
 
 # ---------------------------------------------------------------------------
@@ -818,9 +894,16 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
         models.append(model)
         return model
 
+    real_load = torch.load
+
+    def load_spy(*args, **kwargs):
+        seen.setdefault("loads", []).append((args, kwargs))
+        return real_load(*args, **kwargs)
+
     monkeypatch.setattr(study, "get_config", config_spy)
     monkeypatch.setattr(study, "get_device", device_spy)
     monkeypatch.setattr(study, "WorldModel", model_spy)
+    monkeypatch.setattr(torch, "load", load_spy)
 
     run_job(JOB, small_buffer, tmp_path,
             **dict(JOB_KW, device="cuda"))
@@ -845,6 +928,252 @@ def test_the_jobs_device_reaches_the_training_config_and_the_evaluation(
         "rather than the one get_device returned for the job's --device; on a "
         "CUDA-less machine both are CPU and the model's own parameters cannot "
         f"show it (asked for {seen['device']}, got {seen['moved_to'][0]})")
+
+    # The SAME species one line further down, and it survived here: the guard
+    # above spies the argument reaching `.to()` at the model's construction,
+    # but nothing looked at the `map_location=` of the `torch.load` two lines
+    # below it, so `map_location=torch_device -> torch.device("cpu")` was
+    # invisible. It is invisible NUMERICALLY too, on this machine, because
+    # `get_device(prefer="cuda")` already is cpu here -- like the `.to()` bug
+    # it could only start guarding on the GPU box, the one place nobody is
+    # watching. So it is pinned the same way: by OBJECT IDENTITY against the
+    # device `get_device` returned, which the `hardcoded is not seen["device"]`
+    # check above has already shown a freshly-built device cannot satisfy.
+    checkpoint_loads = [
+        (args, kwargs) for args, kwargs in seen.get("loads", [])
+        if Path(args[0] if args else kwargs["f"]).name.startswith("world_model_")
+    ]
+    assert len(checkpoint_loads) == 1, (
+        "expected exactly one torch.load of the job's checkpoint, saw "
+        f"{len(checkpoint_loads)}")
+    load_kwargs = checkpoint_loads[0][1]
+    assert load_kwargs.get("map_location") is seen["device"], (
+        "the checkpoint was mapped onto a device run_job built for itself "
+        "rather than the one get_device returned for the job's --device; on a "
+        "CUDA-less machine both are CPU, so no tensor can show it "
+        f"(asked for {seen['device']}, got {load_kwargs.get('map_location')})")
+
+
+def test_the_evaluated_model_is_the_trained_one_and_is_in_eval_mode(
+    tmp_path, small_buffer, monkeypatch
+):
+    """NOTHING required the evaluated model to be the TRAINED model.
+
+    `run_job` builds a fresh `WorldModel` at the eval site, loads the
+    checkpoint, validates its arm and seed -- and then
+    `model.load_state_dict(checkpoint["state_dict"])` could be deleted
+    (`_ = checkpoint["state_dict"]`) and all 524 tests still passed. Under that
+    mutation every number in all nine records -- probes, rollout, reward, both
+    filtering diagnostics -- describes a RANDOMLY INITIALISED network, while
+    the checkpoint is dutifully opened, checked against the job's arm and seed,
+    and thrown away. The arm/seed guard would still swear the right checkpoint
+    was used. That is the worst defect this file can carry: the study's only
+    artifact becomes noise and nothing in it looks wrong.
+
+    So the check is on the VALUES, not on a call: a spy on `load_state_dict`
+    would be satisfied by a call whose effect is discarded. After `run_job` the
+    evaluation model's own tensors must equal the checkpoint's.
+
+    CHECK-IT-CAN-FAIL. A weights comparison is worthless if a fresh
+    initialisation would satisfy it anyway -- and here the eval model is
+    constructed from the same seeded config the trainer used, so its fresh
+    weights are exactly what the mutant would leave in place. `moved` below is
+    the set of tensors training actually changed, measured in this fixture, and
+    the assertion is required to have a large one. Measured: 30 of 36 tensors
+    differ (max |fresh - trained| = 0.087 on `encoder.bottleneck.bias`); the 6
+    that do not are `rssm.prior_net.*`, the dynamics prior this tiny fixture
+    leaves untrained -- which is exactly why a comparison on ONE arbitrarily
+    chosen parameter could have been vacuous.
+
+    `model.eval()` is pinned here too, and had no assertion at all: deleting it
+    scores all nine cells with training-mode behaviour active, which is
+    nondeterministic and not comparable across arms.
+
+    ITS CHECK-IT-CAN-FAIL IS THE SUBTLE ONE, and the obvious assertion is
+    vacuous. `model.training is False` AFTER `run_job` cannot fail no matter
+    what this module does, because `evaluate_rollout` calls `model.eval()` for
+    itself (`mbfps/eval/rollout.py:109`) on its way past -- deleting
+    `study.py`'s own call leaves the model in eval mode by the time `run_job`
+    returns, and the mutant survives the check. What it does NOT survive is
+    being asked about the mode at the moment each consumer is CALLED:
+    `fit_probes` and `reward_accuracy` run before `evaluate_rollout` and would
+    be handed a model still in training mode. So the flag is sampled per call
+    site, below, and the rollout's own self-defence is what proves the
+    difference between the two forms of the assertion.
+    """
+    import torch
+
+    real_world_model = study.WorldModel
+    built: dict = {}
+    mode_at_call: dict[str, bool] = {}
+
+    def model_spy(cfg):
+        model = real_world_model(cfg)
+        built["fresh"] = {k: v.detach().clone()
+                          for k, v in model.state_dict().items()}
+        built["model"] = model
+        return model
+
+    def mode_spy(name):
+        real = getattr(study, name)
+
+        def wrapper(*args, **kwargs):
+            mode_at_call[name] = args[0].training
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(study, name, wrapper)
+
+    monkeypatch.setattr(study, "WorldModel", model_spy)
+    for name in ("fit_probes", "reward_accuracy", "evaluate_rollout",
+                 "filtering_report", "filtering_gain"):
+        mode_spy(name)
+
+    run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+
+    assert "model" in built, "run_job never built an evaluation model"
+    # `nn.Module.to()` mutates in place and returns self, so this is the very
+    # object every evaluation below was handed.
+    model = built["model"]
+    checkpoint = torch.load(
+        tmp_path / f"world_model_{JOB_ARM}_seed{JOB_SEED}.pt",
+        map_location="cpu", weights_only=True,
+    )
+    trained = checkpoint["state_dict"]
+    fresh, evaluated = built["fresh"], model.state_dict()
+    assert set(trained) == set(fresh) == set(evaluated) and trained, (
+        "the checkpoint and the evaluation model do not even name the same "
+        "tensors, so nothing below compares what it claims to")
+
+    moved = sorted(k for k in trained if not torch.equal(fresh[k], trained[k]))
+    assert len(moved) > len(trained) // 2, (
+        "training barely moved this fixture's weights, so a freshly "
+        "initialised model would satisfy the comparison below and it could "
+        f"not fail: only {len(moved)} of {len(trained)} tensors differ")
+
+    for key in trained:
+        assert torch.equal(evaluated[key], trained[key]), (
+            f"the evaluated model's {key!r} is not the checkpoint's -- the "
+            "trained weights never reached the model that produced this "
+            "record, so every number in it describes a different network")
+
+    assert set(mode_at_call) == {"fit_probes", "reward_accuracy",
+                                 "evaluate_rollout", "filtering_report",
+                                 "filtering_gain"}, (
+        f"not every evaluation was observed: {sorted(mode_at_call)}")
+    for name, training in mode_at_call.items():
+        assert training is False, (
+            f"{name} was handed a model in TRAINING mode, so this cell was "
+            "scored with training-time behaviour active -- nondeterministic, "
+            "and not comparable with the other eight")
+    # Check-it-can-fail, stated as an assertion so it cannot rot: the rollout
+    # sets eval mode itself, so it is NOT among the call sites that can catch
+    # a deleted `model.eval()`, and neither is the post-hoc flag below.
+    from mbfps.eval import rollout as rollout_module
+
+    assert "model.eval()" in inspect.getsource(rollout_module.evaluate_rollout), (
+        "evaluate_rollout no longer sets eval mode itself; the note above "
+        "about why the post-hoc check is vacuous needs revisiting")
+    assert model.training is False, (
+        "the evaluation model was left in training mode -- note this last "
+        "check is the WEAK form and passes even with study.py's own eval() "
+        "deleted; the per-call-site loop above is what guards the mutation")
+
+
+def test_the_training_config_gets_the_budget_and_window_the_job_ran_at(
+    tmp_path, small_buffer, monkeypatch
+):
+    """`get_config(..., steps=steps, seq_len=seq_len, ...)` had NO spy.
+
+    Exchanging those two keyword values survived the whole suite. The record
+    echoes `run_job`'s own PARAMETERS, never `cfg`, so `record["steps"] ==
+    JOB_KW["steps"]` passes just as happily on a config that trained at the
+    wrong budget. In the real study the mutant trains every cell at steps=64,
+    seq_len=20000 -- a 312-times-shorter run on 312-times-longer sequences --
+    while all nine records report 20000/64 and nothing else ever looks.
+
+    The two values are pairwise-distinct fixture parameters (5 and 4), asserted
+    below, so the exchange genuinely moves both assertions. The last two
+    assertions are the ones that close the loop the record leaves open: the
+    reported numbers must be the CONFIG's, not merely the arguments.
+    """
+    assert JOB_KW["steps"] != JOB_KW["seq_len"], (
+        "these two read the same number here, so exchanging them at the "
+        "get_config call site is invisible to this test")
+
+    real_get_config = study.get_config
+    seen: dict = {}
+
+    def config_spy(arm, **overrides):
+        cfg = real_get_config(arm, **overrides)
+        seen["arm"] = arm
+        seen["overrides"] = overrides
+        seen["cfg"] = cfg
+        return cfg
+
+    monkeypatch.setattr(study, "get_config", config_spy)
+
+    record = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+
+    assert seen, "run_job never built a training config"
+    assert seen["overrides"].get("steps") == JOB_KW["steps"], (
+        "the training budget that reached get_config is not the job's")
+    assert seen["overrides"].get("seq_len") == JOB_KW["seq_len"], (
+        "the sequence length that reached get_config is not the job's")
+    assert seen["cfg"].train.steps == JOB_KW["steps"]
+    assert seen["cfg"].train.seq_len == JOB_KW["seq_len"]
+    assert seen["cfg"].train.seed == JOB_SEED
+    assert seen["arm"] == JOB_ARM
+    assert record["steps"] == seen["cfg"].train.steps, (
+        "the record reports a budget the model was not trained at")
+    assert record["seq_len"] == seen["cfg"].train.seq_len, (
+        "the record reports a sequence length the model was not trained at")
+
+
+def test_the_recorded_seconds_cover_the_training_they_are_meant_to_price(
+    tmp_path, small_buffer, monkeypatch
+):
+    """`record["seconds"] > 0.0` is a textbook vacuous assertion.
+
+    It was the only thing said about the field, and it cannot fail for ANY
+    placement of `started = time.perf_counter()`. Moving that line BELOW the
+    `train_world_model` call survived the suite while making `seconds` the
+    duration of the EVALUATION alone -- seconds of arithmetic reported for a
+    cell that cost ~3.5 hours on the rented GPU, in the study's own cost
+    record and its only evidence of what the nine runs were worth.
+
+    So the trainer is made to take a known, extra half second and the record is
+    required to have counted it. The naive form of this test would be
+    `seconds > SLEEP`; the first assertion below shows why that is not enough
+    -- the evaluation of this fixture alone already outlasts SLEEP, so the
+    mutant would pass it. What separates them is the MARGIN over the
+    evaluation-only stretch, which is the whole of training under the honest
+    line and is nothing at all under the mutant.
+    """
+    sleep_for = 0.5
+    real_train = study.train_world_model
+    marks: dict = {}
+
+    def slow_train(cfg, buffer, out_dir, log_every=100):
+        history = real_train(cfg, buffer, out_dir=out_dir, log_every=log_every)
+        time.sleep(sleep_for)
+        marks["train_returned"] = time.perf_counter()
+        return history
+
+    monkeypatch.setattr(study, "train_world_model", slow_train)
+
+    record = run_job(JOB, small_buffer, tmp_path, **JOB_KW)
+    returned_at = time.perf_counter()
+
+    assert "train_returned" in marks, "the stand-in trainer never ran"
+    evaluation_only = returned_at - marks["train_returned"]
+    assert evaluation_only > sleep_for, (
+        "the evaluation is shorter than the sleep, so `seconds > sleep_for` "
+        "would already tell the two timer placements apart and this test is "
+        "not measuring what it claims to")
+    assert record["seconds"] - evaluation_only > sleep_for / 2, (
+        "`seconds` excludes the training it is supposed to price: it is "
+        f"{record['seconds']:.3f}s against {evaluation_only:.3f}s of "
+        "evaluation, so the timer starts after train_world_model returns")
 
 
 def test_the_evaluation_holds_out_exactly_what_training_held_out(
