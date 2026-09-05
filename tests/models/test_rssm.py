@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from mbfps.models.rssm import LATENT_DIM, RSSM, RSSMConfig, kl_loss
+from mbfps.models.rssm import KL_FREE_BITS, LATENT_DIM, RSSM, RSSMConfig, _categorical_kl, kl_loss
 
 B, T = 3, 7
 
@@ -344,4 +344,161 @@ def test_dyn_scale_and_rep_scale_control_independent_gradients():
     )
     assert grad_post_2.item() == pytest.approx(grad_post_1.item(), rel=1e-4), (
         "raising dyn_scale must not change post's gradient"
+    )
+
+
+def test_categorical_kl_matches_a_hand_computed_value():
+    """Pins `_categorical_kl` against an arithmetic-by-hand answer for a small,
+    deliberately ASYMMETRIC case: 1 batch, 1 time step, 2 categorical groups of
+    3 classes. `q` = [1,2,3]/6 and [4,1,1]/6 against a uniform `p`.
+
+    Every existing test in this file only checks relative properties (zero
+    when equal, positive when different, ordered by free bits, weighted
+    linearly, gradients on the right side) -- none of them pin the KL to an
+    actual number. That leaves two defects invisible to the whole suite:
+
+    1. SUM vs MEAN over the 32 (here 2) categorical groups.
+       `_categorical_kl` sums `per_group` over groups before averaging over
+       batch/time; replacing that `.sum(-1)` with `.mean(-1)` divides every
+       KL by the group count. For this case that is 0.3182570841 / 2 =
+       0.1591285, over 1e-5 away from the pinned value below -- caught.
+       In the real model (32 groups) the same mutation divides the measured
+       ~0.33 KL by 32 down to ~0.010, which never clears the 0.20 free-bits
+       floor and silently zeroes `prior_net`'s gradient for the entire run.
+
+    2. DIRECTION. `_categorical_kl(logits_q, logits_p)` must compute
+       KL(q || p), not KL(p || q). Because `q` and `p` are NOT symmetric
+       here, the two directions give different numbers -- KL(q||p) =
+       0.3182570841 (0.3182570934 in fp32) vs the reversed KL(p||q) =
+       0.3269430 -- a ~0.0087 gap, so a tolerance of 1e-6 tells them apart.
+       A mutation that swaps which argument plays `q` and which plays `p`
+       inside `_categorical_kl` produces the reversed number and fails the
+       first assertion below; the second assertion checks the reversed call
+       explicitly so the direction is pinned both ways, not just implied.
+
+    Hand computation for the forward direction (KL(q||p), p uniform so
+    KL = sum_i q_i * ln(3 * q_i)):
+        group 1: 1/6*ln(1/2) + 2/6*ln(1) + 3/6*ln(3/2) = 0.0872083
+        group 2: 4/6*ln(2)   + 1/6*ln(1/2)*2           = 0.2310491
+        total  = 0.3182574  (0.3182570841 to higher precision)
+    """
+    q = torch.tensor([[1.0, 2.0, 3.0], [4.0, 1.0, 1.0]]) / 6.0
+    logits_q = torch.log(q).unsqueeze(0).unsqueeze(0)  # (B=1, T=1, groups=2, classes=3)
+    logits_p = torch.zeros_like(logits_q)  # uniform p
+
+    forward = _categorical_kl(logits_q, logits_p)
+    reverse = _categorical_kl(logits_p, logits_q)
+
+    assert forward.item() == pytest.approx(0.3182570934, abs=1e-6), (
+        "KL(q||p) does not match the hand-computed value -- check for a "
+        "sum-vs-mean change over the categorical groups"
+    )
+    assert reverse.item() == pytest.approx(0.3269430, abs=1e-6), (
+        "the reversed KL(p||q) does not match its own hand-computed value"
+    )
+    assert forward.item() != pytest.approx(reverse.item(), abs=1e-6), (
+        "forward and reverse KL must differ for this asymmetric q, p -- "
+        "if they match, _categorical_kl is not sensitive to argument order"
+    )
+
+
+def test_kl_free_bits_default_is_the_calibrated_0_20_not_the_rejected_1_0():
+    """`KL_FREE_BITS` is the module's default `free_bits`, and the training
+    loop calls `kl_loss(post, prior)` with NO override -- so this constant,
+    not any value used in the tests above (which all pass `free_bits`
+    explicitly), is what actually gates gradient to `prior_net` in training.
+    1.0 is the DreamerV3 value this project measured and explicitly
+    rejected (see `KL_FREE_BITS`'s docstring: at 1.0, `prior_net` gets
+    gradient on only 1 of 9 sampled steps).
+
+    Pins the constant directly, then exercises its live effect on the bare
+    call path (only the two logit arguments, exactly as production calls
+    it) against two literal, non-`KL_FREE_BITS`-derived comparisons -- so a
+    mutation to the constant is caught even if it were left wired correctly
+    into the `kl_loss` signature.
+    """
+    assert KL_FREE_BITS == pytest.approx(0.20, abs=1e-9)
+
+    near = _logits(peak=0.01)
+    other = _logits(peak=0.0)
+    bare, _ = kl_loss(near, other)  # only the two logit arguments
+    at_020, _ = kl_loss(near, other, free_bits=0.20)
+    at_100, _ = kl_loss(near, other, free_bits=1.00)
+
+    assert bare.item() == pytest.approx(at_020.item(), rel=1e-6), (
+        "the bare call does not match an explicit free_bits=0.20 -- "
+        "KL_FREE_BITS may not be 0.20"
+    )
+    assert bare.item() != pytest.approx(at_100.item(), rel=1e-6), (
+        "the bare call matches free_bits=1.00 -- KL_FREE_BITS looks like "
+        "the rejected DreamerV3 value"
+    )
+
+
+def test_kl_loss_default_scales_are_0_5_dyn_0_1_rep_not_swapped():
+    """The training loop calls `kl_loss(post, prior)` with no `dyn_scale` or
+    `rep_scale` override, so the two defaults (0.5, 0.1) are what actually
+    weights the loss. `dyn` and `rep` are numerically identical for any
+    fixed `post`/`prior` pair (`.detach()` only cuts gradient, never changes
+    a forward value -- see `test_dyn_scale_and_rep_scale_control_independent_
+    gradients`), so a loss-value comparison cannot tell 0.5/0.1 apart from a
+    swapped 0.1/0.5 default. Gradients can: `dyn_scale` only ever reaches
+    `prior` (through the `dyn` term) and `rep_scale` only ever reaches
+    `post` (through the `rep` term).
+
+    The bare call's gradients must match an explicit `dyn_scale=0.5,
+    rep_scale=0.1` call and must NOT match an explicit swapped
+    `dyn_scale=0.1, rep_scale=0.5` call.
+    """
+    post = _logits(peak=4.0).requires_grad_(True)
+    prior = _logits(peak=0.0).requires_grad_(True)
+
+    bare_loss, _ = kl_loss(post, prior, free_bits=0.0)  # only the two logit arguments (+ free_bits=0 to isolate scales)
+    grad_prior_bare = torch.autograd.grad(bare_loss, prior, retain_graph=True)[0].abs().sum()
+    grad_post_bare = torch.autograd.grad(bare_loss, post, retain_graph=True)[0].abs().sum()
+
+    matched_loss, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=0.5, rep_scale=0.1)
+    grad_prior_matched = torch.autograd.grad(matched_loss, prior, retain_graph=True)[0].abs().sum()
+    grad_post_matched = torch.autograd.grad(matched_loss, post, retain_graph=True)[0].abs().sum()
+
+    swapped_loss, _ = kl_loss(post, prior, free_bits=0.0, dyn_scale=0.1, rep_scale=0.5)
+    grad_prior_swapped = torch.autograd.grad(swapped_loss, prior, retain_graph=True)[0].abs().sum()
+    grad_post_swapped = torch.autograd.grad(swapped_loss, post, retain_graph=True)[0].abs().sum()
+
+    assert grad_prior_bare.item() == pytest.approx(grad_prior_matched.item(), rel=1e-5), (
+        "prior's gradient under the bare call does not match dyn_scale=0.5 -- "
+        "the default dyn_scale may not be 0.5"
+    )
+    assert grad_post_bare.item() == pytest.approx(grad_post_matched.item(), rel=1e-5), (
+        "post's gradient under the bare call does not match rep_scale=0.1 -- "
+        "the default rep_scale may not be 0.1"
+    )
+    assert grad_prior_bare.item() != pytest.approx(grad_prior_swapped.item(), rel=1e-3), (
+        "prior's gradient under the bare call matches the SWAPPED "
+        "dyn_scale=0.1 -- the defaults look swapped"
+    )
+    assert grad_post_bare.item() != pytest.approx(grad_post_swapped.item(), rel=1e-3), (
+        "post's gradient under the bare call matches the SWAPPED "
+        "rep_scale=0.5 -- the defaults look swapped"
+    )
+
+
+def test_free_bits_floor_applies_to_rep_independently_of_dyn():
+    """The floor must clamp `dyn` and `rep` INDEPENDENTLY. Replacing
+    `rep_scale * torch.maximum(rep, floor)` with plain `rep_scale * rep`
+    would let `rep` be driven all the way to zero -- collapsing the
+    posterior into the prior on the representation side -- while `dyn`'s own
+    floor still holds, so it is invisible to any test that leaves `dyn_scale`
+    at its default (0.5 dominates the sum and is still correctly floored).
+
+    Isolates `rep` with `dyn_scale=0.0, rep_scale=1.0`, mirroring how
+    `test_kl_balancing_stops_gradients_on_the_right_side` isolates `dyn`
+    with `dyn_scale=1.0, rep_scale=0.0`.
+    """
+    near = _logits(peak=0.01)
+    other = _logits(peak=0.0)
+    clamped, _ = kl_loss(near, other, free_bits=1.0, dyn_scale=0.0, rep_scale=1.0)
+    unclamped, _ = kl_loss(near, other, free_bits=0.0, dyn_scale=0.0, rep_scale=1.0)
+    assert unclamped.item() < clamped.item(), (
+        "rep does not appear to be floored independently of dyn"
     )

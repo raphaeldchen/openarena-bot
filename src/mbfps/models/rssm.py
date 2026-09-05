@@ -210,6 +210,21 @@ def kl_loss(
     Free bits clamp each term at `free_bits` nats. Below that floor the KL is
     not optimised at all, which is what prevents posterior collapse -- without
     it the cheapest way to cut the loss is to make the posterior carry nothing.
+
+    **The clamp is applied to the BATCH-AND-TIME MEAN of each term, not
+    per-(batch, time) element as DreamerV3 does.** `_categorical_kl` already
+    reduces to a scalar (summed over the 32 groups, averaged over B and T)
+    before `dyn`/`rep` ever reach `torch.maximum(..., floor)`, so a single
+    step with a very low KL can still contribute gradient as long as the
+    batch mean clears the floor, and conversely a batch mean below the floor
+    zeroes gradient for every step in it, not just the low ones. This is
+    DELIBERATE, not an oversight: `KL_FREE_BITS = 0.20` above was calibrated
+    against exactly this batch-mean clamp (measured on the real dataset, see
+    that constant's docstring). Changing this to clamp per (batch, time)
+    element instead -- which looks like a faithful DreamerV3 port and is a
+    tempting "fix" -- changes the fraction of steps that clear the floor and
+    silently invalidates the 0.20 calibration; a per-element clamp needs its
+    own free-bits value re-measured from scratch, not 0.20 carried over.
     """
     dyn = _categorical_kl(post_logits.detach(), prior_logits)
     rep = _categorical_kl(post_logits, prior_logits.detach())
