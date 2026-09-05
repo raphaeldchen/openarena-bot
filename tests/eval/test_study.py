@@ -391,8 +391,16 @@ def test_every_evaluation_runs_at_the_jobs_seed_and_the_jobs_window(
     silently accepts its own defaults. A rollout evaluated at seed 0 while the
     model trained at seed 2 is not that cell's number, and a probe fit at a
     different filtering depth from the rollout it is applied to is a
-    distribution mismatch worth ~25 map units of position error."""
+    distribution mismatch worth ~25 map units of position error.
+
+    The job seed is 7, not 2: `JOB_KW["context"]` is 2, so at seed 2 the
+    `seed=` and `context=` assertions below both read 2 and exchanging the two
+    keyword VALUES at the call sites was a no-op this test could not see --
+    the same coincidence-of-fixture-values that hid the probe-ridge swap."""
     seen: dict[str, dict] = {}
+    assert 7 not in (JOB_KW["context"], JOB_KW["horizon"], JOB_KW["seq_len"]), (
+        "the job seed must not coincide with any window value, or a seed/"
+        "window exchange at the call sites is invisible here")
 
     def spy(name):
         real = getattr(study, name)
@@ -407,12 +415,12 @@ def test_every_evaluation_runs_at_the_jobs_seed_and_the_jobs_window(
                  "filtering_report", "filtering_gain", "episode_split"):
         spy(name)
 
-    run_job(StudyJob("random_vit", 2), small_buffer, tmp_path, **JOB_KW)
+    run_job(StudyJob("random_vit", 7), small_buffer, tmp_path, **JOB_KW)
 
     for name in ("fit_probes", "reward_accuracy", "evaluate_rollout",
                  "filtering_report", "filtering_gain"):
         assert name in seen, f"{name} was never called"
-        assert seen[name]["seed"] == 2, f"{name} did not get the job's seed"
+        assert seen[name]["seed"] == 7, f"{name} did not get the job's seed"
     for name in ("fit_probes", "evaluate_rollout", "filtering_report",
                  "filtering_gain"):
         assert seen[name]["context"] == JOB_KW["context"], name
@@ -536,14 +544,30 @@ def test_the_reward_limit_default_bounds_a_bare_call(small_buffer):
         "the bare default must score all three episodes, not a truncation")
 
 
-def test_the_record_reports_the_window_and_budget_the_job_ran_at(record):
+def test_the_record_reports_the_window_and_budget_the_job_ran_at(
+    tmp_path, small_buffer
+):
     """`"steps": 0`, `"seq_len": 0`, `"context": 0` and `"seconds": 0.0` all
     survived: the record is the study's only audit trail for the numbers each
-    cell ran at, and every one of them was write-only."""
-    assert record["steps"] == JOB_KW["steps"]
-    assert record["seq_len"] == JOB_KW["seq_len"]
-    assert record["context"] == JOB_KW["context"]
-    assert record["horizon"] == JOB_KW["horizon"]
+    cell ran at, and every one of them was write-only.
+
+    Run at FOUR DISTINCT values rather than the shared `record` fixture:
+    `JOB_KW` has `steps=3` and `horizon=3`, so exchanging those two fields in
+    the record is a numerical no-op and all four assertions below pass on a
+    record that misreports both. Four distinct values make every pairwise
+    exchange visible."""
+    distinct = dict(steps=5, seq_len=4, context=2, horizon=3, device="cpu")
+    assert len({v for k, v in distinct.items() if k != "device"}) == 4, (
+        "two of these coincide, so exchanging the matching pair of record "
+        "fields would be invisible to this test")
+
+    record = run_job(StudyJob("random_vit", 0), small_buffer, tmp_path,
+                     **distinct)
+
+    assert record["steps"] == distinct["steps"]
+    assert record["seq_len"] == distinct["seq_len"]
+    assert record["context"] == distinct["context"]
+    assert record["horizon"] == distinct["horizon"]
     assert record["split_seed"] == SPLIT_SEED
     assert record["seconds"] > 0.0
 
@@ -659,16 +683,31 @@ def test_the_record_reports_the_training_history_it_was_given(
     """Four surviving mutations at once, all in fields nothing asserted on:
     the KL rate and the KL peak exchanged (`kl_rate < 0.5` is what tells the
     gate a run trained no dynamics prior, and the peak read as a rate means
-    something else entirely), `loss_last20`'s `[-20:]` widened to the whole
-    history (invisible at steps=3, a convergence number replaced by a training
-    average at 20,000), and `steps / seconds` inverted."""
+    something else entirely), `loss_last20`'s `[-20:]` RESIZED in either
+    direction (invisible at steps=3, a convergence number replaced by a
+    training average -- or by a single noisy log point -- at 20,000), and
+    `steps / seconds` inverted.
+
+    The window is pinned in BOTH directions, which needs a non-constant tail.
+    A tail of `[1.0] * 20` only caught WIDENING: narrowing to `[-1:]` or
+    `[-2:]` has the same mean as `[-20:]` when every value in the tail is
+    equal, so the assertion could not see it and both mutants survived. With
+    twenty distinct values the four means are all different -- last 20 = 10.5,
+    last two = 19.5, last one = 20.0, whole history = 40.33 -- so any resizing
+    of the slice moves the number.
+    """
     real_train = study.train_world_model
+    tail = [float(i) for i in range(1, 21)]         # mean 10.5, last 20.0
+    assert len({float(np.mean(tail)), float(np.mean(tail[-2:])),
+                float(tail[-1])}) == 3, (
+        "a constant tail makes the loss_last20 assertion blind to a narrowed "
+        "window, which is the mutation this test exists to kill")
 
     def doctored(cfg, buffer, out_dir, log_every=100):
         history = real_train(cfg, buffer, out_dir=out_dir, log_every=log_every)
         history["steps"] = 1000
         history["seconds"] = 4.0
-        history["loss"] = [100.0] * 10 + [1.0] * 20
+        history["loss"] = [100.0] * 10 + tail
         history["kl_rate_above_free_bits"] = 0.25
         history["kl_dyn_max"] = 7.5
         return history
@@ -679,7 +718,7 @@ def test_the_record_reports_the_training_history_it_was_given(
     assert result["kl_rate_above_free_bits"] == pytest.approx(0.25)
     assert result["kl_dyn_max"] == pytest.approx(7.5)
     assert result["steps_per_second"] == pytest.approx(250.0)
-    assert result["loss_last20"] == pytest.approx(1.0)
+    assert result["loss_last20"] == pytest.approx(10.5)
 
 
 def test_the_record_carries_the_probe_settings_it_measured_with(
@@ -689,12 +728,26 @@ def test_the_record_carries_the_probe_settings_it_measured_with(
     probe's ridge under the other's name, all with a green suite -- no test
     looked inside `record["probe"]` at all. It is the block that tells "the
     band is degenerate because the probe is noise" from "the model sits on its
-    floor"."""
+    floor".
+
+    The two RIDGE assertions need a fixture that can tell the two probes
+    apart, and the honest fit cannot: measured here both probes select 1e7,
+    the top of `probe.RIDGES`, because at steps=3 neither generalises and the
+    maximum penalty always wins. While the two ridges are EQUAL, exchanging
+    them in `_probe_summary` is a numerical no-op and the assertions pass on a
+    swapped record. So the spy pins two DIFFERENT ridges on the real fits, and
+    a guard below fails loudly if that ever collapses again.
+    """
     real_fit = study.fit_probes
     seen: dict = {}
 
     def spy(*args, **kwargs):
         latent, embedding = real_fit(*args, **kwargs)
+        # Only the "ridge" key is overridden. `w`, `mean` and `scale` are the
+        # real fit and `apply_probe` never reads "ridge", so the rollout this
+        # record describes is byte-for-byte the honest one; all that changes
+        # is that the two reported penalties are now distinguishable.
+        latent["ridge"], embedding["ridge"] = 1e1, 1e5
         seen["latent"], seen["embedding"] = latent, embedding
         return latent, embedding
 
@@ -708,7 +761,12 @@ def test_the_record_carries_the_probe_settings_it_measured_with(
     }
     assert seen["latent"]["r2"] != seen["embedding"]["r2"], (
         "the two probes scored identically here, so a latent/embedding swap "
-        "would be invisible to this test")
+        "would be invisible to the two selection_r2 assertions below")
+    assert seen["latent"]["ridge"] != seen["embedding"]["ridge"], (
+        "the two probes report the SAME ridge here, so a latent/embedding "
+        "swap would be invisible to the two ridge assertions below -- which "
+        "is exactly the vacuous state this test was found in "
+        f"(both at {seen['latent']['ridge']})")
     assert probe["latent_ridge"] == seen["latent"]["ridge"]
     assert probe["latent_selection_r2"] == seen["latent"]["r2"]
     assert probe["embedding_ridge"] == seen["embedding"]["ridge"]

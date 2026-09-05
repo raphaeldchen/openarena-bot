@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from mbfps.data.buffer import ReplayBuffer
-from mbfps.data.split import episode_split
+from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.probe import filtering_gain, filtering_report, fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.summary import DEGENERATE, METRICS, metric_summary
@@ -134,7 +134,17 @@ def main() -> None:
     buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
     # Split seed fixed at 0, NOT args.seed: every arm and every seed must be
     # held out on the same episodes, matching train_world_model exactly.
-    train, val = episode_split(buffer.episode_paths(), val_fraction=0.2, seed=0)
+    #
+    # The FRACTION comes from the shared constant for the same reason, and this
+    # script is the third caller of that coupling. `train_world_model` and
+    # `study.run_job` already route through `VAL_FRACTION`; a bare `0.2` here
+    # meant that the day the constant moves, this script would score a
+    # checkpoint on a different held-out set from the one the study reported --
+    # silently, because both sides would still be disjoint and still sum to the
+    # whole. See `mbfps.data.split.VAL_FRACTION`.
+    train, val = episode_split(
+        buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=0
+    )
     backbone = encoder_backbone(cfg.encoder)
 
     # The probe MUST be fit at the same context/horizon the rollout evaluates

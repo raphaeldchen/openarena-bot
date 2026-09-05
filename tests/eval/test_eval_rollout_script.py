@@ -433,3 +433,50 @@ def test_main_produces_the_filtering_gain_beside_criterion_4(monkeypatch, capsys
         "the rollout's seed was not forwarded, so the gain is scored on a "
         "different draw from criterion 4"
     )
+
+
+def test_the_script_splits_at_the_shared_val_fraction(monkeypatch, capsys):
+    """The third caller of the VAL_FRACTION coupling.
+
+    `train_world_model` and `study.run_job` both route through
+    `mbfps.data.split.VAL_FRACTION`; this script held a bare `0.2` literal, so
+    the day the constant moves it would score a checkpoint on a different
+    held-out set from the one the study reported -- silently, because both
+    sides stay disjoint and still sum to the whole.
+
+    Asserting `captured == 0.2` would NOT catch that: it passes again the
+    moment someone re-hardcodes the literal. So the constant is moved to a
+    value no literal in this file equals, and the split is required to follow
+    it. The identity check pins that the script reads the shared name rather
+    than defining a same-valued one of its own.
+    """
+    import mbfps.data.split as split
+
+    assert script.VAL_FRACTION is split.VAL_FRACTION, (
+        "the script must read the shared constant, not its own copy")
+
+    captured: dict = {}
+    _stub_main_dependencies(
+        monkeypatch, [],
+        {"latent_r2": 0.42, "embedding_r2": 0.11, "latent_beats_embedding": True},
+    )
+
+    def split_spy(paths, **kwargs):
+        captured.update(kwargs)
+        return (["t0", "t1"], ["v0"])
+
+    monkeypatch.setattr(script, "episode_split", split_spy)
+    monkeypatch.setattr(script, "VAL_FRACTION", 0.375)
+    monkeypatch.setattr(sys, "argv", [
+        "eval_rollout.py", "--arm", "random_vit", "--checkpoint", "ckpt.pt",
+        "--device", "cpu",
+    ])
+
+    script.main()
+    capsys.readouterr()
+
+    assert captured["val_fraction"] == pytest.approx(0.375), (
+        "the script split at its own literal instead of the shared "
+        "VAL_FRACTION, so it can drift away from the study's held-out set")
+    # The split seed stays pinned at 0 and does NOT follow the job seed.
+    assert captured["seed"] == 0
