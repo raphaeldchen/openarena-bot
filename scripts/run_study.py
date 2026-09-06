@@ -34,6 +34,12 @@ both fields in the name precisely so two cells cannot collide, and checking the
 contents as well is what turns a mis-copied or mis-renamed file into a re-run
 instead of one cell being reported twice under two names.
 
+AND "DONE" IS ALSO NOT "DONE AT SOME OTHER CONFIGURATION". A complete record
+says what it was trained with, and a record from a three-step smoke run is a
+complete record: without the check below, nine of them turn the real 33-hour
+study into a no-op that exits 0, and the gate is then computed from three-step
+models. The driver REFUSES and stops -- see `stale_records`.
+
 FAILURE POLICY: ONE BAD CELL DOES NOT ABORT THE RUN. A job that raises is
 reported with its full traceback, counted, and the driver moves on to the next
 cell; the process exits non-zero at the end if any cell failed. The alternative
@@ -46,10 +52,19 @@ diagnosable in the morning. Nothing is lost by continuing either: NO RECORD IS
 WRITTEN FOR A FAILED CELL, so re-running the script picks up precisely the
 cells that failed. `KeyboardInterrupt` and `SystemExit` are deliberately not
 caught -- when a human does interrupt, they mean the whole run.
+
+`except Exception` IS THE WIDTH THE POLICY NEEDS. The headline example above --
+a missing feature cache for one arm -- raises `FileNotFoundError`, which is an
+`OSError` and neither a `RuntimeError` nor a `ValueError`. Narrowing this to
+the exception types we happen to have seen would let that arm's three cells
+take down the run the policy exists to protect.
 """
 
 import argparse
+import inspect
 import json
+import os
+import socket
 import sys
 import time
 import traceback
@@ -92,16 +107,47 @@ in the set on purpose: only `write_record` adds it, so a hand-made or
 half-converted JSON blob at a record path is treated as pending rather than
 mistaken for a finished 8.3-hour cell.
 
-The set is pinned against `run_job`'s actual output by
-`test_a_real_record_from_run_job_is_recognised_as_complete`. Drift in either
-direction is a disaster with no symptom: a key listed here that `run_job` never
-writes makes EVERY cell permanently pending, so the study re-runs from zero on
-every resume.
+DRIFT IN EITHER DIRECTION IS A DISASTER WITH NO SYMPTOM: a key listed here that
+`run_job` never writes makes EVERY cell permanently pending, so the study
+re-runs from zero on every resume; a key DROPPED from here lets a record short
+of that field count as a finished cell.
+
+The guards are deliberately not derived from this set. `EXPECTED_RECORD_KEYS`
+in `tests/eval/test_run_study.py` is an independent hand-written literal
+compared for EQUALITY, and the drift test compares this set for equality
+against a real `run_job` record. A guard parametrised over this collection
+would have shrunk with it: deleting a key deleted its own test case, and every
+one of `position`, `curves`, `filtering`, `reward` and `probe` could be removed
+with a green suite.
 """
+
+CONFIG_KEYS: tuple[str, ...] = ("steps", "seq_len", "context", "horizon")
+"""The fields that say what a record was trained with, not just which cell.
+
+`record_is_complete` answers "is this cell finished"; these answer "finished at
+the configuration we are asking for". See `stale_records`.
+"""
+
+_RUN_JOB_PARAMETERS = inspect.signature(run_job).parameters
+PROTOCOL_CONTEXT: int = _RUN_JOB_PARAMETERS["context"].default
+PROTOCOL_HORIZON: int = _RUN_JOB_PARAMETERS["horizon"].default
+"""`context` and `horizon` READ OFF `run_job`, never re-declared here.
+
+`main` deliberately has no `--context`/`--horizon` flags (see its docstring):
+`run_job` forwards one value to the probe fit, the rollout and both filtering
+diagnostics, and a second home for them in this file would let the nine records
+carry this script's stale copies. The staleness check needs to know what will
+be requested, so it asks the one home rather than starting a second one.
+"""
+
+LOCK_NAME = "study.lock"
+"""Name of the claim file inside `--out`; see `acquire_lock`."""
 
 EXIT_OK = 0
 EXIT_JOB_FAILED = 1
 EXIT_NO_DATA = 2
+EXIT_CONFIG_MISMATCH = 3
+EXIT_LOCKED = 4
 
 
 def _reject_nonstandard(constant: str):
@@ -120,6 +166,11 @@ def _get(record, *keys):
     Used by the printing path, which must never be the thing that kills a
     33-hour run: a record that is one field short should print `n/a` in that
     column, not raise a KeyError between cell three and cell four.
+
+    BOTH HALVES OF THE GUARD CARRY WEIGHT AND ARE TESTED ALONE. `key not in
+    node` covers the missing field; `not isinstance(node, dict)` covers a
+    record where a whole block has been replaced by a scalar or a `null`,
+    against which `key not in node` raises `TypeError` rather than answering.
     """
     node = record
     for key in keys:
@@ -134,28 +185,80 @@ def record_names_the_job(record, job: StudyJob) -> bool:
     return _get(record, "arm") == job.arm and _get(record, "seed") == job.seed
 
 
-def record_is_complete(path, job: StudyJob) -> bool:
-    """Whether `path` holds a finished record for `job`.
+def complete_record(path, job: StudyJob) -> dict | None:
+    """The parsed record at `path` if it is a finished one for `job`, else None.
 
-    False for: no file, a directory, an unreadable file, an empty file, JSON
-    that does not parse, JSON that is not an object, an object missing any of
-    `REQUIRED_RECORD_KEYS`, one carrying a non-standard NaN token, and one that
-    names a different arm or seed. Every one of those means the cell has to be
-    run; only a complete record for this exact cell is worth skipping.
+    None for: no file, a directory, an unreadable file, a file that is not
+    valid UTF-8, an empty file, JSON that does not parse, JSON that is not an
+    object, an object missing any of `REQUIRED_RECORD_KEYS`, one carrying a
+    non-standard NaN token, and one that names a different arm or seed. Every
+    one of those means the cell has to be run; only a complete record for this
+    exact cell is worth skipping.
+
+    The record itself is returned rather than a bool because the caller that
+    decides "already done" and the caller that decides "done at the requested
+    configuration" must read the same bytes and agree.
     """
     try:
         text = Path(path).read_text()
-    except OSError:
-        return False
+    except (OSError, ValueError):
+        # `UnicodeDecodeError` is a `ValueError`, NOT an `OSError`. One
+        # byte-damaged file among the nine must cost that one cell, not take
+        # the whole resume down at hour zero.
+        return None
     try:
         record = json.loads(text, parse_constant=_reject_nonstandard)
     except ValueError:  # JSONDecodeError, and _reject_nonstandard's ValueError
-        return False
+        return None
     if not isinstance(record, dict):
-        return False
+        return None
     if not REQUIRED_RECORD_KEYS <= set(record):
-        return False
-    return record_names_the_job(record, job)
+        return None
+    if not record_names_the_job(record, job):
+        return None
+    return record
+
+
+def record_is_complete(path, job: StudyJob) -> bool:
+    """Whether `path` holds a finished record for `job`."""
+    return complete_record(path, job) is not None
+
+
+def requested_config(steps: int, seq_len: int) -> dict:
+    """What this invocation is asking every cell to be trained at."""
+    return {"steps": steps, "seq_len": seq_len,
+            "context": PROTOCOL_CONTEXT, "horizon": PROTOCOL_HORIZON}
+
+
+def record_config_mismatch(record, config: dict) -> dict:
+    """`{key: (recorded, requested)}` for every `CONFIG_KEYS` that disagrees."""
+    return {key: (_get(record, key), config[key])
+            for key in CONFIG_KEYS
+            if _get(record, key) != config[key]}
+
+
+def stale_records(out_dir, arms, seeds, config: dict) -> list:
+    """`[(job, mismatch)]` for finished cells recorded at another configuration.
+
+    Only COMPLETE records are considered. An incomplete one is already pending
+    and will simply be re-run; calling it stale would turn one corrupt file
+    into a refusal to do anything at all.
+    """
+    stale: list[tuple[StudyJob, dict]] = []
+    seen: set[StudyJob] = set()
+    for arm in arms:
+        for seed in seeds:
+            job = StudyJob(arm, seed)
+            if job in seen:
+                continue
+            seen.add(job)
+            record = complete_record(job_record_path(out_dir, job), job)
+            if record is None:
+                continue
+            mismatch = record_config_mismatch(record, config)
+            if mismatch:
+                stale.append((job, mismatch))
+    return stale
 
 
 def _cost_key(job: StudyJob) -> tuple:
@@ -186,6 +289,32 @@ def pending_jobs(out_dir, arms=ARMS, seeds=SEEDS) -> list[StudyJob]:
     return sorted(jobs, key=_cost_key)
 
 
+def acquire_lock(out_dir):
+    """Claim `--out` for this process, or return None if someone already has.
+
+    Two drivers pointed at one `--out` both see all nine cells pending and both
+    run all nine: 66 GPU-hours instead of 33, racing on the same record and
+    checkpoint paths, with no warning in either log. `O_CREAT | O_EXCL` is the
+    cheapest thing that makes the second one say so.
+
+    A crashed run leaves the file behind. That is deliberate -- the file names
+    the pid, the host and the start time, so an operator can tell a live run
+    from a dead one, and the cost of being wrong is one `rm` against the cost
+    of silently paying for the study twice.
+    """
+    path = Path(out_dir) / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    with os.fdopen(handle, "w") as stream:
+        json.dump({"pid": os.getpid(), "host": socket.gethostname(),
+                   "started": datetime.now().isoformat(timespec="seconds")},
+                  stream)
+    return path
+
+
 def _fmt(value, spec: str = ".4f") -> str:
     """Format a number that may legitimately be non-finite, None, or missing.
 
@@ -197,6 +326,12 @@ def _fmt(value, spec: str = ".4f") -> str:
     `unsupported format string passed to NoneType.__format__`, and raising in
     the per-job print would kill the loop after the record was safely written
     and lose every cell that had not started yet.
+
+    THE `try` IS NOT DECORATION AND EACH HALF IS TESTED ALONE. `float("n/a")`
+    raises `ValueError` and `float(["a"])` raises `TypeError`; a record hand-
+    edited or half-converted can hold either where a number belongs, and this
+    function exists precisely so that the per-cell print cannot be the thing
+    that ends an unattended run.
     """
     if value is None:
         return "n/a"
@@ -257,6 +392,26 @@ def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
     return "\n".join(lines)
 
 
+def stale_report(stale: list, out_dir) -> str:
+    """What the operator sees instead of a 33-hour run that does nothing."""
+    lines = [
+        f"CONFIGURATION MISMATCH: {len(stale)} finished record(s) in {out_dir} "
+        "were produced at a different configuration.",
+        "Skipping them would report those cells at settings nobody asked for; "
+        "re-running them would overwrite the study's only artifact. "
+        "Refusing instead.",
+    ]
+    for job, mismatch in stale:
+        detail = "  ".join(
+            f"{key}: recorded {recorded!r} != requested {wanted!r}"
+            for key, (recorded, wanted) in sorted(mismatch.items()))
+        lines.append(f"  {job.arm}/s{job.seed}  {detail}")
+    lines.append(
+        "Remedy: point --out somewhere else, or delete those records, or ask "
+        "for the configuration they were run at.")
+    return "\n".join(lines)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # --data and --out stay STRINGS. Everything downstream takes a str
@@ -269,7 +424,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--arms", nargs="*", choices=ARMS, default=list(ARMS))
-    parser.add_argument("--seeds", nargs="*", type=int, default=list(SEEDS))
+    # `--seeds` is restricted exactly as `--arms` is. A shell typo -- `--seeds
+    # 10` -- otherwise buys a night of a rented box training a tenth cell the
+    # aggregation will never look at, and exits 0.
+    parser.add_argument("--seeds", nargs="*", type=int, choices=SEEDS,
+                        default=list(SEEDS))
     return parser
 
 
@@ -282,12 +441,30 @@ def main(argv=None) -> int:
     second home for the study's evaluation protocol -- the day `run_job`'s
     defaults move, the nine records would still carry this file's stale ones.
     """
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    # `nargs="*"` accepts the flag with no values at all, which selects nothing
+    # and would print "0 job(s) pending", exit 0, and look like a finished
+    # study to any wrapper.
+    if not args.arms:
+        parser.error("--arms was given no values, so no cell would run")
+    if not args.seeds:
+        parser.error("--seeds was given no values, so no cell would run")
 
     jobs = pending_jobs(args.out, tuple(args.arms), tuple(args.seeds))
     listing = ", ".join(f"{j.arm}/s{j.seed}" for j in jobs) or "none"
     print(f"{datetime.now().isoformat(timespec='seconds')} "
           f"{len(jobs)} job(s) pending: {listing}", flush=True)
+
+    # Before the "nothing to do" return, or nine smoke records still exit 0;
+    # and before `ReplayBuffer`, so this fails in the first second rather than
+    # the thirty-third hour.
+    config = requested_config(args.steps, args.seq_len)
+    stale = stale_records(args.out, tuple(args.arms), tuple(args.seeds), config)
+    if stale:
+        print(stale_report(stale, args.out), flush=True)
+        return EXIT_CONFIG_MISMATCH
+
     if not jobs:
         # Return before touching --data: a finished study must not depend on
         # the episodes still being on the box, and `ReplayBuffer` would create
@@ -295,6 +472,26 @@ def main(argv=None) -> int:
         print(f"nothing to do; all records already in {args.out}")
         return EXIT_OK
 
+    lock = acquire_lock(args.out)
+    if lock is None:
+        held = Path(args.out) / LOCK_NAME
+        try:
+            holder = held.read_text()
+        except OSError:
+            holder = "<unreadable>"
+        print(f"another driver already holds {held}: {holder}\n"
+              "Two drivers on one --out run all nine cells twice -- 66 "
+              "GPU-hours instead of 33, racing on the same paths. If no run "
+              f"is alive, delete {held} and start again.", flush=True)
+        return EXIT_LOCKED
+    try:
+        return _run(args, jobs)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _run(args, jobs: list[StudyJob]) -> int:
+    """The loop itself, with `--out` already claimed by `acquire_lock`."""
     buffer = ReplayBuffer(args.data, capacity_transitions=BUFFER_CAPACITY)
     if not buffer.episode_paths():
         # Fail on the first second rather than the thirty-third hour: with no
@@ -313,7 +510,9 @@ def main(argv=None) -> int:
                              seq_len=args.seq_len, device=args.device)
         except Exception:
             # Not `BaseException`: KeyboardInterrupt and SystemExit mean the
-            # human wants the whole run stopped, not this cell skipped.
+            # human wants the whole run stopped, not this cell skipped. And
+            # not a narrower tuple: a missing feature cache -- the policy's own
+            # headline example -- is a `FileNotFoundError`.
             failed.append(job)
             print(f"  FAILED after {time.perf_counter() - started:.1f}s; "
                   "no record written, so a re-run picks this cell up again",
@@ -335,6 +534,8 @@ def main(argv=None) -> int:
     done = len(jobs) - len(failed)
     print(f"\n{done}/{len(jobs)} job(s) completed; records in {args.out}")
     if failed:
+        # `failed`, not `jobs`: the morning's first question is which cells to
+        # retry, and a list naming all nine answers it wrongly.
         print("FAILED: " + ", ".join(f"{j.arm}/s{j.seed}" for j in failed)
               + " -- re-run this script to retry exactly those cells")
         return EXIT_JOB_FAILED
