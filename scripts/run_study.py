@@ -145,9 +145,22 @@ LOCK_NAME = "study.lock"
 
 EXIT_OK = 0
 EXIT_JOB_FAILED = 1
-EXIT_NO_DATA = 2
 EXIT_CONFIG_MISMATCH = 3
 EXIT_LOCKED = 4
+EXIT_NO_DATA = 5
+"""The five statuses an unattended run can end on. All distinct, and NONE OF
+THEM IS 2.
+
+2 is argparse's own usage status: `--data` misspelt, `--arms cnn2`, `--seeds`
+with no values -- `parser.error` exits 2 and there is no way to stop it. This
+file used to number `EXIT_NO_DATA` 2 as well, so a wrapper reading the status
+of an overnight run could not tell "I typed the flag wrong and nothing ran" from
+"the box mounted the wrong volume and there are no episodes". Those want
+opposite responses -- fix the command line, versus go and find the data -- and
+distinguishing them is the entire reason these codes exist, since nobody is
+watching the log they would otherwise have to read. 2 is therefore left to
+argparse and the study's own statuses are numbered around it.
+"""
 
 
 def _reject_nonstandard(constant: str):
@@ -477,7 +490,16 @@ def main(argv=None) -> int:
         held = Path(args.out) / LOCK_NAME
         try:
             holder = held.read_text()
-        except OSError:
+        except (OSError, ValueError):
+            # `UnicodeDecodeError` is a `ValueError`, NOT an `OSError` -- the
+            # same distinction `complete_record` above turns on, and this read
+            # got it wrong in the commit that fixed it there. The lock is
+            # written by a process that can be killed mid-write and read by a
+            # second driver that is about to be told to go away: a byte-damaged
+            # claim file must produce the refusal message with an unreadable
+            # holder, not a traceback out of `main` that says nothing about the
+            # lock at all and leaves the operator with a crashed second driver
+            # to diagnose instead of a one-line "someone else holds this".
             holder = "<unreadable>"
         print(f"another driver already holds {held}: {holder}\n"
               "Two drivers on one --out run all nine cells twice -- 66 "

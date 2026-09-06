@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ from mbfps.eval.study import (
     to_json_record,
     write_record,
 )
-from mbfps.utils.config import ARMS
+from mbfps.utils.config import ARMS, Config
 
 _SPEC = importlib.util.spec_from_file_location(
     "run_study", Path(__file__).resolve().parents[2] / "scripts" / "run_study.py")
@@ -196,6 +197,33 @@ two are training diagnostics printed in the log, and a record without them is
 still a finished cell. Naming them here is what lets the drift guard below be
 an EQUALITY against a real record instead of a subset test.
 """
+
+# ---------------------------------------------------------------------------
+# THE EXIT STATUSES, ALSO WRITTEN OUT INDEPENDENTLY.
+#
+# Nobody is watching the 33-hour run, so the process status is what a wrapper,
+# an `&&` or a CI step actually reads. `EXIT_NO_DATA` used to be 2 -- which is
+# argparse's own usage status, and not ours to reuse -- so `--data` misspelt
+# and a box that mounted no episodes were indistinguishable to everything
+# downstream, and those two want opposite responses.
+#
+# Hand-written literals compared for EQUALITY, like `EXPECTED_RECORD_KEYS`
+# above and for the same reason: a guard reading the driver's own constants
+# moves when they move, and renumbering one onto another would take its own
+# test case with it.
+# ---------------------------------------------------------------------------
+
+ARGPARSE_USAGE_STATUS = 2
+"""What `parser.error` exits with. Not ours to choose, and not ours to take."""
+
+EXPECTED_EXIT_STATUS = {
+    "EXIT_OK": 0,
+    "EXIT_JOB_FAILED": 1,
+    "EXIT_CONFIG_MISMATCH": 3,
+    "EXIT_LOCKED": 4,
+    "EXIT_NO_DATA": 5,
+}
+"""Every status `main` can return, spelled out. 2 is deliberately absent."""
 
 
 def _record_body(job: StudyJob, **overrides) -> dict:
@@ -412,6 +440,67 @@ def test_the_driver_uses_the_studys_own_arms_and_seeds():
         "only `write_record` adds this key, so requiring it is what stops a "
         "hand-made JSON blob at a record path from being mistaken for a "
         "finished 8.3-hour cell")
+
+
+def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
+    """THE WHOLE POINT OF THESE CODES IS AN UNATTENDED RUN.
+
+    `EXIT_NO_DATA` was 2, and so is argparse's usage status: `run_study.py
+    --dat runs/...` exited 2 and so did a run against a directory with no
+    episodes in it, so a wrapper could not tell "the command line was wrong and
+    nothing ran" from "the box has no data". Those want opposite responses --
+    fix the flag, versus go and find the episodes -- and the only person who
+    could tell them apart by reading the log is the one who is asleep.
+
+    Pinned against a hand-written literal rather than against the driver's own
+    constants, and by NAME SET as well as by value: an `EXIT_*` added later
+    without a line here is one that is free to land on 2 again, or on top of
+    another of the five.
+    """
+    actual = {name: getattr(run_study, name) for name in EXPECTED_EXIT_STATUS}
+    assert actual == EXPECTED_EXIT_STATUS, (
+        "an exit status was renumbered; every wrapper, `&&` and CI step that "
+        "reads this run's status reads these numbers")
+    assert len(set(actual.values())) == len(EXPECTED_EXIT_STATUS) == 5, (
+        "two statuses collide, so the run cannot say which thing went wrong")
+    assert ARGPARSE_USAGE_STATUS not in actual.values(), (
+        "this status belongs to argparse's own usage errors; a study status "
+        "sharing it makes a typo and a real failure the same event downstream")
+
+    declared = {name for name in vars(run_study) if name.startswith("EXIT_")}
+    assert declared == set(EXPECTED_EXIT_STATUS), (
+        "the driver's exit statuses and the ones pinned here have drifted "
+        "apart; an unpinned status is free to collide with argparse's 2 or "
+        f"with one of the others: {declared ^ set(EXPECTED_EXIT_STATUS)}")
+
+
+def test_the_parser_defaults_name_the_studys_own_directories():
+    """`--out` and `--data` were the two defaults nothing pinned.
+
+    `--steps`, `--seq-len` and `--device` are pinned by
+    `test_main_forwards_the_documented_defaults`; these two were not, and they
+    are exactly the pair the documented no-flag invocation depends on. A silent
+    drift in `--out` writes the nine records where the aggregation does not
+    read: the study looks unstarted, and the next resume pays for all 33 hours
+    again. A drift in `--data` points the driver at a directory with no
+    episodes, where every cell fails identically.
+    """
+    defaults = vars(run_study._parser().parse_args([]))
+    assert defaults["out"] == "runs/m3_study", (
+        "the nine records are the study's only artifact and this is where the "
+        "aggregation and the plan's own commands look for them")
+    assert defaults["data"] == "data/my_way_home"
+
+    # `--data` has a second home, and the two drifting apart would train the
+    # study on episodes nothing else in the codebase is configured to score.
+    data_root = next(f for f in fields(Config) if f.name == "data_root")
+    assert defaults["data"] == data_root.default, (
+        "the driver's default episode directory and `Config.data_root` "
+        "disagree; one of them is now pointing somewhere nothing else reads")
+
+    # Both stay `str` end to end -- see `pending_jobs`' own tolerance test.
+    assert isinstance(defaults["out"], str)
+    assert isinstance(defaults["data"], str)
 
 
 def test_required_record_keys_is_exactly_this_hand_written_set():
@@ -1074,7 +1163,11 @@ def test_main_stops_before_the_first_cell_when_there_are_no_episodes(
 
     status = run_study.main(["--data", str(empty), "--out", str(tmp_path / "s")])
 
-    assert status == run_study.EXIT_NO_DATA == 2
+    assert status == run_study.EXIT_NO_DATA == 5
+    assert status != ARGPARSE_USAGE_STATUS, (
+        "an empty --data used to exit 2, the same status argparse gives a "
+        "misspelt flag, so a wrapper could not tell the box having no episodes "
+        "from the command line being wrong")
     assert calls == []
     assert "no episodes" in capsys.readouterr().out
 
@@ -1102,7 +1195,7 @@ def test_main_refuses_an_arm_the_study_does_not_have(tmp_path, episode_dir):
     with pytest.raises(SystemExit) as excinfo:
         run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
                         "--arms", "cnn2"])
-    assert excinfo.value.code == 2
+    assert excinfo.value.code == ARGPARSE_USAGE_STATUS
 
 
 @pytest.mark.parametrize("argv", [
@@ -1124,7 +1217,10 @@ def test_main_refuses_a_selection_that_would_run_the_wrong_cells(
     with pytest.raises(SystemExit) as excinfo:
         run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
                         *argv])
-    assert excinfo.value.code == 2
+    assert excinfo.value.code == ARGPARSE_USAGE_STATUS
+    assert excinfo.value.code not in set(EXPECTED_EXIT_STATUS.values()), (
+        "argparse's usage status must stay clear of the study's own, or a "
+        "shell typo and a real failure are the same event to any wrapper")
 
 
 def test_the_script_exits_with_mains_status_when_run_as_a_script(tmp_path):
@@ -1148,8 +1244,12 @@ def test_the_script_exits_with_mains_status_when_run_as_a_script(tmp_path):
          "--data", str(empty), "--out", str(tmp_path / "s")],
         capture_output=True, text=True, env=env, timeout=600)
 
-    assert completed.returncode == run_study.EXIT_NO_DATA == 2, (
+    assert completed.returncode == run_study.EXIT_NO_DATA == 5, (
         f"stdout={completed.stdout!r}\nstderr={completed.stderr[-3000:]!r}")
+    assert completed.returncode != ARGPARSE_USAGE_STATUS, (
+        "a status argparse also uses could be produced by the interpreter "
+        "rejecting the command line, which would tell us nothing about "
+        "whether `main`'s return value reached the shell at all")
     assert "no episodes" in completed.stdout
 
 
@@ -1214,7 +1314,10 @@ def test_a_record_from_another_configuration_refuses_rather_than_skipping(
     assert status == run_study.EXIT_CONFIG_MISMATCH == 3
     assert calls == [], "a cell was trained despite the refusal"
     printed = capsys.readouterr().out
-    assert "CONFIGURATION MISMATCH" in printed
+    assert "CONFIGURATION MISMATCH: 1 finished record(s)" in printed, (
+        "one stale record, and the banner says so; the nine-record test below "
+        "is the other direction, and between them the count cannot be a "
+        "literal")
     assert f"{DONE_JOB.arm}/s{DONE_JOB.seed}" in printed
     assert f"{key}: recorded {CONFIG_MISMATCHES[key]!r} != requested" in printed
 
@@ -1257,6 +1360,11 @@ def test_nine_smoke_records_refuse_instead_of_reporting_a_finished_study(
         "the check has to run before the early return, or nine smoke records "
         "still exit 0")
     assert printed.count(f"recorded {SMOKE_STEPS!r} != requested") == 9
+    assert (f"CONFIGURATION MISMATCH: {len(ARMS) * len(SEEDS)} "
+            "finished record(s)") in printed, (
+        "the banner's count was the one part of the refusal nothing pinned, so "
+        "it could say 1 while listing nine; it is the number an operator reads "
+        "before deciding whether one file or the whole study is stale")
     assert "Remedy" in printed
     assert not gone.exists(), (
         "the refusal came after `ReplayBuffer` was asked for the episodes; it "
@@ -1304,10 +1412,14 @@ def test_an_incomplete_record_is_pending_rather_than_a_refusal(
     assert len(calls) == 9
 
 
-def test_only_the_selected_cells_are_checked_for_staleness(
-        tmp_path, episode_dir, monkeypatch):
+def test_only_the_selected_arms_are_checked_for_staleness(
+        tmp_path, episode_dir, monkeypatch, capsys):
     """A stale record for an arm this invocation is not running must not block
-    it -- otherwise one old file makes every future `--arms` run impossible."""
+    it -- otherwise one old file makes every future `--arms` run impossible.
+
+    Half of a compound contract. `--seeds` is left at all three here, so this
+    test says nothing about the seed argument; that is the test below.
+    """
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
     out = tmp_path / "study"
@@ -1317,8 +1429,117 @@ def test_only_the_selected_cells_are_checked_for_staleness(
     status = run_study.main(["--data", str(episode_dir), "--out", str(out),
                              "--arms", "frozen_ssl", *MATCHING_ARGV])
 
-    assert status == 0
+    assert status == run_study.EXIT_OK
     assert len(calls) == 3
+    assert "CONFIGURATION MISMATCH" not in capsys.readouterr().out
+
+    # THE CONTROL: the same directory with the record's own arm selected. The
+    # record really is stale, so a run that does look at it refuses. Without
+    # this, every assertion above would pass just as well against a staleness
+    # check that never found anything at all.
+    calls.clear()
+    assert run_study.main(["--data", str(episode_dir), "--out", str(out),
+                           "--arms", DONE_JOB.arm, *MATCHING_ARGV]
+                          ) == run_study.EXIT_CONFIG_MISMATCH
+    assert calls == []
+
+
+def test_only_the_selected_seeds_are_checked_for_staleness(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """THE OTHER HALF OF THE SAME CONTRACT, EXERCISED ALONE.
+
+    The arms test above varies `--arms` and leaves `--seeds` at all three, so
+    it could not see `stale_records` ignoring the seeds it was passed:
+    replacing its inner loop with a loop over the module-level `SEEDS` survived
+    the whole suite. `pending_jobs` pins both halves and its equivalent
+    mutation dies; this is the missing half of that pair.
+
+    What it costs is the targeted re-run. One cell died on the box, its
+    neighbour holds an old record from a different configuration, and `--seeds
+    1` -- the one-cell repair the resume exists to make possible -- refuses to
+    do anything at all because of a cell it was never asked to touch.
+
+    THE STALE RECORD'S ARM IS ONE THIS INVOCATION IS RUNNING, so nothing but
+    the seed selection can be what excludes it.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
+    stale = StudyJob("frozen_ssl", 2)
+    _write_matching(out, stale, steps=SMOKE_STEPS)
+    argv = ["--data", str(episode_dir), "--out", str(out),
+            "--arms", stale.arm, *MATCHING_ARGV]
+    selected = ("0", "1")
+    assert str(stale.seed) not in selected, (
+        "the stale record's seed must be the one left out, or this test is "
+        "asking whether a selected cell blocks the run")
+
+    status = run_study.main([*argv, "--seeds", *selected])
+
+    assert status == run_study.EXIT_OK
+    assert [c["job"] for c in calls] == [StudyJob(stale.arm, 0),
+                                         StudyJob(stale.arm, 1)]
+    assert "CONFIGURATION MISMATCH" not in capsys.readouterr().out
+
+    # THE CONTROL, same directory, only the seed selection widened to include
+    # the stale cell: it really is stale, and a run that selects it refuses.
+    calls.clear()
+    assert run_study.main([*argv, "--seeds", *selected, str(stale.seed)]
+                          ) == run_study.EXIT_CONFIG_MISMATCH
+    assert calls == [], "a cell was trained despite the refusal"
+    assert f"{stale.arm}/s{stale.seed}" in capsys.readouterr().out
+
+
+def test_a_repeated_arm_or_seed_is_reported_stale_only_once(tmp_path):
+    """`--arms frozen_ssl frozen_ssl` must not list one cell twice.
+
+    Cosmetic beside the seeds hole above, and it is the same asymmetry:
+    `pending_jobs`' dedup is tested and its deletion dies, `stale_records`'
+    was not and its deletion survived. A refusal that names nine cells as
+    eighteen is a refusal an operator has to count twice at 8am.
+    """
+    job = StudyJob("frozen_ssl", 0)
+    _write_matching(tmp_path, job, steps=SMOKE_STEPS)
+    config = run_study.requested_config(CLI_STEPS, CLI_SEQ_LEN)
+
+    stale = run_study.stale_records(
+        tmp_path, (job.arm, job.arm), (job.seed, job.seed), config)
+
+    assert [found for found, _ in stale] == [job]
+    assert stale[0][1] == {"steps": (SMOKE_STEPS, CLI_STEPS)}, (
+        "only `steps` was made wrong, so a mismatch naming any other field "
+        "means the fixture, not the driver, decided this")
+    report = run_study.stale_report(stale, tmp_path)
+    assert report.count(f"{job.arm}/s{job.seed}") == 1
+    assert "CONFIGURATION MISMATCH: 1 finished record(s)" in report
+
+
+def test_the_refusal_lists_a_cells_mismatched_fields_in_a_stable_order(
+        tmp_path):
+    """Nine cells times four fields, read by a human at 8am.
+
+    The order must not be whichever order `CONFIG_KEYS` happens to declare, or
+    the same four disagreements read differently between two runs of the same
+    command.
+    """
+    assert sorted(run_study.CONFIG_KEYS) != list(run_study.CONFIG_KEYS), (
+        "`CONFIG_KEYS` is now declared in alphabetical order, so this test can "
+        "no longer tell a sorted report from the insertion-ordered one and "
+        "dropping the sort would survive it")
+
+    job = DONE_JOB
+    _write_matching(tmp_path, job, **CONFIG_MISMATCHES)   # all four disagree
+    config = run_study.requested_config(CLI_STEPS, CLI_SEQ_LEN)
+
+    stale = run_study.stale_records(tmp_path, (job.arm,), (job.seed,), config)
+    report = run_study.stale_report(stale, tmp_path)
+
+    detail, = [line for line in report.splitlines()
+               if f"{job.arm}/s{job.seed}" in line]
+    assert detail == "  {}/s{}  {}".format(job.arm, job.seed, "  ".join(
+        f"{key}: recorded {CONFIG_MISMATCHES[key]!r} != requested "
+        f"{config[key]!r}"
+        for key in sorted(CONFIG_MISMATCHES)))
 
 
 # ---------------------------------------------------------------------------
@@ -1346,6 +1567,67 @@ def test_a_second_driver_on_the_same_out_refuses_to_start(
         "the message must name who holds it, or an operator cannot tell a "
         "live run from a crashed one and will not dare delete the file")
     assert held.read_bytes(), "the claim must survive the refusal"
+
+
+def test_a_byte_damaged_lock_file_still_produces_the_refusal(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """`read_text` raises `UnicodeDecodeError` here, and that is a
+    `ValueError`, NOT an `OSError`.
+
+    THE SAME DISTINCTION `complete_record` TURNS ON, MISSED AGAIN ONE FUNCTION
+    OVER -- in code written by the commit that had just fixed it there. The
+    lock is written by a process that can be killed between `open` and `write`
+    and read by a second driver that is about to be told to go away, so a
+    half-written or byte-damaged claim is the ordinary case, not an exotic one.
+    Caught only as `OSError`, it came out of `main` as a decode traceback that
+    never mentions the lock at all: the operator at 2am is then debugging a
+    crashed second driver instead of reading one line saying who holds the
+    directory.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
+    out.mkdir()
+    held = out / run_study.LOCK_NAME
+    held.write_bytes(b'{"pid": 4242, "host": "\xff\xfe not utf-8"}')
+    with pytest.raises(UnicodeDecodeError):
+        held.read_text()
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
+
+    assert status == run_study.EXIT_LOCKED
+    assert calls == [], "the second driver trained a cell anyway"
+    printed = capsys.readouterr().out
+    assert str(held) in printed, "the message must name the file to delete"
+    assert "<unreadable>" in printed
+    assert held.read_bytes(), "the claim must survive the refusal"
+
+
+def test_a_lock_that_cannot_be_read_at_all_still_produces_the_refusal(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """The `OSError` half of that same guard, alone.
+
+    A directory at the claim path raises `IsADirectoryError`, which a lone
+    `except ValueError` would not catch. The two halves fail on different
+    inputs and neither can be dropped -- the same pairing `complete_record`
+    already has, in the one place it was missing.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
+    held = out / run_study.LOCK_NAME
+    held.mkdir(parents=True)
+    with pytest.raises(OSError):
+        held.read_text()
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
+
+    assert status == run_study.EXIT_LOCKED
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert str(held) in printed
+    assert "<unreadable>" in printed
+    assert held.is_dir(), "the claim must survive the refusal"
 
 
 def test_the_lock_is_released_when_the_run_finishes(
