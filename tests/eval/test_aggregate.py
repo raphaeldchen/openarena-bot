@@ -31,6 +31,9 @@ the field each column claims to hold.
 import importlib.util
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -124,6 +127,19 @@ FIELD_BASE = {
     "reward.r2": 3100,
     "reward.n_reward_events": 3200,
     "reward.n_steps": 3300,
+    # THE TWO COUNT COLUMNS, WHICH USED TO BE ZERO IN EVERY CELL OF BOTH.
+    # `degenerate` counts steps whose band was POSITIVE but numerically junk
+    # (the gate criterion) and `floor>=pers` counts steps whose band was
+    # NON-POSITIVE (which is why `gap_closed` is NaN by contract there, and in
+    # a study whose bands are non-positive it is the only column that explains
+    # a row of +nan). They mean opposite things and sit side by side, and with
+    # 0 in both, in all nine cells, each column rendered the other's field
+    # without a single assertion changing -- the L1 species, in the headline
+    # table. `steps_degenerate` cannot be given a value here (MAX_DEGENERATE_
+    # STEPS is 0, so a non-zero one would make this fixture a study that fails
+    # its own gate), so the distinctness has to come from this side.
+    "position.steps_floor_above_persistence": 3400,
+    "angle.steps_floor_above_persistence": 3500,
     # `seconds` is rendered as HOURS at two decimals, so its cells have to be
     # more than 18 seconds apart or nine distinct values render as one string
     # -- which they did, and the whole wall_h column read 0.56 for every cell.
@@ -174,6 +190,8 @@ its own range and distinct from `FIELD_BASE`'s.
 
 JOINT_RIDGE = 1e3
 EMBEDDING_RIDGE = 1e5
+ALT_JOINT_RIDGE = 1e7
+ALT_EMBEDDING_RIDGE = 1e1
 """The two ridge decades, DIFFERENT from each other on purpose.
 
 They are outside the distinctness table because every cell of a coherent study
@@ -182,6 +200,16 @@ vary per cell. What they must not do is equal each other: `joint_ridge` and
 `embedding_ridge` sit in adjacent columns of the filtering table, and a
 rendering that printed one under the other's heading would be invisible if they
 agreed. Both are real values from `probe.RIDGES`.
+
+`ALT_*` are the decades a cell moves TO when a test needs two cells to disagree
+on ONE part of `ridge_groups`'s three-part key. All four must be pairwise
+distinct, and distinct as ".1e" TEXT, or a test asserting that a cell moved
+group would read the same number either way; the invariant test asserts it.
+The key is `(ridge_selected, joint_ridge, embedding_ridge)` and every fixture
+cell used to carry the same three, so two of its three parts could be dropped
+without a single test noticing -- W07 merged cells that used different
+embedding ridges into one group, and W08 merged a cell that ran ridge
+selection with one that did not, silencing `ridge_block`'s second warning.
 """
 
 #: The three booleans the report renders, as the RENDERING fixture holds them.
@@ -225,8 +253,13 @@ def _curve(name: str, arm, seed) -> list[float]:
 
 
 def _metric_block(metric: str, arm, seed) -> dict:
-    """One `metric_summary`-shaped block. Counts are 0: the fixture is a study
-    that passes, and every non-zero count is set by the test that needs it."""
+    """One `metric_summary`-shaped block.
+
+    `steps_degenerate` is 0 because the fixture is a study that PASSES and the
+    allowance is zero; `steps_floor_above_persistence` is not gated and is
+    therefore distinct per cell and per metric, so the two adjacent count
+    columns of the metric table can be told apart.
+    """
     return {
         "final_model": 1.0,
         "final_persistence": 2.0,
@@ -237,8 +270,21 @@ def _metric_block(metric: str, arm, seed) -> dict:
         "relative_min": 0.4,
         "relative_median": 0.5,
         "relative_max": 0.6,
-        "steps_floor_above_persistence": 0,
+        "steps_floor_above_persistence": int(
+            _value(f"{metric}.steps_floor_above_persistence", arm, seed)),
+        # Zero in every cell, and it has to be: `MAX_DEGENERATE_STEPS` is 0, so
+        # any other value would make this a study that fails `band_is_usable`.
+        # Its neighbour above carries the distinctness for the pair.
         "steps_degenerate": 0,
+        # PRESENT FOR RECORD FIDELITY AND DELIBERATELY NOT ASSERTED ON.
+        # `metric_summary` writes it and `scripts/run_study.py` renders it as
+        # `finite=`, but neither `aggregate` nor `report_study` reads it --
+        # they count finite `gap_final`s themselves and publish that as
+        # `n_seeds_with_finite_gap`. So it is outside the distinctness table
+        # for the same reason `FIXTURE_STEPS` is: nothing here compares it to
+        # anything, and a distinct value would be decoration. Written down
+        # rather than left silent, because a fixture field nothing asserts on
+        # is otherwise indistinguishable from one whose assertion was lost.
         "gap_finite": FIXTURE_HORIZON,
         "gap_mean": _value(f"{metric}.gap_mean", arm, seed),
         "gap_min": 0.1,
@@ -249,7 +295,8 @@ def _metric_block(metric: str, arm, seed) -> dict:
 
 
 def _record(arm, seed, *, latent_wins=True, reward_degenerate=True,
-            ridge_selected=True):
+            ridge_selected=True, joint_ridge=JOINT_RIDGE,
+            embedding_ridge=EMBEDDING_RIDGE):
     """A complete record for one cell, shaped exactly as `run_job` writes one.
 
     `filtering` is NESTED -- `{"criterion_4": {...}, "gain": {...}}` -- because
@@ -300,8 +347,8 @@ def _record(arm, seed, *, latent_wins=True, reward_degenerate=True,
                 "n_scored_windows": int(
                     _value("filtering.gain.n_scored_windows", arm, seed)),
                 "ridge_selected": ridge_selected,
-                "joint_ridge": JOINT_RIDGE,
-                "embedding_ridge": EMBEDDING_RIDGE,
+                "joint_ridge": joint_ridge,
+                "embedding_ridge": embedding_ridge,
             },
         },
         "reward": {
@@ -400,7 +447,7 @@ def test_the_fixture_values_are_pairwise_distinct_so_no_assertion_is_vacuous():
         "these fixture values collide, so every assertion telling one from "
         f"the other is now a tautology: {collisions}")
     assert len(values) == len(FIELD_BASE) * 9 + len(CURVE_NAMES) * 9 * FIXTURE_HORIZON
-    assert len(values) == 432, (
+    assert len(values) == 450, (
         "a field was dropped from the table rather than made distinct; the "
         "count is spelled out so that deleting a colliding entry cannot be "
         "mistaken for fixing it")
@@ -425,8 +472,28 @@ def test_the_fixture_values_are_pairwise_distinct_so_no_assertion_is_vacuous():
     assert (gaps[0] + gaps[2]) / 2 != sum(gaps) / 3
 
     # The two ridges share a table row and must not agree; see JOINT_RIDGE.
-    assert JOINT_RIDGE != EMBEDDING_RIDGE
-    assert f"{JOINT_RIDGE:.1e}" != f"{EMBEDDING_RIDGE:.1e}"
+    # All four decades, because `ridge_groups`'s key is the PAIR plus the flag
+    # and a test that moves one cell to `ALT_JOINT_RIDGE` proves nothing if
+    # that is the value the cell already held.
+    ridges = [JOINT_RIDGE, EMBEDDING_RIDGE, ALT_JOINT_RIDGE,
+              ALT_EMBEDDING_RIDGE]
+    assert len(set(ridges)) == 4
+    assert len({f"{r:.1e}" for r in ridges}) == 4
+
+    # The two count columns of the metric table mean OPPOSITE things and sit
+    # side by side. `steps_degenerate` is pinned at 0 by the gate's own
+    # allowance, so the pair is only distinguishable if the other one is not.
+    for arm in ARMS:
+        for seed in SEEDS:
+            for metric in METRICS:
+                block = _metric_block(metric, arm, seed)
+                assert block["steps_degenerate"] == 0
+                assert block["steps_floor_above_persistence"] != 0, (
+                    "with 0 in both, each of the two adjacent count columns "
+                    "renders the other's field and no assertion changes")
+    assert len({
+        _metric_block(metric, arm, seed)["steps_floor_above_persistence"]
+        for arm in ARMS for seed in SEEDS for metric in METRICS}) == 18
 
     # The booleans, which cannot be in the table above (`False == 0`).
     assert all(v is True or v is False for v in RENDERED_BOOLEANS.values())
@@ -620,6 +687,80 @@ def test_load_records_refuses_a_file_it_cannot_read(tmp_path):
         load_records(tmp_path)
     assert "result_cnn_seed1.json" in str(error.value)
     assert isinstance(error.value, RecordsUnusable)
+
+
+#: The four ways a file can parse as JSON and still come apart inside
+#: `load_record`, one per exception type its non-finite restore step raises.
+#:
+#: The restore step is not an exotic path: NaN is what `gap_final` holds
+#: whenever the persistence-to-floor band is non-positive, so every real record
+#: of a study with a non-positive band goes through it. `load_records` used to
+#: catch only `(OSError, ValueError)`, so all four escaped `main()` as a
+#: traceback and exit 1 -- the one status this pipeline's numbering reserves
+#: for "nobody caught this" -- instead of the named refusal and EXIT_UNREADABLE.
+#:
+#: The expected type name is carried BESIDE each shape and asserted, so the
+#: four cases cannot collapse into four spellings of one branch: a fix that
+#: caught only `TypeError` would leave three of them failing by name.
+UNREADABLE_SHAPES = [
+    (
+        "TypeError",
+        {"arm": "cnn", "seed": 1, "position": None,
+         "nonfinite": {"position.gap_final": "nan"}},
+    ),
+    ("AttributeError", [1, 2, 3]),
+    (
+        "KeyError",
+        {"arm": "cnn", "seed": 1, "nonfinite": {"reward.mse": "nan"}},
+    ),
+    (
+        "IndexError",
+        {"arm": "cnn", "seed": 1, "curves": {"rssm_position": []},
+         "nonfinite": {"curves.rssm_position.0": "nan"}},
+    ),
+]
+
+
+@pytest.mark.parametrize("expected_type,content", UNREADABLE_SHAPES)
+def test_load_records_refuses_a_record_the_restore_step_cannot_rebuild(
+        tmp_path, expected_type, content):
+    """A file that is valid JSON and is not a well-formed record.
+
+    This is the shape a hand-edited, half-converted or older-format record has,
+    and `load_record`'s non-finite restore is the step most likely to meet one:
+    it walks each dotted path in the record's `nonfinite` map, so a `null`
+    block on the way down raises `TypeError`, a JSON list or scalar has no
+    `.get` (`AttributeError`), a path naming a field that is gone raises
+    `KeyError` and one naming a list index past the end raises `IndexError`.
+    None of the four is an `OSError` or a `ValueError`.
+    """
+    _write(tmp_path, _study())
+    (tmp_path / "result_cnn_seed1.json").write_text(json.dumps(content))
+    with pytest.raises(UnreadableRecord) as error:
+        load_records(tmp_path)
+    message = str(error.value)
+    assert "result_cnn_seed1.json" in message
+    assert expected_type in message, (
+        "the message names the exception the file degraded from, so a guard "
+        "that caught one of the four and let the others through fails here "
+        "by name rather than passing on whichever one it did catch")
+    assert "Re-run that cell" in message, (
+        "the remedy for an unreadable record is to re-run the cell; a "
+        "mislabelled one must be moved by hand, and the two must not swap")
+    assert isinstance(error.value, RecordsUnusable)
+
+
+def test_a_json_scalar_where_a_record_belongs_is_unreadable_not_mislabelled(
+        tmp_path):
+    """The two refusals want OPPOSITE responses from the operator -- re-run the
+    cell, or move the file by hand -- so a file that is not a record at all
+    must not arrive as a mislabelling."""
+    _write(tmp_path, _study())
+    (tmp_path / "result_cnn_seed1.json").write_text("42")
+    with pytest.raises(UnreadableRecord) as error:
+        load_records(tmp_path)
+    assert "AttributeError" in str(error.value)
+    assert not isinstance(error.value, MislabelledRecord)
 
 
 def test_the_mislabelled_refusal_names_the_directory_on_its_remedy_line(
@@ -832,6 +973,53 @@ def test_a_none_where_a_number_belongs_does_not_crash_or_count_as_positive():
     assert summary["n_seeds_with_finite_gap"] == 2
 
 
+def test_a_gap_of_exactly_zero_closed_none_of_the_band():
+    """THE BOUNDARY THE HEADLINE CRITERION IS DEFINED AT.
+
+    Spec section 4 criterion 1 asks for `gap_closed > 0`, and the strictness of
+    that inequality is the whole difference between "the world model learned
+    something" and "the world model is persistence": a gap of exactly 0.0 means
+    the model's final-step error equals the persistence baseline's, i.e. it
+    closed NONE of the persistence-to-floor band. That is a realistic output
+    for a decoder that collapsed onto copying the last observed state, and it
+    is the null hypothesis this whole study exists to reject. The suite pinned
+    a negative gap, a NaN gap and a +inf gap and never the boundary itself, so
+    `(gaps > 0)` could soften to `(gaps >= 0)` with nothing failing.
+    """
+    records = _study()
+    _cell(records, "frozen_ssl", 1)["position"]["gap_final"] = 0.0
+    summary = per_arm(records)["frozen_ssl"]
+    assert summary["all_seeds_positive"] is False
+    assert summary["n_seeds_with_finite_gap"] == 3, (
+        "0.0 is finite; if this said 2 the `finite.all()` half would be what "
+        "failed and the boundary would still be untested")
+    verdict = evaluate_gate(records)
+    assert verdict["criteria"]["beats_persistence"] is False
+    assert verdict["passed"] is False
+
+
+def test_a_bool_where_a_number_belongs_is_a_flag_and_not_a_measurement():
+    """`True` is an `int` in Python, so a boolean where `gap_final` belongs
+    would be averaged in as 1.0 -- finite, strictly positive, and therefore a
+    seed that "beat persistence" on the strength of a flag. `_is_number`
+    excludes `bool` for exactly that, and nothing exercised the exclusion.
+
+    The same `_num` feeds the degeneracy counts, the reward numbers and the
+    gain, so a bool anywhere a number belongs is promoted across the whole
+    aggregation, not just here.
+    """
+    records = _study()
+    _cell(records, "cnn", 0)["position"]["gap_final"] = True
+    summary = per_arm(records)["cnn"]
+    assert math.isnan(summary["gap_final_by_seed"][0])
+    assert summary["n_seeds_with_finite_gap"] == 2
+    assert summary["all_seeds_positive"] is False
+    assert evaluate_gate(records)["criteria"]["beats_persistence"] is False
+    assert bool(True) > 0, (
+        "spelled out: were `True` averaged in it would be 1.0, which is both "
+        "finite and strictly positive -- the criterion would PASS on it")
+
+
 def test_the_flat_keys_are_the_gate_metrics_own_and_not_angles():
     """The flat `gap_final_*` keys are position's. Position and angle carry
     different numbers in the fixture, so a flat view that came to hold angle's
@@ -895,6 +1083,61 @@ def test_a_record_missing_its_degeneracy_count_has_not_shown_a_usable_band():
     assert summary["any_degenerate"] is True
 
 
+def test_a_record_missing_its_ANGLE_degeneracy_count_is_no_different():
+    """The same guard for the OTHER metric, and it is not a duplicate.
+
+    `max()` with a NaN in it is ORDER-DEPENDENT -- `max([nan, 0.0])` is `nan`
+    but `max([0.0, nan])` is `0.0`, because `0.0 > nan` and `nan > 0.0` are
+    both False -- and `METRICS` is `("position", "angle")`. The sibling test
+    above deletes POSITION's count, which puts the NaN first, so an unguarded
+    `max(degenerate)` returns NaN there anyway and the guard it is testing can
+    be deleted with a green suite. Deleting ANGLE's count puts the NaN second,
+    where only the explicit NaN check can catch it.
+    """
+    records = _study()
+    del _cell(records, "cnn", 2)["angle"]["steps_degenerate"]
+    summary = per_arm(records)["cnn"]
+    assert math.isnan(summary["metrics"]["angle"]["max_degenerate_steps"])
+    assert summary["metrics"]["position"]["max_degenerate_steps"] == 0, (
+        "position's count is present and zero, so it is the NaN in SECOND "
+        "position that this test turns on -- exactly the one an unguarded "
+        "max() would step over")
+    assert math.isnan(summary["max_degenerate_steps"])
+    verdict = evaluate_gate(records)
+    assert verdict["criteria"]["band_is_usable"] is False
+    assert verdict["passed"] is False
+
+
+def test_per_arm_reports_the_band_median_and_the_floor_above_persistence_count():
+    """Two fields nothing in this module ever read.
+
+    `band_median_by_seed` was computed, exposed in the API and asserted
+    nowhere; `max_steps_floor_above_persistence` is a PRINTED column of the
+    headline table (`floor>=pers`) whose field was equally unguarded, so it
+    could read `steps_degenerate` instead. Those two counts mean opposite
+    things -- `degenerate` is a band that was positive and numerically junk,
+    `floor>=pers` is a band that was NON-POSITIVE, which is why `gap_closed` is
+    NaN by contract there. In a study whose bands are non-positive, that column
+    is the only place the report explains a row full of +nan.
+    """
+    summary = per_arm(_study())["frozen_ssl"]
+    for metric in METRICS:
+        block = summary["metrics"][metric]
+        assert block["band_median_by_seed"] == [
+            _value(f"{metric}.band_median", "frozen_ssl", seed)
+            for seed in SEEDS]
+        assert block["max_steps_floor_above_persistence"] == max(
+            _value(f"{metric}.steps_floor_above_persistence", "frozen_ssl",
+                   seed)
+            for seed in SEEDS)
+        assert block["max_degenerate_steps"] == 0
+        assert block["max_steps_floor_above_persistence"] != block[
+            "max_degenerate_steps"], (
+            "the two counts have to differ in the fixture or each column is "
+            "free to render the other's field")
+        assert block["band_median_by_seed"] != block["gap_mean_by_seed"]
+
+
 def test_per_arm_reads_criterion_4_out_of_its_nested_block():
     """`run_job` writes `filtering: {criterion_4: {...}, gain: {...}}`, and
     criterion 4's flag is inside the first. A reader of
@@ -929,6 +1172,28 @@ def test_a_missing_criterion_4_flag_is_not_a_pass():
     summary = per_arm(records)["cnn"]
     assert summary["filtering_all_pass"] is False
     assert summary["latent_beats_embedding_by_seed"] == [None, True, True]
+
+
+@pytest.mark.parametrize("not_a_bool", [1, 0, "false", "true", []])
+def test_a_criterion_4_flag_that_is_not_a_boolean_is_not_an_answer(not_a_bool):
+    """`_flag`'s `isinstance(node, (bool, np.bool_))` check, alone.
+
+    It is what makes "the record does not carry a real boolean" distinguishable
+    from "the record says no", and nothing exercised it. Criterion 4's flag is
+    the ONE criterion the measured study fails, so this is the number the whole
+    milestone turns on: without the check, a JSON `1` reads as True and -- much
+    worse -- so does the STRING "false", because `bool("false")` is True. The
+    same `_flag` feeds `any_reward_degenerate` and `ridge_selected`, the R1
+    disclosure, so a non-boolean there becomes a measured answer too.
+    """
+    records = _study()
+    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+        "latent_beats_embedding"] = not_a_bool
+    summary = per_arm(records)["cnn"]
+    assert summary["latent_beats_embedding_by_seed"] == [None, True, True]
+    assert summary["filtering_all_pass"] is False
+    assert evaluate_gate(records)["criteria"][
+        "filtering_beats_embedding"] is False
 
 
 def test_per_arm_reports_the_gain_with_its_interval():
@@ -970,6 +1235,54 @@ def test_a_confidence_interval_straddling_zero_does_not_exclude_it():
     assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [False]
 
 
+@pytest.mark.parametrize("ci_low,ci_high", [
+    (float("nan"), -0.0040),
+    (-0.0395, float("nan")),
+    (float("nan"), float("nan")),
+])
+def test_an_interval_with_one_end_is_not_an_interval(ci_low, ci_high):
+    """`low > 0.0 or high < 0.0` is a DISJUNCTION, so ONE finite end on the
+    right side of zero satisfies it on its own -- and a gain whose lower bound
+    was never computed was therefore reported as SIGNIFICANT.
+
+    The report script has always rendered this case as "n/a", saying why in its
+    own docstring: an interval with one end is not an interval, and rendering
+    it as `False` would say "the interval covers zero", which nobody measured.
+    The aggregation -- which is the API a write-up or a later task reads --
+    said `True`. The two disagreed with no test comparing them.
+    """
+    records = [_record("cnn", 0)]
+    records[0]["filtering"]["gain"].update(
+        gain=-0.0208, ci_low=ci_low, ci_high=ci_high)
+    assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [None]
+
+
+def test_the_api_and_the_column_read_the_interval_the_same_way():
+    """The aggregation's `gain_ci_excludes_zero_by_seed` and the report's
+    `CI excl 0` column are two implementations of one rule, and they used to
+    give opposite answers on a one-ended interval. Compared over the cases that
+    separate them, including the MEASURED interval."""
+    cases = [
+        (-0.0395, -0.0040),          # the measured study: entirely below zero
+        (0.0040, 0.0610),            # entirely above zero
+        (-0.0100, 0.0200),           # straddling zero
+        (float("nan"), -0.0040),     # one end never computed
+        (-0.0395, float("nan")),
+    ]
+    rendered = {None: "n/a", True: "True", False: "False"}
+    for low, high in cases:
+        records = [_record("cnn", 0)]
+        records[0]["filtering"]["gain"].update(ci_low=low, ci_high=high)
+        api = per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"][0]
+        assert rendered[api] == report_study._excludes_zero(low, high), (
+            f"the API and the column disagree about [{low}, {high}]")
+    assert {report_study._excludes_zero(low, high)
+            for low, high in cases} == {"True", "False", "n/a"}, (
+        "the five cases must produce all three renderings, or two "
+        "implementations that both answered one thing for everything would "
+        "satisfy the loop above")
+
+
 def test_per_arm_flags_seeds_that_selected_different_ridges():
     """R1, the reason it is a requirement: the scored R^2 moves ~0.10 per
     decade while the gain is ~0.02, so the gain's SIGN moves with the selected
@@ -977,10 +1290,11 @@ def test_per_arm_flags_seeds_that_selected_different_ridges():
     seeds that selected different decades is a mean over different estimators
     and nothing in the number itself says so."""
     records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 2)["filtering"]["gain"]["joint_ridge"] = 1e7
+    _cell(records, "cnn", 2)["filtering"]["gain"][
+        "joint_ridge"] = ALT_JOINT_RIDGE
     summary = per_arm(records)["cnn"]
     assert summary["gain_ridges_agree"] is False
-    assert summary["gain_ridges"][2]["joint_ridge"] == 1e7
+    assert summary["gain_ridges"][2]["joint_ridge"] == ALT_JOINT_RIDGE
     assert summary["gain_ridges"][0]["joint_ridge"] == JOINT_RIDGE
 
 
@@ -1056,6 +1370,45 @@ def test_a_reward_block_scored_over_no_steps_has_not_reported_one():
     assert not math.isnan(summary["reward_mse_by_seed"][2])
 
 
+def test_a_reward_mse_that_never_computed_has_not_reported_accuracy():
+    """The `not isnan(mse)` term, ALONE.
+
+    `reward_reported` is a three-term conjunction and only its third term ever
+    had an isolating test; the one test that could fail it through the two mse
+    terms deleted the WHOLE reward block, so all three failed at once and
+    either of the first two could be dropped with a green suite. A NaN mse is
+    not exotic here -- `_summarise_reward`'s own contract produces one when the
+    target has no variance, which is `my_way_home`'s normal case -- and a cell
+    that reported no usable accuracy would then read `reward_reported PASS`.
+    """
+    records = _study()
+    _cell(records, "cnn", 1)["reward"]["mse"] = float("nan")
+    summary = per_arm(records)["cnn"]
+    assert summary["reward_reported"] is False
+    assert not math.isnan(summary["reward_baseline_mse_by_seed"][1]), (
+        "the baseline is finite here, so this test turns on the mse term and "
+        "not on its neighbour")
+    assert summary["reward_r2_by_seed"][1] == _value("reward.r2", "cnn", 1)
+    assert evaluate_gate(records)["criteria"]["reward_reported"] is False
+
+
+def test_a_reward_baseline_that_never_computed_has_not_reported_accuracy():
+    """The `not isnan(baseline_mse)` term, ALONE. An MSE over a near-constant
+    target looks precise and means nothing without the baseline beside it, so
+    a cell that lost the baseline has not reported its accuracy either."""
+    records = _study()
+    del _cell(records, "frozen_ssl", 2)["reward"]["baseline_mse"]
+    summary = per_arm(records)["frozen_ssl"]
+    assert summary["reward_reported"] is False
+    assert math.isnan(summary["reward_baseline_mse_by_seed"][2])
+    assert not math.isnan(summary["reward_mse_by_seed"][2]), (
+        "the mse is finite here, so this test turns on the baseline term and "
+        "not on its neighbour")
+    assert summary["reward_mse_by_seed"][2] == _value(
+        "reward.mse", "frozen_ssl", 2)
+    assert evaluate_gate(records)["criteria"]["reward_reported"] is False
+
+
 def test_per_arm_reports_throughput_and_the_worst_kl_rate():
     summary = per_arm(_study())["frozen_ssl"]
     assert summary["steps_per_second_by_seed"] == [
@@ -1091,6 +1444,63 @@ def test_curves_all_shorter_than_the_horizon_are_still_incomplete():
     assert per_arm(records)["cnn"]["curves_ok"] is False
 
 
+@pytest.mark.parametrize("block", [None, 7, [1, 2], "x"])
+def test_a_curves_block_that_is_not_a_dict_has_produced_no_curves(block):
+    """The `not isinstance(curves, dict)` half, alone.
+
+    Every other curve test reaches INTO the dict -- `record["curves"][name]` --
+    so a record whose WHOLE `curves` key came back as a null or a scalar was
+    never constructed anywhere, and the guard could return True with a green
+    suite: gate criterion 2 (the error-vs-horizon curve of each arm with
+    persistence and floor on the same axes) reported as MET with nothing on
+    disk to draw. It is the same corruption species `_get` and `_num` are
+    guarded against for `position`, `filtering` and `reward`; it was missed
+    for `curves`.
+
+    The gap list is asserted, not just the boolean: "all six curves are
+    missing" is the finding, and a guard that answered False for some other
+    reason would satisfy a bare `is False`.
+    """
+    records = _study()
+    _cell(records, "cnn", 1)["curves"] = block
+    assert aggregate.curve_gaps(_cell(records, "cnn", 1)) == list(CURVE_NAMES)
+    assert per_arm(records)["cnn"]["curves_ok"] is False
+    verdict = evaluate_gate(records)
+    assert verdict["criteria"]["curves_produced"] is False
+    assert verdict["passed"] is False
+
+
+def test_a_record_with_no_curves_key_at_all_has_produced_no_curves():
+    """The absent block, beside the null one above, because the two are NOT
+    interchangeable everywhere.
+
+    `curve_gaps` sees `None` for both, so this half of it is one branch. But
+    `mean_curve` read `record.get("curves", {})`, and there the two part
+    company: an absent key takes the `{}` default and answers `None` safely,
+    while a stored `null` is returned as itself and `.get(name)` on it raises
+    `AttributeError`. Pinning only the shape that happens to be safe there is
+    how that crash survived.
+    """
+    records = _study()
+    del _cell(records, "frozen_ssl", 0)["curves"]
+    assert aggregate.curve_gaps(_cell(records, "frozen_ssl", 0)) == list(
+        CURVE_NAMES)
+    assert per_arm(records)["frozen_ssl"]["curves_ok"] is False
+    assert evaluate_gate(records)["criteria"]["curves_produced"] is False
+
+
+def test_curve_gaps_names_only_the_curves_that_are_short():
+    """`curves_produced` is the one criterion the report cannot attribute to a
+    cell from a table, so the gate carries the NAMES. A list that named all six
+    whenever any one was short would be no more use than the bare boolean."""
+    record = _record("cnn", 0)
+    assert aggregate.curve_gaps(record) == []
+    del record["curves"]["floor_angle"]
+    record["curves"]["rssm_position"] = [1.0, 2.0]
+    assert aggregate.curve_gaps(record) == ["rssm_position", "floor_angle"], (
+        "in CURVE_NAMES order, and only the two that are actually short")
+
+
 # ---------------------------------------------------------------------------
 # ridge_groups and mean_curve
 # ---------------------------------------------------------------------------
@@ -1110,11 +1520,12 @@ def test_ridge_groups_splits_cells_that_selected_different_decades():
     records = _study()
     for seed in SEEDS:
         _cell(records, "random_vit", seed)["filtering"]["gain"][
-            "joint_ridge"] = 1e7
+            "joint_ridge"] = ALT_JOINT_RIDGE
     groups = ridge_groups(records)
     assert len(groups) == 2
     assert [g["n_cells"] for g in groups] == [6, 3]
-    assert [g["joint_ridge"] for g in groups] == [JOINT_RIDGE, 1e7]
+    assert [g["joint_ridge"] for g in groups] == [JOINT_RIDGE,
+                                                  ALT_JOINT_RIDGE]
     assert groups[1]["cells"] == [("random_vit", seed) for seed in SEEDS]
 
 
@@ -1144,6 +1555,100 @@ def test_ridge_groups_does_not_open_a_group_per_broken_cell():
     assert groups[0]["n_cells"] == 9
 
 
+def test_two_cells_that_used_different_EMBEDDING_ridges_are_two_groups():
+    """The second of the grouping key's three parts, alone.
+
+    `gain = joint_r2 - embedding_r2`, so two cells that priced the EMBEDDING
+    probe at different decades are two different estimators even when their
+    joint ridges agree -- exactly the "mean over different estimators" whose
+    sign R1 says is not interpretable. Every fixture cell used to carry the
+    same joint ridge, the same embedding ridge and the same flag, so two of
+    the key's three parts could be dropped with nothing failing. The only
+    existing splitting test moves the JOINT ridge, which is the one part that
+    was already pinned. Here the joint ridge is asserted EQUAL across the two
+    groups, so the split can only have come from the embedding half.
+    """
+    records = _study()
+    _cell(records, "cnn", 0)["filtering"]["gain"][
+        "embedding_ridge"] = ALT_EMBEDDING_RIDGE
+    groups = ridge_groups(records)
+    assert len(groups) == 2
+    assert {g["joint_ridge"] for g in groups} == {JOINT_RIDGE}, (
+        "the joint ridge agrees, so a key that had lost the embedding half "
+        "would have put all nine cells in one group")
+    assert {g["embedding_ridge"] for g in groups} == {
+        EMBEDDING_RIDGE, ALT_EMBEDDING_RIDGE}
+    assert sorted(g["n_cells"] for g in groups) == [1, 8]
+    assert [g["cells"] for g in groups if g["n_cells"] == 1] == [[("cnn", 0)]]
+
+
+def test_a_cell_that_skipped_selection_is_not_grouped_with_one_that_did_not():
+    """The FLAG, the third part of the key, alone -- both ridges agree here.
+
+    `ridge_block`'s "at least one cell computed its gain with NO ridge
+    selection" warning is driven by `group['ridge_selected'] is not True` over
+    GROUPS, not over cells, so a key that merged the two would render a single
+    group reading `True` and suppress the warning entirely: a gain computed at
+    `fit_probe`'s default penalty averaged in beside selected ones with
+    nothing saying so. The existing rendering test sets the flag False for ALL
+    nine cells, which is one group either way.
+    """
+    records = _study()
+    _cell(records, "cnn", 0)["filtering"]["gain"]["ridge_selected"] = False
+    groups = ridge_groups(records)
+    assert len(groups) == 2
+    assert {g["joint_ridge"] for g in groups} == {JOINT_RIDGE}
+    assert {g["embedding_ridge"] for g in groups} == {EMBEDDING_RIDGE}, (
+        "both ridges agree, so the split is the flag's doing alone")
+    assert [g["ridge_selected"] for g in groups] == [True, False]
+    block = report_study.ridge_block(groups)
+    assert "NO ridge selection" in _row(block, "WARNING: at least one cell")
+
+
+def test_a_group_publishes_the_denominator_its_mean_was_taken_over():
+    """`gain_mean` is a `nanmean`, and `n_cells` counts every cell in the
+    group whether its gain was computed or not.
+
+    Both module docstrings promise that nothing is dropped from a denominator
+    without the denominator being printed -- `_metric_summary` publishes
+    `n_seeds_with_finite_gap`, `per_arm` publishes `n_seeds_with_finite_gain`
+    -- and this row was the exception: `cells 9` printed beside a mean over
+    six, with all nine named as members.
+    """
+    records = _study()
+    for seed in SEEDS:
+        del _cell(records, "cnn", seed)["filtering"]["gain"]["gain"]
+    [group] = ridge_groups(records)
+    assert group["n_cells"] == 9
+    assert group["n_finite_gains"] == 6
+    survivors = [
+        _value("filtering.gain.gain", arm, seed)
+        for arm in ARMS if arm != "cnn" for seed in SEEDS
+    ]
+    assert group["gain_mean"] == pytest.approx(sum(survivors) / 6)
+    assert group["gain_mean"] != pytest.approx(
+        sum(survivors) / 9), (
+        "spelled out: the numerator is over six and so is the denominator; a "
+        "mean that divided by nine would be a different number")
+
+
+def test_a_group_whose_every_gain_is_undefined_reports_a_zero_denominator():
+    """The all-NaN guard on that mean, and the denominator beside it.
+
+    `np.nanmean` over an all-NaN slice is a RuntimeWarning on the way to the
+    same NaN; the guard is what keeps that out of `study.log`. The row still
+    says `cells 9`, so `finite 0` is the only thing telling the reader that
+    the `nan` is a mean of nothing rather than a mean of nine nans."""
+    records = _study()
+    for arm in ARMS:
+        for seed in SEEDS:
+            del _cell(records, arm, seed)["filtering"]["gain"]["gain"]
+    [group] = ridge_groups(records)
+    assert group["n_cells"] == 9
+    assert group["n_finite_gains"] == 0
+    assert math.isnan(group["gain_mean"])
+
+
 def test_mean_curve_averages_across_the_seeds_of_one_arm():
     records = [_record("cnn", seed) for seed in SEEDS]
     curve = mean_curve(records, "rssm_position")
@@ -1161,6 +1666,41 @@ def test_mean_curve_refuses_a_ragged_set_rather_than_averaging_horizons():
     _cell(records, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
     with pytest.raises(ValueError, match="different lengths"):
         mean_curve(records, "rssm_position")
+
+
+def test_mean_curve_names_the_cell_whose_curve_is_MISSING():
+    """The `missing` guard, which is not the ragged-set guard.
+
+    A record short of ONE of its six curves is exactly what `curves_produced`
+    exists to detect, so the gate is already reporting FAIL by the time the
+    figure is drawn. Without this guard the length loop raises `TypeError`
+    ("object of type 'NoneType' has no len()"), which `write_figure` does NOT
+    catch -- it catches `ValueError` and `OSError` -- so the process dies
+    AFTER the verdict has been printed and the exit status is lost. The
+    ragged-set test above covers the `ValueError` half only.
+    """
+    records = [_record("cnn", seed) for seed in SEEDS]
+    del _cell(records, "cnn", 1)["curves"]["rssm_position"]
+    with pytest.raises(ValueError) as error:
+        mean_curve(records, "rssm_position")
+    assert str(error.value) == "no 'rssm_position' curve for [('cnn', 1)]", (
+        "the cell is named; 'a curve is missing somewhere in nine records' is "
+        "not a message anyone can act on")
+    assert "different lengths" not in str(error.value), (
+        "a missing curve and a ragged set are two findings with two remedies")
+
+
+def test_mean_curve_survives_a_curves_block_that_is_not_a_dict():
+    """`record.get("curves", {})` answers with the block that IS there, so a
+    `curves` key holding a null or a scalar reached `.get(name)` and raised
+    `AttributeError` -- which `write_figure` does not catch either."""
+    records = [_record("cnn", seed) for seed in SEEDS]
+    _cell(records, "cnn", 0)["curves"] = None
+    _cell(records, "cnn", 2)["curves"] = 7
+    with pytest.raises(ValueError) as error:
+        mean_curve(records, "rssm_position")
+    assert str(error.value) == (
+        "no 'rssm_position' curve for [('cnn', 0), ('cnn', 2)]")
 
 
 def test_mean_curve_refuses_a_name_that_is_not_one_of_the_six():
@@ -1252,6 +1792,36 @@ def test_the_gate_fails_on_a_record_that_is_not_a_study_cell():
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["every_record_is_a_study_cell"] is False
     assert verdict["unexpected_cells"] == ["arm='cnn' seed=17"]
+    assert verdict["passed"] is False
+
+
+def test_a_missing_cell_beside_a_stray_file_is_not_a_complete_study():
+    """Nine records is not nine CELLS, and this is the shape the study will
+    actually meet: `result_cnn_seed2.json` never got written and a
+    `result_cnn_seed7.json` is left over from an earlier `--arms cnn --seeds 7`
+    run into the same directory.
+
+    Completeness is `expected - present`, deliberately not a count: a superset
+    or `len(present) >= len(expected)` test passes on this set. Neither of the
+    two existing completeness tests can tell the two forms apart -- one removes
+    a record (eight, both forms fail) and one adds a tenth (ten, both forms
+    pass). Under the count form the gate reports `all_nine_cells_present` PASS
+    while the very next lines of the same block print `MISSING CELLS: cnn/s2`,
+    a self-contradictory verdict naming the wrong cause for a NOT PASSED.
+    """
+    records = [r for r in _study() if (r["arm"], r["seed"]) != ("cnn", 2)]
+    records.append(_record("cnn", 0) | {"seed": 7})
+    verdict = evaluate_gate(records)
+    assert verdict["n_records"] == 9, (
+        "nine records, so a criterion that counted rather than compared sets "
+        "would read this study as complete")
+    assert verdict["criteria"]["all_nine_cells_present"] is False
+    assert verdict["criteria"]["every_record_is_a_study_cell"] is False
+    assert verdict["criteria"]["no_duplicate_cells"] is True, (
+        "the stray cell is its own finding and must not be reported as a "
+        "duplicate of the one it stands in for")
+    assert verdict["missing_cells"] == [("cnn", 2)]
+    assert verdict["unexpected_cells"] == ["arm='cnn' seed=7"]
     assert verdict["passed"] is False
 
 
@@ -1416,13 +1986,13 @@ def test_the_metric_table_puts_each_seeds_gap_in_its_own_column():
         "        mean  finite  unanimous  degenerate  floor>=pers")
     assert _row(table, "cnn         position") == (
         "cnn         position    +1000.0000  +1001.0000  +1003.0000"
-        "  +1001.3333     3/3       True           0            0")
+        "  +1001.3333     3/3       True           0         3403")
     assert _row(table, "cnn         angle") == (
         "cnn         angle       +1300.0000  +1301.0000  +1303.0000"
-        "  +1301.3333     3/3       True           0            0")
+        "  +1301.3333     3/3       True           0         3503")
     assert _row(table, "random_vit  position") == (
         "random_vit  position    +1010.0000  +1011.0000  +1013.0000"
-        "  +1011.3333     3/3       True           0            0")
+        "  +1011.3333     3/3       True           0         3413")
 
 
 def test_the_metric_table_marks_a_missing_cell_in_its_own_column():
@@ -1435,7 +2005,7 @@ def test_the_metric_table_marks_a_missing_cell_in_its_own_column():
     table = report_study.metric_table(records, per_arm(records))
     assert _row(table, "cnn         position") == (
         "cnn         position    +1000.0000     MISSING  +1003.0000"
-        "  +1001.5000     2/3       True           0            0")
+        "  +1001.5000     2/3       True           0         3403")
 
 
 def test_the_metric_table_survives_an_arm_with_no_records_at_all():
@@ -1456,7 +2026,7 @@ def test_the_metric_table_shows_a_nan_cell_and_the_denominator_that_moved():
     table = report_study.metric_table(records, per_arm(records))
     assert _row(table, "cnn         position") == (
         "cnn         position    +1000.0000        +nan  +1003.0000"
-        "  +1001.5000     2/3      False           0            0")
+        "  +1001.5000     2/3      False           0         3403")
 
 
 def test_the_criterion_4_table_puts_the_latent_against_the_embedding():
@@ -1513,12 +2083,64 @@ def test_the_gain_table_says_n_a_for_an_interval_with_one_end_missing():
         "      True     2800")
 
 
+def test_the_CI_column_reads_an_interval_below_zero_AND_one_above():
+    """THE COLUMN THE MEASURED RESULT IS READ OFF, and each half of the
+    disjunction that renders it, ALONE.
+
+    `bool(low > 0.0 or high < 0.0)` has two terms and the fixture's interval
+    is [+2400, +2500] -- BOTH ENDS POSITIVE -- so `low > 0.0` answered every
+    assertion in this module and the second term was never the deciding one.
+    The half that hides there is the half the real study exercises: the
+    measured bottleneck-free gain is -0.0208 with a 95% CI of
+    [-0.0395, -0.0040], entirely BELOW zero, which is the finding. With only
+    the first term the column prints `False` for that interval -- "the
+    interval covers zero", "the negative gain is not distinguishable from
+    zero" -- the opposite of what was measured, in the column a reader looks
+    at to decide whether the negative gain is real, corroborating the one
+    criterion the milestone fails.
+
+    So: the measured interval, where only `high < 0.0` is true; one entirely
+    above zero, where only `low > 0.0` is true; and one straddling zero, where
+    neither is. Three rows, three renderings, no term carried by its
+    neighbour.
+    """
+    records = _rendering_study()
+    _cell(records, "cnn", 0)["filtering"]["gain"].update(
+        gain=-0.0208, ci_low=-0.0395, ci_high=-0.0040)
+    _cell(records, "cnn", 1)["filtering"]["gain"].update(
+        gain=0.0325, ci_low=0.0040, ci_high=0.0610)
+    _cell(records, "cnn", 2)["filtering"]["gain"].update(
+        gain=-0.0100, ci_low=-0.0300, ci_high=0.0200)
+    table = report_study.gain_table(records)
+    assert _row(table, "cnn/s0") == (
+        "cnn/s0            +2600.0000  +2700.0000     -0.0208"
+        "         [-0.0395, -0.0040]       True      1.0e+03      1.0e+05"
+        "      True     2800"), (
+        "the MEASURED study: the interval is entirely below zero, so only "
+        "`high < 0.0` can be what decided this row")
+    assert _row(table, "cnn/s1") == (
+        "cnn/s1            +2601.0000  +2701.0000     +0.0325"
+        "         [+0.0040, +0.0610]       True      1.0e+03      1.0e+05"
+        "      True     2801"), (
+        "entirely above zero, so only `low > 0.0` can be what decided it")
+    assert _row(table, "cnn/s2") == (
+        "cnn/s2            +2603.0000  +2703.0000     -0.0100"
+        "         [-0.0300, +0.0200]      False      1.0e+03      1.0e+05"
+        "      True     2803"), (
+        "straddling zero: neither term is true, so a column that always said "
+        "True would fail here rather than pass on the two rows above")
+    assert report_study._excludes_zero(-0.0395, -0.0040) == "True"
+    assert report_study._excludes_zero(0.0040, 0.0610) == "True"
+    assert report_study._excludes_zero(-0.0300, 0.0200) == "False"
+
+
 def test_the_ridge_block_lists_the_decade_every_gain_was_computed_at():
     block = report_study.ridge_block(ridge_groups(_rendering_study()))
     assert _row(block, "selected") == (
-        "selected    joint_ridge  embed_ridge  cells  gain_mean  members")
+        "selected    joint_ridge  embed_ridge  cells  finite  gain_mean"
+        "  members")
     assert _row(block, "True") == (
-        "True            1.0e+03      1.0e+05      9 +2306.3333  "
+        "True            1.0e+03      1.0e+05      9       9 +2306.3333  "
         "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
         "random_vit/s0 random_vit/s1 random_vit/s2")
     assert "WARNING" not in block, (
@@ -1530,7 +2152,8 @@ def test_the_ridge_block_warns_when_the_cells_did_not_agree():
     """R1. There is no correction for this, only the disclosure."""
     records = _rendering_study()
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["filtering"]["gain"]["joint_ridge"] = 1e7
+        _cell(records, "cnn", seed)["filtering"]["gain"][
+            "joint_ridge"] = ALT_JOINT_RIDGE
     block = report_study.ridge_block(ridge_groups(records))
     warning = _row(block, "WARNING: the nine cells")
     assert "SIGN is not interpretable" in warning
@@ -1548,6 +2171,67 @@ def test_the_ridge_block_warns_when_a_cell_skipped_selection_entirely():
     assert not any(line.startswith("WARNING: the nine cells")
                    for line in block.splitlines()), (
         "one group cannot have disagreed with itself")
+
+
+def test_the_ridge_block_warns_when_a_cell_does_not_SAY_whether_it_selected():
+    """`is not True`, and the half of it an explicit `False` cannot reach.
+
+    The warning is deliberately written to cover BOTH "the cell says it did
+    not select" and "the cell does not say whether it did" -- `_flag` keeps
+    those apart on purpose, and only the first was tested, because the sibling
+    above builds its fixture with an explicit `False`, on which `is False` and
+    `is not True` agree. With the flag DELETED the group renders `n/a` in the
+    `selected` column and `is False` stops warning: the reader is shown a
+    grouping of gains that may not be the same estimator, with nothing saying
+    so.
+    """
+    records = _rendering_study()
+    for seed in SEEDS:
+        del _cell(records, "cnn", seed)["filtering"]["gain"]["ridge_selected"]
+    block = report_study.ridge_block(ridge_groups(records))
+    assert _row(block, "n/a") == (
+        "n/a             1.0e+03      1.0e+05      3       3 +2301.3333  "
+        "cnn/s0 cnn/s1 cnn/s2")
+    assert "NO ridge selection" in _row(block, "WARNING: at least one cell")
+
+
+def test_the_ridge_block_prints_the_denominator_beside_the_count_of_cells():
+    """`cells 9` beside a mean over six was the one row in the report that
+    broke the module docstring's promise that the denominator of every mean is
+    printed beside it. The three cells whose gain was never computed are still
+    named as members, which is why the two columns have to differ."""
+    records = _rendering_study()
+    for seed in SEEDS:
+        del _cell(records, "cnn", seed)["filtering"]["gain"]["gain"]
+    block = report_study.ridge_block(ridge_groups(records))
+    assert _row(block, "selected") == (
+        "selected    joint_ridge  embed_ridge  cells  finite  gain_mean"
+        "  members")
+    assert _row(block, "True") == (
+        "True            1.0e+03      1.0e+05      9       6 +2308.8333  "
+        "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "random_vit/s0 random_vit/s1 random_vit/s2"), (
+        "nine cells, six of them in the mean, all nine named -- and the mean "
+        "is +2308.8333 rather than the nine-cell +2306.3333, so a mean taken "
+        "over the wrong set would not render this row")
+
+
+def test_the_ridge_block_names_a_record_that_names_no_cell():
+    """`record_cell` is None for a record whose seed is a string, and
+    `for arm, seed in group['cells']` cannot unpack that. The fallback keeps a
+    damaged record costing a legible table row rather than the report -- which
+    is drawn after the verdict is already on the operator's screen.
+
+    The stray carries seed "7", not "0": a record that renamed itself after
+    the cell it was copied from would render `cnn/s0` twice and the row would
+    read the same whether the fallback ran or not.
+    """
+    records = _rendering_study()
+    records.append(_record("cnn", 0) | {"seed": "7"})
+    assert _row(report_study.ridge_block(ridge_groups(records)), "True") == (
+        "True            1.0e+03      1.0e+05     10      10 +2305.7000  "
+        "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "random_vit/s0 random_vit/s1 random_vit/s2 cnn/s7")
 
 
 def test_the_reward_table_reports_the_numbers_and_the_target_flag():
@@ -1626,6 +2310,52 @@ def test_the_gate_block_names_a_duplicated_and_an_unexpected_cell():
         "  RECORDS THAT ARE NOT STUDY CELLS: arm='cnn' seed=17")
 
 
+def test_the_gate_block_names_the_cell_and_the_curve_that_came_up_short():
+    """`curves_produced` was the ONE criterion a reader could not locate.
+
+    Every other failing criterion is attributable from the report:
+    `beats_persistence` and `band_is_usable` have per-seed columns and their
+    own `unanimous`/`degenerate` columns, `filtering_beats_embedding` and
+    `reward_reported` have their own tables, and the three cell-accounting
+    criteria name their cells. A short `floor_angle` in one cell printed
+    `  [FAIL] curves_produced` and nothing else -- the word "curve" appeared
+    nowhere else in the output -- leaving the operator to open nine JSON files
+    to find which of six curves in which cell is missing.
+    """
+    records = _study()
+    del _cell(records, "frozen_ssl", 1)["curves"]["floor_angle"]
+    _cell(records, "cnn", 0)["curves"]["rssm_position"] = [1.0, 2.0]
+    # A record that names NO cell, also short a curve. `record_cell` answers
+    # None for it, and `f"{cell[0]}/s{cell[1]}"` cannot unpack a None -- so the
+    # line that is supposed to name a broken record has to be able to name the
+    # most broken one. It is listed by its own self-description, the same text
+    # the RECORDS THAT ARE NOT STUDY CELLS line uses, with the seed's `repr`
+    # visible so `seed=7` and `seed='7'` cannot read alike.
+    stray = _record("cnn", 0) | {"seed": "7"}
+    del stray["curves"]["floor_position"]
+    records.append(stray)
+    verdict = evaluate_gate(records)
+    assert verdict["criteria"]["curves_produced"] is False
+    block = report_study.gate_block(verdict)
+    assert _row(block, "  CURVES INCOMPLETE") == (
+        "  CURVES INCOMPLETE (3 of 9): cnn/s0 (rssm_position), "
+        "frozen_ssl/s1 (floor_angle), arm='cnn' seed='7' (floor_position)"), (
+        "each cell with the name of ITS OWN short curve: a line that named "
+        "all six for any of them would be no more use than the bare FAIL. "
+        "The count is of incomplete records against the nine cells EXPECTED, "
+        "which is why a tenth record can make it read 3 of 9")
+    assert _row(block, "  [FAIL] curves_produced") == (
+        "  [FAIL] curves_produced")
+
+
+def test_the_gate_block_says_nothing_about_curves_when_all_six_are_there():
+    """The other rendering. A line printed unconditionally would be satisfied
+    by every complete study as well as by every broken one."""
+    block = report_study.gate_block(evaluate_gate(_study()))
+    assert "CURVES INCOMPLETE" not in block
+    assert "curve" not in block.replace("curves_produced", "")
+
+
 def test_the_report_states_the_policy_the_means_were_taken_under():
     """Either policy is defensible; neither is defensible in silence."""
     records = _study()
@@ -1636,6 +2366,122 @@ def test_the_report_states_the_policy_the_means_were_taken_under():
     assert _row(text, "  --out") == "  --out       runs/x"
     assert _row(text, "  records") == (
         "  records     9 of 9 expected cells (3 arms x 3 seeds)")
+
+
+#: The seven sections of the report, each with the callable that renders it.
+#:
+#: The tables are individually pinned character-for-character above; what this
+#: pins is the JOIN between them and the DOCUMENT. Five of the seven could be
+#: deleted from `report()` -- the training table, the criterion-4 table, the
+#: gain table, the ridge block and the reward table, i.e. both artefacts R1
+#: exists to produce and the table carrying the number the milestone fails on
+#: -- leaving their section headers behind, and the suite stayed green,
+#: because every one of them was tested only by being called directly.
+REPORT_SECTIONS = [
+    ("--- gap_closed at the final horizon step, by arm and seed "
+     "(fraction of the persistence-to-floor band) ---",
+     lambda records, verdict: report_study.metric_table(
+         records, verdict["per_arm"])),
+    ("--- training ---",
+     lambda records, verdict: report_study.training_table(records)),
+    ("--- filtering, gate criterion 4: does the posterior latent beat the "
+     "raw encoder embedding of the same frame? ---",
+     lambda records, verdict: report_study.criterion_4_table(records)),
+    ("--- filtering, the bottleneck-free companion: what appending h to "
+     "that same embedding buys ---",
+     lambda records, verdict: report_study.gain_table(records)),
+    ("--- the ridge decade each gain was computed at ---",
+     lambda records, verdict: report_study.ridge_block(
+         verdict["ridge_groups"])),
+    ("--- reward prediction (spec criterion 3: reported per arm, and "
+     "deliberately not gated -- the target is near-constant by "
+     "construction) ---",
+     lambda records, verdict: report_study.reward_table(records)),
+    ("--- M3 exit gate (spec section 4) ---",
+     lambda records, verdict: report_study.gate_block(verdict)),
+]
+
+
+def test_every_section_of_the_report_is_actually_in_the_report():
+    """Header AND body, as one contiguous block, for all seven.
+
+    Asserted as `f"{header}\\n{table}"` rather than as two `in` checks: a
+    header line and a row that both appear somewhere is satisfied by a report
+    whose sections have been shuffled, and a body alone is satisfied by any
+    table that happens to render the same text. The headers are distinct, so
+    each pair can only be answered by its own section.
+    """
+    records = _rendering_study()
+    verdict = evaluate_gate(records)
+    text = report_study.report(records, verdict, "runs/x")
+    for header, render in REPORT_SECTIONS:
+        body = render(records, verdict)
+        assert body.strip(), f"{header} rendered nothing to assert on"
+        assert f"{header}\n{body}" in text, (
+            f"the section header {header!r} is in the report and the table it "
+            "names is not directly under it")
+    assert [line for line in text.splitlines() if line.startswith("---")] == [
+        header for header, _ in REPORT_SECTIONS], (
+        "seven sections, in this order, and no eighth: a header with no table "
+        "under it is what every one of these deletions left behind")
+
+
+def test_the_report_renders_the_ridge_grouping_out_of_the_VERDICT():
+    """R1's disclosure has three independent ways to vanish -- the block
+    deleted from `report()`, the section's data emptied at the verdict, and
+    the warnings' condition weakened -- and this is the middle one.
+
+    `report()` renders `verdict["ridge_groups"]`, so a verdict carrying `[]`
+    prints the section header, the column header, no group, no members, no
+    mean and NEITHER warning. Every ridge test called `ridge_groups()`
+    directly, so nothing noticed.
+    """
+    records = _rendering_study()
+    verdict = evaluate_gate(records)
+    groups = verdict["ridge_groups"]
+    assert [g["n_cells"] for g in groups] == [9]
+    assert groups[0]["cells"] == [
+        (arm, seed) for arm in ARMS for seed in SEEDS]
+    assert groups[0]["gain_mean"] == pytest.approx(
+        sum(_value("filtering.gain.gain", arm, seed)
+            for arm in ARMS for seed in SEEDS) / 9)
+    text = report_study.report(records, verdict, "runs/x")
+    assert _row(text, "True            1.0e+03").endswith("random_vit/s2"), (
+        "the members are in the printed report, not only in the return value "
+        "of a function the report might not be calling")
+
+
+def test_a_non_numeric_leaf_costs_its_own_column_and_not_the_report():
+    """`_fmt` and `_count` degrade to `str(value)` on a value that is not a
+    number, and neither `except` clause was ever entered.
+
+    The closest existing test replaces whole BLOCKS with scalars, and `_get`
+    answers `None` for a scalar block, so both formatters take their
+    `value is None` branch and the except never runs. Reaching it needs a
+    non-numeric value at a LEAF -- `gap_final` holding the string "1.2.3", or
+    `n_scored_windows` holding "many" -- which is what a hand-edited or
+    half-converted record has. Raising there loses the WHOLE report to one bad
+    field after the 33 GPU hours are already paid for.
+    """
+    assert report_study._fmt("1.2.3", "+.4f") == "1.2.3"
+    assert report_study._count("many") == "many"
+    assert report_study._fmt(None, "+.4f") == "n/a", (
+        "the None branch and the except branch are two different guards; "
+        "spelled out here so a fix that collapsed them shows up")
+    records = _rendering_study()
+    _cell(records, "cnn", 1)["position"]["gap_final"] = "1.2.3"
+    _cell(records, "cnn", 2)["filtering"]["gain"]["n_scored_windows"] = "many"
+    verdict = evaluate_gate(records)
+    text = report_study.report(records, verdict, "runs/x")
+    assert _row(text, "cnn         position") == (
+        "cnn         position    +1000.0000       1.2.3  +1003.0000"
+        "  +1001.5000     2/3      False           0         3403"), (
+        "the bad leaf is printed as the text it holds, in its own column, and "
+        "the two good seeds either side of it are untouched")
+    assert _row(text, "cnn/s2            +2603.0000").endswith("     many")
+    assert _row(text, "GATE:") == "GATE: NOT PASSED", (
+        "a string where a number belongs is not a measurement, so the "
+        "criterion that read it fails -- the report is what must survive")
 
 
 def test_the_report_says_how_many_of_the_nine_cells_it_found():
@@ -1673,6 +2519,82 @@ def test_main_exits_gate_not_passed_when_the_gate_does_not_pass(
         "that did not pass is a result, not an error that suppresses output")
 
 
+def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
+        tmp_path, capsys):
+    """THE WORST OUTCOME THIS FILE CAN PRODUCE: a milestone declared met on a
+    study that did not run.
+
+    `evaluate_gate` judges every criterion over `arms` and not over whichever
+    arms happen to have records -- its docstring says so and says why -- and
+    eight mutations of that contract inside the function are killed. Nothing
+    pinned the ONE call site that supplies `arms`. `main` calling
+    `evaluate_gate(records, arms=the arms it found)` prints GATE: PASSED,
+    returns EXIT_OK, reports "6 of 9" as "6 of 6", lists no missing cells and
+    marks every criterion PASS.
+
+    The cnn arm is 25 of the study's 33 hours and is the one that does not
+    finish on a rented box. The only main-level incomplete-study test removes
+    a single SEED, which leaves all three arm names present and therefore
+    cannot tell the two calls apart.
+
+    Every per-arm criterion is asserted, not just the cell-accounting ones: an
+    arm with no record fails all five, and it is the five that would otherwise
+    be read off the two cheap arms that did finish.
+    """
+    records = [r for r in _study() if r["arm"] != "cnn"]
+    status = report_study.main(["--out", str(_write(tmp_path, records))])
+    out = capsys.readouterr().out
+    assert status == report_study.EXIT_GATE_NOT_PASSED
+    assert _row(out, "GATE:") == "GATE: NOT PASSED"
+    assert _row(out, "  records") == (
+        "  records     6 of 9 expected cells (3 arms x 3 seeds)")
+    assert _row(out, "  MISSING CELLS") == (
+        "  MISSING CELLS (3 of 9): cnn/s0, cnn/s1, cnn/s2")
+    for criterion in ("all_nine_cells_present", "beats_persistence",
+                      "band_is_usable", "filtering_beats_embedding",
+                      "reward_reported", "curves_produced"):
+        assert _row(out, f"  [FAIL] {criterion}") == f"  [FAIL] {criterion}"
+    assert "[PASS]" in out, (
+        "the two arms that DID finish still pass what they can -- a report "
+        "that failed everything would satisfy this test without judging "
+        "anything over the missing arm")
+    assert _row(out, "cnn         position") == (
+        "cnn         position       MISSING     MISSING     MISSING"
+        "         n/a     0/3        n/a         n/a          n/a"), (
+        "the arm that never ran has a row of MISSING, not an absent row: an "
+        "arm that is not in the table is an arm nobody looks for")
+
+
+def test_main_gates_over_the_STUDYS_seeds_not_over_the_ones_that_ran(
+        tmp_path, capsys):
+    """The other half of the same call site, and it fails the same way.
+
+    `evaluate_gate(records, seeds=the seeds it found)` is the seed-shaped twin
+    of the arms mutation above: a study that lost seed 2 in all three arms --
+    one overnight run that never started, three cells -- would be gated as a
+    complete 3x2 study and report `6 of 6`. Removing a seed from ONE arm, which
+    is what the existing incomplete-study test does, leaves seed 2 present in
+    the other two arms and so cannot tell the two calls apart, exactly as
+    removing one seed cannot tell the arms mutation apart.
+    """
+    records = [r for r in _study() if r["seed"] != 2]
+    status = report_study.main(["--out", str(_write(tmp_path, records))])
+    out = capsys.readouterr().out
+    assert status == report_study.EXIT_GATE_NOT_PASSED
+    assert _row(out, "GATE:") == "GATE: NOT PASSED"
+    assert _row(out, "  records") == (
+        "  records     6 of 9 expected cells (3 arms x 3 seeds)")
+    assert _row(out, "  MISSING CELLS") == (
+        "  MISSING CELLS (3 of 9): cnn/s2, frozen_ssl/s2, random_vit/s2")
+    assert _row(out, "  [FAIL] all_nine_cells_present") == (
+        "  [FAIL] all_nine_cells_present")
+    assert _row(out, "cnn         position") == (
+        "cnn         position    +1000.0000  +1001.0000     MISSING"
+        "  +1000.5000     2/3       True           0         3401"), (
+        "the seed the study owes is still a column, and the finite "
+        "denominator is still 3 -- 2/2 would read as a complete arm")
+
+
 def test_main_reports_an_incomplete_study_rather_than_aggregating_it(
         tmp_path, capsys):
     records = [r for r in _study() if (r["arm"], r["seed"]) != ("cnn", 2)]
@@ -1682,6 +2604,63 @@ def test_main_reports_an_incomplete_study_rather_than_aggregating_it(
     assert _row(out, "  MISSING CELLS") == "  MISSING CELLS (1 of 9): cnn/s2"
     assert _row(out, "  records") == (
         "  records     8 of 9 expected cells (3 arms x 3 seeds)")
+
+
+def test_main_names_the_directory_it_ACTUALLY_read(tmp_path, capsys):
+    """The `--out` line is the outermost label on the nine numbers below it.
+
+    `main` passes `args.out` to `report`, and every `main` test asserted a gate
+    row, a metric row or an error line -- never the header -- so `main` could
+    print a directory it never opened and stay green. The operator is told to
+    move files between study directories and re-run, so a header naming the
+    wrong one is the same failure class as the mislabelled record the whole
+    module refuses to aggregate: a number under the wrong label has no symptom.
+    """
+    where = tmp_path / "some_other_study"
+    where.mkdir()
+    report_study.main(["--out", str(_write(where, _study()))])
+    out = capsys.readouterr().out
+    assert _row(out, "  --out") == f"  --out       {where}"
+    assert "runs/m3_study" not in out, (
+        "the parser's DEFAULT is runs/m3_study; a header hard-coded to it "
+        "would render correctly on every run that used the default")
+
+
+def test_the_script_exits_with_the_status_main_returned(tmp_path):
+    """`raise SystemExit(main())`, the one line the suite never runs.
+
+    The test module loads this script with `spec_from_file_location`, so
+    `__name__` is "report_study" and the `if __name__ == "__main__"` guard
+    never fires; every status test calls `main()` and asserts its RETURN
+    VALUE. The five statuses exist so an unattended wrapper can tell a
+    milestone that did not pass from a report that could not be produced, and
+    the whole of that design is delivered by that single unexecuted line --
+    drop the `raise` and every one of them becomes 0.
+
+    Three cases, because a process that always exited 0, or always 1, would
+    satisfy any one of them alone.
+    """
+    script = _ROOT / "scripts" / "report_study.py"
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", MPLBACKEND="Agg")
+
+    def status(out_dir):
+        return subprocess.run(
+            [sys.executable, str(script), "--out", str(out_dir)],
+            capture_output=True, text=True, env=env, cwd=str(_ROOT),
+        ).returncode
+
+    assert status(_write(tmp_path / "passing", _study())) == (
+        report_study.EXIT_OK) == 0
+    failing = _study()
+    _cell(failing, "cnn", 0)["filtering"]["criterion_4"][
+        "latent_beats_embedding"] = False
+    assert status(_write(tmp_path / "failing", failing)) == (
+        report_study.EXIT_GATE_NOT_PASSED), (
+        "a milestone that did not pass reporting 0 to the wrapper is the "
+        "whole reason these statuses are numbered the way they are")
+    assert status(tmp_path / "nothing_here") == report_study.EXIT_NO_RECORDS
+    assert len({report_study.EXIT_OK, report_study.EXIT_GATE_NOT_PASSED,
+                report_study.EXIT_NO_RECORDS}) == 3
 
 
 def test_main_refuses_a_directory_with_no_records(tmp_path, capsys):
@@ -1745,7 +2724,7 @@ def test_a_record_one_field_short_does_not_kill_the_report():
     assert _row(report_study.metric_table(records, verdict["per_arm"]),
                 "cnn         position") == (
         "cnn         position    +1000.0000         n/a  +1003.0000"
-        "  +1001.5000     2/3      False           0            0")
+        "  +1001.5000     2/3      False           0         3403")
 
 
 def test_main_refuses_a_mislabelled_record_and_prints_the_remedy(
@@ -1799,6 +2778,57 @@ def test_the_figure_skips_a_record_that_names_no_cell(tmp_path):
     assert figure.exists()
 
 
+def test_the_figure_draws_the_model_against_BOTH_baselines(tmp_path,
+                                                           monkeypatch):
+    """Spec criterion 2 asks for the curve of each arm with both baselines on
+    the SAME axes, and nothing asserted anything about the figure's CONTENT --
+    only that a non-empty PNG appeared.
+
+    Dropping the persistence line leaves a picture of the model against the
+    floor, which is the single most flattering way to draw a study that did
+    not pass: an arm that never beat persistence looks like a success story,
+    and the figure is the artefact most likely to end up in a write-up on its
+    own, detached from the table that would have contradicted it.
+
+    The spy reads the axes at `savefig`, so it sees what was actually about to
+    be written rather than what the code says it drew.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    drawn = {}
+    real_savefig = Figure.savefig
+
+    def spy(self, *args, **kwargs):
+        drawn["labels"] = [[line.get_label() for line in ax.get_lines()]
+                           for ax in self.axes]
+        drawn["titles"] = [ax.get_title() for ax in self.axes]
+        return real_savefig(self, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", spy)
+    figure = tmp_path / "curves.png"
+    assert report_study.write_figure(_study(), figure) == f"figure={figure}"
+    assert drawn["titles"] == [f"{arm} (mean of 3 seed(s))" for arm in ARMS], (
+        "one panel per arm, in ARMS order, so a label below belongs to the "
+        "arm the panel is titled with")
+    assert drawn["labels"] == [["persistence", "rssm", "floor"]] * len(ARMS), (
+        "the model AND both baselines, on every panel: persistence is the "
+        "line criterion 1 is measured against and floor is the ceiling on "
+        "what any model could do")
+
+
+def test_a_figure_with_no_arm_to_draw_is_a_message_and_not_a_blank_canvas(
+        tmp_path):
+    """`plt.subplots(1, 0, ...)` is a figure with no axes and it saves
+    happily, so without the guard an empty directory produces a blank PNG and
+    a `figure=` line that says one was drawn."""
+    figure = tmp_path / "curves.png"
+    assert report_study.write_figure([], figure) == (
+        "figure NOT written: no arm has a record")
+    assert not figure.exists()
+
+
 def test_a_figure_that_cannot_be_drawn_does_not_cost_the_verdict(
         tmp_path, capsys):
     """The gate verdict is already printed above the figure line. A ragged
@@ -1815,6 +2845,52 @@ def test_a_figure_that_cannot_be_drawn_does_not_cost_the_verdict(
     assert _row(out, "figure NOT written").startswith(
         "figure NOT written: 'rssm_position' curves have different lengths")
     assert _row(out, "GATE:") == "GATE: NOT PASSED"
+    assert not (tmp_path / "curves.png").exists()
+
+
+@pytest.mark.parametrize("first_missing,gaps,mangle", [
+    # `write_figure` plots persistence, then the model, then the floor, so the
+    # name in the FIGURE's message is the first of the three that is gone,
+    # while the GATE's line names every curve the record is short of. Both are
+    # carried beside each shape and asserted, so the three cases cannot
+    # collapse into three spellings of one branch -- one curve gone is one
+    # name in the gate line, and a `curves` block that is not a dict is all
+    # six.
+    ("rssm_position", ["rssm_position"],
+     lambda record: record["curves"].pop("rssm_position")),
+    ("persistence_position", list(CURVE_NAMES),
+     lambda record: record.update(curves=None)),
+    ("persistence_position", list(CURVE_NAMES),
+     lambda record: record.update(curves=7)),
+])
+def test_a_record_with_no_curve_to_draw_costs_the_picture_not_the_status(
+        tmp_path, capsys, first_missing, gaps, mangle):
+    """The MISSING curve, which is a different failure from the ragged one.
+
+    A record short of one of its six curves, or whose whole `curves` block
+    came back as a null or a scalar, used to reach `len(None)` or `None.get`
+    inside `mean_curve` -- `TypeError` and `AttributeError`, neither of which
+    `write_figure` catches, because it catches `ValueError` and `OSError`. The
+    figure is drawn AFTER the verdict is printed, so the process died with a
+    traceback with the whole report already on the operator's screen and the
+    exit status replaced by 1 -- the one status this pipeline's numbering
+    reserves for "nobody caught this", and exactly what the gate's own FAIL on
+    `curves_produced` was already telling them about.
+    """
+    records = _study()
+    mangle(_cell(records, "cnn", 1))
+    status = report_study.main([
+        "--out", str(_write(tmp_path, records)),
+        "--figure", str(tmp_path / "curves.png")])
+    out = capsys.readouterr().out
+    assert status == report_study.EXIT_GATE_NOT_PASSED, (
+        "not 1: a traceback and a gate that did not pass are the two things "
+        "an unattended wrapper most needs to tell apart")
+    assert _row(out, "figure NOT written") == (
+        f"figure NOT written: no {first_missing!r} curve for [('cnn', 1)]")
+    assert _row(out, "GATE:") == "GATE: NOT PASSED"
+    assert _row(out, "  CURVES INCOMPLETE") == (
+        f"  CURVES INCOMPLETE (1 of 9): cnn/s1 ({', '.join(gaps)})")
     assert not (tmp_path / "curves.png").exists()
 
 

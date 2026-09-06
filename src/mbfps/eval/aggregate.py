@@ -338,9 +338,25 @@ def load_records(out_dir) -> list[dict]:
     for path in sorted(out_dir.glob(RECORD_GLOB)):
         try:
             record = load_record(path)
-        except (OSError, ValueError) as error:
+        except (
+            OSError, ValueError, TypeError, AttributeError, KeyError, IndexError
+        ) as error:
             # `UnicodeDecodeError` is a `ValueError`, not an `OSError`, and a
             # truncated write parses as neither -- both arrive here.
+            #
+            # THE FOUR AFTER `ValueError` ARE THE NON-FINITE RESTORE STEP.
+            # `load_record` walks each dotted path in the record's `nonfinite`
+            # map and writes the float back, and that walk is where a file
+            # which is valid JSON but is not a well-formed record comes apart:
+            # a JSON list or scalar has no `.get` (`AttributeError`), a `null`
+            # block indexed on the way down raises `TypeError`, a dotted path
+            # naming a field that is gone raises `KeyError`, and one naming a
+            # list index past the end raises `IndexError`. That is the NORMAL
+            # path, not an exotic one -- NaN is what `gap_final` holds whenever
+            # the band is non-positive, so the restore step runs on real
+            # records -- and letting any of the four escape costs the operator
+            # the named refusal below and exits 1, the one status this
+            # pipeline's numbering says must mean "uncaught traceback".
             raise UnreadableRecord(
                 f"{path} matches {RECORD_GLOB!r} but could not be read back as "
                 f"a record ({type(error).__name__}: {error}). It is not "
@@ -407,28 +423,51 @@ def _nanmin(values: list[float]) -> float:
     return min(finite) if finite else float("nan")
 
 
-def _curves_ok(record) -> bool:
-    """Whether this record carries a complete error-vs-horizon curve set.
+def _curve_of(record, name):
+    """One named curve out of a record, or None if the record does not carry it.
+
+    The `not isinstance(curves, dict)` half is not decoration: a record whose
+    whole `curves` block came back as a `null` or a scalar is the same
+    corruption species `_get` and `_num` guard against, and `{}.get` on it
+    raises rather than answering.
+    """
+    curves = record.get("curves") if isinstance(record, dict) else None
+    return curves.get(name) if isinstance(curves, dict) else None
+
+
+def curve_gaps(record) -> list[str]:
+    """Which of the six curves this record does not carry usably, by name.
 
     All six curves (`CURVE_NAMES`), all the same length, that length equal to
     the horizon the record says it was evaluated at. A record with three of the
     six cannot have persistence and floor drawn on the same axes as the model,
     which is what spec criterion 2 asks for; and a set of curves shorter than
     the horizon is a truncated rollout being plotted as a complete one.
+
+    NAMES rather than a bool, because `curves_produced` is the one gate
+    criterion a reader cannot locate from the report: every other failing
+    criterion has a per-cell column or a named cell list, and this one used to
+    print `[FAIL] curves_produced` and nothing else, leaving the operator to
+    open nine JSON files. `_curves_ok` is this list being empty, so the
+    criterion and the line that explains it cannot drift apart.
     """
     curves = record.get("curves") if isinstance(record, dict) else None
     if not isinstance(curves, dict):
-        return False
-    lengths = set()
+        return list(CURVE_NAMES)
+    horizon = record.get("horizon") if isinstance(record, dict) else None
+    if not isinstance(horizon, int) or isinstance(horizon, bool):
+        return list(CURVE_NAMES)
+    gaps = []
     for name in CURVE_NAMES:
         curve = curves.get(name)
-        if not isinstance(curve, list) or not curve:
-            return False
-        lengths.add(len(curve))
-    horizon = record.get("horizon")
-    if not isinstance(horizon, int) or isinstance(horizon, bool):
-        return False
-    return lengths == {horizon}
+        if not isinstance(curve, list) or not curve or len(curve) != horizon:
+            gaps.append(name)
+    return gaps
+
+
+def _curves_ok(record) -> bool:
+    """Whether this record carries a complete error-vs-horizon curve set."""
+    return not curve_gaps(record)
 
 
 def per_arm(records: list[dict]) -> dict:
@@ -503,8 +542,19 @@ def per_arm(records: list[dict]) -> dict:
             "gain_by_seed": [float(g) for g in gains],
             "gain_ci_low_by_seed": ci_low,
             "gain_ci_high_by_seed": ci_high,
+            # None, NOT False, when either end is undefined: an interval with
+            # one end is not an interval, and `bool(low > 0 or high < 0)` is a
+            # DISJUNCTION -- one finite end on the right side of zero satisfies
+            # it on its own, so a gain whose lower bound was never computed
+            # would be reported as significant. `report_study._excludes_zero`
+            # renders exactly this rule as "n/a" and
+            # `test_the_two_readings_of_the_interval_agree` pins the two
+            # together; they used to disagree, with the API being the wrong one.
             "gain_ci_excludes_zero_by_seed": [
-                bool(low > 0.0 or high < 0.0) for low, high in zip(ci_low, ci_high)
+                None
+                if math.isnan(low) or math.isnan(high)
+                else bool(low > 0.0 or high < 0.0)
+                for low, high in zip(ci_low, ci_high)
             ],
             "gain_mean": (
                 float(np.nanmean(gains)) if finite_gains.any() else float("nan")
@@ -594,6 +644,16 @@ def ridge_groups(records: list[dict]) -> list[dict]:
             {
                 **bucket,
                 "n_cells": len(bucket["cells"]),
+                # THE DENOMINATOR THE MEAN WAS ACTUALLY TAKEN OVER, beside the
+                # count of cells in the group. `gain_mean` is `np.nanmean`, so
+                # a group of nine cells three of which never computed a gain
+                # published `cells 9` next to a mean over six -- the one row in
+                # this module that broke the module docstring's blanket promise
+                # that nothing is dropped from a denominator without the
+                # denominator being printed. `_metric_summary` publishes
+                # `n_seeds_with_finite_gap` and `per_arm` publishes
+                # `n_seeds_with_finite_gain` for the same reason.
+                "n_finite_gains": int(finite.sum()),
                 "gain_mean": (
                     float(np.nanmean(gains)) if finite.any() else float("nan")
                 ),
@@ -624,7 +684,13 @@ def mean_curve(records: list[dict], name: str) -> np.ndarray:
     """
     if name not in CURVE_NAMES:
         raise ValueError(f"{name!r} is not one of {CURVE_NAMES}")
-    curves = [record.get("curves", {}).get(name) for record in records]
+    # `record.get("curves", {})` answers with the block that IS there, so a
+    # record whose whole `curves` key came back as a `null` or a scalar --
+    # the corruption species `_get` and `_curves_ok` both guard against --
+    # would reach `.get(name)` and raise `AttributeError`. `write_figure`
+    # catches `ValueError` and `OSError`, so that escapes main() AFTER the
+    # verdict has been printed and costs the report its exit status.
+    curves = [_curve_of(record, name) for record in records]
     missing = [
         record_cell(r) for r, c in zip(records, curves) if not isinstance(c, list)
     ]
@@ -668,6 +734,21 @@ def evaluate_gate(records: list[dict], arms=ARMS, seeds=SEEDS) -> dict:
             if c is None or c not in expected
         }
     )
+    # Which cell, and which of its six curves. `curves_produced` was the one
+    # criterion the report could not attribute: `beats_persistence` and
+    # `band_is_usable` have per-seed columns, `filtering_beats_embedding` and
+    # `reward_reported` have their own tables, and the three cell-accounting
+    # criteria name their cells -- while a short `floor_angle` in one cell
+    # printed `[FAIL] curves_produced` and left the operator nine JSON files to
+    # open. Sorted by cell so the line is stable across directory order.
+    incomplete_curves = sorted(
+        (
+            (c if c is not None else _describe_cell(r), curve_gaps(r))
+            for r, c in zip(records, cells)
+            if curve_gaps(r)
+        ),
+        key=lambda item: str(item[0]),
+    )
 
     criteria = {
         "all_nine_cells_present": not (expected - set(present)),
@@ -708,6 +789,7 @@ def evaluate_gate(records: list[dict], arms=ARMS, seeds=SEEDS) -> dict:
         "missing_cells": sorted(expected - set(present)),
         "duplicate_cells": duplicates,
         "unexpected_cells": unexpected,
+        "incomplete_curves": incomplete_curves,
         "n_records": len(records),
         "n_expected": len(expected),
     }
@@ -725,6 +807,7 @@ __all__ = [
     "RecordsUnusable",
     "SEEDS",
     "UnreadableRecord",
+    "curve_gaps",
     "evaluate_gate",
     "load_records",
     "mean_curve",

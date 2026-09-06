@@ -330,7 +330,7 @@ def ridge_block(groups: list[dict]) -> str:
     """
     lines = [
         f"{'selected':<10}{'joint_ridge':>13}{'embed_ridge':>13}{'cells':>7}"
-        f"{'gain_mean':>11}  members"
+        f"{'finite':>8}{'gain_mean':>11}  members"
     ]
     for group in groups:
         members = " ".join(f"{arm}/s{seed}" for arm, seed in group["cells"])
@@ -339,6 +339,10 @@ def ridge_block(groups: list[dict]) -> str:
             f"{_fmt(group['joint_ridge'], '.1e'):>13}"
             f"{_fmt(group['embedding_ridge'], '.1e'):>13}"
             f"{group['n_cells']:>7}"
+            # The denominator `gain_mean` was taken over, beside the count of
+            # cells in the group -- the `finite` column of the metric table,
+            # for the one mean that used to publish only the numerator's cells.
+            f"{_count(group['n_finite_gains']):>8}"
             f"{_fmt(group['gain_mean'], '+.4f'):>11}  {members}"
         )
     if len(groups) > 1:
@@ -390,6 +394,19 @@ def reward_table(records, arms=ARMS, seeds=SEEDS) -> str:
     return "\n".join(lines)
 
 
+def _cell_label(cell) -> str:
+    """`cnn/s0` for a real cell, and the record's own self-description for a
+    record that names no cell at all.
+
+    `evaluate_gate` reports an incomplete curve set against `record_cell`'s
+    answer, which is None for a record whose seed is the string "1"; a message
+    about a broken record still has to be able to name the record.
+    """
+    if isinstance(cell, tuple) and len(cell) == 2:
+        return f"{cell[0]}/s{cell[1]}"
+    return str(cell)
+
+
 def gate_block(verdict: dict) -> str:
     """Every criterion with its own verdict, then the conjunction.
 
@@ -423,6 +440,21 @@ def gate_block(verdict: dict) -> str:
         lines.append(
             "  RECORDS THAT ARE NOT STUDY CELLS: "
             + ", ".join(verdict["unexpected_cells"])
+        )
+    if verdict.get("incomplete_curves"):
+        # `curves_produced` is the one criterion with no per-cell column
+        # anywhere in the report: every other failing criterion is locatable
+        # from a table or from a named cell list, and this one used to print
+        # `[FAIL] curves_produced` and nothing else, leaving the operator to
+        # open nine JSON files to find which of six curves in which cell is
+        # short. Named here beside MISSING CELLS for the same reason.
+        listing = ", ".join(
+            f"{_cell_label(cell)} ({', '.join(names)})"
+            for cell, names in verdict["incomplete_curves"]
+        )
+        lines.append(
+            f"  CURVES INCOMPLETE ({len(verdict['incomplete_curves'])} of "
+            f"{verdict['n_expected']}): {listing}"
         )
     lines.append("")
     lines.append(f"GATE: {'PASSED' if verdict['passed'] else 'NOT PASSED'}")
