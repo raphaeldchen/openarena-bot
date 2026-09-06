@@ -171,11 +171,43 @@ SUMMARY_VALUES = {
 """One distinct value per rendered field. Booleans are deliberately absent.
 
 `False == 0` and `True == 1` in Python, so a bool in a distinctness table
-either collides with a real number or forces one out of the table. The two
-booleans `job_summary` prints are pinned by the character-for-character
-assertion instead, and chosen to differ from the values `_record_body` uses so
-that a hardcoded literal in their place still fails.
+either collides with a real number or forces one out of the table.
+
+THE TWO BOOLEANS THEREFORE NEED A GUARD OF THEIR OWN, AND ONE RENDERING IS NOT
+IT. This docstring used to claim they were "pinned by the character-for-
+character assertion, and chosen to differ from the values `_record_body` uses
+so that a hardcoded literal in their place still fails". That was wrong twice
+over, and the claim is what stopped anyone adding the real guard.
+
+Differing from `_record_body` is beside the point: a mutation replacing
+`_get(record, "filtering", "criterion_4", "latent_beats_embedding")` with a
+literal writes `True` or `False`, not whatever the test fixture happens to
+hold elsewhere. And a bool has only TWO values, so any single rendering
+excludes only ONE of the two literals -- the fixture said `True` here, the
+mutation said `True` there, and `EXPECTED_SUMMARY` could not tell them apart.
+Both booleans were free to be constants in all nine cells: gate criterion 4
+reported as passing whatever the record said, and a degenerate reward target
+reported as healthy.
+
+So the two are pinned twice, and each pinning kills the literal the other
+cannot: `_summary_record` now holds the OPPOSITE of the literal a mutation
+would use (`False` for the filtering flag, `True` for the reward flag), which
+`EXPECTED_SUMMARY` checks character for character, and
+`test_job_summary_reads_its_two_booleans_out_of_the_record_both_ways` renders
+the block again with both flipped.
 """
+
+#: The two booleans `job_summary` prints, as `_summary_record` writes them.
+#
+# Each is the NEGATION of the literal its own mutation substitutes -- the
+# filtering line's mutation is `-> True`, the reward line's is `-> False` --
+# so `EXPECTED_SUMMARY` fails on both. Kept as named constants rather than
+# spelled inline so `EXPECTED_SUMMARY` and the fixture cannot drift apart into
+# an agreement neither of them meant.
+SUMMARY_BOOLEANS = {
+    "filtering.latent_beats_embedding": False,
+    "reward.is_degenerate": True,
+}
 
 #: Every number above that a mutation could exchange for another. All distinct.
 PAIRWISE_DISTINCT_PARAMETERS = {
@@ -442,9 +474,11 @@ def _summary_record() -> dict:
             "criterion_4": {
                 "latent_r2": value["filtering.latent_r2"],
                 "embedding_r2": value["filtering.embedding_r2"],
-                # True, where `_record_body` writes False, so the mutation that
-                # replaces the flag with a hardcoded literal still fails.
-                "latent_beats_embedding": True,
+                # The OPPOSITE of the literal the mutation writes -- see
+                # SUMMARY_BOOLEANS. The other direction is covered by
+                # `test_job_summary_reads_its_two_booleans_out_of_the_record...`
+                "latent_beats_embedding":
+                    SUMMARY_BOOLEANS["filtering.latent_beats_embedding"],
             },
             "gain": {
                 "gain": value["filtering.gain"],
@@ -460,8 +494,8 @@ def _summary_record() -> dict:
             "baseline_mse": value["reward.baseline_mse"],
             "r2": value["reward.r2"],
             "n_steps": 900, "n_reward_events": 6,
-            # False, where `_record_body` writes True; same argument.
-            "is_degenerate": False,
+            # Likewise the opposite of its own mutation's literal.
+            "is_degenerate": SUMMARY_BOOLEANS["reward.is_degenerate"],
         },
     )
 
@@ -486,10 +520,10 @@ EXPECTED_SUMMARY = "\n".join([
     "band_median=5115.000 degenerate=5117",
     "  angle     gap_final=+5118.0000 gap_mean=+5119.0000 finite=5120/5121 "
     "band_median=5122.000 degenerate=5124",
-    "  filtering criterion_4_latent_beats_embedding=True gain=+5127.0000 "
+    "  filtering criterion_4_latent_beats_embedding=False gain=+5127.0000 "
     "CI[+5128.0000, +5129.0000]",
     "  reward    mse=5130.00000 baseline=5131.00000 r2=+5132.0000 "
-    "degenerate_target=False",
+    "degenerate_target=True",
 ])
 
 
@@ -608,6 +642,21 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
         "every field `job_summary` renders needs a distinct value here, or "
         "the character-for-character assertion on the block cannot tell that "
         "field from the one beside it")
+
+    # The two booleans are out of the table above on purpose (`False == 0`),
+    # so their distinctness is asserted here instead. They must disagree with
+    # EACH OTHER, or the character-for-character block cannot tell a mutation
+    # that renders one under the other's label from the correct code; and each
+    # must be a real `bool`, since `0`/`1` would render as digits and quietly
+    # change what `EXPECTED_SUMMARY` is checking.
+    assert set(SUMMARY_BOOLEANS) == {"filtering.latent_beats_embedding",
+                                     "reward.is_degenerate"}
+    assert all(value is True or value is False
+               for value in SUMMARY_BOOLEANS.values())
+    assert (SUMMARY_BOOLEANS["filtering.latent_beats_embedding"]
+            is not SUMMARY_BOOLEANS["reward.is_degenerate"]), (
+        "the two booleans `job_summary` prints agree in the fixture, so a "
+        "mutation printing either under the other's label is invisible")
 
     # The parser's defaults are two of those thirteen, and they are only
     # distinct-by-construction if they really are the defaults.
@@ -1194,6 +1243,45 @@ def test_job_summary_renders_every_field_from_the_place_it_claims_to():
         "be a no-op")
 
 
+@pytest.mark.parametrize("criterion_4", [False, True], ids=["fails", "passes"])
+def test_job_summary_reads_its_two_booleans_out_of_the_record_both_ways(
+        criterion_4):
+    """A BOOL HAS TWO VALUES, SO ONE RENDERING EXCLUDES ONLY ONE LITERAL.
+
+    `EXPECTED_SUMMARY` above is an equality over the whole block and still
+    could not tell `_get(record, "filtering", "criterion_4",
+    "latent_beats_embedding")` from the literal `True`, nor `_get(record,
+    "reward", "is_degenerate")` from the literal `False`, because the fixture
+    said exactly what those literals say -- the L1 species, inside the guard
+    that was supposed to be the thorough one. Both are now written the other
+    way round there, which kills those two mutations; this renders the block
+    with both flipped again, which kills the two mutations that go the other
+    way. Neither test alone is enough and neither is redundant.
+
+    WHAT IS AT STAKE. These are the two verdicts an operator reads per cell:
+    whether the gate's criterion 4 passed, and whether the reward target was
+    degenerate. A constant in either place reports the same verdict for all
+    nine cells whatever the records say -- a study whose headline finding is
+    printed by the logger rather than measured.
+
+    The two are flipped in OPPOSITE directions in each case, so a mutation
+    that renders one of them under the other's label is caught as well.
+    """
+    record = _summary_record()
+    record["filtering"]["criterion_4"]["latent_beats_embedding"] = criterion_4
+    record["reward"]["is_degenerate"] = not criterion_4
+
+    text = run_study.job_summary(
+        SUMMARY_JOB, record, SUMMARY_WALL_SECONDS)
+
+    assert f"criterion_4_latent_beats_embedding={criterion_4} " in text, (
+        "the gate's criterion 4 is not being read from the record; the "
+        "per-cell log would report the same verdict for all nine cells")
+    assert f"degenerate_target={not criterion_4}" in text, (
+        "the reward target's degeneracy is not being read from the record; a "
+        "target with no variance would be logged as healthy in every cell")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1670,16 +1758,16 @@ def test_main_refuses_a_selection_that_would_run_the_wrong_cells(
         "shell typo and a real failure are the same event to any wrapper")
 
 
-@pytest.mark.parametrize("argv, expected", [
-    (["--steps", "200"], "--steps 200"),
+@pytest.mark.parametrize("argv, expected, floor", [
+    (["--steps", "200"], "--steps 200", run_study.MIN_STEPS),
     (["--steps", str(run_study.MIN_STEPS - 1)],
-     f"--steps {run_study.MIN_STEPS - 1}"),
-    (["--seq-len", "6"], "--seq-len 6"),
+     f"--steps {run_study.MIN_STEPS - 1}", run_study.MIN_STEPS),
+    (["--seq-len", "6"], "--seq-len 6", run_study.MIN_SEQ_LEN),
     (["--seq-len", str(run_study.MIN_SEQ_LEN - 1)],
-     f"--seq-len {run_study.MIN_SEQ_LEN - 1}"),
+     f"--seq-len {run_study.MIN_SEQ_LEN - 1}", run_study.MIN_SEQ_LEN),
 ], ids=["steps_typo", "steps_just_under", "seq_len_typo", "seq_len_just_under"])
 def test_a_mistyped_training_length_is_refused_at_the_command_line(
-        tmp_path, episode_dir, argv, expected, capsys):
+        tmp_path, episode_dir, argv, expected, floor, capsys):
     """THE SMOKE-RUN TRAP IN A NEW COAT, and the config guard cannot help.
 
     `--arms` and `--seeds` are choice-restricted with the stated rationale that
@@ -1695,16 +1783,42 @@ def test_a_mistyped_training_length_is_refused_at_the_command_line(
     EACH FLAG ALONE, AND EACH JUST UNDER ITS OWN FLOOR: a check that compared
     `steps` against `MIN_SEQ_LEN`, or that tested only one of the two flags,
     would pass for half of these.
+
+    THE ASSERTIONS ARE MADE AGAINST THE REFUSAL ALONE, NOT AGAINST `stderr`.
+    `parser.error` writes argparse's own usage banner to stderr before the
+    message, and that banner lists every flag the parser has -- `--allow-short`
+    included. `assert "--allow-short" in capsys.readouterr().err` was therefore
+    satisfied by argparse whether or not the refusal mentioned the waiver at
+    all: the one sentence telling the operator how to authorise a deliberate
+    short run could be deleted with a green suite, leaving a floor with no
+    documented way over it in the message that announces it. Both the string
+    and the output were right; the assertion still could not fail. So the
+    banner is split off and the guards below read only what this module wrote.
     """
     with pytest.raises(SystemExit) as excinfo:
         run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
                         *argv])
     assert excinfo.value.code == ARGPARSE_USAGE_STATUS
     assert excinfo.value.code not in set(EXPECTED_EXIT_STATUS.values())
-    message = capsys.readouterr().err
-    assert expected in message, (
-        "the refusal must name the flag and the value that was typed")
-    assert "--allow-short" in message, (
+    banner, separator, refusal = capsys.readouterr().err.partition("error: ")
+    assert separator and refusal.strip(), (
+        "argparse's error line was not found, so the split below would leave "
+        "an empty string that every `in` assertion is vacuously true about")
+    assert "--allow-short" in banner, (
+        "THIS SPLIT IS WHY THIS TEST CAN FAIL. argparse's usage banner names "
+        "every flag the parser has, so an assertion against the whole of "
+        "stderr is answered by the banner rather than by the refusal")
+
+    assert refusal.startswith(expected), (
+        "the refusal must OPEN with the flag and the value that was typed. "
+        "A bare `in` is answered by the typo example the message goes on to "
+        "give, which spells out `--steps 200` and `--seq-len 6` literally, so "
+        "two of these four cases could not fail on the interpolation at all")
+    assert f"floor of {floor}" in refusal, (
+        "the refusal must cite the floor of the flag it is refusing; citing "
+        "the other one tells an operator who typed --seq-len 6 that the "
+        "minimum is 5000")
+    assert "Pass --allow-short if the short run is deliberate" in refusal, (
         "a deliberate short run has to be told how to say so, or the floor is "
         "just a wall")
 
@@ -1744,6 +1858,61 @@ def test_a_deliberate_short_run_is_allowed_when_it_says_so(
         "--arms", "cnn", "--seeds", "0"]) == 0
     assert calls[0]["kwargs"]["steps"] == SMOKE_STEPS
     assert calls[0]["kwargs"]["seq_len"] == 1
+
+
+@pytest.mark.parametrize("steps, seq_len", [
+    (run_study.MIN_STEPS, run_study.MIN_SEQ_LEN + 1),
+    (run_study.MIN_STEPS + 1, run_study.MIN_SEQ_LEN),
+], ids=["steps_exactly_at_its_floor", "seq_len_exactly_at_its_floor"])
+def test_a_run_exactly_at_a_floor_is_accepted_without_allow_short(
+        steps, seq_len):
+    """THE ACCEPT SIDE OF THE BOUNDARY, WHICH NOTHING PINNED.
+
+    The refusals above are parametrised at `MIN_STEPS - 1` and
+    `MIN_SEQ_LEN - 1`, and both of those are refused by `value < floor` and by
+    `value <= floor` alike -- so the off-by-one survived the whole suite. Under
+    it, `--steps 5000` and `--seq-len 32` are refused as typos: the operator on
+    the rented box is told the minimum is 5000 while typing exactly 5000, and
+    the only way out of the message is `--allow-short`, which is the flag that
+    says the run is NOT what the floor is for. A floor that refuses its own
+    value is a floor one higher that nobody wrote down.
+
+    Each flag sits on its own floor with the other clear of its own, so a
+    single comparison covering only one of them cannot pass for both.
+    """
+    assert run_study.short_config_complaint(
+        steps, seq_len, allow_short=False) is None, (
+        "a run exactly at the floor was refused; the comparison has become "
+        "`<=` and the real floor is one above the documented one")
+
+
+def test_the_allow_short_help_names_both_floors():
+    """`--help` IS WHAT AN OPERATOR READS BEFORE SPENDING A NIGHT'S RENT.
+
+    Nothing pinned this text, so collapsing it to "permit a short run" survived
+    the suite -- and this is the only place `--help` names either floor. The
+    numbers appear nowhere else in the help: `--steps` and `--seq-len` are
+    declared with no `help=` at all, so their defaults are not shown either.
+    Someone deciding what to type has the two floors here or nowhere.
+
+    EACH FLOOR IS CHECKED BESIDE ITS OWN FLAG, so a text that swapped them --
+    "--steps below 32 or --seq-len below 5000" -- fails too; that reading sends
+    a 20000-step run through `--allow-short` and a 6-token one without it.
+    """
+    help_text = run_study._parser().format_help()
+    # The LAST occurrence: the first is in argparse's own usage banner, which
+    # lists every flag and no help text at all. What follows the last one is
+    # this option's help and nothing else, since `--allow-short` is added last.
+    entry = " ".join(help_text.rpartition("--allow-short")[2].split())
+    assert entry, "the --allow-short entry was not found in --help"
+
+    assert f"--steps below {run_study.MIN_STEPS}" in entry, (
+        "--help must name the --steps floor; it is named nowhere else there")
+    assert f"--seq-len below {run_study.MIN_SEQ_LEN}" in entry, (
+        "--help must name the --seq-len floor; likewise")
+    assert run_study.MIN_STEPS != run_study.MIN_SEQ_LEN, (
+        "the two floors are equal, so the pairing assertions above can no "
+        "longer tell a swapped help text from a correct one")
 
 
 def test_the_studys_own_configuration_is_above_both_floors():
@@ -2133,7 +2302,16 @@ def test_a_second_driver_on_the_same_out_refuses_to_start(
         tmp_path, episode_dir, monkeypatch, capsys):
     """Two drivers pointed at one --out both saw all nine cells pending and
     both ran all nine: 66 GPU-hours instead of 33, racing on the same record
-    and checkpoint paths, with no warning in either log."""
+    and checkpoint paths, with no warning in either log.
+
+    THE PATH IS DEMANDED ON BOTH LINES SEPARATELY. The refusal interpolates the
+    claim file twice -- once to say what is held, once to say what to delete --
+    so `assert str(held) in printed` is answered by whichever of the two
+    survives, and either could be dropped alone with a green suite. They do
+    different jobs: the first identifies the directory the operator has been
+    refused, the second is the remedy they act on at 2am, and a remedy reading
+    "delete it and start again" with no `it` is not one.
+    """
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
     out = tmp_path / "study"
@@ -2145,7 +2323,16 @@ def test_a_second_driver_on_the_same_out_refuses_to_start(
     assert status == run_study.EXIT_LOCKED == 4
     assert calls == [], "the second driver trained a cell anyway"
     printed = capsys.readouterr().out
-    assert str(held) in printed
+    announcement, = [line for line in printed.splitlines()
+                     if line.startswith("another driver already holds")]
+    remedy, = [line for line in printed.splitlines()
+               if "delete" in line and "start again" in line]
+    assert str(held) in announcement, (
+        "the refusal must name the claim it is refusing on; without it the "
+        "operator is told someone holds something, somewhere")
+    assert str(held) in remedy, (
+        "the remedy line must name the file to delete rather than leaning on "
+        "the line above it")
     assert str(os.getpid()) in printed, (
         "the message must name who holds it, or an operator cannot tell a "
         "live run from a crashed one and will not dare delete the file")
@@ -2180,8 +2367,10 @@ def test_the_claim_names_the_pid_the_host_and_the_start_time(tmp_path):
         "decides on before deleting a file that may belong to a live run")
 
 
+@pytest.mark.parametrize("content", [b"", b"   \n\t\n  "],
+                         ids=["zero_byte", "whitespace_only"])
 def test_a_claim_that_is_empty_still_says_something_to_decide_on(
-        tmp_path, episode_dir, monkeypatch, capsys):
+        tmp_path, episode_dir, monkeypatch, capsys, content):
     """A ZERO-BYTE CLAIM IS THE LIKELIEST DAMAGED ONE, and reading it SUCCEEDS.
 
     It is what a process killed between `os.open` and `json.dump` leaves --
@@ -2192,14 +2381,25 @@ def test_a_claim_that_is_empty_still_says_something_to_decide_on(
     then has to decide whether to delete a claim on no evidence at all: delete
     a live run's and the study runs twice, leave a dead one's and the resume
     they came to do refuses.
+
+    AND WHITESPACE IS THE SAME CLAIM WITH A NEWLINE IN IT. The read is
+    `read_text().strip()`, and the `.strip()` was doing all the work here with
+    nothing to hold it: dropped, the zero-byte case still passed, and a claim
+    holding a lone newline -- an interrupted `echo`, an editor that saves a
+    trailing newline into a file it emptied, a partial write that landed on a
+    separator -- went straight back to printing the bare colon this branch was
+    written to remove. The two cases share every line below because they are
+    one defect; only the bytes on disk differ.
     """
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
     out = tmp_path / "study"
     out.mkdir()
     held = out / run_study.LOCK_NAME
-    held.write_bytes(b"")
-    assert held.read_text() == "", "this case exists because the read SUCCEEDS"
+    held.write_bytes(content)
+    assert not held.read_text().strip(), (
+        "this case exists because the read SUCCEEDS and yields nothing an "
+        "operator could act on -- not because it raises")
 
     status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
 
@@ -2249,6 +2449,17 @@ def test_an_out_that_cannot_be_created_is_not_reported_as_a_failed_cell(
     had run and the command line was wrong. That is the ambiguity the
     `EXIT_NO_DATA` 2->5 renumbering existed to remove, reintroduced through the
     uncaught-exception path.
+
+    THE PATH IS ASSERTED AGAINST OUR OWN HALF OF THE LINE, NOT THE WHOLE LINE.
+    The message is `--out {out_dir} cannot be used as a directory: {error}`,
+    and the `OSError` interpolated on the right already reads `[Errno 21] Is a
+    directory: '<path>'` -- so `assert str(out) in printed` was answered by the
+    strerror, and dropping our own interpolation left `--out cannot be used as
+    a directory:` followed by an errno, with a green suite. That message names
+    no flag value at all: an operator reading it at 2am cannot tell which of
+    `--out` and `--data` the driver is complaining about, which is the mistake
+    `stale_report` was already repaired for one function over. So the line is
+    split at the colon this module wrote and the path is demanded on the left.
     """
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
@@ -2263,7 +2474,20 @@ def test_an_out_that_cannot_be_created_is_not_reported_as_a_failed_cell(
     assert status == run_study.EXIT_OUT_UNUSABLE
     assert calls == []
     printed = capsys.readouterr().out
-    assert str(out) in printed
+    ours, separator, strerror = printed.partition(
+        " cannot be used as a directory: ")
+    assert separator, (
+        "the refusal no longer has the shape this test splits on; without the "
+        "split every assertion below is made against an empty string")
+    assert str(out) in ours, (
+        "the message must name --out itself. THIS IS WHY THE SPLIT IS HERE: "
+        "the OSError's own text carries the path too, so asserting against "
+        "the whole line is satisfied whether or not this message says which "
+        "flag it means")
+    assert str(out) in strerror, (
+        "the OSError really does supply the path on its own -- if it ever "
+        "stops, the split above is no longer what makes this test able to "
+        "fail and the assertion before it is passing for a new reason")
     assert "no claim file to delete" in printed, (
         "the held-lock remedy is actively wrong here: there is no lock")
 
@@ -2306,6 +2530,11 @@ def test_a_lock_that_cannot_be_created_is_not_reported_as_one_already_held(
     assert calls == []
     printed = capsys.readouterr().out
     assert "Permission denied" in printed, "the real fault must be reported"
+    assert str(out / run_study.LOCK_NAME) in printed, (
+        "the message must name the claim path it could not create. The errno "
+        "raised here carries no filename -- unlike the mkdir failure, whose "
+        "strerror was answering that test's path assertion for it -- so "
+        "nothing else in this output can supply it")
     assert "already holds" not in printed, (
         "this is not a claim, and telling the operator to delete one sends "
         "them looking for a file that does not exist")
