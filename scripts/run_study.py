@@ -143,12 +143,40 @@ be requested, so it asks the one home rather than starting a second one.
 LOCK_NAME = "study.lock"
 """Name of the claim file inside `--out`; see `acquire_lock`."""
 
+MISLABELLED_SUFFIX = ".mislabelled"
+"""Appended to a record that names another cell; see `quarantine_record`.
+
+Deliberately NOT ending in `.json`, for the same reason `LOCK_NAME` does not:
+the aggregation globs `--out`, and a quarantined record that still looks like a
+record is quarantined in name only.
+"""
+
+MIN_STEPS = 5_000
+MIN_SEQ_LEN = 32
+"""Floors under `--steps` and `--seq-len`, below which `--allow-short`.
+
+`--arms` and `--seeds` are choice-restricted because a shell typo must not buy
+a night of a rented box. These two decide HOW MUCH training happens and were
+unrestricted: `--steps 200` for `--steps 20000` writes nine complete records at
+a smoke configuration and exits 0, and the corrective re-run at 20000 is then
+REFUSED with `EXIT_CONFIG_MISMATCH` until all nine are deleted by hand. The
+config-mismatch guard cannot help, because the records agree with the flags
+they were made with; the typo has to be caught at the command line or not at
+all.
+
+A quarter of the study's own 20000 steps and half its seq_len of 64, so that a
+dropped digit (2000, 200, 20; 6 or 4 for 64) is refused while a deliberate
+short run only has to say so. The smoke run in the plan's Step 1 is deliberate
+and passes `--allow-short`.
+"""
+
 EXIT_OK = 0
 EXIT_JOB_FAILED = 1
 EXIT_CONFIG_MISMATCH = 3
 EXIT_LOCKED = 4
 EXIT_NO_DATA = 5
-"""The five statuses an unattended run can end on. All distinct, and NONE OF
+EXIT_OUT_UNUSABLE = 6
+"""The six statuses an unattended run can end on. All distinct, and NONE OF
 THEM IS 2.
 
 2 is argparse's own usage status: `--data` misspelt, `--arms cnn2`, `--seeds`
@@ -160,6 +188,13 @@ opposite responses -- fix the command line, versus go and find the data -- and
 distinguishing them is the entire reason these codes exist, since nobody is
 watching the log they would otherwise have to read. 2 is therefore left to
 argparse and the study's own statuses are numbered around it.
+
+`EXIT_OUT_UNUSABLE` exists for the same reason. `--out` naming an existing
+FILE, a read-only mount, a full disk: every one of those used to come out of
+`main` as an uncaught traceback, and an uncaught traceback exits 1 -- which IS
+`EXIT_JOB_FAILED`. A wrapper reading the overnight run's status was then told
+"some cells failed, re-run to retry exactly those" when nothing ran at all and
+the command line was wrong. See `acquire_lock` and `OutDirUnusable`.
 """
 
 
@@ -302,6 +337,18 @@ def pending_jobs(out_dir, arms=ARMS, seeds=SEEDS) -> list[StudyJob]:
     return sorted(jobs, key=_cost_key)
 
 
+class OutDirUnusable(Exception):
+    """`--out` could not be created or claimed, and NOT because it is held.
+
+    "Another driver already holds this" and "this directory cannot be written
+    to" want opposite responses from the operator -- go and find the other run,
+    versus fix the disk or the path -- and the remedy printed for the first
+    (delete the claim file) is actively wrong for the second, where no claim
+    file exists. Collapsing them inside `EXIT_LOCKED` is the same mistake the
+    `EXIT_NO_DATA` 2->5 renumbering existed to undo, one level down.
+    """
+
+
 def acquire_lock(out_dir):
     """Claim `--out` for this process, or return None if someone already has.
 
@@ -313,19 +360,78 @@ def acquire_lock(out_dir):
     A crashed run leaves the file behind. That is deliberate -- the file names
     the pid, the host and the start time, so an operator can tell a live run
     from a dead one, and the cost of being wrong is one `rm` against the cost
-    of silently paying for the study twice.
+    of silently paying for the study twice. All three fields are load-bearing:
+    a bare pid is ambiguous across the laptop and the rented box, and a claim
+    with no start time is exactly the claim an operator will not dare delete.
+
+    `parents=True` IS LOAD-BEARING. `runs/` is gitignored with zero tracked
+    files, so on a fresh clone on the rented box `--out runs/m3_study` has no
+    parent, and this mkdir is the FIRST thing in the whole driver that creates
+    `--out` -- `pending_jobs` and `stale_records` only build paths. Without it
+    the plan's own Step 3 command dies at second zero inside this helper with a
+    `FileNotFoundError` that never mentions `--out`.
+
+    ONLY `FileExistsError` OUT OF `os.open` MEANS "HELD". Everything else it
+    can raise -- ENOSPC on a full disk, EROFS on a read-only mount, EACCES,
+    EMFILE -- is a filesystem fault, and reporting it as a held lock sends the
+    operator to delete a file that does not exist. Those raise `OutDirUnusable`
+    instead, and so does a failure of the mkdir (`--out` naming an existing
+    file raises `FileExistsError` from THERE, which is not a claim either).
     """
     path = Path(out_dir) / LOCK_NAME
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise OutDirUnusable(
+            f"--out {out_dir} cannot be used as a directory: {error}") from error
     try:
         handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return None
+    except OSError as error:
+        raise OutDirUnusable(
+            f"the claim file {path} cannot be created: {error}") from error
     with os.fdopen(handle, "w") as stream:
         json.dump({"pid": os.getpid(), "host": socket.gethostname(),
                    "started": datetime.now().isoformat(timespec="seconds")},
                   stream)
     return path
+
+
+def quarantine_record(path) -> Path | None:
+    """Move a record that names another cell out of the aggregation's way.
+
+    A record at this cell's path describing another cell is the worst outcome
+    the study has, and the driver used to print MISLABELLED, count the cell
+    failed, and LEAVE THE FILE THERE -- exactly where the aggregation's glob
+    finds it. An operator who reads the log in the morning, fixes the cause and
+    runs the aggregation without re-running the driver then gets two cells of
+    one arm and none of another.
+
+    RENAMED RATHER THAN DELETED, AND THE RUN CONTINUES. Deleting is wrong: the
+    file is the output of a real 1.4-to-8.3-hour training run and may be the
+    only copy of whichever cell it actually describes. Refusing to continue is
+    also wrong: it contradicts the failure policy at the top of this file --
+    one bad cell must not throw away the eight that would still run, and 25 of
+    the study's 33 hours are the `cnn` arm. So the file is kept, under a name
+    the aggregation cannot read as a record, and the cell goes back to pending.
+
+    Never overwrites an earlier quarantined file, and never raises: this runs
+    inside the per-cell loop, after the record is safely on disk, and must not
+    become the thing that ends an unattended run. Returns the new path, or None
+    if the move failed (the message then tells the operator to move it by hand).
+    """
+    path = Path(path)
+    target = path.with_name(path.name + MISLABELLED_SUFFIX)
+    index = 1
+    while target.exists():
+        target = path.with_name(f"{path.name}{MISLABELLED_SUFFIX}.{index}")
+        index += 1
+    try:
+        path.replace(target)
+    except OSError:
+        return None
+    return target
 
 
 def _fmt(value, spec: str = ".4f") -> str:
@@ -406,10 +512,22 @@ def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
 
 
 def stale_report(stale: list, out_dir) -> str:
-    """What the operator sees instead of a 33-hour run that does nothing."""
+    """What the operator sees instead of a 33-hour run that does nothing.
+
+    `out_dir` IS THE `--out` DIRECTORY AND THE MESSAGE SAYS SO TWICE. The
+    remedy this report prints tells the operator to delete files, and it used
+    to say "delete those records" without naming where they are -- so the
+    directory came only from the banner, and handing this function `--data`
+    instead put the EPISODE directory there. An operator following that at 8am
+    deletes `data/my_way_home`, which is not reproducible from anything in the
+    repository and takes the study with it. The records are named individually,
+    the directory is named on the remedy line itself, and `--data` is named as
+    the thing NOT to touch.
+    """
     lines = [
-        f"CONFIGURATION MISMATCH: {len(stale)} finished record(s) in {out_dir} "
-        "were produced at a different configuration.",
+        f"CONFIGURATION MISMATCH: {len(stale)} finished record(s) in the "
+        f"--out directory {out_dir} were produced at a different "
+        "configuration.",
         "Skipping them would report those cells at settings nobody asked for; "
         "re-running them would overwrite the study's only artifact. "
         "Refusing instead.",
@@ -420,8 +538,10 @@ def stale_report(stale: list, out_dir) -> str:
             for key, (recorded, wanted) in sorted(mismatch.items()))
         lines.append(f"  {job.arm}/s{job.seed}  {detail}")
     lines.append(
-        "Remedy: point --out somewhere else, or delete those records, or ask "
-        "for the configuration they were run at.")
+        "Remedy: point --out somewhere else, or delete the record files "
+        f"listed above from the --out directory {out_dir} (NOT from --data, "
+        "which holds the episodes and is not what this message is about), or "
+        "ask for the configuration they were run at.")
     return "\n".join(lines)
 
 
@@ -442,7 +562,46 @@ def _parser() -> argparse.ArgumentParser:
     # aggregation will never look at, and exits 0.
     parser.add_argument("--seeds", nargs="*", type=int, choices=SEEDS,
                         default=list(SEEDS))
+    # The floors under --steps/--seq-len cannot be `choices` (any large value
+    # is legitimate), so they are checked in `main` and waived by this flag.
+    # A deliberate smoke run says so on the command line; a typo does not.
+    parser.add_argument("--allow-short", action="store_true",
+                        help=f"permit --steps below {MIN_STEPS} or --seq-len "
+                             f"below {MIN_SEQ_LEN} (for a deliberate smoke "
+                             "run); without it they are refused as typos")
     return parser
+
+
+def short_config_complaint(steps: int, seq_len: int, allow_short: bool):
+    """The `parser.error` text for an out-of-range `--steps`/`--seq-len`, or None.
+
+    EACH FLAG IS CHECKED ALONE and each of the two thresholds is checked alone,
+    so that a guard covering only one of the four cases cannot pass for the
+    other three.
+
+    Non-positive is refused even WITH `--allow-short`: `--steps 0` trains
+    nothing and `--seq-len 0` has no meaning, so there is no deliberate run
+    they could be. The floors above that are waivable, because a three-step
+    smoke run is a real thing the plan asks for.
+    """
+    for flag, value in (("--steps", steps), ("--seq-len", seq_len)):
+        if value < 1:
+            return (f"{flag} {value} is not a run: it must be at least 1, "
+                    "and --allow-short does not waive that")
+    if allow_short:
+        return None
+    for flag, value, floor, typo in (
+            ("--steps", steps, MIN_STEPS, "--steps 200 for --steps 20000"),
+            ("--seq-len", seq_len, MIN_SEQ_LEN, "--seq-len 6 for --seq-len 64")):
+        if value < floor:
+            return (
+                f"{flag} {value} is below the study's floor of {floor}. A "
+                f"typo here ({typo}) writes nine complete records at a smoke "
+                "configuration and exits 0, and the corrective re-run is then "
+                "refused as a configuration mismatch until all nine are "
+                "deleted by hand. Pass --allow-short if the short run is "
+                "deliberate")
+    return None
 
 
 def main(argv=None) -> int:
@@ -463,6 +622,10 @@ def main(argv=None) -> int:
         parser.error("--arms was given no values, so no cell would run")
     if not args.seeds:
         parser.error("--seeds was given no values, so no cell would run")
+    complaint = short_config_complaint(
+        args.steps, args.seq_len, args.allow_short)
+    if complaint is not None:
+        parser.error(complaint)
 
     jobs = pending_jobs(args.out, tuple(args.arms), tuple(args.seeds))
     listing = ", ".join(f"{j.arm}/s{j.seed}" for j in jobs) or "none"
@@ -485,11 +648,22 @@ def main(argv=None) -> int:
         print(f"nothing to do; all records already in {args.out}")
         return EXIT_OK
 
-    lock = acquire_lock(args.out)
+    try:
+        lock = acquire_lock(args.out)
+    except OutDirUnusable as error:
+        # NOT `EXIT_JOB_FAILED`. Letting this out of `main` as a traceback
+        # exits 1, which is the status that means "some cells failed, re-run to
+        # retry exactly those" -- and nothing ran at all.
+        print(f"{error}\n"
+              "Nothing was run and no record was written. This is the --out "
+              "path or the filesystem under it, NOT a cell that failed and "
+              "NOT another driver holding the directory; there is no claim "
+              "file to delete.", flush=True)
+        return EXIT_OUT_UNUSABLE
     if lock is None:
         held = Path(args.out) / LOCK_NAME
         try:
-            holder = held.read_text()
+            holder = held.read_text().strip()
         except (OSError, ValueError):
             # `UnicodeDecodeError` is a `ValueError`, NOT an `OSError` -- the
             # same distinction `complete_record` above turns on, and this read
@@ -501,6 +675,14 @@ def main(argv=None) -> int:
             # lock at all and leaves the operator with a crashed second driver
             # to diagnose instead of a one-line "someone else holds this".
             holder = "<unreadable>"
+        if not holder:
+            # A zero-byte claim is what a process killed between `os.open` and
+            # `json.dump` leaves behind -- the likeliest damaged lock there is,
+            # and reading it SUCCEEDS and returns "", so the guard above cannot
+            # see it. Without this the refusal ended at a bare colon and the
+            # operator had nothing at all to decide on.
+            holder = "<empty: written by a driver that died before it could "
+            holder += "name itself>"
         print(f"another driver already holds {held}: {holder}\n"
               "Two drivers on one --out run all nine cells twice -- 66 "
               "GPU-hours instead of 33, racing on the same paths. If no run "
@@ -547,11 +729,25 @@ def _run(args, jobs: list[StudyJob]) -> int:
             # The record at this cell's path describes another cell. Left
             # alone this is the worst outcome the study has: the aggregation
             # would report one arm's numbers under another's name, and the
-            # resume check would keep the cell pending forever.
+            # resume check would keep the cell pending forever. So it is moved
+            # aside -- see `quarantine_record` for why moved and not deleted,
+            # and why the remaining cells still run.
             failed.append(job)
+            moved = quarantine_record(job_record_path(args.out, job))
+            fate = (f"Moved to {moved}, where the aggregation cannot read it"
+                    if moved is not None else
+                    "IT COULD NOT BE MOVED: move it out of --out by hand "
+                    "before aggregating, or one arm's numbers are reported "
+                    "under another's name")
+            # The record's OWN arm and seed, never the job's. This line exists
+            # to say what the record CLAIMS against what was asked for, and
+            # echoing the job on both sides prints the self-contradictory
+            # "the record says arm='frozen_ssl' ..., not 'frozen_ssl'/1" --
+            # destroying the one fact needed to work out whose numbers these
+            # are.
             print(f"  MISLABELLED: the record says arm={_get(record, 'arm')!r} "
-                  f"seed={_get(record, 'seed')!r}, not {job.arm!r}/{job.seed!r}",
-                  flush=True)
+                  f"seed={_get(record, 'seed')!r}, not {job.arm!r}/{job.seed!r}"
+                  f". {fate}.", flush=True)
 
     done = len(jobs) - len(failed)
     print(f"\n{done}/{len(jobs)} job(s) completed; records in {args.out}")

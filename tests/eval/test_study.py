@@ -818,7 +818,20 @@ def test_a_checkpoint_that_does_not_fit_the_model_is_refused(
 
 
 def test_the_returned_record_does_not_crash_the_studys_own_driver(record):
-    """`scripts/run_study.py`'s per-job print, verbatim, on a degenerate cell.
+    """The same format specs the driver's per-job print uses, on a degenerate cell.
+
+    NOT the driver's block verbatim, and this docstring used to claim it was.
+    The field names below (`steps/s=`, `kl_rate=`, `position_gap_final=`) are a
+    hand-written paraphrase of `job_summary`'s (`steps_per_second=`,
+    `kl_rate_above_free_bits=`, `gap_final=`), and nothing here calls
+    `job_summary` at all -- so a "verbatim" claim was exactly the kind that
+    stops someone adding the end-to-end guard that was in fact missing. The
+    driver's own block is now pinned character for character by
+    `test_job_summary_renders_every_field_from_the_place_it_claims_to`, and
+    that main prints it by `test_main_prints_the_per_cell_summary_block`, both
+    in `tests/eval/test_run_study.py`. What THIS test is for is unchanged and
+    is `run_job`'s side of the contract: the record it returns must hold live
+    floats, so that a degenerate cell formats rather than raising.
 
     `run_job` used to return `write_record`'s SANITISED output, so
     `record["position"]["gap_final"]` was `None` rather than NaN and the

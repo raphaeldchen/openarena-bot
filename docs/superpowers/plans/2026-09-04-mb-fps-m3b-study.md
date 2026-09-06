@@ -1602,12 +1602,19 @@ git commit -m "feat: NaN-aware aggregation and the M3 gate verdict"
 ```bash
 .venv/bin/python -m pytest -q
 caffeinate -dimsu .venv/bin/python scripts/run_study.py --out runs/m3_smoke \
-  --steps 20 --seq-len 8 --device cpu --arms random_vit --seeds 0
+  --steps 20 --seq-len 8 --device cpu --arms random_vit --seeds 0 --allow-short
 .venv/bin/python scripts/report_study.py --out runs/m3_smoke
 ```
 
 Expected: the suite green, one record written, the report printing a table and a
 gate verdict of NOT PASSED (one cell of nine).
+
+`--allow-short` is required here and only here. `--steps`/`--seq-len` below the
+study's own floors (5000 / 32) are refused at the command line, because
+`--steps 200` for `--steps 20000` otherwise writes nine complete records at a
+smoke configuration and exits 0, and the corrective re-run is then refused as a
+configuration mismatch until all nine are deleted by hand. Step 3 below is the
+real run and passes neither flag.
 
 - [ ] **Step 2: Provision the GPU box**
 

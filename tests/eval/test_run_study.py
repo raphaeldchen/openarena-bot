@@ -18,9 +18,11 @@ import importlib.util
 import inspect
 import json
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import fields
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,6 +131,52 @@ CONFIG_MISMATCHES = {
     "horizon": 97,
 }
 
+# ...the wall-clock seconds the driver's own timer reports for a cell.
+#
+# The spy returns in microseconds, so `time.perf_counter()` really does read
+# ~0.0 either side of a call and `wall={_fmt(elapsed, '.1f')}s` renders "0.0" --
+# which is also what the mutation `time.perf_counter() - started -> 0.0`
+# renders. The clock is therefore driven, not measured; see `_FakeClock`.
+SUMMARY_WALL_SECONDS = 42.5
+
+# ...and the value of every field `job_summary` renders, all different from one
+# another, so that a mutation exchanging any two of them changes the text.
+#
+# `job_summary` formats roughly twenty-five fields and exactly four of them
+# were pinned. Every number an operator uses at 8am to decide whether a cell is
+# broken could be swapped with its neighbour, replaced by a literal, or dropped
+# outright with a green suite. The whole block is asserted character for
+# character below, and that assertion is only worth anything if no two of these
+# are equal -- `band_median` showing `band_min` is invisible if they agree.
+SUMMARY_VALUES = {
+    "steps": 5101, "seq_len": 5102, "context": 5103, "horizon": 5104,
+    "split_seed": 5105,
+    "seconds": 5106.0, "steps_per_second": 5107.0,
+    "kl_rate_above_free_bits": 5108.0, "kl_dyn_max": 5109.0,
+    "loss_last20": 5110.0,
+    "position.gap_final": 5111.0, "position.gap_mean": 5112.0,
+    "position.gap_finite": 5113, "position.n_steps": 5114,
+    "position.band_median": 5115.0, "position.band_min": 5116.0,
+    "position.steps_degenerate": 5117,
+    "angle.gap_final": 5118.0, "angle.gap_mean": 5119.0,
+    "angle.gap_finite": 5120, "angle.n_steps": 5121,
+    "angle.band_median": 5122.0, "angle.band_min": 5123.0,
+    "angle.steps_degenerate": 5124,
+    "filtering.latent_r2": 5125.0, "filtering.embedding_r2": 5126.0,
+    "filtering.gain": 5127.0, "filtering.ci_low": 5128.0,
+    "filtering.ci_high": 5129.0,
+    "reward.mse": 5130.0, "reward.baseline_mse": 5131.0, "reward.r2": 5132.0,
+    "wall_seconds": SUMMARY_WALL_SECONDS,
+}
+"""One distinct value per rendered field. Booleans are deliberately absent.
+
+`False == 0` and `True == 1` in Python, so a bool in a distinctness table
+either collides with a real number or forces one out of the table. The two
+booleans `job_summary` prints are pinned by the character-for-character
+assertion instead, and chosen to differ from the values `_record_body` uses so
+that a hardcoded literal in their place still fails.
+"""
+
 #: Every number above that a mutation could exchange for another. All distinct.
 PAIRWISE_DISTINCT_PARAMETERS = {
     "cli.steps": CLI_STEPS,
@@ -146,7 +194,15 @@ PAIRWISE_DISTINCT_PARAMETERS = {
     "run.horizon": RUN_HORIZON,
     "protocol.context": PROTOCOL_CONTEXT,
     "protocol.horizon": PROTOCOL_HORIZON,
+    # The study's own split seed. `_record_body` writes it into every record's
+    # `split_seed` field, and `job_summary` prints that field on the same line
+    # as the recorded steps/seq_len. It is 0, and so is the seed of a third of
+    # the study's cells: a summary test using a job with seed 0 cannot tell
+    # `split_seed={record}` from `split_seed={job.seed}`, which is the L1
+    # species inside the one guard job_summary had.
+    "study.split_seed": SPLIT_SEED,
     **{f"mismatch.{key}": value for key, value in CONFIG_MISMATCHES.items()},
+    **{f"summary.{key}": value for key, value in SUMMARY_VALUES.items()},
 }
 
 # The three scenario cells: one per arm AND one per seed, so that no test can
@@ -222,8 +278,17 @@ EXPECTED_EXIT_STATUS = {
     "EXIT_CONFIG_MISMATCH": 3,
     "EXIT_LOCKED": 4,
     "EXIT_NO_DATA": 5,
+    "EXIT_OUT_UNUSABLE": 6,
 }
-"""Every status `main` can return, spelled out. 2 is deliberately absent."""
+"""Every status `main` can return, spelled out. 2 is deliberately absent.
+
+`EXIT_OUT_UNUSABLE` is the newest and was added for the same reason
+`EXIT_NO_DATA` stopped being 2: `--out` naming an existing file, a read-only
+mount or a full disk came out of `main` as an uncaught traceback, and an
+uncaught traceback exits 1 -- which IS `EXIT_JOB_FAILED`. The wrapper reading
+the overnight run's status was told "some cells failed, re-run to retry exactly
+those" when nothing had run.
+"""
 
 
 def _record_body(job: StudyJob, **overrides) -> dict:
@@ -293,7 +358,17 @@ def _write_complete(out_dir, job: StudyJob, **overrides) -> Path:
 
 
 #: The flags whose configuration `_write_matching` writes into a record.
-MATCHING_ARGV = ["--steps", str(CLI_STEPS), "--seq-len", str(CLI_SEQ_LEN)]
+MATCHING_ARGV = ["--steps", str(CLI_STEPS), "--seq-len", str(CLI_SEQ_LEN),
+                 "--allow-short"]
+"""...and `--allow-short`, because `CLI_STEPS`/`CLI_SEQ_LEN` really are short.
+
+The fixture's numbers are deliberately tiny and deliberately unlike anything
+the study asks for, which is what makes "the log echoes the flags we passed"
+detectable -- and it is also exactly what `MIN_STEPS`/`MIN_SEQ_LEN` refuse. A
+deliberate short run says so on the command line; that is the whole
+distinction the floors draw, so the fixture says so too rather than the floors
+being lowered until the fixture slips under them.
+"""
 
 
 def _write_matching(out_dir, job: StudyJob, **overrides) -> Path:
@@ -313,6 +388,127 @@ def _write_matching(out_dir, job: StudyJob, **overrides) -> Path:
 def _sanitised(job: StudyJob, **overrides) -> dict:
     """Exactly what the file would hold, as a dict we can then damage."""
     return to_json_record(_record_body(job, **overrides))
+
+
+#: The cell `SUMMARY_RECORD` was asked for...
+SUMMARY_JOB = StudyJob("frozen_ssl", 1)
+#: ...and the cell it actually names. DELIBERATELY A DIFFERENT ONE.
+#
+# The `cell` line is built as `arm=... seed=... (requested .../s...)`, i.e.
+# built to show the two disagreeing, and the mutation that reads both halves
+# off the job is invisible whenever they agree. `SUMMARY_JOB.seed` is also
+# neither `SPLIT_SEED` nor `SUMMARY_RECORD_JOB.seed`, so `split_seed` on the
+# next line can be told from both.
+SUMMARY_RECORD_JOB = StudyJob("cnn", 2)
+
+
+def _summary_record() -> dict:
+    """A record with a DISTINCT value in every field `job_summary` renders.
+
+    `_record_body`'s own values repeat -- `position` and `angle` are literally
+    the same dict -- so a mutation printing one metric block's number under the
+    other's label reads identically. Here every leaf is its own number, drawn
+    from `SUMMARY_VALUES`, which the pairwise-distinctness invariant guards.
+    """
+    value = SUMMARY_VALUES
+
+    def metric(prefix: str) -> dict:
+        block = dict(_record_body(SUMMARY_RECORD_JOB)["position"])
+        block.update({
+            "gap_final": value[f"{prefix}.gap_final"],
+            "gap_mean": value[f"{prefix}.gap_mean"],
+            "gap_finite": value[f"{prefix}.gap_finite"],
+            "n_steps": value[f"{prefix}.n_steps"],
+            "band_median": value[f"{prefix}.band_median"],
+            "band_min": value[f"{prefix}.band_min"],
+            "steps_degenerate": value[f"{prefix}.steps_degenerate"],
+        })
+        return block
+
+    return _record_body(
+        SUMMARY_RECORD_JOB,
+        steps=value["steps"], seq_len=value["seq_len"],
+        context=value["context"], horizon=value["horizon"],
+        split_seed=value["split_seed"],
+        seconds=value["seconds"],
+        steps_per_second=value["steps_per_second"],
+        kl_rate_above_free_bits=value["kl_rate_above_free_bits"],
+        kl_dyn_max=value["kl_dyn_max"], loss_last20=value["loss_last20"],
+        # Two train episodes and one val: the counts differ, so the mutation
+        # that reports each under the other's label changes the text.
+        episodes={"train": ["ep_a.npz", "ep_b.npz"], "val": ["ep_c.npz"]},
+        position=metric("position"), angle=metric("angle"),
+        filtering={
+            "criterion_4": {
+                "latent_r2": value["filtering.latent_r2"],
+                "embedding_r2": value["filtering.embedding_r2"],
+                # True, where `_record_body` writes False, so the mutation that
+                # replaces the flag with a hardcoded literal still fails.
+                "latent_beats_embedding": True,
+            },
+            "gain": {
+                "gain": value["filtering.gain"],
+                "ci_low": value["filtering.ci_low"],
+                "ci_high": value["filtering.ci_high"],
+                "confidence": 0.95, "joint_r2": 0.31, "embedding_r2": 0.33,
+                "n_scored_windows": 120, "ridge_selected": True,
+                "joint_ridge": 1.0, "embedding_ridge": 10.0,
+            },
+        },
+        reward={
+            "mse": value["reward.mse"],
+            "baseline_mse": value["reward.baseline_mse"],
+            "r2": value["reward.r2"],
+            "n_steps": 900, "n_reward_events": 6,
+            # False, where `_record_body` writes True; same argument.
+            "is_degenerate": False,
+        },
+    )
+
+
+#: `job_summary(SUMMARY_JOB, _summary_record(), SUMMARY_WALL_SECONDS)`, by hand.
+#
+# WRITTEN OUT RATHER THAN COMPUTED, for the reason `EXPECTED_RECORD_KEYS` is:
+# a guard that formats the record the way the function does moves whenever the
+# function moves, and every field swap the audit found survives it. Comparing
+# the whole block against a literal is what fails on a field read from the
+# wrong place, a field replaced by a constant, a field dropped, a label
+# detached from its numbers, and `"\n".join` becoming `" ".join`.
+EXPECTED_SUMMARY = "\n".join([
+    "  cell      arm=cnn seed=2 (requested frozen_ssl/s1)",
+    "  recorded  steps=5101 seq_len=5102 context=5103 horizon=5104 "
+    "split_seed=5105",
+    "  timing    wall=42.5s recorded=5106.0s steps_per_second=5107.00",
+    "  training  kl_rate_above_free_bits=5108.000 kl_dyn_max=5109.000 "
+    "loss_last20=5110.0000",
+    "  episodes  train=2 val=1",
+    "  position  gap_final=+5111.0000 gap_mean=+5112.0000 finite=5113/5114 "
+    "band_median=5115.000 degenerate=5117",
+    "  angle     gap_final=+5118.0000 gap_mean=+5119.0000 finite=5120/5121 "
+    "band_median=5122.000 degenerate=5124",
+    "  filtering criterion_4_latent_beats_embedding=True gain=+5127.0000 "
+    "CI[+5128.0000, +5129.0000]",
+    "  reward    mse=5130.00000 baseline=5131.00000 r2=+5132.0000 "
+    "degenerate_target=False",
+])
+
+
+class _FakeClock:
+    """A `time` stand-in whose `perf_counter` advances by a known amount.
+
+    The spy returns in microseconds, so the driver's real elapsed time is
+    ~0.0 and `wall=0.0s` is what both the correct code and the mutation
+    `time.perf_counter() - started -> 0.0` print. Driving the clock is what
+    makes the difference visible: every cell's block must read `wall=42.5s`.
+    """
+
+    def __init__(self, step: float = SUMMARY_WALL_SECONDS):
+        self.step = step
+        self.now = 0.0
+
+    def perf_counter(self) -> float:
+        self.now += self.step
+        return self.now
 
 
 @pytest.fixture
@@ -352,6 +548,21 @@ def _spy(behaviour=None):
     overrides. Like the real thing it writes the record and returns the LIVE
     dict, so the resume path and the printing path are both exercised, and it
     records the configuration it was called with.
+
+    EVERY KEY RECORDED HERE IS READ BY AN ASSERTION SOMEWHERE, and that is a
+    rule rather than an accident. `"buffer"` was captured on every call from
+    the day this spy was written and no assertion ever looked at it, so
+    `run_job(job, None, ...)` -- which on the rented box makes all nine cells
+    raise inside `run_job`, be swallowed by the per-cell handler, and end the
+    session 0/9 with nine identical tracebacks -- survived the entire suite. A
+    value a spy records but nothing checks is not a guard; it is the shape of
+    one. The readers are:
+
+      "job"      -- the order and identity tests;
+      "buffer"   -- `test_main_hands_every_cell_the_one_buffer_it_built`;
+      "out_dir"  -- `test_main_hands_run_job_the_out_dir_string_argparse_produced`;
+      "kwargs"   -- the flag-forwarding and defaults tests;
+      "record"   -- `test_main_prints_the_per_cell_summary_block`.
     """
     calls: list[dict] = []
 
@@ -362,6 +573,7 @@ def _spy(behaviour=None):
         body = _record_body(
             job, **{**_recorded_config(kwargs), **(overrides or {})})
         write_record(job_record_path(out_dir, job), body)
+        calls[-1]["record"] = body
         return body
 
     return fake, calls
@@ -388,7 +600,14 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
         "these fixture parameters collide, so every assertion that tells one "
         "from the other is now a tautology and a mutation exchanging them "
         f"survives the suite: {collisions}")
-    assert len(set(values)) == 19, "all nineteen must still be listed"
+    assert len(set(values)) == len(PAIRWISE_DISTINCT_PARAMETERS) == 53, (
+        "an entry was dropped from the table rather than made distinct; the "
+        "count is spelled out so that deleting a colliding parameter cannot "
+        "be mistaken for fixing it")
+    assert len(SUMMARY_VALUES) == 33, (
+        "every field `job_summary` renders needs a distinct value here, or "
+        "the character-for-character assertion on the block cannot tell that "
+        "field from the one beside it")
 
     # The parser's defaults are two of those thirteen, and they are only
     # distinct-by-construction if they really are the defaults.
@@ -461,7 +680,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     assert actual == EXPECTED_EXIT_STATUS, (
         "an exit status was renumbered; every wrapper, `&&` and CI step that "
         "reads this run's status reads these numbers")
-    assert len(set(actual.values())) == len(EXPECTED_EXIT_STATUS) == 5, (
+    assert len(set(actual.values())) == len(EXPECTED_EXIT_STATUS) == 6, (
         "two statuses collide, so the run cannot say which thing went wrong")
     assert ARGPARSE_USAGE_STATUS not in actual.values(), (
         "this status belongs to argparse's own usage errors; a study status "
@@ -625,6 +844,37 @@ def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     # The control. Without it, an implementation that calls everything
     # incomplete would pass all eighteen parametrisations above.
     path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
+    assert run_study.record_is_complete(path, INCOMPLETE_JOB)
+    assert INCOMPLETE_JOB not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+
+
+def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
+    """THE OTHER DIRECTION, WHICH NO FIXTURE PRODUCED: nothing spare.
+
+    `complete_record` asks `REQUIRED_RECORD_KEYS <= set(record)`. Turning that
+    subset test into a PROPER subset (`<`) survived the whole suite, because
+    `_record_body` always writes all twenty top-level keys and a proper-subset
+    relation holds for every fixture in this file. The one record shape that
+    tells `<` from `<=` is the one with exactly the eighteen required keys and
+    neither optional diagnostic -- a finished cell that legitimately lacks
+    `kl_dyn_max` and `loss_last20`, which `OPTIONAL_RECORD_KEYS` above declares
+    a record is allowed to lack.
+
+    Under `<` such a cell is permanently pending: every resume re-runs it, an
+    8.3-hour `cnn` cell is paid for again on every attempt, and the study never
+    converges. That is the disaster `REQUIRED_RECORD_KEYS`' own docstring calls
+    one with no symptom, and the driver and its own tests would flatly disagree
+    about what a finished cell is.
+    """
+    path = job_record_path(tmp_path, INCOMPLETE_JOB)
+    exact = _sanitised(INCOMPLETE_JOB)
+    for key in OPTIONAL_RECORD_KEYS:
+        del exact[key]
+    assert set(exact) == set(EXPECTED_RECORD_KEYS), (
+        "this record must hold the required keys and NOTHING ELSE, or it is "
+        "still a proper superset and cannot tell `<` from `<=`")
+    path.write_text(json.dumps(exact))
+
     assert run_study.record_is_complete(path, INCOMPLETE_JOB)
     assert INCOMPLETE_JOB not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
 
@@ -908,20 +1158,40 @@ def test_job_summary_never_raises_on_a_record_full_of_holes():
     assert "frozen_ssl" in text and "n/a" in text and "nan" in text
 
 
-def test_job_summary_reports_the_configuration_the_record_carries():
-    """A log that echoes the flags we asked for cannot show that something
-    else was used. Task 4 shipped exactly that defect: the record reported
-    `run_job`'s parameters rather than the config actually trained with, so a
-    steps/seq_len swap trained every cell wrong and reported it right.
+def test_job_summary_renders_every_field_from_the_place_it_claims_to():
+    """THE WHOLE BLOCK, CHARACTER FOR CHARACTER. Four of ~25 fields were pinned.
+
+    `job_summary` is the morning's only view of what the nine cells measured,
+    and its own docstring promises the configuration line is "READ BACK OUT OF
+    THE RECORD, not echoed from this script's own flags". The steps/seq_len
+    half of that promise was guarded. Nothing else was: the arm and the seed on
+    that very line could be echoed from the job, `split_seed` could be made a
+    literal, `wall` and `recorded` could be exchanged, `band_median` could show
+    `band_min`, `finite` and `n_steps` could be swapped, `mse` and
+    `baseline_mse` could be swapped, `r2` could read `mse`, the angle block
+    could vanish, the reward block could vanish, and the lines could be joined
+    by spaces -- all with a green suite.
+
+    An equality against a hand-written block fails on every one of those.
+    `SUMMARY_JOB` and `SUMMARY_RECORD_JOB` are different cells on purpose, so
+    the `arm=... seed=... (requested .../s...)` line shows the two disagreeing
+    rather than agreeing by construction.
     """
-    job = StudyJob("cnn", 0)
-    record = _record_body(job)
-    text = run_study.job_summary(job, record, 61.0)
-    assert f"steps={RECORD_STEPS}" in text
-    assert f"seq_len={RECORD_SEQ_LEN}" in text
-    assert f"context={RECORD_CONTEXT}" in text
-    assert f"horizon={RECORD_HORIZON}" in text
-    assert str(CLI_STEPS) not in text and str(DEFAULT_STEPS) not in text
+    text = run_study.job_summary(
+        SUMMARY_JOB, _summary_record(), SUMMARY_WALL_SECONDS)
+
+    assert text == EXPECTED_SUMMARY, (
+        "the per-cell log block changed; every number below is what an "
+        "operator reads at 8am to decide whether a cell is broken")
+
+    # The two halves of the cell line really are distinguishable, or the
+    # equality above would hold for a block that echoed the job on both sides.
+    assert SUMMARY_JOB.arm != SUMMARY_RECORD_JOB.arm
+    assert SUMMARY_JOB.seed != SUMMARY_RECORD_JOB.seed
+    assert SUMMARY_RECORD_JOB.seed != SPLIT_SEED != SUMMARY_JOB.seed, (
+        "split_seed is printed on the same line as the recorded seed; if "
+        "either seed equalled it, a mutation reading one for the other would "
+        "be a no-op")
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +1215,100 @@ def test_main_runs_every_pending_job_once_in_cheap_first_order(
     assert "9/9 job(s) completed" in printed
 
 
+def test_main_hands_every_cell_the_one_buffer_it_built(
+        tmp_path, episode_dir, monkeypatch):
+    """NOTHING REQUIRED THE DRIVER TO HAND `run_job` THE BUFFER IT BUILT.
+
+    The spy has recorded `"buffer"` on every call since it was written and no
+    assertion ever read the key -- captured and never checked. So
+    `run_job(job, None, ...)` passed the whole suite, and on the rented box all
+    nine cells raise inside `run_job`, are swallowed by the per-cell
+    `except Exception`, and the run ends 0/9 with nine identical tracebacks
+    after burning the session. This is the sibling of the defect where nothing
+    required the evaluated model to be the TRAINED one.
+
+    THE ASSERTION IS IDENTITY, NOT EQUALITY. `BUFFER_CAPACITY`'s docstring
+    rests the whole study on it -- "the nine cells must be trained and scored
+    on the identical episode set or the study compares arms against different
+    data" -- and two buffers built over the same directory are equal in every
+    respect an equality could reach while being exactly the thing the docstring
+    forbids. Counting the constructions is the other half: a throwaway buffer
+    built per cell would still be `is` itself.
+    """
+    built: list[dict] = []
+    real = run_study.ReplayBuffer
+
+    def recording(root, **kwargs):
+        buffer = real(root, **kwargs)
+        built.append({"root": root, "kwargs": kwargs, "buffer": buffer})
+        return buffer
+
+    monkeypatch.setattr(run_study, "ReplayBuffer", recording)
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+
+    assert run_study.main(["--data", str(episode_dir),
+                           "--out", str(tmp_path / "study")]) == 0
+
+    assert len(built) == 1, (
+        "the driver built more than one buffer; a second one rebuilt inside "
+        "the loop is how the nine cells stop sharing an episode set")
+    assert built[0]["root"] == str(episode_dir), (
+        "the buffer must be built over --data. Built over --out it has no "
+        "episodes, which the EXIT_NO_DATA guard catches only by accident")
+    assert built[0]["kwargs"] == {
+        "capacity_transitions": run_study.BUFFER_CAPACITY}
+    assert len(calls) == 9
+    for call in calls:
+        assert call["buffer"] is built[0]["buffer"], (
+            f"{call['job']} was handed {call['buffer']!r} rather than the "
+            "buffer the driver built")
+
+
+def test_main_prints_the_per_cell_summary_block(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """THE BLOCK WAS CHECKED FOR NOT RAISING AND FOR NOTHING ELSE.
+
+    The whole `print(job_summary(...))` statement could be deleted from `_run`
+    with a green suite: `job_summary` has unit tests but nothing connected it
+    to the driver's output, and the integration assertions only looked at the
+    `===== [i/n] =====` banner, the pending header and the completion line.
+    With the nine records, `study.log` is the entire product of a 33-hour
+    unattended run, and that deletion empties it of every metric while leaving
+    every status line intact.
+
+    The arguments are pinned too, each of the three separately: the block was
+    equally free to be fed a blank record (every column reads `n/a`), a job
+    naming a seed that does not exist, or a constant wall time.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    # The spy returns in microseconds, so the real elapsed time rounds to the
+    # same "0.0" the constant-wall mutation prints. Drive the clock instead.
+    monkeypatch.setattr(run_study, "time", _FakeClock())
+    out = tmp_path / "study"
+
+    assert run_study.main(["--data", str(episode_dir), "--out", str(out)]) == 0
+
+    printed = capsys.readouterr().out
+    assert len(calls) == 9
+    for call in calls:
+        block = run_study.job_summary(
+            call["job"], call["record"], SUMMARY_WALL_SECONDS)
+        assert block in printed, (
+            f"{call['job']}'s summary block is not in the log; the morning "
+            f"has the status lines and no metrics:\n{block}")
+    assert printed.count("  reward    mse=") == 9, (
+        "one block per cell, or a single block is standing in for nine")
+
+    # The three arguments really are distinguishable here, or the assertion
+    # above would hold for a driver that passed the wrong ones.
+    assert len({c["job"] for c in calls}) == 9
+    assert "wall=0.0s" not in printed, (
+        "the driven clock must make a constant wall time visible")
+    assert "arm=None" not in printed, "a blank record would render like this"
+
+
 def test_main_forwards_the_flags_it_was_given(
         tmp_path, episode_dir, monkeypatch):
     """A driver that drops `--device` on the rented CUDA box falls back through
@@ -955,7 +1319,7 @@ def test_main_forwards_the_flags_it_was_given(
 
     assert run_study.main([
         "--data", str(episode_dir), "--out", str(tmp_path / "study"),
-        "--steps", str(CLI_STEPS), "--seq-len", str(CLI_SEQ_LEN),
+        *MATCHING_ARGV,
         "--device", CLI_DEVICE, "--arms", "frozen_ssl",
         "--seeds", "0", "2",
     ]) == 0
@@ -1125,15 +1489,29 @@ def test_a_keyboard_interrupt_stops_the_whole_run(
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("overrides", [
-    {"arm": "cnn"},          # wrong arm, RIGHT seed
-    {"seed": CLI_SEED},      # right arm, WRONG seed
+@pytest.mark.parametrize("overrides, claimed", [
+    ({"arm": "cnn"}, "arm='cnn' seed=1"),          # wrong arm, RIGHT seed
+    ({"seed": CLI_SEED}, f"arm='frozen_ssl' seed={CLI_SEED}"),  # wrong seed
 ], ids=["wrong_arm", "wrong_seed"])
-def test_main_reports_a_record_that_names_another_cell(
-        tmp_path, episode_dir, monkeypatch, capsys, overrides):
-    """The worst outcome the study has, and the reason each half is exercised
-    alone: a record at this cell's path describing another cell would be
-    aggregated under the wrong arm's name."""
+def test_main_quarantines_a_record_that_names_another_cell(
+        tmp_path, episode_dir, monkeypatch, capsys, overrides, claimed):
+    """The worst outcome the study has, and it used to be LEFT ON DISK.
+
+    The driver printed MISLABELLED, counted the cell failed, exited 1 -- and
+    left `result_frozen_ssl_seed1.json` sitting at the cell's own path with
+    `arm='cnn'` inside it, exactly where the aggregation's glob finds it. The
+    driver's own resume is safe, but an operator who reads the log in the
+    morning, fixes the cause and runs the AGGREGATION without re-running the
+    driver gets two `cnn` cells and no `frozen_ssl`/s1: one arm's numbers
+    reported under another's name, which is the thing this branch's own comment
+    calls the worst outcome the study has.
+
+    Each half of `record_names_the_job` is exercised alone, and the message is
+    pinned to the RECORD's claim rather than the job's: echoing the job on both
+    sides prints "the record says arm='frozen_ssl' ..., not 'frozen_ssl'/1",
+    a self-contradictory sentence that destroys the one fact needed to work out
+    whose numbers these are.
+    """
     liar = StudyJob("frozen_ssl", 1)
 
     def behaviour(job):
@@ -1141,15 +1519,84 @@ def test_main_reports_a_record_that_names_another_cell(
 
     fake, _ = _spy(behaviour)
     monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
 
-    status = run_study.main(["--data", str(episode_dir),
-                             "--out", str(tmp_path / "study")])
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
 
     assert status == run_study.EXIT_JOB_FAILED
     printed = capsys.readouterr().out
     assert "MISLABELLED" in printed
+    assert claimed in printed, (
+        "the message must say what the RECORD claims, not repeat the cell we "
+        "asked for on both sides of the sentence")
     assert f"{liar.arm}/s{liar.seed}" in printed.split("FAILED:")[-1]
     assert "8/9 job(s) completed" in printed
+
+    # The file is off the aggregation's path...
+    record_path = job_record_path(out, liar)
+    assert not record_path.exists(), (
+        "the mislabelled record is still at the cell's own path, where the "
+        "aggregation reads it as this cell's result")
+    # ...and still on disk, under a name that is not a record's.
+    quarantined = record_path.with_name(
+        record_path.name + run_study.MISLABELLED_SUFFIX)
+    assert quarantined.is_file(), "the record was destroyed rather than moved"
+    assert json.loads(quarantined.read_text())["arm"] == overrides.get(
+        "arm", liar.arm), "the quarantined file is not the record we saw"
+    assert str(quarantined) in printed, (
+        "the log must say where the file went, or the operator cannot find it")
+
+    # The other eight cells still ran: one bad cell does not abort the run.
+    assert len(list(out.glob("result_*.json"))) == 8
+
+
+def test_the_quarantine_suffix_cannot_be_read_as_a_record(tmp_path):
+    """The same argument `LOCK_NAME` makes, for the same directory.
+
+    The aggregation globs `--out`. A quarantined record whose name still ends
+    in `.json` is quarantined in name only, and a name that still starts with
+    `result_` is picked up by the narrower glob too.
+    """
+    assert not run_study.MISLABELLED_SUFFIX.endswith(".json")
+
+    record = job_record_path(tmp_path, DONE_JOB)
+    record.write_text('{"arm": "cnn"}')
+    assert [p.name for p in tmp_path.glob("result_*.json")] == [record.name], (
+        "the control: the glob really does find a record at this path, so an "
+        "empty result below means the move worked and not that nothing was "
+        "ever there")
+
+    moved = run_study.quarantine_record(record)
+    assert not moved.name.endswith(".json")
+    assert list(tmp_path.glob("result_*.json")) == []
+    assert list(tmp_path.glob("*.json")) == [], (
+        "the aggregation globs the whole directory; a quarantined record that "
+        "still ends in .json is quarantined in name only")
+
+
+def test_quarantining_twice_does_not_overwrite_the_first_file(tmp_path):
+    """Two mislabelled records for one cell across two runs are two facts.
+
+    Overwriting would leave the operator with the second and no sign of the
+    first, and each is the output of a real 1.4-to-8.3-hour training run.
+    """
+    path = job_record_path(tmp_path, DONE_JOB)
+    path.write_text('{"arm": "first"}')
+    first = run_study.quarantine_record(path)
+    path.write_text('{"arm": "second"}')
+    second = run_study.quarantine_record(path)
+
+    assert first != second
+    assert json.loads(first.read_text())["arm"] == "first"
+    assert json.loads(second.read_text())["arm"] == "second"
+    assert not path.exists()
+
+
+def test_quarantining_a_file_that_is_not_there_does_not_kill_the_run(tmp_path):
+    """This runs inside the per-cell loop, after the record is on disk, and
+    must not become the thing that ends an unattended run. `None` is the
+    signal that the message has to tell the operator to move it by hand."""
+    assert run_study.quarantine_record(tmp_path / "no_such_record.json") is None
 
 
 def test_main_stops_before_the_first_cell_when_there_are_no_episodes(
@@ -1221,6 +1668,99 @@ def test_main_refuses_a_selection_that_would_run_the_wrong_cells(
     assert excinfo.value.code not in set(EXPECTED_EXIT_STATUS.values()), (
         "argparse's usage status must stay clear of the study's own, or a "
         "shell typo and a real failure are the same event to any wrapper")
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["--steps", "200"], "--steps 200"),
+    (["--steps", str(run_study.MIN_STEPS - 1)],
+     f"--steps {run_study.MIN_STEPS - 1}"),
+    (["--seq-len", "6"], "--seq-len 6"),
+    (["--seq-len", str(run_study.MIN_SEQ_LEN - 1)],
+     f"--seq-len {run_study.MIN_SEQ_LEN - 1}"),
+], ids=["steps_typo", "steps_just_under", "seq_len_typo", "seq_len_just_under"])
+def test_a_mistyped_training_length_is_refused_at_the_command_line(
+        tmp_path, episode_dir, argv, expected, capsys):
+    """THE SMOKE-RUN TRAP IN A NEW COAT, and the config guard cannot help.
+
+    `--arms` and `--seeds` are choice-restricted with the stated rationale that
+    a shell typo must not buy a night of a rented box; the two flags that
+    decide HOW MUCH training happens were unrestricted. `--steps 200` for
+    `--steps 20000` writes nine complete records at a smoke configuration and
+    exits 0 -- and `record_config_mismatch` cannot catch it, because the
+    records agree with the flags they were made with. The corrective re-run at
+    20000 is then REFUSED with `EXIT_CONFIG_MISMATCH` until all nine records
+    are deleted by hand. The typo guard stopped exactly where a typo is most
+    expensive.
+
+    EACH FLAG ALONE, AND EACH JUST UNDER ITS OWN FLOOR: a check that compared
+    `steps` against `MIN_SEQ_LEN`, or that tested only one of the two flags,
+    would pass for half of these.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
+                        *argv])
+    assert excinfo.value.code == ARGPARSE_USAGE_STATUS
+    assert excinfo.value.code not in set(EXPECTED_EXIT_STATUS.values())
+    message = capsys.readouterr().err
+    assert expected in message, (
+        "the refusal must name the flag and the value that was typed")
+    assert "--allow-short" in message, (
+        "a deliberate short run has to be told how to say so, or the floor is "
+        "just a wall")
+
+
+@pytest.mark.parametrize("argv", [
+    ["--steps", "0"], ["--steps", "-5"],
+    ["--seq-len", "0"], ["--seq-len", "-3"],
+], ids=["steps_zero", "steps_negative", "seq_len_zero", "seq_len_negative"])
+def test_a_non_positive_training_length_is_refused_even_with_allow_short(
+        tmp_path, episode_dir, argv):
+    """`--allow-short` waives the FLOOR, not arithmetic.
+
+    `--steps 0` trains nothing and `--seq-len 0` has no meaning, so there is no
+    deliberate run they could be. All four were accepted, wrote nine complete
+    records and exited 0.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
+                        "--allow-short", *argv])
+    assert excinfo.value.code == ARGPARSE_USAGE_STATUS
+
+
+def test_a_deliberate_short_run_is_allowed_when_it_says_so(
+        tmp_path, episode_dir, monkeypatch):
+    """THE CONTROL. Without it a driver that refused every configuration --
+    the study's own 20000/64 included -- would pass all eight cases above.
+
+    The plan's Step 1 smoke run is a real thing, and the floor exists to tell
+    a deliberate one from a typo, not to forbid short runs.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+
+    assert run_study.main([
+        "--data", str(episode_dir), "--out", str(tmp_path / "smoke"),
+        "--steps", str(SMOKE_STEPS), "--seq-len", "1", "--allow-short",
+        "--arms", "cnn", "--seeds", "0"]) == 0
+    assert calls[0]["kwargs"]["steps"] == SMOKE_STEPS
+    assert calls[0]["kwargs"]["seq_len"] == 1
+
+
+def test_the_studys_own_configuration_is_above_both_floors():
+    """A floor raised past the study itself would refuse the real run.
+
+    The defaults are what the plan's Step 3 command uses with no flags at all,
+    so a `MIN_STEPS` above 20000 turns the 33-hour run into a usage error.
+    """
+    defaults = vars(run_study._parser().parse_args([]))
+    assert defaults["steps"] >= run_study.MIN_STEPS > 0
+    assert defaults["seq_len"] >= run_study.MIN_SEQ_LEN > 0
+    assert not defaults["allow_short"], (
+        "the waiver must be off by default, or the floors are decoration")
+    # And the floors really do bite on a dropped digit, which is the typo they
+    # exist for: 20000 -> 2000 and 64 -> 6.
+    assert defaults["steps"] // 10 < run_study.MIN_STEPS
+    assert defaults["seq_len"] // 10 < run_study.MIN_SEQ_LEN
 
 
 def test_the_script_exits_with_mains_status_when_run_as_a_script(tmp_path):
@@ -1542,6 +2082,49 @@ def test_the_refusal_lists_a_cells_mismatched_fields_in_a_stable_order(
         for key in sorted(CONFIG_MISMATCHES)))
 
 
+def test_the_refusal_says_delete_from_out_and_names_which_directory(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """THE LOG USED TO TELL THE OPERATOR TO DELETE THE DATASET.
+
+    `print(stale_report(stale, args.out))` with `args.data` in its place
+    survived the whole suite, and the banner then names the EPISODE directory
+    as the place holding the stale records while the Remedy line says to delete
+    those records. An operator following that at 8am deletes
+    `data/my_way_home`, which is not reproducible from anything in the
+    repository and takes the study with it. The directory could also be dropped
+    from the banner entirely, which leaves the operator told to delete files
+    and not told where they are -- the same instruction, aimed at nothing.
+
+    So `--out` is named, and named ON THE REMEDY LINE ITSELF rather than only
+    in the banner four lines up, and `--data` is named as the thing not to
+    touch. The two directories in this test are siblings, so neither path is a
+    substring of the other and "names --out" cannot pass by naming --data.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
+    _write_matching(out, DONE_JOB, steps=SMOKE_STEPS)
+    assert str(out) not in str(episode_dir) and str(episode_dir) not in str(out)
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out),
+                             *MATCHING_ARGV])
+
+    assert status == run_study.EXIT_CONFIG_MISMATCH
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert str(episode_dir) not in printed, (
+        "the refusal named the episode directory as the place holding the "
+        "stale records, and its own remedy says to delete them")
+    remedy, = [line for line in printed.splitlines()
+               if line.startswith("Remedy:")]
+    assert str(out) in remedy, (
+        "the line that tells the operator to delete files must say which "
+        "directory to delete them from")
+    assert "--out" in remedy and "NOT from --data" in remedy
+    banner = printed.splitlines()[1]
+    assert str(out) in banner and "--out" in banner
+
+
 # ---------------------------------------------------------------------------
 # one driver per --out
 # ---------------------------------------------------------------------------
@@ -1567,6 +2150,191 @@ def test_a_second_driver_on_the_same_out_refuses_to_start(
         "the message must name who holds it, or an operator cannot tell a "
         "live run from a crashed one and will not dare delete the file")
     assert held.read_bytes(), "the claim must survive the refusal"
+
+
+def test_the_claim_names_the_pid_the_host_and_the_start_time(tmp_path):
+    """All three fields, because the docstring rests on all three.
+
+    `acquire_lock` leaves a crashed run's claim behind deliberately, and the
+    justification is that "the file names the pid, the host and the start time,
+    so an operator can tell a live run from a dead one". Only the pid was
+    pinned: the host could be dropped or replaced by a literal and the start
+    time could become the string "unknown", with a green suite. A bare pid is
+    ambiguous across the laptop and the rented box, and a claim with no start
+    time is exactly the claim an operator will not dare delete -- so they leave
+    it, and the resume they came to run refuses.
+    """
+    before = datetime.now().replace(microsecond=0)
+    path = run_study.acquire_lock(tmp_path / "study")
+    after = datetime.now()
+
+    claim = json.loads(path.read_text())
+    assert claim["pid"] == os.getpid()
+    assert claim["host"] == socket.gethostname(), (
+        "the host tells the laptop's run from the rented box's")
+    # Parsed rather than matched, so the literal "unknown" fails here, and
+    # bounded, so a frozen timestamp does too.
+    assert before <= datetime.fromisoformat(claim["started"]) <= after
+    assert set(claim) == {"pid", "host", "started"}, (
+        "a field was added or dropped; every one of them is what the operator "
+        "decides on before deleting a file that may belong to a live run")
+
+
+def test_a_claim_that_is_empty_still_says_something_to_decide_on(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """A ZERO-BYTE CLAIM IS THE LIKELIEST DAMAGED ONE, and reading it SUCCEEDS.
+
+    It is what a process killed between `os.open` and `json.dump` leaves --
+    the code concedes the lock "is written by a process that can be killed
+    mid-write" -- and `read_text` returns `""` rather than raising, so the
+    `<unreadable>` guard cannot see it. The refusal printed "another driver
+    already holds <path>: " and stopped at the colon, and the operator at 2am
+    then has to decide whether to delete a claim on no evidence at all: delete
+    a live run's and the study runs twice, leave a dead one's and the resume
+    they came to do refuses.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "study"
+    out.mkdir()
+    held = out / run_study.LOCK_NAME
+    held.write_bytes(b"")
+    assert held.read_text() == "", "this case exists because the read SUCCEEDS"
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
+
+    assert status == run_study.EXIT_LOCKED
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert str(held) in printed
+    assert "<empty" in printed, (
+        "the refusal must name the empty claim as empty rather than trailing "
+        "off after the colon")
+    assert f"{held}: \n" not in printed
+    assert held.exists(), "the claim must survive the refusal"
+
+
+def test_out_two_levels_deep_is_created_rather_than_crashing(
+        tmp_path, episode_dir, monkeypatch):
+    """`parents=True` IS LOAD-BEARING, and every test writes a one-level --out.
+
+    `runs/` is gitignored with zero tracked files, so on a freshly cloned repo
+    on the rented GPU box the directory does not exist, and `acquire_lock`'s
+    mkdir is the FIRST thing in the whole driver that creates `--out` --
+    `pending_jobs` and `stale_records` only build paths. With `parents=False`
+    the plan's own Step 3 command dies at second zero with a bare
+    `FileNotFoundError` raised from inside the lock helper, a traceback that
+    never mentions `--out` or a missing directory. Every other test here uses
+    `tmp_path / "study"`, whose parent always exists.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "runs" / "m3_study"
+    assert not out.parent.exists(), "the missing parent is the whole point"
+
+    assert run_study.main(["--data", str(episode_dir), "--out", str(out),
+                           "--arms", "cnn", "--seeds", "0"]) == 0
+
+    assert len(calls) == 1
+    assert job_record_path(out, StudyJob("cnn", 0)).is_file()
+
+
+def test_an_out_that_cannot_be_created_is_not_reported_as_a_failed_cell(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """AN UNCAUGHT TRACEBACK EXITS 1, AND 1 IS `EXIT_JOB_FAILED`.
+
+    `--out` naming an existing file made the mkdir raise `FileExistsError`
+    straight out of `main`, and the wrapper reading the overnight run's status
+    was told "some cells failed, re-run to retry exactly those" when nothing
+    had run and the command line was wrong. That is the ambiguity the
+    `EXIT_NO_DATA` 2->5 renumbering existed to remove, reintroduced through the
+    uncaught-exception path.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "not_a_directory"
+    out.write_text("this is a file")
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
+
+    # Not `EXIT_JOB_FAILED`, which is what an uncaught traceback exits with;
+    # the two are pinned apart by `test_every_exit_status_is_distinct_...`,
+    # so naming the right one here is enough.
+    assert status == run_study.EXIT_OUT_UNUSABLE
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert str(out) in printed
+    assert "no claim file to delete" in printed, (
+        "the held-lock remedy is actively wrong here: there is no lock")
+
+
+def test_a_lock_that_cannot_be_created_is_not_reported_as_one_already_held(
+        tmp_path, episode_dir, monkeypatch, capsys):
+    """ENOSPC, EROFS, EACCES AND EMFILE ARE NOT "SOMEONE ELSE HOLDS THIS".
+
+    `except FileExistsError` widened to `except OSError` survives the suite,
+    and then every failure of `os.open` at all is reported as another driver's
+    claim: the run exits `EXIT_LOCKED` and the printed remedy tells the
+    operator to delete a lock file that does not exist, at 2am, on a box they
+    are paying for, while the actual fault is the filesystem. The two want
+    opposite responses -- go and find the other run, versus fix the disk --
+    which is the same argument the module makes for why `EXIT_NO_DATA` must not
+    be argparse's 2.
+
+    The `FileExistsError` half is exercised alone by
+    `test_a_second_driver_on_the_same_out_refuses_to_start`; this is the other
+    half alone.
+    """
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    real_open = os.open
+
+    def refusing(path, flags, *args, **kwargs):
+        if str(path).endswith(run_study.LOCK_NAME):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(run_study.os, "open", refusing)
+    out = tmp_path / "study"
+
+    status = run_study.main(["--data", str(episode_dir), "--out", str(out)])
+
+    # Not `EXIT_LOCKED`: a full disk and a second driver want opposite
+    # responses and must not be the same event to the wrapper. The two codes
+    # are pinned apart by `test_every_exit_status_is_distinct_...`.
+    assert status == run_study.EXIT_OUT_UNUSABLE
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert "Permission denied" in printed, "the real fault must be reported"
+    assert "already holds" not in printed, (
+        "this is not a claim, and telling the operator to delete one sends "
+        "them looking for a file that does not exist")
+
+
+def test_the_release_survives_a_claim_that_is_already_gone(
+        tmp_path, episode_dir, monkeypatch):
+    """`missing_ok=True` EXISTS SO THE RELEASE CANNOT REPLACE THE RUN'S STATUS.
+
+    The `finally` is there so a `return` cannot leak the claim; with
+    `missing_ok=False` the release itself becomes a way to fail, and a
+    `FileNotFoundError` out of a `finally` clause discards whatever `_run`
+    returned. An operator who deletes the claim while the run is live -- having
+    decided from a stale-looking pid that it was dead -- turns a clean 9/9 into
+    a traceback and an exit status of 1.
+    """
+    out = tmp_path / "study"
+
+    def behaviour(job):
+        (out / run_study.LOCK_NAME).unlink(missing_ok=True)
+        return None
+
+    fake, calls = _spy(behaviour)
+    monkeypatch.setattr(run_study, "run_job", fake)
+
+    assert run_study.main(["--data", str(episode_dir), "--out", str(out),
+                           "--arms", "cnn", "--seeds", "0"]) == 0
+    assert len(calls) == 1
+    assert not (out / run_study.LOCK_NAME).exists()
 
 
 def test_a_byte_damaged_lock_file_still_produces_the_refusal(
