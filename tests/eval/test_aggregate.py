@@ -28,6 +28,7 @@ character-for-character table assertions below can be checked by eye against
 the field each column claims to hold.
 """
 
+import builtins
 import importlib.util
 import json
 import math
@@ -1501,6 +1502,90 @@ def test_curve_gaps_names_only_the_curves_that_are_short():
         "in CURVE_NAMES order, and only the two that are actually short")
 
 
+@pytest.mark.parametrize("curve,why", [
+    ("1234", "a JSON string"),
+    ({"0": 1.0, "1": 2.0, "2": 3.0, "3": 4.0}, "a mapping"),
+])
+def test_a_curve_that_is_not_a_LIST_has_not_been_produced(curve, why):
+    """The `not isinstance(curve, list)` term of the three-term guard, ALONE.
+
+    Every other curve test in this module deletes the name, shortens the list
+    or replaces the whole `curves` block; nothing anywhere put a NON-LIST in a
+    curve SLOT, so that term was never the deciding one. The fixtures here are
+    chosen to be exactly `FIXTURE_HORIZON` long, so `len(curve) != horizon` is
+    FALSE for both and the isinstance term is the only thing that can answer:
+    without it a record whose `rssm_position` came back as the four-character
+    string "1234" reports a complete curve set, `curves_produced` PASSES, and
+    `write_figure` then hands `plt.plot` four characters where a rollout
+    belongs.
+    """
+    record = _record("cnn", 0)
+    assert len(curve) == FIXTURE_HORIZON, (
+        f"{why} of exactly the horizon's length is the point: a shorter one "
+        "would be caught by the length term and prove nothing")
+    record["curves"]["rssm_position"] = curve
+    assert aggregate.curve_gaps(record) == ["rssm_position"], (
+        "only the slot that is not a list, and it IS one of the gaps")
+    assert aggregate._curves_ok(record) is False
+
+
+def test_six_EMPTY_curves_at_a_horizon_of_zero_are_still_no_curves():
+    """The `not curve` term, alone, and the only shape that can reach it.
+
+    At any positive horizon an empty list is already caught by
+    `len(curve) != horizon`, so the term can only be the deciding one when the
+    record says its horizon was 0 -- where `len([]) != 0` is False and a
+    record carrying six empty curves would otherwise report a complete
+    error-vs-horizon curve set with nothing at all to draw.
+    """
+    record = _record("cnn", 0)
+    record["horizon"] = 0
+    record["curves"] = {name: [] for name in CURVE_NAMES}
+    assert aggregate.curve_gaps(record) == list(CURVE_NAMES)
+
+
+@pytest.mark.parametrize("horizon,length", [
+    # A float: `len(curve) != 4.0` is FALSE for a four-step curve, so without
+    # the guard a record whose horizon came back as `4.0` -- which is what a
+    # JSON `"horizon": 4.0` or a half-converted record holds -- reports every
+    # curve complete.
+    (float(FIXTURE_HORIZON), FIXTURE_HORIZON),
+    # A bool: `isinstance(True, int)` is True, so only the explicit
+    # `isinstance(horizon, bool)` half excludes it, and `len(curve) != True`
+    # is False for a one-step curve.
+    (True, 1),
+])
+def test_a_horizon_that_is_not_an_INT_leaves_every_curve_unverifiable(
+        horizon, length):
+    """The moved guard's RETURN VALUE: all six names, not an empty list.
+
+    The guard used to sit after the length loop and answer a bool; it now sits
+    before the loop and answers `list(CURVE_NAMES)`, and nothing exercised
+    that. The two shapes here are the ones where the length comparison AGREES
+    with a horizon it should never have been allowed to compare against, so
+    they are the two that tell the guard's answer apart from the loop's: with
+    the guard gone, both report a complete curve set and gate criterion 2 --
+    the error-vs-horizon curve of each arm with persistence and floor on the
+    same axes -- is reported as MET by a record that never said how many steps
+    it rolled out.
+    """
+    records = _study()
+    broken = _cell(records, "cnn", 1)
+    broken["horizon"] = horizon
+    broken["curves"] = {
+        name: [float(step) for step in range(length)] for name in CURVE_NAMES}
+    assert aggregate.curve_gaps(broken) == list(CURVE_NAMES), (
+        "a horizon nothing can be checked against makes every curve "
+        "unverifiable, which is not the same as none being short")
+    assert per_arm(records)["cnn"]["curves_ok"] is False
+    verdict = evaluate_gate(records)
+    assert verdict["criteria"]["curves_produced"] is False
+    assert verdict["passed"] is False
+    assert _row(report_study.gate_block(verdict), "  CURVES INCOMPLETE") == (
+        "  CURVES INCOMPLETE (1 of 9): cnn/s1 "
+        f"({', '.join(CURVE_NAMES)})")
+
+
 # ---------------------------------------------------------------------------
 # ridge_groups and mean_curve
 # ---------------------------------------------------------------------------
@@ -2195,6 +2280,42 @@ def test_the_ridge_block_warns_when_a_cell_does_not_SAY_whether_it_selected():
     assert "NO ridge selection" in _row(block, "WARNING: at least one cell")
 
 
+def test_the_ridge_block_does_not_warn_about_a_decade_its_own_table_refutes():
+    """M9. A named warning the table beside it refutes is one a reader learns
+    to discount, and this block is the whole of R1's disclosure.
+
+    `ridge_groups` keys on `(ridge_selected, joint_ridge, embedding_ridge)`,
+    so two groups can differ in the FLAG alone. The first warning asked
+    `len(groups) > 1`, so it fired on that split and printed "the nine cells
+    did not all select the same ridge decade" directly under two rows whose
+    `joint_ridge` and `embed_ridge` columns hold THE SAME TWO NUMBERS -- the
+    only two columns the sentence is about.
+
+    What that split IS about is the second warning, and it still fires: the
+    disclosure is not lost, it is told truthfully. The sibling above, where
+    the two groups really do sit at different decades, is the other rendering.
+    """
+    records = _rendering_study()
+    for seed in SEEDS:
+        _cell(records, "cnn", seed)["filtering"]["gain"][
+            "ridge_selected"] = False
+    block = report_study.ridge_block(ridge_groups(records))
+    assert _row(block, "False") == (
+        "False           1.0e+03      1.0e+05      3       3 +2301.3333  "
+        "cnn/s0 cnn/s1 cnn/s2")
+    assert _row(block, "True") == (
+        "True            1.0e+03      1.0e+05      6       6 +2308.8333  "
+        "frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "random_vit/s0 random_vit/s1 random_vit/s2"), (
+        "two groups, and both ridge columns identical in both rows -- which "
+        "is what makes the decade warning below a claim the table refutes")
+    assert not any(line.startswith("WARNING: the nine cells")
+                   for line in block.splitlines()), (
+        "no cell moved decade; the flag is what split the groups")
+    assert "NO ridge selection" in _row(block, "WARNING: at least one cell"), (
+        "and the warning that IS about the flag still fires")
+
+
 def test_the_ridge_block_prints_the_denominator_beside_the_count_of_cells():
     """`cells 9` beside a mean over six was the one row in the report that
     broke the module docstring's promise that the denominator of every mean is
@@ -2368,62 +2489,212 @@ def test_the_report_states_the_policy_the_means_were_taken_under():
         "  records     9 of 9 expected cells (3 arms x 3 seeds)")
 
 
-#: The seven sections of the report, each with the callable that renders it.
+#: Every row of every per-cell table, as a LITERAL label, in the order the
+#: study owes them: three arms x three seeds, the middle arm in the middle.
+_CELL_ROWS = tuple(f"{arm}/s{seed}" for arm in ARMS for seed in SEEDS)
+
+#: The metric table's rows: one per arm and metric, its label column being
+#: `f"{arm:<12}{metric:<10}"`.
+_METRIC_ROWS = tuple(
+    f"{arm:<12}{metric:<10}" for arm in ARMS for metric in METRICS)
+
+#: The seven sections of the report: the section header, the first line of the
+#: block that must sit DIRECTLY under it, and the label prefix of every row of
+#: that block, in order. `None` for the gate block, whose lines are asserted
+#: against `GATE_CRITERIA` at the foot of the test instead.
 #:
 #: The tables are individually pinned character-for-character above; what this
-#: pins is the JOIN between them and the DOCUMENT. Five of the seven could be
-#: deleted from `report()` -- the training table, the criterion-4 table, the
-#: gain table, the ridge block and the reward table, i.e. both artefacts R1
-#: exists to produce and the table carrying the number the milestone fails on
-#: -- leaving their section headers behind, and the suite stayed green,
-#: because every one of them was tested only by being called directly.
+#: pins is the JOIN between them and the DOCUMENT, and the SET OF ROWS each one
+#: prints. Five of the seven could be deleted from `report()` -- the training
+#: table, the criterion-4 table, the gain table, the ridge block and the reward
+#: table, i.e. both artefacts R1 exists to produce and the table carrying the
+#: number the milestone fails on -- leaving their section headers behind, and
+#: the suite stayed green, because every one of them was tested only by being
+#: called directly.
+#:
+#: NOT ONE OF THESE EXPECTATIONS IS PRODUCED BY THE CODE UNDER TEST. The first
+#: version of this table carried a CALLABLE per section and built each expected
+#: body by calling the very renderer the assertion was meant to judge, so a
+#: mutated renderer answered the assertion with its own output: with the last
+#: arm, the last seed or a named arm dropped from `criterion_4_table` or
+#: `training_table`, the shortened table still sat under its header and matched
+#: the shortened expectation, and the suite stayed green while the criterion-4
+#: table lost three cells two lines under a header still reading "records 9 of
+#: 9 expected cells". That is the L7 species living inside the fix for L7.
+#: Here every column header is a string typed out in full and every row list is
+#: built from ARMS, SEEDS and METRICS -- constants of `mbfps.utils.config` and
+#: `mbfps.eval.summary`, pinned to their literal values in the test below and
+#: in `tests/utils/test_config.py`, not owned by `scripts/report_study.py`. A
+#: renderer that drops, reorders or renames a row cannot make the expectation
+#: move with it.
 REPORT_SECTIONS = [
     ("--- gap_closed at the final horizon step, by arm and seed "
      "(fraction of the persistence-to-floor band) ---",
-     lambda records, verdict: report_study.metric_table(
-         records, verdict["per_arm"])),
+     "arm         metric          seed 0      seed 1      seed 2"
+     "        mean  finite  unanimous  degenerate  floor>=pers",
+     _METRIC_ROWS),
     ("--- training ---",
-     lambda records, verdict: report_study.training_table(records)),
+     "cell               steps/s   kl_rate  kl_dyn_max  loss_last20   wall_h",
+     _CELL_ROWS),
     ("--- filtering, gate criterion 4: does the posterior latent beat the "
      "raw encoder embedding of the same frame? ---",
-     lambda records, verdict: report_study.criterion_4_table(records)),
+     "cell                latent_r2     embed_r2   latent_beats_embedding",
+     _CELL_ROWS),
     ("--- filtering, the bottleneck-free companion: what appending h to "
      "that same embedding buys ---",
-     lambda records, verdict: report_study.gain_table(records)),
+     "cell                joint_r2    embed_r2        gain"
+     "                     95% CI  CI excl 0  joint_ridge  embed_ridge"
+     "  selected  windows",
+     _CELL_ROWS),
     ("--- the ridge decade each gain was computed at ---",
-     lambda records, verdict: report_study.ridge_block(
-         verdict["ridge_groups"])),
+     "selected    joint_ridge  embed_ridge  cells  finite  gain_mean  members",
+     # One group: every cell of both fixtures below carries the same three-part
+     # ridge key, so the block is its column header and exactly one row.
+     ("True",)),
     ("--- reward prediction (spec criterion 3: reported per arm, and "
      "deliberately not gated -- the target is near-constant by "
      "construction) ---",
-     lambda records, verdict: report_study.reward_table(records)),
-    ("--- M3 exit gate (spec section 4) ---",
-     lambda records, verdict: report_study.gate_block(verdict)),
+     "cell                       mse    baseline_mse           r2   events"
+     "    steps  degenerate_target",
+     _CELL_ROWS),
+    # The gate block's first line depends on the verdict rather than on the
+    # study's shape, so the caller spells it out; its rows are asserted
+    # against GATE_CRITERIA at the foot of the test below.
+    ("--- M3 exit gate (spec section 4) ---", None, None),
 ]
 
 
-def test_every_section_of_the_report_is_actually_in_the_report():
-    """Header AND body, as one contiguous block, for all seven.
+def _section_body(text: str, header: str) -> list[str]:
+    """The lines directly under `header`, to the blank line that ends them.
 
-    Asserted as `f"{header}\\n{table}"` rather than as two `in` checks: a
-    header line and a row that both appear somewhere is satisfied by a report
-    whose sections have been shuffled, and a body alone is satisfied by any
-    table that happens to render the same text. The headers are distinct, so
-    each pair can only be answered by its own section.
+    The section headers are distinct, so this can only return the block that
+    belongs to the header it was asked for; a body picked out by matching its
+    own text would be satisfied by any table rendering the same rows.
     """
+    lines = text.splitlines()
+    assert lines.count(header) == 1, (
+        f"{lines.count(header)} lines are {header!r}; the block below it "
+        f"cannot be identified:\n{text}")
+    body = []
+    for line in lines[lines.index(header) + 1:]:
+        if not line:
+            break
+        body.append(line)
+    return body
+
+
+def _assert_sections(text: str, gate_first_line: str) -> None:
+    """Every section's header, its column header and its full row set."""
+    for header, column_header, rows in REPORT_SECTIONS:
+        if column_header is None:
+            column_header = gate_first_line
+        assert f"{header}\n{column_header}" in text, (
+            f"the section header {header!r} is in the report and the table it "
+            "names is not directly under it")
+        if rows is None:
+            continue
+        body = _section_body(text, header)
+        assert len(body) - 1 == len(rows), (
+            f"{header!r} printed {len(body) - 1} rows under its column "
+            f"header and the study owes {len(rows)}:\n" + "\n".join(body))
+        # The length is asserted FIRST: `zip` truncates to the shorter of the
+        # two, so a table short of a row would otherwise compare only the rows
+        # it still has and agree with itself.
+        assert [line[:len(row)] for line, row in zip(body[1:], rows)] == list(
+            rows), (
+            f"{header!r} does not print one row per cell, in ARMS x SEEDS "
+            "order:\n" + "\n".join(body))
+
+
+def test_every_section_of_the_report_is_actually_in_the_report():
+    """Header, column header and one row per cell, for all seven sections.
+
+    The join is asserted as the literal `f"{header}\\n{column_header}"` rather
+    than as two `in` checks: a header line and a row that both appear
+    somewhere is satisfied by a report whose sections have been shuffled.
+    """
+    assert ARMS == ("cnn", "frozen_ssl", "random_vit"), (
+        "the row expectations are built from ARMS, METRICS and SEEDS, which "
+        "the renderer reads too; pinned literally here so that a constant "
+        "losing an entry cannot move both sides of the comparison together")
+    assert METRICS == ("position", "angle")
+    assert aggregate.SEEDS == SEEDS == (0, 1, 2)
     records = _rendering_study()
     verdict = evaluate_gate(records)
     text = report_study.report(records, verdict, "runs/x")
-    for header, render in REPORT_SECTIONS:
-        body = render(records, verdict)
-        assert body.strip(), f"{header} rendered nothing to assert on"
-        assert f"{header}\n{body}" in text, (
-            f"the section header {header!r} is in the report and the table it "
-            "names is not directly under it")
+    _assert_sections(text, "  [PASS] all_nine_cells_present")
     assert [line for line in text.splitlines() if line.startswith("---")] == [
-        header for header, _ in REPORT_SECTIONS], (
+        header for header, _, _ in REPORT_SECTIONS], (
         "seven sections, in this order, and no eighth: a header with no table "
         "under it is what every one of these deletions left behind")
+    gate = _section_body(text, REPORT_SECTIONS[-1][0])
+    assert [line[len("  [PASS] "):] for line in gate
+            if line.startswith(("  [PASS] ", "  [FAIL] "))] == list(
+        GATE_CRITERIA), (
+        "every criterion, by name, in GATE_CRITERIA order -- a conjunction "
+        "reported with one of its terms missing is a five-criterion gate "
+        "reported as a four-criterion pass")
+    assert text.splitlines()[-1] == "GATE: NOT PASSED", (
+        "the verdict is the LAST line of the report: the rendering fixture "
+        "has latent_beats_embedding False, which is what the real trained "
+        "model measured")
+
+
+def test_all_five_per_cell_tables_MARK_a_missing_cell_rather_than_dropping_it():
+    """THE MARKER, IN ALL FIVE TABLES. Only the metric table's was pinned.
+
+    Deleting the `MISSING` line from `training_table`, `criterion_4_table`,
+    `gain_table` or `reward_table` -- each of which prints it for a cell with
+    no record and then `continue`s -- left the whole suite green. With
+    frozen_ssl's three records absent the shipped criterion-4 table prints
+    three MISSING rows between the cnn and the random_vit rows; without that
+    line it prints six rows and nothing else: a full-looking, evenly spaced
+    table describing a study nobody ran, in the table carrying the number the
+    milestone fails on, two lines under a header that still says how many
+    cells are missing.
+
+    The four markers are at four DIFFERENT column widths -- 10, 13, 12 and 14
+    -- so no one of these four expectations can be satisfied by another
+    table's row, and the section loop re-runs here over the incomplete study,
+    so a table that dropped the row instead of marking it is short by three.
+    """
+    records = [r for r in _rendering_study() if r["arm"] != "frozen_ssl"]
+    verdict = evaluate_gate(records)
+    text = report_study.report(records, verdict, "runs/x")
+    assert _row(text, "  records") == (
+        "  records     6 of 9 expected cells (3 arms x 3 seeds)")
+    assert _row(text, "  MISSING CELLS") == (
+        "  MISSING CELLS (3 of 9): frozen_ssl/s0, frozen_ssl/s1, "
+        "frozen_ssl/s2")
+    _assert_sections(text, "  [FAIL] all_nine_cells_present")
+    assert _row(text, "frozen_ssl  position") == (
+        "frozen_ssl  position       MISSING     MISSING     MISSING"
+        "         n/a     0/3        n/a         n/a          n/a")
+    assert _row(text, "frozen_ssl  angle") == (
+        "frozen_ssl  angle          MISSING     MISSING     MISSING"
+        "         n/a     0/3        n/a         n/a          n/a")
+    for header, marker in (
+        ("--- training ---", "frozen_ssl/s0      MISSING"),
+        ("--- filtering, gate criterion 4: does the posterior latent beat "
+         "the raw encoder embedding of the same frame? ---",
+         "frozen_ssl/s0         MISSING"),
+        ("--- filtering, the bottleneck-free companion: what appending h to "
+         "that same embedding buys ---",
+         "frozen_ssl/s0        MISSING"),
+        ("--- reward prediction (spec criterion 3: reported per arm, and "
+         "deliberately not gated -- the target is near-constant by "
+         "construction) ---",
+         "frozen_ssl/s0          MISSING"),
+    ):
+        body = _section_body(text, header)
+        assert body[4:7] == [
+            marker,
+            marker.replace("/s0", "/s1"),
+            marker.replace("/s0", "/s2"),
+        ], (
+            f"the three cells of the arm that never ran are marked MISSING, "
+            f"in their own rows, between cnn's and random_vit's, under "
+            f"{header!r}:\n" + "\n".join(body))
 
 
 def test_the_report_renders_the_ridge_grouping_out_of_the_VERDICT():
@@ -2892,6 +3163,121 @@ def test_a_record_with_no_curve_to_draw_costs_the_picture_not_the_status(
     assert _row(out, "  CURVES INCOMPLETE") == (
         f"  CURVES INCOMPLETE (1 of 9): cnn/s1 ({', '.join(gaps)})")
     assert not (tmp_path / "curves.png").exists()
+
+
+def test_a_missing_matplotlib_costs_the_FIGURE_and_not_the_exit_status(
+        tmp_path):
+    """I3. The imports used to sit OUTSIDE the try that guards every other way
+    of failing to draw, so the whole report printed correctly and the process
+    then died with an uncaught `ImportError`: exit 1.
+
+    1 is what this module's EXIT_* docstring reserves for "an uncaught
+    traceback", and the statuses exist so an unattended wrapper can tell a
+    milestone that did not pass from a report that could not be produced. A
+    rented GPU box may well not have matplotlib, and matplotlib is the one
+    dependency nothing else in the report needs -- so the gate's own verdict,
+    already printed in full above, was replaced by the one status that says
+    nobody caught this.
+
+    Exercised with an UNIMPORTABLE matplotlib in a real subprocess rather than
+    by patching `write_figure`: the defect is in which statements the `try`
+    covers, and a mock of the function under test cannot see that.
+    """
+    stub = tmp_path / "no_matplotlib"
+    stub.mkdir()
+    (stub / "matplotlib.py").write_text(
+        "raise ImportError(\"No module named 'matplotlib'\")\n")
+    records = _study()
+    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+        "latent_beats_embedding"] = False
+    figure = tmp_path / "curves.png"
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(stub)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    done = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "report_study.py"),
+         "--out", str(_write(tmp_path / "study", records)),
+         "--figure", str(figure)],
+        capture_output=True, text=True, env=env, cwd=str(_ROOT),
+    )
+    assert "Traceback" not in done.stderr, done.stderr
+    assert done.returncode == report_study.EXIT_GATE_NOT_PASSED, (
+        "the gate's own status, not 1: the verdict was already on the "
+        f"operator's screen.\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}")
+    assert _row(done.stdout, "GATE:") == "GATE: NOT PASSED"
+    assert _row(done.stdout, "figure NOT written") == (
+        "figure NOT written: No module named 'matplotlib'"), (
+        "reported the way every other figure failure already is")
+    assert _row(done.stdout, "cnn         position").startswith(
+        "cnn         position    +1000.0000"), (
+        "and the whole report is still printed")
+    assert not figure.exists()
+
+
+def test_the_figure_is_drawn_AFTER_the_verdict_is_printed(tmp_path, capsys):
+    """M7. A test's own message says the figure is drawn after the verdict so
+    that a figure failure cannot cost the report; the ORDER itself was
+    unpinned, and reversing the two statements in `main` left the suite green.
+
+    Both renderings, because the figure line is the last line either way: the
+    figure that could not be drawn is the case the ordering exists for, and
+    the one that was drawn is the case a report printed second would still
+    look right in.
+    """
+    ragged = _study()
+    _cell(ragged, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
+    report_study.main(["--out", str(_write(tmp_path / "ragged", ragged)),
+                       "--figure", str(tmp_path / "ragged.png")])
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2] == "GATE: NOT PASSED"
+    assert lines[-1].startswith("figure NOT written: "), (
+        "a figure that could not be drawn must be reported UNDER a verdict "
+        "the operator has already read, never in front of it")
+
+    drawn = tmp_path / "drawn.png"
+    report_study.main(["--out", str(_write(tmp_path / "good", _study())),
+                       "--figure", str(drawn)])
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2] == "GATE: PASSED"
+    assert lines[-1] == f"figure={drawn}"
+
+
+def test_every_line_main_prints_is_FLUSHED(tmp_path, capsys, monkeypatch):
+    """M8. Every `print` in the script carries `flush=True` deliberately, so
+    the report reaches a pipe or a log before anything else can happen to the
+    process -- the figure is drawn after it, and drawing is the step most
+    likely to die. None of the five was pinned.
+
+    The spy records the keyword arguments each call was ACTUALLY made with,
+    which is the only place `flush=True` is observable: it changes nothing a
+    captured stream can be asked about afterwards.
+    """
+    calls = []
+    real_print = builtins.print
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", spy)
+    # All five call sites: the report, the figure line, the empty directory,
+    # the mislabelled record and the unreadable one.
+    report_study.main(["--out", str(_write(tmp_path / "study", _study())),
+                       "--figure", str(tmp_path / "curves.png")])
+    report_study.main(["--out", str(tmp_path / "empty_directory")])
+    mislabelled = _write(tmp_path / "mislabelled", _study())
+    (mislabelled / "result_cnn_seed0.json").write_text(
+        json.dumps({**_record("random_vit", 2), "nonfinite": {}}))
+    report_study.main(["--out", str(mislabelled)])
+    unreadable = _write(tmp_path / "unreadable", _study())
+    (unreadable / "result_frozen_ssl_seed2.json").write_text("{")
+    report_study.main(["--out", str(unreadable)])
+    assert len(calls) == 5, (
+        "five prints, one per call site; a site that stopped printing would "
+        f"otherwise leave the survivors to answer this test:\n{calls}")
+    assert calls == [{"flush": True}] * 5, (
+        "every one of them flushed: the report has to be on the pipe before "
+        "the figure is attempted")
 
 
 def test_main_does_not_write_a_figure_unless_asked(tmp_path, capsys):

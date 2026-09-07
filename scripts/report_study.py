@@ -345,7 +345,21 @@ def ridge_block(groups: list[dict]) -> str:
             f"{_count(group['n_finite_gains']):>8}"
             f"{_fmt(group['gain_mean'], '+.4f'):>11}  {members}"
         )
-    if len(groups) > 1:
+    # THE WARNING IS ABOUT THE TWO RIDGE COLUMNS PRINTED ABOVE IT, so it is
+    # decided by exactly the text those columns hold. `ridge_groups` keys on
+    # `(ridge_selected, joint_ridge, embedding_ridge)`, so two groups can differ
+    # in the FLAG alone and carry identical decades -- and `len(groups) > 1`
+    # then printed "the nine cells did not all select the same ridge decade"
+    # directly under two rows whose `joint_ridge` and `embed_ridge` columns are
+    # the same number. A named warning the table beside it refutes is one a
+    # reader learns to discount, and this block is the whole of R1's
+    # disclosure. The flag splitting the groups is what the SECOND warning is
+    # for, and it fires on exactly that case.
+    decades = {
+        (_fmt(group["joint_ridge"], ".1e"), _fmt(group["embedding_ridge"], ".1e"))
+        for group in groups
+    }
+    if len(decades) > 1:
         lines.append(
             "WARNING: the nine cells did not all select the same ridge decade. "
             "The scored R^2 moves ~0.10 per decade while the gain is ~0.02, so "
@@ -521,11 +535,6 @@ def write_figure(records: list[dict], figure, arms=ARMS) -> str:
     SAME axes; drawing the model alone would make an arm that never beat
     persistence look like a success story. Returns a line for the report.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     figure = Path(figure)
     def arm_of(record):
         cell = record_cell(record)
@@ -534,6 +543,22 @@ def write_figure(records: list[dict], figure, arms=ARMS) -> str:
     drawn = [arm for arm in arms if any(arm_of(r) == arm for r in records)]
     if not drawn:
         return "figure NOT written: no arm has a record"
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as error:
+        # THE IMPORT IS PART OF THE GUARDED REGION, not a precondition of it.
+        # matplotlib is the one dependency of this script that nothing else in
+        # the report needs, and a rented GPU box may well not have it. Outside
+        # the guard the whole report prints correctly and the process then dies
+        # with an uncaught `ImportError`: exit 1, which the EXIT_* docstring
+        # above reserves for "an uncaught traceback", in place of the
+        # EXIT_GATE_NOT_PASSED the verdict already on screen had earned. A
+        # missing drawing library must cost the FIGURE, exactly as a ragged
+        # curve set or an unwritable path does below.
+        return f"figure NOT written: {error}"
     fig, axes = plt.subplots(
         1, len(drawn), figsize=(5 * len(drawn), 4), squeeze=False
     )
