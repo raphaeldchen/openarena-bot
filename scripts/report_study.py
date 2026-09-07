@@ -548,7 +548,7 @@ def write_figure(records: list[dict], figure, arms=ARMS) -> str:
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except ImportError as error:
+    except (ImportError, ValueError, OSError) as error:
         # THE IMPORT IS PART OF THE GUARDED REGION, not a precondition of it.
         # matplotlib is the one dependency of this script that nothing else in
         # the report needs, and a rented GPU box may well not have it. Outside
@@ -558,6 +558,17 @@ def write_figure(records: list[dict], figure, arms=ARMS) -> str:
         # EXIT_GATE_NOT_PASSED the verdict already on screen had earned. A
         # missing drawing library must cost the FIGURE, exactly as a ragged
         # curve set or an unwritable path does below.
+        #
+        # ALL THREE WAYS THIS REGION FAILS ON A FRESHLY PROVISIONED BOX, not
+        # just the absent package. `matplotlib.use("Agg")` raises ValueError
+        # when the backend cannot be selected, and importing matplotlib raises
+        # OSError when it has nowhere to put its font cache -- no writable
+        # HOME, an MPLCONFIGDIR pointing at a read-only volume. Both are
+        # ordinary on the rented GPU box this guard exists for, and both
+        # produced the exact outcome the guard was added to prevent: a
+        # milestone that did not pass reporting exit 1 instead of
+        # EXIT_GATE_NOT_PASSED. The same three types are what the drawing
+        # block below already treats as costing the figure and nothing else.
         return f"figure NOT written: {error}"
     fig, axes = plt.subplots(
         1, len(drawn), figsize=(5 * len(drawn), 4), squeeze=False

@@ -2240,9 +2240,58 @@ def test_the_ridge_block_warns_when_the_cells_did_not_agree():
         _cell(records, "cnn", seed)["filtering"]["gain"][
             "joint_ridge"] = ALT_JOINT_RIDGE
     block = report_study.ridge_block(ridge_groups(records))
+    assert _row(block, "True            1.0e+07") == (
+        "True            1.0e+07      1.0e+05      3       3 +2301.3333  "
+        "cnn/s0 cnn/s1 cnn/s2"), (
+        "the EMBED column reads 1.0e+05 in both rows, so only the joint half "
+        "of the decade key can be what split them")
     warning = _row(block, "WARNING: the nine cells")
     assert "SIGN is not interpretable" in warning
     assert len(block.splitlines()) == 4
+
+
+def test_the_ridge_block_warns_when_the_cells_split_on_the_EMBEDDING_decade():
+    """L3, and the half of the decade key the M9 fix left undecided.
+
+    The fix for M9 replaced `len(groups) > 1` with a set of
+    `(joint_ridge, embed_ridge)` RENDERED PAIRS -- a new compound condition,
+    and the sibling above varies `joint_ridge` ALONE while the M9 test beside
+    it is the case where NEITHER ridge differs. So no test in this suite could
+    tell the pair from its first element: deleting the `embedding_ridge` half
+    of the key left all 847 green.
+
+    What that costs is R1's entire disclosure on a study that split on the
+    embedding decade. With cnn's three cells at `ALT_EMBEDDING_RIDGE` the
+    block prints two rows whose `embed_ridge` columns read 1.0e+01 and
+    1.0e+05 -- two decades, on the page -- and with the embedding half gone it
+    prints those SAME two rows and no warning, publishing a nine-cell mean
+    over two estimators as though the cells had agreed. R1 exists because the
+    gain's SIGN moves with the selected decade; a mean across decades with the
+    disclosure silently absent is the one rendering it was written to prevent.
+
+    `joint_ridge` is 1.0e+03 in BOTH rows here, exactly as `embed_ridge` is
+    identical in both rows of the sibling above, so neither term can be
+    carried by the other and each half of the key decides its own case.
+    """
+    records = _rendering_study()
+    for seed in SEEDS:
+        _cell(records, "cnn", seed)["filtering"]["gain"][
+            "embedding_ridge"] = ALT_EMBEDDING_RIDGE
+    block = report_study.ridge_block(ridge_groups(records))
+    assert _row(block, "True            1.0e+03      1.0e+01") == (
+        "True            1.0e+03      1.0e+01      3       3 +2301.3333  "
+        "cnn/s0 cnn/s1 cnn/s2")
+    assert _row(block, "True            1.0e+03      1.0e+05") == (
+        "True            1.0e+03      1.0e+05      6       6 +2308.8333  "
+        "frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "random_vit/s0 random_vit/s1 random_vit/s2"), (
+        "the JOINT column reads 1.0e+03 in both rows, so only the embedding "
+        "half of the decade key can be what split them")
+    warning = _row(block, "WARNING: the nine cells")
+    assert "SIGN is not interpretable" in warning
+    assert len(block.splitlines()) == 4, (
+        "header, two rows, one warning -- the flag agreed, so the second "
+        "warning must not fire and stand in for the first")
 
 
 def test_the_ridge_block_warns_when_a_cell_skipped_selection_entirely():
@@ -3165,9 +3214,68 @@ def test_a_record_with_no_curve_to_draw_costs_the_picture_not_the_status(
     assert not (tmp_path / "curves.png").exists()
 
 
+def _stub_matplotlib_env(tmp_path, name, source):
+    """A directory holding a `matplotlib.py` that fails the way `source` says,
+    first on `PYTHONPATH`, as an environment for a subprocess.
+
+    A stub is not byte-for-byte the same as a broken installation, but it
+    raises the same exception at the same statement, and it is the only way to
+    exercise WHICH STATEMENTS the `try` covers -- which a patch of
+    `write_figure` cannot see by construction. None of these can pass
+    vacuously: if the stub failed to shadow the real package the figure would
+    be written and the `figure NOT written` assertion would fail.
+    """
+    stub = tmp_path / name
+    stub.mkdir()
+    (stub / "matplotlib.py").write_text(source)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(stub)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    return env
+
+
+def _report_against(env, tmp_path, records, name):
+    """`scripts/report_study.py` run for real under `env`, on a real study."""
+    figure = tmp_path / f"{name}.png"
+    done = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "report_study.py"),
+         "--out", str(_write(tmp_path / name, records)),
+         "--figure", str(figure)],
+        capture_output=True, text=True, env=env, cwd=str(_ROOT),
+    )
+    return done, figure
+
+
+def _assert_the_figure_alone_was_lost(done, figure, message):
+    """The gate's own status and the whole report, with the figure line
+    reporting `message` the way every other figure failure already is."""
+    assert "Traceback" not in done.stderr, done.stderr
+    assert done.returncode == report_study.EXIT_GATE_NOT_PASSED, (
+        "the gate's own status, not 1: the verdict was already on the "
+        f"operator's screen.\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}")
+    assert _row(done.stdout, "GATE:") == "GATE: NOT PASSED"
+    assert _row(done.stdout, "figure NOT written") == (
+        f"figure NOT written: {message}")
+    assert _row(done.stdout, "cnn         position").startswith(
+        "cnn         position    +1000.0000"), (
+        "and the whole report is still printed")
+    assert not figure.exists()
+
+
+def _failing_study():
+    """Nine cells, criterion 4 failing -- a study whose correct exit status is
+    EXIT_GATE_NOT_PASSED, so a status of 1 cannot come from the verdict."""
+    records = _study()
+    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+        "latent_beats_embedding"] = False
+    return records
+
+
 def test_a_missing_matplotlib_costs_the_FIGURE_and_not_the_exit_status(
         tmp_path):
-    """I3. The imports used to sit OUTSIDE the try that guards every other way
+    """I3, and the `ImportError` term of the guard ALONE.
+
+    The imports used to sit OUTSIDE the try that guards every other way
     of failing to draw, so the whole report printed correctly and the process
     then died with an uncaught `ImportError`: exit 1.
 
@@ -3183,34 +3291,111 @@ def test_a_missing_matplotlib_costs_the_FIGURE_and_not_the_exit_status(
     by patching `write_figure`: the defect is in which statements the `try`
     covers, and a mock of the function under test cannot see that.
     """
-    stub = tmp_path / "no_matplotlib"
-    stub.mkdir()
-    (stub / "matplotlib.py").write_text(
+    env = _stub_matplotlib_env(
+        tmp_path, "no_matplotlib",
         "raise ImportError(\"No module named 'matplotlib'\")\n")
-    records = _study()
-    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
-        "latent_beats_embedding"] = False
+    done, figure = _report_against(env, tmp_path, _failing_study(), "study")
+    _assert_the_figure_alone_was_lost(
+        done, figure, "No module named 'matplotlib'")
+
+
+def test_a_backend_that_cannot_be_selected_costs_the_FIGURE_and_not_the_status(
+        tmp_path):
+    """The `ValueError` term of the guard ALONE: `matplotlib.use("Agg")`.
+
+    The I3 fix pulled the imports inside the try but caught `ImportError`
+    only, and `use()` is the one statement in that region that cannot raise
+    one. matplotlib raises `ValueError` from `use()` when the named backend
+    cannot be selected -- an Agg build missing its C extension, a
+    `MPLBACKEND` the environment already set to something unavailable -- and
+    that is ordinary on a freshly provisioned rented GPU box.
+
+    The outcome without this term is precisely the one I3 was fixed to
+    prevent: the whole report prints, the verdict is on screen, and the
+    process then dies with an uncaught `ValueError` -- exit 1, the status this
+    module's EXIT_* docstring reserves for an uncaught traceback, in place of
+    the EXIT_GATE_NOT_PASSED the verdict had earned. An unattended wrapper
+    reading that status cannot tell a milestone that did not pass from a
+    report that could not be produced.
+
+    The stub IMPORTS cleanly and fails at `use`, so `ImportError` cannot be
+    what catches this; the sibling above imports-fails and never reaches
+    `use`. Neither term is carried by the other.
+    """
+    env = _stub_matplotlib_env(
+        tmp_path, "unselectable_backend",
+        "def use(backend, *a, **k):\n"
+        "    raise ValueError(f'{backend!r} is not a valid value for backend')\n")
+    done, figure = _report_against(env, tmp_path, _failing_study(), "study")
+    _assert_the_figure_alone_was_lost(
+        done, figure, "'Agg' is not a valid value for backend")
+
+
+def test_an_unwritable_matplotlib_cache_costs_the_FIGURE_and_not_the_status(
+        tmp_path):
+    """The `OSError` term of the guard ALONE: the import itself.
+
+    matplotlib builds a font cache at import time and raises `OSError` when it
+    has nowhere to put one -- no writable HOME, or an `MPLCONFIGDIR` pointing
+    at a read-only volume. That is not an exotic failure on the box this guard
+    exists for: it is the DEFAULT state of a freshly provisioned rented GPU
+    instance with no cache directory, and it is the failure most likely to hit
+    a 33-hour study on its very first report.
+
+    `OSError` is neither an `ImportError` nor a `ValueError`, so before this
+    term the report printed in full and the process died with an uncaught
+    traceback: exit 1 for a study whose real answer was NOT PASSED.
+
+    The drawing block below already treats `OSError` as costing the figure and
+    nothing else -- an unwritable output path is the same class of failure --
+    so this term makes the two halves of `write_figure` agree about what a
+    filesystem that will not cooperate is allowed to cost.
+    """
+    env = _stub_matplotlib_env(
+        tmp_path, "unwritable_cache",
+        "raise OSError(\"Matplotlib is unable to create the cache directory "
+        "'/nonexistent/.config/matplotlib'\")\n")
+    done, figure = _report_against(env, tmp_path, _failing_study(), "study")
+    _assert_the_figure_alone_was_lost(
+        done, figure,
+        "Matplotlib is unable to create the cache directory "
+        "'/nonexistent/.config/matplotlib'")
+
+
+def test_no_arm_to_draw_short_circuits_BEFORE_matplotlib_is_imported(tmp_path):
+    """The guard above must not become a reason to import at all.
+
+    `write_figure` answers "no arm has a record" before touching matplotlib,
+    and the existing test for that message runs where matplotlib imports
+    fine -- so it reads the same either way and the ORDER is unpinned. Moving
+    the check below the try would still return a `figure NOT written` line, a
+    plausible-looking near-miss, but it would name the broken cache instead of
+    the empty record set: the operator is told the box cannot draw when what
+    actually happened is that there was nothing to draw.
+
+    Run against the same unwritable-cache stub as the sibling above, which is
+    the environment where the two orderings differ. If the import moved first
+    this asserts the wrong line, and if the stub failed to shadow matplotlib
+    the sibling above fails instead.
+    """
+    env = _stub_matplotlib_env(
+        tmp_path, "unwritable_cache",
+        "raise OSError('Matplotlib is unable to create the cache directory')\n")
     figure = tmp_path / "curves.png"
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(stub)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     done = subprocess.run(
-        [sys.executable, str(_ROOT / "scripts" / "report_study.py"),
-         "--out", str(_write(tmp_path / "study", records)),
-         "--figure", str(figure)],
+        [sys.executable, "-c",
+         "import importlib.util, sys\n"
+         "spec = importlib.util.spec_from_file_location('rs', sys.argv[1])\n"
+         "m = importlib.util.module_from_spec(spec)\n"
+         "spec.loader.exec_module(m)\n"
+         "print(m.write_figure([], sys.argv[2]))\n",
+         str(_ROOT / "scripts" / "report_study.py"), str(figure)],
         capture_output=True, text=True, env=env, cwd=str(_ROOT),
     )
     assert "Traceback" not in done.stderr, done.stderr
-    assert done.returncode == report_study.EXIT_GATE_NOT_PASSED, (
-        "the gate's own status, not 1: the verdict was already on the "
-        f"operator's screen.\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}")
-    assert _row(done.stdout, "GATE:") == "GATE: NOT PASSED"
-    assert _row(done.stdout, "figure NOT written") == (
-        "figure NOT written: No module named 'matplotlib'"), (
-        "reported the way every other figure failure already is")
-    assert _row(done.stdout, "cnn         position").startswith(
-        "cnn         position    +1000.0000"), (
-        "and the whole report is still printed")
+    assert done.stdout.strip() == "figure NOT written: no arm has a record", (
+        "the empty record set, not the cache directory -- the short-circuit "
+        "runs before matplotlib is imported at all")
     assert not figure.exists()
 
 
