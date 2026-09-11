@@ -1050,6 +1050,19 @@ def test_gather_probe_data_windows_match_the_rollouts_length_guard_exactly(
     which side is "right", this compares the two functions directly on the
     identical episode and requires them to agree on how many windows it
     contributes -- whatever that number is.
+
+    THIS TEST NO LONGER CARRIES WHAT ITS NAME CLAIMS, and is kept only because
+    it still catches an incorrect RE-INLINE of either side. Both functions now
+    take their windows from `mbfps.eval.windows.window_starts`, so they cannot
+    disagree, and this comparison can no longer fail on divergence. It was also
+    always narrower than the protocol it named: it probes only
+    `episode.length == need`, where the STRIDE never runs, so a copy that
+    dropped the `+ 1` on the stride's stop -- silently losing 22 of the shipped
+    split's 229 windows -- passed it. Its value moved to
+    `tests/eval/test_windows.py`: a boundary table on the iterator itself, a
+    length-by-length agreement test covering the exact multiples, and a routing
+    test that replaces the iterator with a restricted stub and requires BOTH
+    call sites to lose the same windows.
     """
     context, horizon = 2, 3
     need = context + horizon

@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from mbfps.data.episode import load_episode
+from mbfps.eval.windows import window_starts
 
 PROBE_KEYS: tuple[str, ...] = ("pos_x", "pos_y", "angle")
 """Privileged channels that actually vary in this scenario."""
@@ -236,16 +237,19 @@ def gather_probe_data(
 
     for path in list(paths)[:limit]:
         episode = load_episode(path)
-        if episode.length < need + 1:
+        # The rollout's own window rule, from the one place that owns it -- the
+        # length guard, the stride and the `+ 1` on its stop. What is shared is
+        # the per-episode window RULE, not the episode SET: `limit` above caps
+        # how many episodes the probe is fit on, and `evaluate_rollout` scores
+        # every validation path.
+        starts = window_starts(episode.length, context, horizon)
+        if not starts:
             continue
         source = source_for(model, path, episode, backbone)
         all_actions = (
             torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
         )
-        # The same stride and the same final window as `evaluate_rollout`:
-        # `range(0, length - need, need)` would drop the last window whenever
-        # `length % need == 0`, which is a silent change in what is fit on.
-        for start in range(0, episode.length - need + 1, need):
+        for start in starts:
             frames = torch.as_tensor(source[start : start + need + 1]).to(device)
             # Drop the FIRST frame: `embeddings[k]` must be the frame
             # `actions[k]` led to, per RSSM.observe's action-time convention.

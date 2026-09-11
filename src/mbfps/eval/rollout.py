@@ -48,6 +48,7 @@ from mbfps.eval.probe import (
     position_error,
     probe_targets,
 )
+from mbfps.eval.windows import window_starts
 
 
 def gap_closed(
@@ -120,25 +121,16 @@ def evaluate_rollout(
 
     for path in val_paths:
         episode = load_episode(path)
-        # Not a pure fast path: at episode.length == need exactly, the window
-        # loop below is NOT empty. `range(0, episode.length - need + 1, need)`
-        # = `range(0, 1, need)` yields ONE legal window (start=0, reading
-        # `source[0 : need + 1]` -- exactly the T+1 rows on hand). This guard
-        # deliberately excludes that window rather than admitting it; a
-        # weaker `< need` check would let it through instead, and
-        # `gather_probe_data` must drop it too to keep the probe fit under
-        # the identical protocol -- see
-        # test_gather_probe_data_windows_match_the_rollouts_length_guard_exactly
-        # in tests/eval/test_probe.py.
-        if episode.length < need + 1:
+        # THE window rule -- the length guard, the stride and the `+ 1` on its
+        # stop -- lives in `window_starts` because `gather_probe_data` and both
+        # diagnostics must cut the identical windows or their numbers are not
+        # comparable to this one's. See that function for what each part of it
+        # is defending against.
+        starts = window_starts(episode.length, context, horizon)
+        if not starts:
             continue
         source = source_for(model, path, episode, feature_backbone)
-        # `start = episode.length - need` is a LEGAL window: it reads
-        # `privileged[...start+need]` and `obs[...start+need]`, both in range
-        # for a T+1-row array. `range(0, episode.length - need, need)` would
-        # exclude it whenever `episode.length % need == 0`, silently dropping
-        # the final window. The `+ 1` restores it.
-        for start in range(0, episode.length - need + 1, need):
+        for start in starts:
             window = slice(start, start + need + 1)
             # `window` spans need+1 frames; drop the FIRST one so
             # embeddings[k] is the frame actions[k] led to, matching the
