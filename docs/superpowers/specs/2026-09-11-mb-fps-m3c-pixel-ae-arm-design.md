@@ -109,22 +109,37 @@ same per-row treatment, different input width. Against the 9.73M-parameter RSSM 
 all arms share byte-for-byte it is noise, and it is recorded here and as an `encoder_params`
 integer in every study record rather than hidden.
 
-### 2.3 `cnn` is retired, not redefined
+### 2.3 `cnn` is retired from the study, not deleted from the codebase
 
 ```python
 ARMS: tuple[str, ...] = ("pixel_ae", "frozen_ssl", "random_vit")
+"""The study's arms. Every M3 tool -- the driver, report, aggregation, rollout
+evaluation, diagnostics, pooling -- takes `choices=ARMS`."""
+
+KINDS: tuple[str, ...] = ("cnn",) + ARMS
+"""Every encoder `build_encoder` can construct. `get_config` validates against
+this, not `ARMS`, because M2's autoencoder scripts and tests still build the
+end-to-end `CNNEncoder` under the name `cnn` and must keep doing so."""
 ```
 
-The old name is removed from `ARMS`, `_ARM_BACKBONE`, `build_encoder` and `encoder_input_kind`.
-It is not repointed: a study record, checkpoint or diagnostic that says `arm="cnn"` continues to
-mean the end-to-end pixel arm of M3b, and nothing can read a `pixel_ae` artefact under the old
-name or vice versa. `encoder_input_kind` returns `"features"` for every registered arm; the
-`"obs"` branch and the `CNNEncoder` class stay in the codebase (M2 still uses them) but no M3 arm
-builds them.
+Two tuples, not one, because two milestones read them. `cnn` stays buildable: `build_encoder`,
+`encoder_input_kind` (`"obs"`) and `_ARM_BACKBONE` (`None`) keep their `cnn` branches, and M2's
+`train_autoencoder.py`, `reconstruction_grid.py` and `eval_reconstruction.py` take
+`choices=KINDS`. It cannot be *selected* by any M3 tool, because those take `choices=ARMS`. A study
+record, checkpoint or diagnostic that says `arm="cnn"` continues to mean the end-to-end pixel arm
+of M3b, and nothing can read a `pixel_ae` artefact under the old name or vice versa.
 
-The study driver, aggregation, report and diagnostics are written over `ARMS` and need no
-arm-specific change. The `_SLOW_ARMS` cost ordering in `scripts/run_study.py` loses its slow arm:
-`pixel_ae` trains at feature-arm speed.
+The `_SLOW_ARMS` cost ordering in `scripts/run_study.py` becomes empty: every study arm trains at
+feature-arm speed.
+
+Test impact, so it is planned rather than discovered: ~280 references to `"cnn"` in the aggregate,
+driver, diagnostics and pooling tests use it as an arm *label* in fixtures and become
+`"pixel_ae"`; the `CNNEncoder` tests in `tests/models/test_encoders.py` and all of
+`tests/training/test_autoencoder.py` mean the encoder class and keep it; `tests/training/
+test_world_model.py`'s `tiny()` fixture keeps `cnn` as its default because the RSSM and loss tests
+are indifferent to which encoder feeds them and a pixel encoder needs no feature file, while its
+`test_all_three_arms_train` is parametrised over `ARMS` and writes `(41, 64, 32)` features for
+`pixel_ae`.
 
 ### 2.4 What does not change
 
@@ -178,7 +193,8 @@ record schema gains `git_sha` and `device` (the M3b write-up's other half of ope
 |---|---|
 | `src/mbfps/data/features.py` | `BACKBONES` gains `"pixel_ae"`; `build_backbone` loads and freezes the M2 encoder; `FeatureExtractor` emits `(64, 32)` rows for it; `BACKBONE_GEOMETRY` is defined here, next to `BACKBONES` |
 | `src/mbfps/models/encoders.py` | `BottleneckEncoder` reads geometry from the registry; `_N_PATCHES` and `cfg.patch_dim` removed; `_ARM_BACKBONE`, `build_encoder`, `encoder_input_kind` gain `pixel_ae`, lose `cnn` |
-| `src/mbfps/utils/config.py` | `ARMS`; `EncoderConfig.patch_dim` removed; `cnn_depth` stays (M2) |
+| `src/mbfps/utils/config.py` | `ARMS`, `KINDS`; `get_config` validates against `KINDS`; `EncoderConfig.patch_dim` removed; `cnn_depth` stays (M2) |
+| `scripts/train_autoencoder.py`, `reconstruction_grid.py`, `eval_reconstruction.py` | `choices=KINDS` (M2 keeps building `cnn`) |
 | `src/mbfps/data/loader.py` | feature-shape validation against the registry |
 | `src/mbfps/eval/study.py` | record gains `git_sha`, `device`, `encoder_params`, and the full loss/parts history |
 | `scripts/cache_features.py` | `--backbone pixel_ae` |
