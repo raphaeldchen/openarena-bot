@@ -39,6 +39,31 @@ the per-action contrast was among the rungs, because a null on order and
 counts alone is exactly what an action-conditioned prior that reads the
 action's identity produces.
 
+EVERY RUNG IS ALSO READ WHERE NO PROBE INTERVENES. Beside the position and
+angle deltas each rung prints its embedding-space ratio: the median per-window
+L2 between the intervened and real imaginations' embeddings, over the median
+L2 between the real imagination and a second draw of it from a different
+stream point -- the TWO-DRAW distance, about sqrt(2) times one draw's own
+spread, which is the landmark "1" means. Exactly 0 is an action-blind prior;
+below 1 is a response smaller than the two-draw distance; above 1 is larger.
+It is the one reading the pixel arm's degenerate probe cannot attenuate, so
+the UNMEASURABLE verdict quotes it. THE TOP RUNG IS PRINTED ON THE SAME AXIS
+AS THE OTHER TWO: the contrast's own numerator is the distance between two
+held imaginations -- a between-counterfactual distance, structurally larger
+than either's distance to real -- so the ladder row prints the two contrast
+actions' held-vs-real ratios and the contrast gets its own row. The record
+persists the per-window series behind every statistic -- each rung's
+horizon-mean delta per window, its embedding numerator, both ratio summaries
+and the per-step ratio, the noise reference and the window -> episode index
+-- so `scripts/pool_dynamics.py` can pool the nine cells by episode.
+
+TWO MORE SELF-CHECKS GUARD THE RULER. The noise draw is one more `imagine`
+per window, and it must leave the stream exactly where `evaluate_rollout`
+leaves it or every later window's rungs move: `noise_restored` must read True
+and `noise_same` -- the windows whose reference was the canonical latent
+bitwise -- must read 0. Either failing is `EXIT_STREAM_DIVERGED`, the same
+defect class as `stream_drift`: the arms no longer share a stream.
+
 WHAT MAKES THE OUTPUT READABLE, and why each piece is here:
 
   * EVERY PER-SEED COLUMN IS INDEXED BY ITS SEED, never by position in a list.
@@ -140,6 +165,7 @@ from mbfps.eval.diagnostics import (
     regrounding_sweep,
     supports_matched_stream,
 )
+from mbfps.eval.pooling import cluster_standard_error
 from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, StudyJob, job_record_path, load_record, write_record
@@ -156,11 +182,11 @@ EXIT_RECORD_MISMATCH = 14
 EXIT_STREAM_DIVERGED = 15
 EXIT_MISLABELLED_CHECKPOINT = 16
 EXIT_UNSUPPORTED_DEVICE = 17
-"""Disjoint from `run_study.py`'s (0, 1, 3, 4, 5, 6) and `report_study.py`'s
-(0, 7, 8, 9, 10), and none of them 1 (an uncaught traceback) or 2 (argparse's
-own usage error). The three scripts run one after another in the same shell and
-a wrapper reads the status; a collision would report one script's failure under
-another's meaning."""
+"""Disjoint from `run_study.py`'s (0, 1, 3, 4, 5, 6), `report_study.py`'s
+(0, 7, 8, 9, 10) and `pool_dynamics.py`'s (0, 18-22), and none of them 1 (an
+uncaught traceback) or 2 (argparse's own usage error). The scripts run one
+after another in the same shell and a wrapper reads the status; a collision
+would report one script's failure under another's meaning."""
 
 MISSING = "MISSING"
 
@@ -269,34 +295,6 @@ def delta_band(result, metric: str = "position") -> np.ndarray:
     return NOMINAL_Z * rows.std(axis=0, ddof=1) / np.sqrt(rows.shape[0])
 
 
-def _cluster_standard_error(values: np.ndarray, labels: np.ndarray) -> float:
-    """Standard error of `values.mean()` when the observations come in clusters.
-
-    The shipped 229 windows are cut from 24 validation episodes at 3 to 10
-    windows each, and windows from one episode share its map, its route and its
-    difficulty -- so `std / sqrt(229)` claims a precision the data does not
-    support. Measured on the shipped cells the cluster-robust standard error is
-    up to 1.32x the naive one, and the interval it produces is exactly what the
-    verdict's equivalence statement rests on.
-
-    The estimator is the usual sandwich for a sample mean: sum the residuals
-    WITHIN each cluster, square those sums, and carry the small-sample
-    correction `G / (G - 1)`. Summing within the cluster before squaring is
-    what makes correlated residuals add rather than cancel; squaring first
-    would give the naive variance back under a longer name.
-
-    NaN below two clusters -- a between-cluster spread cannot be estimated from
-    one -- so a caller can tell "not clustered" from "clustered, and small".
-    """
-    groups = np.unique(labels)
-    if groups.size < 2:
-        return float("nan")
-    residual = values - values.mean()
-    total = float(sum(residual[labels == group].sum() ** 2 for group in groups))
-    correction = groups.size / (groups.size - 1)
-    return float(np.sqrt(correction * total) / values.size)
-
-
 def delta_summary(result, metric: str = "position") -> dict:
     """One rung's effect on one channel as ONE comparison rather than forty-five.
 
@@ -326,12 +324,17 @@ def delta_summary(result, metric: str = "position") -> dict:
     band = delta_band(result, metric)
     steps = int(band.size)
     curve = result.position_delta() if metric == "position" else result.angle_delta()
+    # Over ALL windows, in traversal order and index-aligned with the
+    # episode index -- an unchanged window contributes its exact zero here
+    # and is EXCLUDED from `mean` below; the persisted mask is what lets a
+    # reader reproduce the one from the other.
+    window_mean = _window_deltas(result, metric).mean(axis=1)
     if rows.shape[0] < 2:
         return {
             "mean": float("nan"), "se": float("inf"), "se_independent": float("inf"),
             "delta_final": float("nan"), "steps_outside": 0,
             "expected_outside": 0.05 * steps,
-            "delta": curve, "band": band,
+            "delta": curve, "band": band, "window_mean": window_mean,
         }
     per_window = rows.mean(axis=1)
     independent = float(per_window.std(ddof=1) / np.sqrt(per_window.size))
@@ -342,7 +345,7 @@ def delta_summary(result, metric: str = "position") -> dict:
     clustered = float("nan")
     if result.window_episode is not None:
         labels = np.asarray(result.window_episode)[result.changed]
-        clustered = _cluster_standard_error(per_window, labels)
+        clustered = cluster_standard_error(per_window, labels)
     return {
         "mean": float(per_window.mean()),
         "se": independent if not np.isfinite(clustered) else clustered,
@@ -352,6 +355,44 @@ def delta_summary(result, metric: str = "position") -> dict:
         "expected_outside": 0.05 * steps,
         "delta": curve,
         "band": band,
+        "window_mean": window_mean,
+    }
+
+
+def embedding_block(result) -> dict | None:
+    """One rung's probe-free reading, or None for a rung never measured there.
+
+    The per-window numerator and its per-step curve, the two medians and
+    their ratio -- see `PairedDelta.embedding_ratio` for what 0, below 1 and
+    above 1 mean -- then the OTHER summary of the same series, the median of
+    per-window ratios, and the per-step ratio of the two window-mean curves.
+    Both extras exist because the horizon-mean ratio of medians hides two
+    things measured on the shipped cells: the two summaries straddle 1.0 on
+    frozen_ssl (0.97 against 1.06), and the per-step ratio rises from 0.67 at
+    step 1 to 1.14 at step 45 while the horizon mean reads "about 1". The
+    curve ratio is NaN, never inf, at a step where the ruler's curve is 0.
+    None, never a zero block, for a hand-built result: nothing downstream
+    may print an unmeasured rung as a null.
+    """
+    if result.window_embedding_distance is None or result.window_noise_distance is None:
+        return None
+    if result.noise_distance_curve is None:
+        raise ValueError(
+            f"rung {result.name!r} carries a noise ruler per window but no ruler curve, "
+            "so its per-step ratio cannot be read; the library sets both together"
+        )
+    curve = np.asarray(result.embedding_distance_curve, dtype=float)
+    noise_curve = np.asarray(result.noise_distance_curve, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        curve_ratio = np.where(noise_curve == 0.0, np.nan, curve / noise_curve)
+    return {
+        "window_distance": np.asarray(result.window_embedding_distance, dtype=float),
+        "curve": curve,
+        "median": result.embedding_median(),
+        "noise_median": result.noise_median(),
+        "ratio_of_medians": result.embedding_ratio(),
+        "median_of_ratios": result.median_of_ratios(),
+        "curve_ratio": curve_ratio,
     }
 
 
@@ -377,7 +418,11 @@ def rung_block(result) -> dict:
         "steps_changed_mean": result.mean_steps_changed,
         "steps_changed_min": result.min_steps_changed,
         "multiset_distance_mean": result.mean_multiset_distance,
+        # The per-window mask, persisted so a reader can reproduce the
+        # changed-window mean from the all-window series.
+        "window_steps_changed": np.asarray(result.window_steps_changed, dtype=int),
         **{metric: delta_summary(result, metric) for metric in CHANNELS},
+        "embedding": embedding_block(result),
     }
     held = getattr(result, "held", None)
     if held is not None:
@@ -403,22 +448,34 @@ def selfcheck_table(cells: dict, arms, seeds, smallest_k: int) -> str:
     of any size could reach the ladder through it. Printing it beside the
     self-checks is what stops a null through a degenerate probe from being
     read as a null about the dynamics.
+
+    THE LAST TWO COLUMNS GUARD THE EMBEDDING-SPACE RULER. `noise_restored`
+    is whether the stream came back bitwise -- both generators -- after every
+    window's noise draw; `noise_same` is how many windows' noise reference
+    was the canonical imagination bitwise. The first must read True and the
+    second 0, or the rungs no longer share a stream and every ratio above is
+    read against a ruler that measured nothing.
     """
     lines = [
         f"{'arm':<12}{'seed':>6}{'open_loop_k':>14}{'record_repro':>14}"
         f"{'stream_drift':>14}{f'k{smallest_k}_is_floor':>13}{'probe_r2':>10}"
+        f"{'noise_restored':>16}{'noise_same':>12}"
     ]
     for arm in arms:
         for seed in seeds:
             cell = cells.get((arm, seed))
             row = f"{arm:<12}{seed:>6}"
             if cell is None:
-                row += f"{MISSING:>14}{MISSING:>14}{MISSING:>14}{MISSING:>13}{MISSING:>10}"
+                row += (
+                    f"{MISSING:>14}{MISSING:>14}{MISSING:>14}{MISSING:>13}{MISSING:>10}"
+                    f"{MISSING:>16}{MISSING:>12}"
+                )
             else:
                 row += (
                     f"{cell['open_loop']:>14.3e}{cell['record']:>14.3e}"
                     f"{cell['stream']:>14.3e}{str(cell['smallest_k_is_floor']):>13}"
                     f"{cell['probe_selection_r2']:>10.3f}"
+                    f"{str(cell['noise_restored']):>16}{cell['noise_collapsed']:>12}"
                 )
             lines.append(row)
     return "\n".join(lines)
@@ -426,16 +483,39 @@ def selfcheck_table(cells: dict, arms, seeds, smallest_k: int) -> str:
 
 LADDER_ROWS: tuple[str, ...] = (
     "horizon-mean", "angle horizon-mean", "final step", "changed/total",
-    "steps moved/horizon", "multiset dist/horizon",
+    "steps moved/horizon", "multiset dist/horizon", "embed ratio num/noise",
+    "embed contrast/noise", "embed step 1|H ratio",
 )
 """`ladder_table`'s rows per rung, in print order."""
+
+
+def _ratio_text(embedding: dict | None) -> str:
+    """The embedding-ratio cell: MISSING for a rung never measured there, the
+    ratio to three places, or -- undefined -- WHY: `nan (noise 0)` for a ruler
+    that measured no spread, never a 0.000 that would read as action-blind;
+    `nan (no window)` when the ruler was positive and no window changed."""
+    if embedding is None:
+        return MISSING
+    ratio = float(embedding["ratio_of_medians"])
+    if np.isfinite(ratio):
+        return f"{ratio:.3f}"
+    return "nan (noise 0)" if float(embedding["noise_median"]) == 0.0 else "nan (no window)"
+
+
+def _step_ratio_text(embedding: dict | None) -> str:
+    """The per-step ratio at the first and last horizon step, `a|b`, or
+    MISSING; a NaN step prints as `nan`, never as a number."""
+    if embedding is None:
+        return MISSING
+    curve = np.asarray(embedding["curve_ratio"], dtype=float)
+    return "|".join(f"{v:.3f}" if np.isfinite(v) else "nan" for v in (curve[0], curve[-1]))
 
 
 def ladder_table(cells: dict, arms, seeds, rungs) -> str:
     """Per-arm, per-RUNG rows in `LADDER`'s order; per-SEED columns keyed by
     `(arm, seed)`.
 
-    SIX rows per rung. The first three are three different statistics rather
+    SEVEN rows per rung. The first three are three different statistics rather
     than one printed three times. `horizon-mean` is the position decision
     statistic -- the mean over the horizon of each changed window's delta,
     read against its own spread -- and `angle horizon-mean` is the same on
@@ -447,7 +527,23 @@ def ladder_table(cells: dict, arms, seeds, rungs) -> str:
     a late-horizon effect against the early steps. Printing one under the
     other's name is a fourfold misreport with nothing to show for it.
 
-    The last three rows are what say whether any of those numbers means
+    The seventh row is the reading no probe intervenes in: the rung's median
+    embedding-space distance to the REAL imagination over the median distance
+    between two draws of that imagination -- 0 for an action-blind prior,
+    below 1 for a response smaller than the two-draw distance, above 1 for
+    one larger. It is the row that can be read on the pixel arm, whose probe
+    reads a constant. FOR THE CONSTANT RUNG IT PRINTS THE TWO CONTRAST
+    ACTIONS' OWN HELD-VS-REAL RATIOS, `first|second` in contrast order, so the
+    row is the same estimand at every rung; the contrast's own numerator is
+    the distance between two COUNTERFACTUALS, structurally larger than
+    either's distance to real, and printing it in this row put a different
+    estimand on top of the ladder. It gets the eighth row, `embed
+    contrast/noise`, which the sequence rungs leave blank. The ninth is the
+    rung's own per-step ratio at step 1 and step H -- for the constant rung,
+    the contrast's, directly under its row -- because a horizon mean near 1
+    hides a per-step ratio that crosses 1 late (0.67 -> 1.14 on frozen_ssl).
+
+    The three rows before it are what say whether any of those numbers means
     anything: how many windows the rung changed at all, how many of the
     horizon's steps it moved per window on average AND at least, and how far
     the multiset moved. None is redundant with another. A held action on a
@@ -498,6 +594,18 @@ def ladder_table(cells: dict, arms, seeds, rungs) -> str:
                 rows["multiset dist/horizon"] += (
                     f"{block['multiset_distance_mean']:>10.1f}/{steps:<7}"
                 )
+                if "contrast" in block:
+                    held = block.get("held", {})
+                    pair = "|".join(
+                        _ratio_text(held.get(action, {}).get("embedding"))
+                        for action in block["contrast"]
+                    )
+                    rows["embed ratio num/noise"] += f"{pair:>18}"
+                    rows["embed contrast/noise"] += f"{_ratio_text(block.get('embedding')):>18}"
+                else:
+                    rows["embed ratio num/noise"] += f"{_ratio_text(block.get('embedding')):>18}"
+                    rows["embed contrast/noise"] += f"{'':>18}"
+                rows["embed step 1|H ratio"] += f"{_step_ratio_text(block.get('embedding')):>18}"
             lines.extend(rows[name] for name in LADDER_ROWS)
     return "\n".join(lines)
 
@@ -508,14 +616,17 @@ def held_table(cells: dict, arms, seeds, rungs) -> str:
     The contrast is the decision, and it is a difference of two of these
     rows; the rows themselves are what let a reader see which held actions
     move the imagined position and in which direction, and how far each held
-    sequence sits from the windows it replaced. Two rows per action: the
-    position horizon-mean delta with its band, and steps moved per window with
-    the minimum. Printed only when the constant rung ran.
+    sequence sits from the windows it replaced. Four rows per action: the
+    position horizon-mean delta with its band, steps moved per window with
+    the minimum, then the held action's OWN embedding-space ratio against
+    the real imagination -- the same axis as the ladder's sequence rungs,
+    which is what makes the top rung readable beside them -- and that ratio
+    at step 1 and step H. Printed only when the constant rung ran.
     """
     if "constant" not in rungs:
         return ""
     lines = [
-        f"{'arm':<12}{'held':<13}{'row':<20}" + "".join(f"{f'seed {s}':>18}" for s in seeds)
+        f"{'arm':<12}{'held':<13}{'row':<22}" + "".join(f"{f'seed {s}':>18}" for s in seeds)
     ]
     for arm in arms:
         actions = sorted(
@@ -528,8 +639,10 @@ def held_table(cells: dict, arms, seeds, rungs) -> str:
         )
         for index, action in enumerate(actions):
             label = arm if index == 0 else ""
-            delta = f"{label:<12}{action_name(action):<13}{'horizon-mean':<20}"
-            moved = f"{'':<12}{'':<13}{'steps moved/horizon':<20}"
+            delta = f"{label:<12}{action_name(action):<13}{'horizon-mean':<22}"
+            moved = f"{'':<12}{'':<13}{'steps moved/horizon':<22}"
+            ratio = f"{'':<12}{'':<13}{'embed ratio num/noise':<22}"
+            steps = f"{'':<12}{'':<13}{'embed step 1|H ratio':<22}"
             for seed in seeds:
                 cell = cells.get((arm, seed))
                 block = (
@@ -539,6 +652,8 @@ def held_table(cells: dict, arms, seeds, rungs) -> str:
                 if block is None:
                     delta += f"{MISSING:>18}"
                     moved += f"{MISSING:>18}"
+                    ratio += f"{MISSING:>18}"
+                    steps += f"{MISSING:>18}"
                     continue
                 position = block["position"]
                 delta += f"{position['mean']:>+11.3f} +-{NOMINAL_Z * position['se']:>4.2f}"
@@ -547,7 +662,40 @@ def held_table(cells: dict, arms, seeds, rungs) -> str:
                     f"/{block['steps']}"
                 )
                 moved += f"{text:>18}"
-            lines.extend((delta, moved))
+                ratio += f"{_ratio_text(block.get('embedding')):>18}"
+                steps += f"{_step_ratio_text(block.get('embedding')):>18}"
+            lines.extend((delta, moved, ratio, steps))
+    return "\n".join(lines)
+
+
+def noise_table(cells: dict, arms, seeds) -> str:
+    """The ruler's own shape: its window-mean curve at step 1 and step H, and
+    the growth between them, per cell.
+
+    The horizon-mean ratio cannot show this, and measured on the shipped
+    cells it is the difference between the arms: cnn's ruler is flat from
+    step 2 (0.12 -> 0.13) while frozen_ssl's grows ~6x (2.1 -> 12.5). A flat
+    ruler means the imagination does not diverge with the horizon in
+    embedding space -- a one-step response on a memoryless latent -- and a
+    reader shown only "ratio 0.3 at every rung" would call the two arms the
+    same shape. MISSING for a cell that did not run.
+    """
+    lines = [f"{'arm':<12}{'row':<22}" + "".join(f"{f'seed {s}':>18}" for s in seeds)]
+    for arm in arms:
+        ruler = f"{arm:<12}{'noise ruler step 1->H':<22}"
+        growth = f"{'':<12}{'ruler growth H/1':<22}"
+        for seed in seeds:
+            cell = cells.get((arm, seed))
+            if cell is None or cell.get("noise_reference") is None:
+                ruler += f"{MISSING:>18}"
+                growth += f"{MISSING:>18}"
+                continue
+            curve = np.asarray(cell["noise_reference"]["curve"], dtype=float)
+            first, last = float(curve[0]), float(curve[-1])
+            ruler += f"{f'{first:.3f}->{last:.3f}':>18}"
+            factor = f"x{last / first:.2f}" if first > 0.0 else "nan (step 1 = 0)"
+            growth += f"{factor:>18}"
+        lines.extend((ruler, growth))
     return "\n".join(lines)
 
 
@@ -939,7 +1087,7 @@ def verdict_block(arm: str, seed: int, cell: dict, *, family: int) -> str:
             f"final step against a widest null band of {NOMINAL_Z * widest:.3f}). No "
             "action effect of any size could have reached the ladder through it, so "
             "this says nothing about whether the prior uses the action and licenses "
-            "no claim about M4."
+            "no claim about M4." + _embedding_note(cell)
         )
         return "\n".join(lines) + _reproduction_note(cell)
     if "constant" not in null:
@@ -960,6 +1108,55 @@ def verdict_block(arm: str, seed: int, cell: dict, *, family: int) -> str:
         "tested imagines the same future, and M4 is BLOCKED on this evidence."
     )
     return "\n".join(lines) + _reproduction_note(cell)
+
+
+def _embedding_note(cell: dict) -> str:
+    """The one reading a degenerate probe cannot attenuate, quoted where the
+    verdict says the probe registered nothing. Appended only when the
+    constant rung ran and was measured there; the decision logic is
+    untouched -- the pooled script is the decision surface for this number.
+
+    FOUR THINGS, in this order, because each corrects a misreading of the
+    one before. The two contrast actions' OWN held-vs-real ratios -- the same
+    axis as the rungs below. The between-held contrast, named as a distance
+    between two counterfactuals and NOT on that axis. The contrast's per-step
+    ratio at step 1 and step H, because its horizon mean sits near 1 on
+    frozen_ssl while the per-step ratio runs 0.67 -> 1.14. And the ruler's
+    own growth over the horizon, because a ratio of 0.3 at every rung reads
+    the same on a ruler that is flat (cnn) and one that grows 6x
+    (frozen_ssl), and those are not the same shape of response.
+    """
+    block = cell["rungs"].get("constant")
+    if block is None or block.get("embedding") is None:
+        return ""
+    first, second = block["contrast"]
+    held = block.get("held", {})
+    own = "; ".join(
+        f"held {action_name(action)} vs real {_ratio_text(held.get(action, {}).get('embedding'))}"
+        for action in (first, second)
+    )
+    embedding = block["embedding"]
+    at_first, at_last = _step_ratio_text(embedding).split("|")
+    steps = int(np.asarray(embedding["curve_ratio"]).size)
+    note = (
+        f" In embedding space, where no probe intervenes, each held action's distance "
+        f"to the real imagination over the distance between two draws of it reads: "
+        f"{own} (0 would be action-blind; 1 is the two-draw distance, about sqrt(2) "
+        f"times one draw's own spread). The contrast's numerator is the distance "
+        f"between the two held imaginations -- held {action_name(first)} against held "
+        f"{action_name(second)} -- and reads {_ratio_text(embedding)}; it is a "
+        f"between-counterfactual distance, structurally larger than either held "
+        f"action's distance to real, and not on the same axis as the rungs. Its "
+        f"per-step ratio is step 1 {at_first}, step {steps} {at_last}"
+    )
+    noise = cell.get("noise_reference")
+    if noise is not None:
+        curve = np.asarray(noise["curve"], dtype=float)
+        note += (
+            f"; the ruler grows {curve[0]:.3f} -> {curve[-1]:.3f} over the horizon "
+            f"(a flat ruler is an imagination that does not diverge with the horizon)"
+        )
+    return note + "."
 
 
 def _equivalence(cell: dict, se: float, rungs) -> str:
@@ -1146,6 +1343,19 @@ def diagnose_cell(args, arm: str, seed: int, device) -> dict:
         # fit. On every cnn cell this is -0.036, and the verdict reads it.
         "probe_selection_r2": float(record["probe"]["embedding_selection_r2"]),
         "windows_total": ladder.windows_total,
+        # The window -> episode index, ONCE, so a reader can cluster every
+        # per-window series below by it.
+        "window_episode": ladder.window_episode,
+        # The embedding-space ruler and its two self-checks. Read STRICTLY:
+        # a ladder without a noise reference is not one this script can
+        # gate, and a default here would print a ratio nobody measured.
+        "noise_reference": {
+            "window_distance": ladder.noise_reference.window_embedding_distance,
+            "curve": ladder.noise_reference.embedding_distance_curve,
+            "median": float(np.median(ladder.noise_reference.window_embedding_distance)),
+        },
+        "noise_restored": bool(ladder.noise_reference.stream_restored),
+        "noise_collapsed": int(ladder.noise_reference.windows_collapsed),
         "rung_order": ladder.order,
         # One block per rung, in the ladder's order, each carrying its OWN
         # counts beside its own per-channel delta -- the same assembly for
@@ -1225,6 +1435,26 @@ def _channel_record(channel: dict) -> dict:
         "steps_expected_outside_by_chance": channel["expected_outside"],
         "delta": [float(v) for v in channel["delta"]],
         "band": [float(v) for v in channel["band"]],
+        # Per window over ALL windows, traversal order, index-aligned with
+        # `windows.episode`; `delta_mean` above is the mean over the CHANGED
+        # ones, and the rung's `window_steps_changed` says which those are.
+        "window_delta_mean": [float(v) for v in channel["window_mean"]],
+    }
+
+
+def _embedding_record(block: dict | None) -> dict | None:
+    if block is None:
+        return None
+    return {
+        "window_distance": [float(v) for v in block["window_distance"]],
+        "curve": [float(v) for v in block["curve"]],
+        "median": float(block["median"]),
+        "noise_median": float(block["noise_median"]),
+        # The decision-bearing summary, and the other one beside it -- see
+        # `PairedDelta.embedding_ratio` for why the ratio of medians decides.
+        "ratio_of_medians": float(block["ratio_of_medians"]),
+        "median_of_ratios": float(block["median_of_ratios"]),
+        "curve_ratio": [float(v) for v in block["curve_ratio"]],
     }
 
 
@@ -1245,7 +1475,10 @@ def _rung_record(block: dict) -> dict:
         "steps_changed_mean": block["steps_changed_mean"],
         "steps_changed_min": block["steps_changed_min"],
         "multiset_distance_mean": block["multiset_distance_mean"],
+        "window_steps_changed": [int(v) for v in block["window_steps_changed"]],
         **{metric: _channel_record(block[metric]) for metric in CHANNELS},
+        # None for a rung never measured in embedding space -- never a zero.
+        "embedding": _embedding_record(block.get("embedding")),
     }
     if "contrast" in block:
         record["contrast"] = [int(a) for a in block["contrast"]]
@@ -1274,7 +1507,29 @@ def build_record(cell: dict, args, device, *, family: int) -> dict:
     wrote under `shuffle` before the ladder existed, under the keys `delta_*`
     in place of `position_delta_*`; it is written ONCE, under the rung's own
     name, so a reader diffing the nine shipped cells has exactly one copy.
+
+    EVERY PER-WINDOW SERIES IS CHECKED AGAINST `windows.total` BEFORE THE
+    RECORD EXISTS -- the episode index, each rung's and held action's delta
+    series and changed mask, the noise reference. A series persisted over
+    the changed windows only, or a stale index, would let a pooling reader
+    cluster row `w` on episode `w'` with every count looking right; refused
+    here by name rather than discovered nine cells later.
     """
+    total = int(cell["windows_total"])
+    episode = cell["window_episode"]
+    if episode is not None and len(episode) != total:
+        raise ValueError(
+            f"the window -> episode index has {len(episode)} entries for {total} "
+            "windows; a stale index would cluster every per-window series wrongly"
+        )
+    for name, block in cell["rungs"].items():
+        _require_window_series(block, name, total)
+    noise = cell["noise_reference"]
+    if noise is not None and len(noise["window_distance"]) != total:
+        raise ValueError(
+            f"the noise reference has {len(noise['window_distance'])} entries for "
+            f"{total} windows"
+        )
     return {
         "arm": cell["arm"],
         "seed": cell["seed"],
@@ -1291,9 +1546,27 @@ def build_record(cell: dict, args, device, *, family: int) -> dict:
             "stream_drift": cell["stream"],
             "smallest_k": cell["smallest_k"],
             "smallest_k_is_bitwise_the_floor": cell["smallest_k_is_floor"],
+            "noise_reference_stream_restored": cell["noise_restored"],
+            "noise_reference_windows_collapsed": cell["noise_collapsed"],
+        },
+        # The embedding-space ruler, ONCE: every rung's ratio is read against
+        # this one series, so a copy under each rung would be nine copies.
+        "noise_reference": None if noise is None else {
+            "window_distance": [float(v) for v in noise["window_distance"]],
+            "curve": [float(v) for v in noise["curve"]],
+            "median": float(noise["median"]),
+            "windows_collapsed": cell["noise_collapsed"],
+            "stream_restored": cell["noise_restored"],
         },
         "probe": {"embedding_selection_r2": cell["probe_selection_r2"]},
-        "windows": {"total": cell["windows_total"]},
+        "windows": {
+            "total": cell["windows_total"],
+            # Per window, in traversal order; null when the ladder carried no
+            # clustering, never `range(n)` -- a pooling reader must refuse
+            # to cluster on nothing rather than treat every window as its
+            # own episode.
+            "episode": None if episode is None else [int(e) for e in episode],
+        },
         "ladder": {
             "rungs": list(cell["rung_order"]),
             "intervention_seed": args.intervention_seed,
@@ -1315,6 +1588,25 @@ def build_record(cell: dict, args, device, *, family: int) -> dict:
             for name, curve in cell["curves"].items()
         },
     }
+
+
+def _require_window_series(block: dict, name: str, total: int) -> None:
+    """Every per-window series in one rung's block -- and its held actions'
+    -- has exactly `total` entries, or the record is refused naming the rung."""
+    lengths = {
+        "window_steps_changed": len(block["window_steps_changed"]),
+        **{f"{metric}.window_delta_mean": len(block[metric]["window_mean"]) for metric in CHANNELS},
+    }
+    if block.get("embedding") is not None:
+        lengths["embedding.window_distance"] = len(block["embedding"]["window_distance"])
+    wrong = {field: n for field, n in lengths.items() if n != total}
+    if wrong:
+        raise ValueError(
+            f"rung {name!r}: per-window series {wrong} do not span the {total} windows; "
+            "a series persisted over the changed windows only cannot be clustered"
+        )
+    for action, held in block.get("held", {}).items():
+        _require_window_series(held, f"{name} held {action}", total)
 
 
 def parse_args(argv=None):
@@ -1426,7 +1718,10 @@ def main(argv=None) -> int:
         )
         return EXIT_NO_CHECKPOINTS
 
-    print("\n--- self-checks (all three numeric columns must read exactly 0) ---")
+    print(
+        "\n--- self-checks (the three numeric columns must read exactly 0; "
+        "noise_restored True and noise_same 0) ---"
+    )
     print(selfcheck_table(cells, args.arms, args.seeds, min(args.ks)))
     print("\n--- action-intervention ladder (position and angle, horizon-mean delta) ---")
     print(ladder_table(cells, args.arms, args.seeds, args.rungs))
@@ -1434,6 +1729,8 @@ def main(argv=None) -> int:
     if held:
         print("\n--- held actions of the constant rung, each against the real sequence ---")
         print(held)
+    print("\n--- the embedding-space ruler's own shape (window-mean two-draw distance per step) ---")
+    print(noise_table(cells, args.arms, args.seeds))
     print("\n--- k-step re-grounding sweep (position, final horizon step) ---")
     print(sweep_table(cells, args.arms, args.seeds, args.ks))
     print("\n--- what a difference between two k columns has to clear (paired) ---")
@@ -1470,6 +1767,30 @@ def main(argv=None) -> int:
                 f"ladder's real arm differs from evaluate_rollout by "
                 f"{cell['stream']:.3e}, so the rungs did not share a sampling "
                 "stream with it and every delta above is noise."
+            )
+            return EXIT_STREAM_DIVERGED
+    # The same defect class, two more ways to have it: the noise reference's
+    # draw did not leave the stream where it found it (every later window's
+    # rungs moved with it), or the reference was the canonical imagination
+    # bitwise in some window (it drew the canonical's uniforms, and the ratio
+    # there is x / 0).
+    for cell in cells.values():
+        if not cell["noise_restored"]:
+            print(
+                f"\nSTREAM DIVERGED for {cell['arm']} seed {cell['seed']}: the noise "
+                "reference's draw did not restore the sampling stream on every "
+                "window (both generators), so every window after the first started "
+                "somewhere evaluate_rollout never started it and every delta above "
+                "is noise."
+            )
+            return EXIT_STREAM_DIVERGED
+        if cell["noise_collapsed"] != 0:
+            print(
+                f"\nSTREAM DIVERGED for {cell['arm']} seed {cell['seed']}: the noise "
+                f"reference was the canonical imagination bitwise on "
+                f"{cell['noise_collapsed']} of {cell['windows_total']} windows, so it "
+                "drew the canonical pass's own uniforms and the embedding ratios "
+                "above are read against a ruler that measured nothing."
             )
             return EXIT_STREAM_DIVERGED
     for cell in cells.values():

@@ -23,12 +23,14 @@ import numpy as np
 import pytest
 import torch
 
+import mbfps.eval.pooling as pooling
 from mbfps.eval.diagnostics import (
     LADDER,
     LADDER_PERTURBS,
     ArmResult,
     ContrastResult,
     LadderResult,
+    NoiseReference,
     RegroundingSweep,
 )
 from mbfps.eval.rollout import RolloutResult
@@ -89,7 +91,8 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
 
 def _arm(
     name, reference: RolloutResult, curve, changed, deltas=None, episodes=None,
-    steps_changed=None, multiset=None, angle_deltas=None,
+    steps_changed=None, multiset=None, angle_deltas=None, embedding=None, noise=None,
+    embedding_curve=None, noise_curve=None,
 ) -> ArmResult:
     """One fabricated intervened arm against `reference`.
 
@@ -99,6 +102,12 @@ def _arm(
     separable. The multiset distance defaults to the step count -- a test
     about the multiset row passes its own. The angle deltas default to the
     position deltas over ten, so the two channels are numerically distinct.
+    `embedding` and `noise` are the per-window embedding-space numerator and
+    ruler; absent, the arm was "not measured in embedding space", which is
+    what every hand-built result carried before the reading existed. The
+    per-step curves are the flat series of each window mean unless
+    `embedding_curve` / `noise_curve` hand in their own -- a test about the
+    per-step ratio passes both, so step 1 and step H differ.
     """
     curve = np.asarray(curve, dtype=float)
     changed = np.asarray(changed, dtype=bool)
@@ -108,6 +117,7 @@ def _arm(
     if steps_changed is None:
         steps_changed = np.where(changed, curve.size, 0)
     steps_changed = np.asarray(steps_changed, dtype=int)
+    flat = lambda series: None if series is None else np.full(curve.size, float(np.mean(series)))  # noqa: E731
     return ArmResult(
         name=name,
         position=curve,
@@ -120,6 +130,12 @@ def _arm(
         ),
         horizon=curve.size,
         window_episode=(None if episodes is None else np.asarray(episodes, int)),
+        window_embedding_distance=(None if embedding is None else np.asarray(embedding, float)),
+        embedding_distance_curve=(
+            flat(embedding) if embedding_curve is None else np.asarray(embedding_curve, float)
+        ),
+        window_noise_distance=(None if noise is None else np.asarray(noise, float)),
+        noise_distance_curve=flat(noise) if noise_curve is None else np.asarray(noise_curve, float),
     )
 
 
@@ -132,6 +148,7 @@ def _shuffle(
 
 def _contrast(
     reference: RolloutResult, held: dict, contrast=(3, 0), changed=None, steps_changed=None,
+    embedding=None,
 ) -> ContrastResult:
     """The constant rung: `held` maps an action to its `ArmResult`, and the
     contrast's deltas are the difference of the two named ones -- exactly as
@@ -157,10 +174,27 @@ def _contrast(
         window_multiset_distance=steps_changed.copy(),
         horizon=held[first].horizon,
         window_episode=held[first].window_episode,
+        window_embedding_distance=(None if embedding is None else np.asarray(embedding, float)),
+        embedding_distance_curve=(
+            None if embedding is None
+            else np.full(held[first].horizon, float(np.mean(embedding)))
+        ),
+        window_noise_distance=held[first].window_noise_distance,
+        noise_distance_curve=held[first].noise_distance_curve,
     )
 
 
-def _ladder(reference: RolloutResult, arms: dict) -> LadderResult:
+def _noise(distance, collapsed=0, restored=True) -> NoiseReference:
+    distance = np.asarray(distance, float)
+    return NoiseReference(
+        window_embedding_distance=distance,
+        embedding_distance_curve=np.full(H, float(distance.mean())),
+        windows_collapsed=collapsed,
+        stream_restored=restored,
+    )
+
+
+def _ladder(reference: RolloutResult, arms: dict, noise: NoiseReference | None = None) -> LadderResult:
     """`arms` maps a rung name to its result; the order is `LADDER`'s."""
     order = tuple(name for name in LADDER if name in arms)
     constant = arms.get("constant")
@@ -175,6 +209,7 @@ def _ladder(reference: RolloutResult, arms: dict) -> LadderResult:
         action_marginal_counts=np.array([7, 2, 1]),
         windows_total=next(iter(arms.values())).windows_total,
         window_episode=next(iter(arms.values())).window_episode,
+        noise_reference=noise,
     )
 
 
@@ -243,6 +278,11 @@ def _stub(
     rung_steps=None,
     shuffle_deltas=None,
     rung_deltas=None,
+    episodes=None,
+    rung_embedding=None,
+    noise_distance=None,
+    noise_collapsed=0,
+    noise_restored=True,
     state=None,
 ):
     """Everything `main` touches, replaced; the checkpoint and record are real files.
@@ -251,7 +291,18 @@ def _stub(
     the shuffled rung's per-window deltas alone; `rung_deltas` maps a rung name
     to its own, so a test can make the rungs disagree. `changed` is every
     rung's mask unless `rung_changed` gives a rung its own; `rung_steps` does
-    the same for the steps moved, over `STUB_STEPS`.
+    the same for the steps moved, over `STUB_STEPS`. `episodes` is the
+    per-window episode index the ladder reports, None meaning unknown.
+
+    THE EMBEDDING-SPACE READING IS DERIVED FROM THE LOADED MODEL by default:
+    every rung's and held action's per-window numerator is
+    `signature + offset + w` -- the same +4/+5/+6 offsets as the curves, +6 /
+    +1.5 / +0.5 for the held actions -- and the noise reference is
+    `signature` in every window, so the record's new fields are VALUES that
+    only the checkpoint's parameters produce. `rung_embedding` overrides a
+    rung's numerator (a rung name, or `("held", action)`), and an explicit
+    `None` there removes the reading -- a rung not measured in embedding space.
+    `noise_distance` overrides the noise series.
     """
     state = {} if state is None else state
     state.setdefault("fit_probes", [])
@@ -320,6 +371,18 @@ def _stub(
         # The rungs are built in REVERSED order so the ladder's order cannot
         # be the dict's insertion order by coincidence.
         real = _rollout(reference.rssm_position + shuffle_offset)
+        windows = len(masks["shuffled"])
+        signature = model.signature()
+        noise = (
+            [signature] * windows if noise_distance is None else list(noise_distance)
+        )
+        embeddings = dict(rung_embedding or {})
+
+        def numerator(key, offset):
+            if key in embeddings:
+                return embeddings[key]
+            return [signature + offset + w for w in range(windows)]
+
         rungs = {}
         for name in reversed(LADDER):
             if name not in arms:
@@ -328,7 +391,8 @@ def _stub(
             if name != "constant":
                 rungs[name] = _arm(
                     name, real, reference.rssm_position + offset, masks[name],
-                    deltas=deltas.get(name), steps_changed=steps[name],
+                    deltas=deltas.get(name), steps_changed=steps[name], episodes=episodes,
+                    embedding=numerator(name, offset), noise=noise,
                 )
                 continue
             # Held arms at +6 (the constant rung's own offset) for held
@@ -339,15 +403,20 @@ def _stub(
             held = {
                 action: _arm(
                     name, real, reference.rssm_position + (offset, 1.5, 0.5)[i],
-                    masks[name], steps_changed=steps[name],
+                    masks[name], steps_changed=steps[name], episodes=episodes,
+                    embedding=numerator(("held", action), (offset, 1.5, 0.5)[i]), noise=noise,
                 )
                 for i, action in enumerate(STUB_HELD)
             }
-            rungs[name] = _contrast(real, held, steps_changed=steps[name])
+            rungs[name] = _contrast(
+                real, held, steps_changed=steps[name], embedding=numerator(name, offset),
+            )
             if deltas.get(name) is not None:
                 rungs[name].window_position_delta = np.asarray(deltas[name], float)
                 rungs[name].window_angle_delta = np.asarray(deltas[name], float) / 10.0
-        return _ladder(real, rungs)
+        return _ladder(
+            real, rungs, noise=_noise(noise, collapsed=noise_collapsed, restored=noise_restored),
+        )
 
     def fake_split(paths, **kwargs):
         state["split"].append(kwargs)
@@ -411,7 +480,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     mine = statuses("diagnose_dynamics")
     assert len(set(mine.values())) == len(mine), mine
     assert 1 not in mine.values() and 2 not in mine.values()
-    for other in ("run_study", "report_study"):
+    for other in ("run_study", "report_study", "pool_dynamics"):
         theirs = statuses(other)
         clash = (set(mine.values()) & set(theirs.values())) - {0}
         assert not clash, f"diagnose_dynamics collides with {other} on {clash}"
@@ -718,20 +787,23 @@ def _channel(delta, band, mean=None, se=0.5, outside=0):
     """One channel's block of a fabricated rung: the aggregate the verdict
     decides on and the per-step curves it reports beside that."""
     delta = np.asarray(delta, float)
+    mean = (float(np.nanmean(delta)) if delta.size and not np.isnan(delta).all()
+            else float("nan")) if mean is None else mean
     return {
         "delta": delta, "band": np.asarray(band, float),
-        "mean": (float(np.nanmean(delta)) if delta.size and not np.isnan(delta).all()
-                 else float("nan")) if mean is None else mean,
+        "mean": mean,
         "se": se, "se_independent": se,
         "delta_final": float(delta[-1]) if delta.size else float("nan"),
         "steps_outside": outside, "expected_outside": 0.05 * delta.size,
+        # Per window over ALL windows; `_rung` sizes it to the cell's total.
+        "window_mean": None,
     }
 
 
 def _rung(
     delta, band, changed=4, total=4, mean=None, se=0.5, outside=0, episodes=4,
     steps_changed_mean=None, steps_changed_min=None, multiset=None, angle=None,
-    contrast=None, held=None,
+    contrast=None, held=None, embedding=None,
 ):
     """One rung's block of a fabricated cell: the counts that say whether the
     statistics mean anything, then one channel block each for position and
@@ -741,7 +813,8 @@ def _rung(
     The counts default to values that DIFFER from one another and from the
     step count, so a row that printed one under another's name is not
     satisfied by the fixture: 4 changed of 4 total, 2.5 steps moved of `len(
-    delta)`, minimum 1, multiset 0.5.
+    delta)`, minimum 1, multiset 0.5. `embedding` is the rung's embedding
+    block as `rung_block` builds it, None for a rung not measured there.
     """
     delta = np.asarray(delta, float)
     block = {
@@ -762,6 +835,13 @@ def _rung(
             if angle is None else angle
         ),
     }
+    # The per-window series the record persists: every window carries the
+    # mean, and the changed ones come first -- sized to `total`.
+    block["window_steps_changed"] = np.array([2] * changed + [0] * (total - changed))
+    for name in ("position", "angle"):
+        if block[name]["window_mean"] is None:
+            block[name]["window_mean"] = np.full(total, block[name]["mean"])
+    block["embedding"] = embedding
     if contrast is not None:
         block["contrast"] = tuple(contrast)
         block["held"] = {} if held is None else held
@@ -780,6 +860,8 @@ def _ladder_cell(
     if "constant" in rungs and "contrast" not in rungs["constant"]:
         rungs["constant"] = rungs["constant"] | {"contrast": (3, 0), "held": {}}
     return {
+        "arm": "cnn", "seed": 0, "split_names": list(VAL_NAMES), "curves": {},
+        "action_marginal": None,
         "open_loop": open_loop, "record": record, "stream": stream,
         "smallest_k_is_floor": smallest_k_is_floor,
         "probe_selection_r2": probe_r2,
@@ -792,6 +874,8 @@ def _ladder_cell(
         "spread_final": 0.25,
         "paired": {"1v3": 0.125},
         "floor_margin": 4.0, "floor_margin_se": 0.75, "smallest_k": 1,
+        "window_episode": None,
+        "noise_reference": None, "noise_restored": True, "noise_collapsed": 0,
     }
 
 
@@ -998,8 +1082,8 @@ def test_the_held_table_prints_every_held_action_against_the_real_sequence():
     })}
     table = script.held_table(cells, ["cnn"], [0], LADDER)
     lines = table.splitlines()
-    assert len(lines) == 1 + 2 * len(held), lines
-    noop, forward = lines[1:3], lines[3:5]
+    assert len(lines) == 1 + 4 * len(held), lines
+    noop, forward = lines[1:5], lines[5:9]
     assert noop[0][12:25].strip() == "NOOP" and forward[0][12:25].strip() == "MOVE_FORWARD"
     assert "-11.600 +-7.90" in noop[0] and "+31.000 +-12.00" in forward[0], lines
     assert "38.0(min 7)/2" in noop[1] and "41.0(min 22)/2" in forward[1], lines
@@ -1440,6 +1524,7 @@ def test_each_self_check_lands_in_its_own_column():
     header, row = script.selfcheck_table(cells, ["cnn"], [0], 1).splitlines()
     assert header.split() == [
         "arm", "seed", "open_loop_k", "record_repro", "stream_drift", "k1_is_floor", "probe_r2",
+        "noise_restored", "noise_same",
     ], header
     # Sliced by the header's own column offsets, so the assertion is about
     # WHERE each number is printed and not merely that it appears somewhere.
@@ -1450,7 +1535,7 @@ def test_each_self_check_lands_in_its_own_column():
     assert columns["open_loop_k"] == "1.000e-01", columns
     assert columns["record_repro"] == "2.000e-02", columns
     assert columns["stream_drift"] == "3.000e-03", columns
-    assert row.split()[-1] == f"{PROBE_R2:.3f}", row
+    assert row.split()[-3] == f"{PROBE_R2:.3f}", row
 
 
 def test_the_self_check_column_names_the_k_the_alarm_was_computed_at():
@@ -1799,6 +1884,8 @@ def test_the_written_record_carries_its_self_checks_and_a_curve_for_every_k(
         "stream_drift": 0.0,
         "smallest_k": 1,
         "smallest_k_is_bitwise_the_floor": False,
+        "noise_reference_stream_restored": True,
+        "noise_reference_windows_collapsed": 0,
     }
     # The probe the ladder was read through, from the study record.
     assert written["probe"] == {"embedding_selection_r2": PROBE_R2}
@@ -1858,7 +1945,7 @@ def test_the_written_record_carries_every_rung_with_its_own_counts_and_the_choic
     # One cell, three rungs, two channels.
     assert written["ladder"]["family"] == 6
     assert written["ladder"]["family_threshold_z"] == pytest.approx(script.family_threshold(6))
-    assert written["windows"] == {"total": 3}
+    assert written["windows"] == {"total": 3, "episode": None}
     assert list(written["interventions"]) == list(LADDER)
     expected_counts = {
         "shuffled": (2, 1.0, 0), "resampled": (3, 2.0, 1), "constant": (3, 3.0, 3),
@@ -2070,7 +2157,7 @@ def test_the_diagnostic_record_names_both_arm_and_seed_and_carries_its_device(
     assert written["device"] == "cpu"
     assert written["torch_version"] == torch.__version__
     assert written["episodes"]["val"] == VAL_NAMES
-    assert written["windows"] == {"total": 2}
+    assert written["windows"] == {"total": 2, "episode": None}
     for name in LADDER:
         block = written["interventions"][name]
         assert block["windows_changed"] == 0 and block["episodes_changed"] == 0, name
@@ -2086,3 +2173,547 @@ def test_the_diagnostic_record_names_both_arm_and_seed_and_carries_its_device(
     text = path.read_text()
     assert "NaN" not in text, "a bare NaN token reached the file"
     json.loads(text, parse_constant=lambda token: pytest.fail(f"non-JSON {token!r}"))
+
+
+# ---------------------------------------------------------------------------
+# The per-window series, the episode index and the embedding-space reading
+# in the record; the noise reference's self-checks in the gate.
+# ---------------------------------------------------------------------------
+
+
+def test_the_record_persists_every_rungs_per_window_deltas_in_traversal_order_and_the_episode_index(
+    monkeypatch, tmp_path
+):
+    """Today each rung persists only the 45-step horizon-mean delta; the
+    per-window series lives in memory and is discarded. It is what a pooled
+    cross-cell statistic needs, so every rung -- and every held action --
+    writes its per-window horizon-mean delta over ALL windows in traversal
+    order, and the record writes the window -> episode index ONCE, at the top
+    level, so a reader can cluster by it.
+
+    Distinct per window AND per rung (`offset + w`), so a reversed series,
+    one rung's series under another's name, or `[delta_mean] * n` are all
+    caught by value. Window 2 is UNCHANGED under the shuffled rung and
+    carries a nonzero delta on purpose: the all-window series must carry it
+    while the decision statistic `delta_mean` must not, and the persisted
+    `window_steps_changed` is what reproduces the one from the other. The
+    angle series is the position series over ten. Unequal clusters ([0, 0,
+    1]), so an index that counted windows is caught.
+
+    THE PER-WINDOW DELTA VARIES OVER THE HORIZON. Each window's row is
+    `linspace(0, 2 * (4 + i + 0.1 w), H)`, whose mean is `4 + i + 0.1 w` and
+    whose max, min, first and last steps are all different numbers -- with a
+    constant row, as this fixture first had, `mean(axis=1)`, `max(axis=1)`
+    and `[:, 0]` coincide and the horizon reduction of the very series the
+    pooling reader consumes was pinned by nothing.
+    """
+    windows = 3
+    per_rung = {
+        name: np.stack([np.linspace(0.0, 2.0 * (4.0 + i + 0.1 * w), H) for w in range(windows)])
+        for i, name in enumerate(LADDER)
+    }
+    for rows in per_rung.values():
+        assert (rows.max(axis=1) != rows.mean(axis=1)).all() and (rows[:, 0] != rows.mean(axis=1)).all()
+    _stub(
+        monkeypatch, tmp_path,
+        changed=(True, True, True),
+        rung_deltas=per_rung,
+        rung_changed={"shuffled": (True, True, False)},
+        rung_steps={"shuffled": (2, 1, 0), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
+        episodes=[0, 0, 1],
+    )
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+
+    assert written["windows"] == {"total": 3, "episode": [0, 0, 1]}
+    for i, name in enumerate(LADDER):
+        block = written["interventions"][name]
+        expected = [4.0 + i + 0.1 * w for w in range(windows)]
+        assert len(block["position"]["window_delta_mean"]) == 3, name
+        assert block["position"]["window_delta_mean"] == pytest.approx(expected), name
+        # Exactly the horizon MEAN of the per-window rows, bitwise.
+        np.testing.assert_array_equal(
+            block["position"]["window_delta_mean"], per_rung[name].mean(axis=1), err_msg=name
+        )
+        np.testing.assert_array_equal(
+            block["angle"]["window_delta_mean"], (per_rung[name] / 10.0).mean(axis=1), err_msg=name
+        )
+        assert "episode" not in block and "window_episode" not in block, name
+    shuffled = written["interventions"]["shuffled"]
+    assert shuffled["window_steps_changed"] == [2, 1, 0]
+    assert written["interventions"]["resampled"]["window_steps_changed"] == [1, 2, 3]
+    # The decision statistic is the mean over the CHANGED windows only, and
+    # the persisted mask is what reproduces it from the all-window series.
+    series = np.asarray(shuffled["position"]["window_delta_mean"])
+    mask = np.asarray(shuffled["window_steps_changed"]) > 0
+    assert shuffled["position"]["delta_mean"] == series[mask].mean()
+    assert shuffled["position"]["delta_mean"] != pytest.approx(series.mean())
+    for name in LADDER:
+        block = written["interventions"][name]
+        series = np.asarray(block["position"]["window_delta_mean"])
+        mask = np.asarray(block["window_steps_changed"]) > 0
+        assert block["position"]["delta_mean"] == series[mask].mean(), name
+    # Each held action carries its OWN series (+6 / +1.5 / +0.5 offsets).
+    held = written["interventions"]["constant"]["held"]
+    assert held["3"]["position"]["window_delta_mean"] == pytest.approx([6.0] * 3)
+    assert held["0"]["position"]["window_delta_mean"] == pytest.approx([1.5] * 3)
+    assert held["3"]["window_steps_changed"] == [3, 3, 3]
+
+
+def test_the_record_writes_a_null_episode_index_when_the_ladder_reports_none(
+    monkeypatch, tmp_path
+):
+    """A hand-built ladder carries no clustering; the record must say so with
+    `null` rather than invent `range(n)` -- which a pooling reader would then
+    cluster on as if every window were its own episode."""
+    _stub(monkeypatch, tmp_path)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    assert written["windows"] == {"total": 2, "episode": None}
+
+
+def test_the_record_refuses_a_per_window_series_or_an_episode_index_of_the_wrong_length(
+    tmp_path
+):
+    """A stale index -- or a series persisted over the changed windows only --
+    would let a pooling reader cluster row `w` on episode `w'`. Refused by
+    name at write time, before a record that looks complete exists."""
+    args = script.parse_args(_argv(tmp_path))
+    device = torch.device("cpu")
+    clean = _null_ladder(total=4) | {"window_episode": [0, 0, 1, 1]}
+    assert script.build_record(clean, args, device, family=1)["windows"]["episode"] == [0, 0, 1, 1]
+
+    with pytest.raises(ValueError, match="episode"):
+        script.build_record(clean | {"window_episode": [0, 1]}, args, device, family=1)
+
+    short = _null_ladder(total=4)
+    short["rungs"]["resampled"]["position"]["window_mean"] = np.zeros(2)
+    with pytest.raises(ValueError, match="resampled"):
+        script.build_record(short, args, device, family=1)
+    short = _null_ladder(total=4)
+    short["rungs"]["constant"]["window_steps_changed"] = np.zeros(3, int)
+    with pytest.raises(ValueError, match="constant"):
+        script.build_record(short, args, device, family=1)
+
+    # The three variants that were never exercised: a HELD action's series
+    # (reached only through the recursion into `held`), a rung's embedding
+    # numerator, and the top-level noise reference -- each wrong alone, each
+    # named. Deleting the recursion, the embedding entry or the noise check
+    # passed every test until these existed.
+    block = lambda n: {  # noqa: E731
+        "window_distance": np.ones(n), "curve": np.ones(H), "median": 1.0,
+        "noise_median": 1.0, "ratio_of_medians": 1.0, "median_of_ratios": 1.0,
+        "curve_ratio": np.ones(H),
+    }
+    short = _null_ladder(total=4)
+    short["rungs"]["constant"]["held"] = {3: _rung([0.0] * H, [0.2] * H, total=4, embedding=block(4))}
+    short["rungs"]["constant"]["held"][3]["position"]["window_mean"] = np.zeros(3)
+    with pytest.raises(ValueError, match="held 3"):
+        script.build_record(short, args, device, family=1)
+    short = _null_ladder(total=4)
+    short["rungs"]["resampled"]["embedding"] = block(5)
+    with pytest.raises(ValueError, match="embedding.window_distance"):
+        script.build_record(short, args, device, family=1)
+    short = _null_ladder(total=4) | {
+        "noise_reference": {"window_distance": np.ones(3), "curve": np.ones(H), "median": 1.0},
+    }
+    with pytest.raises(ValueError, match="noise reference"):
+        script.build_record(short, args, device, family=1)
+    # And each of those, at the right length, is accepted.
+    whole = _null_ladder(total=4) | {
+        "noise_reference": {"window_distance": np.ones(4), "curve": np.ones(H), "median": 1.0},
+    }
+    whole["rungs"]["resampled"]["embedding"] = block(4)
+    whole["rungs"]["constant"]["held"] = {3: _rung([0.0] * H, [0.2] * H, total=4, embedding=block(4))}
+    assert script.build_record(whole, args, device, family=1)["interventions"]["constant"]["held"]["3"]
+
+
+def test_the_record_carries_the_embedding_reading_per_rung_and_the_noise_reference_once(
+    monkeypatch, tmp_path
+):
+    """Per rung: the per-window numerator, its curve, the two medians and their
+    ratio -- distinct values per rung, so one rung's block written under every
+    rung's name is caught (0.5 against 0.75). A rung not measured in embedding
+    space writes `null`, never 0. The noise reference is written ONCE at the
+    top level with its two self-checks, and never under a rung; the self-check
+    block carries both.
+    """
+    _stub(
+        monkeypatch, tmp_path,
+        changed=(True, True, True),
+        rung_steps={"shuffled": (2, 1, 3), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
+        rung_embedding={"shuffled": [1.0, 2.0, 9.0], "resampled": [3.0, 3.0, 3.0], "constant": None},
+        noise_distance=[4.0, 4.0, 4.0],
+    )
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+
+    shuffled = written["interventions"]["shuffled"]["embedding"]
+    assert shuffled["window_distance"] == [1.0, 2.0, 9.0]
+    assert shuffled["curve"] == [4.0] * H
+    assert shuffled["median"] == 2.0
+    assert shuffled["noise_median"] == 4.0
+    assert shuffled["ratio_of_medians"] == 0.5
+    assert written["interventions"]["resampled"]["embedding"]["ratio_of_medians"] == 0.75
+    assert written["interventions"]["constant"]["embedding"] is None
+    # Held actions keep their own reading beside the contrast's.
+    held = written["interventions"]["constant"]["held"]["3"]["embedding"]
+    assert held["window_distance"] == [TRAINED_SIGNATURE + 6.0 + w for w in range(3)]
+    noise = written["noise_reference"]
+    assert noise == {
+        "window_distance": [4.0, 4.0, 4.0], "curve": [4.0] * H, "median": 4.0,
+        "windows_collapsed": 0, "stream_restored": True,
+    }
+    for name in LADDER:
+        assert "noise_reference" not in written["interventions"][name]
+        assert "window_noise_distance" not in written["interventions"][name]
+    assert written["self_checks"]["noise_reference_stream_restored"] is True
+    assert written["self_checks"]["noise_reference_windows_collapsed"] == 0
+
+
+def test_an_undefined_embedding_ratio_round_trips_as_nan_and_never_as_zero(
+    monkeypatch, tmp_path
+):
+    """A noise median of exactly 0 -- a rig that draws nothing -- makes every
+    ratio undefined. It must reach the record as NaN through the `nonfinite`
+    map and come back as NaN from `load_record`: 0.0 there would read as
+    "action-blind" for a rung whose ruler measured nothing."""
+    _stub(monkeypatch, tmp_path, noise_distance=[0.0, 0.0], noise_collapsed=0)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    ratio = written["interventions"]["shuffled"]["embedding"]["ratio_of_medians"]
+    assert np.isnan(ratio)
+    raw = json.loads(script.diagnostic_record_path(tmp_path, "cnn", 0).read_text())
+    assert raw["interventions"]["shuffled"]["embedding"]["ratio_of_medians"] is None
+    assert "interventions.shuffled.embedding.ratio_of_medians" in raw["nonfinite"]
+
+
+def test_the_new_record_fields_are_derived_from_the_loaded_checkpoint(
+    monkeypatch, tmp_path
+):
+    """M8, for the new path: the embedding block's VALUES are what the loaded
+    parameters produce. The fake ladder derives every numerator from
+    `model.signature()`, so a script that evaluated a freshly initialised model
+    writes a different number here -- asserted to differ first."""
+    assert _TinyModel().signature() != TRAINED_SIGNATURE
+    _stub(monkeypatch, tmp_path)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    assert written["interventions"]["shuffled"]["embedding"]["window_distance"] == [
+        TRAINED_SIGNATURE + 4.0 + w for w in range(2)
+    ]
+    assert written["noise_reference"]["window_distance"] == [TRAINED_SIGNATURE] * 2
+
+
+def test_a_noise_reference_that_moved_the_stream_or_collapsed_is_a_stream_divergence(
+    monkeypatch, tmp_path, capsys
+):
+    """Two ways the ruler can be wrong, one status: the stream did not come
+    back after the noise draw (every later window's rungs moved with it), or
+    the reference was bitwise the canonical imagination in some window (it
+    drew the canonical's uniforms and the ratio there is x / 0). Both are the
+    defect class `EXIT_STREAM_DIVERGED` names -- the rungs no longer share
+    the stream -- each exercised alone, each named in the output, and the
+    clean pair exits OK.
+    """
+    _stub(monkeypatch, tmp_path, noise_restored=False)
+    assert script.main(_argv(tmp_path)) == script.EXIT_STREAM_DIVERGED
+    out = capsys.readouterr().out
+    assert "STREAM DIVERGED" in out and "noise reference" in out and "restore" in out
+
+    _stub(monkeypatch, tmp_path, noise_collapsed=2)
+    assert script.main(_argv(tmp_path)) == script.EXIT_STREAM_DIVERGED
+    out = capsys.readouterr().out
+    assert "STREAM DIVERGED" in out and "noise reference" in out and "2 of 2" in out
+
+    _stub(monkeypatch, tmp_path)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+
+
+def test_the_noise_self_checks_land_in_their_own_columns():
+    """Beside the three exact equalities: whether the stream came back after
+    every noise draw, and how many windows' reference was the canonical
+    latent. Given values that differ from every other column."""
+    cells = {("cnn", 0): _cell([1.0], [0.5]) | {"noise_restored": False, "noise_collapsed": 7}}
+    header, row = script.selfcheck_table(cells, ["cnn"], [0], 1).splitlines()
+    assert header.split()[-2:] == ["noise_restored", "noise_same"]
+    assert row.split()[-2:] == ["False", "7"], row
+
+
+def test_the_ladder_table_prints_the_embedding_ratio_in_its_own_row_and_MISSING_without_one():
+    """One more row per rung: the probe-free ratio against sampling noise.
+    Typed here, not read from `LADDER_ROWS`. 0.5 and 0.75 land under their
+    own rungs; a rung with no embedding block prints MISSING there and
+    nowhere else; an undefined ratio prints as `nan (noise 0)`, never as
+    0.000."""
+    assert list(script.LADDER_ROWS) == [
+        "horizon-mean", "angle horizon-mean", "final step", "changed/total",
+        "steps moved/horizon", "multiset dist/horizon", "embed ratio num/noise",
+        "embed contrast/noise", "embed step 1|H ratio",
+    ]
+    block = lambda ratio, noise=4.0: {  # noqa: E731
+        "window_distance": np.array([1.0, 2.0]), "curve": np.array([1.5] * 2),
+        "median": 1.5, "noise_median": noise, "ratio_of_medians": ratio,
+        "median_of_ratios": ratio, "curve_ratio": np.array([ratio, ratio]),
+    }
+    rungs = {
+        "shuffled": _rung([1.0, 1.0], [0.5, 0.5], mean=1.0, embedding=block(0.5)),
+        "resampled": _rung([2.0, 2.0], [0.5, 0.5], mean=2.0, embedding=block(0.75)),
+        "constant": _rung([3.0, 3.0], [0.5, 0.5], mean=3.0, embedding=None),
+    }
+    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    row = lambda index: _seed_columns(_rung_rows(table, index)["embed ratio num/noise"])[0].strip()  # noqa: E731
+    assert row(0) == "0.500"
+    assert row(1) == "0.750"
+    # The constant rung's row is the held PAIR, and a cell with no held
+    # readings prints MISSING for each of the two; its contrast row too.
+    assert row(2) == "MISSING|MISSING"
+    assert _seed_columns(_rung_rows(table, 2)["embed contrast/noise"])[0].strip() == "MISSING"
+    assert "MISSING" not in _rung_rows(table, 2)["horizon-mean"]
+
+    rungs["shuffled"] = _rung([1.0, 1.0], [0.5, 0.5], mean=1.0, embedding=block(float("nan"), 0.0))
+    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    assert row(0) == "nan (noise 0)"
+    assert "0.000" not in _rung_rows(table, 0)["embed ratio num/noise"]
+    # Undefined over a POSITIVE ruler is the other way to have no ratio: no
+    # window changed. Named as that, never as the ruler's fault.
+    assert script._ratio_text(block(float("nan"), 4.0)) == "nan (no window)"
+    assert script._ratio_text(None) == "MISSING"
+
+
+def test_the_verdict_quotes_the_embedding_ratio_where_the_probe_cannot_register():
+    """On every `cnn` cell the position probe is a constant predictor and the
+    verdict reads UNMEASURABLE THROUGH THIS PROBE. The embedding-space reading
+    is the one thing that CAN be read there, so that branch quotes the held
+    contrast's ratio -- and only when the rung carries one. The decision
+    logic itself is unchanged: the sentence is appended, not substituted."""
+    unmeasurable = dict(floor=9.0, persistence=1.0)
+    plain = _verdict(_null_ladder(**unmeasurable))
+    assert "UNMEASURABLE THROUGH THIS PROBE" in plain
+    assert "embedding space" not in plain
+
+    cell = _null_ladder(**unmeasurable)
+    cell["rungs"]["constant"]["embedding"] = _embedding(1.7)
+    quoted = _verdict(cell)
+    assert "UNMEASURABLE THROUGH THIS PROBE" in quoted
+    assert "In embedding space" in quoted and "1.700" in quoted, quoted
+    assert "held MOVE_FORWARD against held NOOP" in quoted
+
+
+def _embedding(ratio, *, noise=4.0, curve_ratio=None, median_of_ratios=None) -> dict:
+    """An embedding block as `rung_block` builds it, with every scalar its
+    own number: the ratio of medians, the median of ratios (defaults to a
+    DIFFERENT value, so the two cannot be printed for each other) and the
+    per-step ratio curve (defaults to a ramp, so step 1 and step H differ)."""
+    return {
+        "window_distance": np.array([1.0, 2.0]), "curve": np.full(H, 1.5),
+        "median": 1.5, "noise_median": noise, "ratio_of_medians": ratio,
+        "median_of_ratios": ratio + 0.11 if median_of_ratios is None else median_of_ratios,
+        "curve_ratio": (
+            np.linspace(ratio / 2.0, 2.0 * ratio, H) if curve_ratio is None
+            else np.asarray(curve_ratio, float)
+        ),
+    }
+
+
+def test_the_ladder_table_reads_the_constant_rung_on_the_same_axis_as_the_rungs_below_it():
+    """The top rung's numerator is the distance between two COUNTERFACTUALS
+    (held FORWARD against held NOOP), which by the triangle inequality is
+    structurally larger than either's distance to real -- a different
+    estimand from the shuffled and resampled rows, and printing all three
+    under one label manufactured a monotone ladder. So the `embed ratio
+    num/noise` row prints, for the constant rung, the two contrast actions'
+    OWN held-vs-real ratios in contrast order (`first|second`); the
+    between-held distance goes in its own row, `embed contrast/noise`, which
+    the sequence rungs leave blank; and `embed step 1|H ratio` prints the
+    rung's own per-step ratio at the first and last step -- the contrast's
+    for the constant rung, right under the contrast row. Every number is
+    distinct, so a row that read another's is caught by value; the held
+    pair is NOT the sorted order (0.74 comes first because held 3 is first
+    in the contrast).
+    """
+    held = {
+        3: _rung([31.0] * H, [12.0] * H, mean=31.0, embedding=_embedding(0.74)),
+        0: _rung([-11.6] * H, [7.9] * H, mean=-11.6, embedding=_embedding(0.35)),
+        1: _rung([2.0] * H, [1.0] * H, mean=2.0, embedding=_embedding(0.55)),
+    }
+    rungs = {
+        "shuffled": _rung([1.0] * H, [0.5] * H, mean=1.0, embedding=_embedding(0.21, curve_ratio=[0.15, 0.2, 0.29])),
+        "resampled": _rung([2.0] * H, [0.5] * H, mean=2.0, embedding=_embedding(0.4)),
+        "constant": _rung(
+            [3.0] * H, [0.5] * H, mean=3.0, contrast=(3, 0), held=held,
+            embedding=_embedding(1.02, curve_ratio=[0.67, 0.9, 1.14]),
+        ),
+    }
+    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    cell = lambda index, row: _seed_columns(_rung_rows(table, index)[row])[0].strip()  # noqa: E731
+    assert cell(0, "embed ratio num/noise") == "0.210"
+    assert cell(1, "embed ratio num/noise") == "0.400"
+    assert cell(2, "embed ratio num/noise") == "0.740|0.350", "the constant rung's row is not the held pair"
+    assert cell(0, "embed contrast/noise") == "" and cell(1, "embed contrast/noise") == ""
+    assert cell(2, "embed contrast/noise") == "1.020"
+    assert cell(0, "embed step 1|H ratio") == "0.150|0.290"
+    assert cell(2, "embed step 1|H ratio") == "0.670|1.140"
+    assert "1.02" not in _rung_rows(table, 2)["embed ratio num/noise"]
+    # A constant rung whose held blocks were never measured prints MISSING
+    # for the pair, and a contrast with no reading prints MISSING too.
+    bare = {"constant": _rung([3.0] * H, [0.5] * H, mean=3.0, contrast=(3, 0), held={
+        3: _rung([31.0] * H, [12.0] * H, mean=31.0), 0: _rung([-11.6] * H, [7.9] * H, mean=-11.6),
+    })}
+    table = script.ladder_table({("cnn", 0): _ladder_cell(bare)}, ["cnn"], [0], ("constant",))
+    assert cell(0, "embed ratio num/noise") == "MISSING|MISSING"
+    assert cell(0, "embed contrast/noise") == "MISSING"
+    assert cell(0, "embed step 1|H ratio") == "MISSING"
+
+
+def test_the_held_table_prints_each_held_actions_embedding_ratio_and_its_step_1_and_H():
+    """The same-axis reading of the top rung is each held action's own
+    distance to real, so the held table carries it: the horizon-mean ratio
+    and the per-step ratio at step 1 and step H, per action, beside the
+    delta and steps-moved rows -- four rows per action. MISSING when the
+    action was not measured in embedding space."""
+    held = {
+        3: _rung([31.0] * 2, [12.0] * 2, mean=31.0, se=6.0,
+                 embedding=_embedding(0.74, curve_ratio=[0.5, 0.9])),
+        0: _rung([-11.6] * 2, [7.9] * 2, mean=-11.6, se=3.95),
+    }
+    cells = {("cnn", 0): _ladder_cell({
+        "constant": _rung([42.6] * 2, [14.0] * 2, mean=42.6, se=7.0, contrast=(3, 0), held=held),
+    })}
+    lines = script.held_table(cells, ["cnn"], [0], LADDER).splitlines()
+    assert len(lines) == 1 + 4 * len(held), lines
+    noop, forward = lines[1:5], lines[5:9]
+    assert forward[0][12:25].strip() == "MOVE_FORWARD"
+    assert [line[25:47].strip() for line in forward] == [
+        "horizon-mean", "steps moved/horizon", "embed ratio num/noise", "embed step 1|H ratio",
+    ]
+    assert forward[2].split()[-1] == "0.740"
+    assert forward[3].split()[-1] == "0.500|0.900"
+    assert noop[2].split()[-1] == "MISSING" and noop[3].split()[-1] == "MISSING"
+
+
+def test_the_record_persists_both_ratio_summaries_and_the_per_step_ratio_curve(
+    monkeypatch, tmp_path
+):
+    """Two summaries of one series -- the ratio of medians (decision-bearing)
+    and the median of per-window ratios -- and the per-step ratio of the two
+    mean curves, so a reader can see where in the horizon the response sits.
+    On the stub the numerators are `signature + offset + w` over a noise of
+    [1, 6, 2] per window -- THREE windows, so the noise mean (3) and median
+    (2) differ and a curve ratio taken over the median instead of the ruler's
+    own curve is caught -- so the two summaries are typed by hand and
+    differ; the curve ratio is the flat numerator curve over the flat noise
+    curve. NaN over a zero ruler in every one of them, never 0."""
+    noise = np.array([1.0, 6.0, 2.0])
+    _stub(
+        monkeypatch, tmp_path, changed=(True, True, True), noise_distance=list(noise),
+        rung_steps={"shuffled": (2, 1, 3), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
+    )
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    shuffled = written["interventions"]["shuffled"]["embedding"]
+    numerator = np.array([TRAINED_SIGNATURE + 4.0 + w for w in range(3)])
+    assert shuffled["ratio_of_medians"] == np.median(numerator) / 2.0
+    assert shuffled["median_of_ratios"] == np.median(numerator / noise)
+    assert shuffled["ratio_of_medians"] != shuffled["median_of_ratios"]
+    assert shuffled["curve_ratio"] == [numerator.mean() / 3.0] * H
+    held = written["interventions"]["constant"]["held"]["0"]["embedding"]
+    assert held["median_of_ratios"] == np.median((TRAINED_SIGNATURE + 1.5 + np.arange(3)) / noise)
+
+    _stub(monkeypatch, tmp_path, noise_distance=[0.0, 0.0])
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    shuffled = written["interventions"]["shuffled"]["embedding"]
+    assert np.isnan(shuffled["median_of_ratios"])
+    assert all(np.isnan(v) for v in shuffled["curve_ratio"])
+
+
+def test_the_verdicts_embedding_note_separates_the_held_pair_from_the_contrast_and_quotes_the_horizon():
+    """Where the probe cannot register, the note quotes the two contrast
+    actions' own held-vs-real ratios (the same axis as the rungs below),
+    the between-held contrast SEPARATELY and named as a between-counterfactual
+    distance, the contrast's per-step ratio at step 1 and step H, and how
+    much the noise ruler itself grows over the horizon -- cnn's is flat and
+    frozen_ssl's grows 6x, and the horizon-mean hides both."""
+    cell = _null_ladder(floor=9.0, persistence=1.0)
+    cell["rungs"]["constant"]["embedding"] = _embedding(1.02, curve_ratio=np.linspace(0.67, 1.14, H))
+    cell["rungs"]["constant"]["held"] = {
+        3: _rung([0.0] * H, [0.2] * H, embedding=_embedding(0.355)),
+        0: _rung([0.0] * H, [0.2] * H, embedding=_embedding(0.74)),
+    }
+    cell["noise_reference"] = {"window_distance": np.ones(4), "curve": np.linspace(2.1, 12.5, H), "median": 1.0}
+    note = script._embedding_note(cell)
+    assert "held MOVE_FORWARD vs real 0.355" in note and "held NOOP vs real 0.740" in note, note
+    assert "between the two held imaginations" in note and "1.020" in note
+    assert "not on the same axis" in note
+    assert "step 1 0.670" in note and f"step {H} 1.140" in note, note
+    assert "ruler grows 2.100 -> 12.500" in note, note
+    assert "two draws" in note
+    cell["rungs"]["constant"]["held"][3]["embedding"] = None
+    assert "held MOVE_FORWARD vs real MISSING" in script._embedding_note(cell)
+
+
+def test_the_noise_growth_table_prints_each_cells_ruler_at_step_1_and_step_H():
+    """Per cell, the noise ruler's window-mean curve at the first and last
+    horizon step, so a flat ruler (no compounding dynamics in embedding
+    space) and a growing one are told apart at a glance -- the shape the
+    horizon-mean ratio cannot show. MISSING for a cell that did not run."""
+    cells = {
+        ("cnn", 0): _cell([1.0], [0.5]) | {
+            "noise_reference": {"window_distance": np.ones(4), "curve": np.array([0.12, 0.13]), "median": 1.0},
+        },
+        ("cnn", 2): _cell([1.0], [0.5]) | {
+            "noise_reference": {"window_distance": np.ones(4), "curve": np.array([2.1, 12.5]), "median": 1.0},
+        },
+    }
+    header, ruler, growth = script.noise_table(cells, ["cnn"], [0, 1, 2]).splitlines()
+    assert header.split() == ["arm", "row", "seed", "0", "seed", "1", "seed", "2"]
+    assert ruler.split() == ["cnn", "noise", "ruler", "step", "1->H", "0.120->0.130", "MISSING", "2.100->12.500"], ruler
+    assert growth.split() == ["ruler", "growth", "H/1", "x1.08", "MISSING", "x5.95"], growth
+
+
+def test_the_script_reads_the_cluster_standard_error_from_the_pooling_module():
+    """ONE implementation. The per-cell ruler and the pooled ruler are the
+    same estimator, so the script imports it from `pooling` rather than
+    keeping a copy that could drift while both kept passing. The clustered
+    fixture still reads 20.0 through the script, and the same rows give the
+    same number through the module."""
+    assert script.cluster_standard_error is pooling.cluster_standard_error
+    assert not hasattr(script, "_cluster_standard_error")
+    reference = _rollout([1.0] * H)
+    deltas = np.array([[0.0] * H, [0.0] * H, [40.0] * H, [40.0] * H])
+    summary = script.delta_summary(
+        _shuffle(reference, [2.0] * H, [True] * 4, deltas=deltas, episodes=[0, 0, 1, 1])
+    )
+    assert summary["se"] == pytest.approx(20.0)
+    assert pooling.cluster_standard_error(deltas.mean(axis=1), [0, 0, 1, 1]) == pytest.approx(20.0)
+    assert summary["window_mean"] == pytest.approx([0.0, 0.0, 40.0, 40.0])
+
+
+def test_a_record_this_script_writes_is_readable_by_the_pooling_reader(monkeypatch, tmp_path):
+    """The two schemas are pinned to each other here: a record the diagnose
+    script writes -- with an episode index -- is exactly what
+    `pooling.read_series` consumes, series and identity alike, and one
+    written by a ladder with no clustering is refused by it rather than
+    read naively."""
+    _stub(
+        monkeypatch, tmp_path, changed=(True, True, True), episodes=[0, 0, 1],
+        rung_steps={"shuffled": (2, 1, 0), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
+        rung_changed={"shuffled": (True, True, False)},
+    )
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    record = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    for rung in LADDER:
+        cell = pooling.read_series(record, rung, "angle")
+        assert (cell.arm, cell.seed, cell.rung, cell.channel) == ("cnn", 0, rung, "angle")
+        np.testing.assert_array_equal(cell.episode, [0, 0, 1])
+        assert cell.delta.shape == cell.changed.shape == cell.embedding.shape == cell.noise.shape == (3,)
+        assert (cell.device, cell.torch_version, cell.horizon, cell.context) == ("cpu", torch.__version__, H, 5)
+    np.testing.assert_array_equal(
+        pooling.read_series(record, "shuffled").changed, [True, True, False]
+    )
+
+    _stub(monkeypatch, tmp_path)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    with pytest.raises(pooling.StaleRecord, match="episode"):
+        pooling.read_series(load_record(script.diagnostic_record_path(tmp_path, "cnn", 0)), "shuffled")

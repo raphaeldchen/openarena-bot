@@ -625,8 +625,11 @@ def test_the_sweep_scores_every_horizon_step_exactly_once_for_every_k(
     k = 2
     sweep(model, [path], oracle_probe(episode), ks=(k, HORIZON))
     # Two open-loop calls of the full horizon -- the k == HORIZON arm and the
-    # canonical pass -- plus this k's own segments. Compared as an unordered
-    # structure so a legitimate reordering of the arms does not fail it.
+    # canonical pass -- plus this k's own segments, and NOTHING else: the
+    # sweep reads no embedding-space ratio, so it draws no noise reference,
+    # and a third full-horizon call here is a 45-step `imagine` per window
+    # that nobody reads. Compared as an unordered structure so a legitimate
+    # reordering of the arms does not fail it.
     assert lengths.count(HORIZON) == 2, lengths
     segments = [n for n in lengths if n != HORIZON]
     assert len(segments) == -(-HORIZON // k), lengths
@@ -708,8 +711,14 @@ def test_a_model_whose_dynamics_use_the_action_moves_under_the_permutation(
     )
     result = shuffle(model, [path], oracle_probe(episode))
 
-    # Two arms per window, in call order: the permuted one, then the canonical.
-    permuted, canonical = seen[0::2], seen[1::2]
+    # Three `imagine` calls per window, in call order: the permuted arm, the
+    # canonical pass, then the NOISE REFERENCE -- a second imagination over the
+    # real actions, asserted here to be handed the canonical call's tensor
+    # bitwise, not merely skipped over.
+    assert len(seen) == 3 * 2, len(seen)
+    permuted, canonical, noise = seen[0::3], seen[1::3], seen[2::3]
+    for index, (a, b) in enumerate(zip(canonical, noise)):
+        np.testing.assert_array_equal(a, b, err_msg=f"window {index}")
     steps = np.arange(1, HORIZON + 1)
     expected = lambda arms: np.mean(  # noqa: E731
         [STEP * np.abs(np.cumsum(a) - steps) for a in arms], axis=0
@@ -773,7 +782,9 @@ def test_the_permuted_actions_reach_imagine_and_preserve_the_multiset(
 
     starts = window_starts(episode.length, CONTEXT, HORIZON)
     assert len(starts) >= 2, "fixture must span more than one window"
-    permuted = seen[0::2]
+    # Permuted arm, canonical pass, noise reference: three calls per window.
+    assert len(seen) == 3 * len(starts), len(seen)
+    permuted = seen[0::3]
     orders = []
     for index, start in enumerate(starts):
         window = episode.actions[start + CONTEXT : start + CONTEXT + HORIZON]
@@ -1016,19 +1027,26 @@ def _per_rung(seen, arms, windows):
 
     `arms` is every arm in CALL order -- a rung name, or `("constant", a)` for
     the held action `a`, since the constant rung holds every action in the
-    support and each is its own call. Each window makes one call per arm plus
-    the canonical pass LAST, so the stride is `len(arms) + 1` and the canonical
-    calls are the remainder. An arm whose actions never reached `imagine`
-    shows up here as the wrong tensor in its own slot rather than as a missing
-    call.
+    support and each is its own call. Each window makes one call per arm, then
+    the canonical pass, then the NOISE REFERENCE -- a second imagination over
+    the real actions -- so the stride is `len(arms) + 2`, the canonical calls
+    sit at `len(arms)` and the noise calls at `len(arms) + 1`. The noise call
+    is asserted HERE to carry the canonical call's actions bitwise, so no
+    caller can quietly slice it away: a noise reference handed an intervened
+    sequence would be measuring the intervention twice. An arm whose actions
+    never reached `imagine` shows up as the wrong tensor in its own slot rather
+    than as a missing call.
     """
     arms = list(arms)
-    stride = len(arms) + 1
+    stride = len(arms) + 2
     assert len(seen) == stride * windows, (len(seen), stride, windows)
-    return (
-        {name: seen[index::stride] for index, name in enumerate(arms)},
-        seen[len(arms) :: stride],
-    )
+    canonical = seen[len(arms) :: stride]
+    noise = seen[len(arms) + 1 :: stride]
+    for index, (a, b) in enumerate(zip(canonical, noise)):
+        np.testing.assert_array_equal(
+            a, b, err_msg=f"window {index}: the noise reference was not handed the real actions"
+        )
+    return {name: seen[index::stride] for index, name in enumerate(arms)}, canonical
 
 
 def _ladder_arms(result):
@@ -1081,6 +1099,27 @@ def test_every_rung_is_bit_identical_on_a_model_whose_dynamics_ignore_actions(
     np.testing.assert_array_equal(rung.window_position_delta, 0.0)
     np.testing.assert_array_equal(rung.window_angle_delta, 0.0)
     assert rung.windows_changed == rung.windows_total > 0
+
+    # THE EMBEDDING-SPACE HALF, in the same body. Intervened and real share the
+    # per-window snapshot, so on an action-blind model the numerator is bitwise
+    # 0.0 in every window and the ratio exactly 0.0 -- not approx, not NaN. And
+    # the zero is only evidence beside a NOISE REFERENCE that is NOT zero: the
+    # second imagination is drawn from a different stream point, so it differs
+    # from the canonical one in every window even here. A numerator that never
+    # ran, or a noise reference replayed from the canonical snapshot, both give
+    # 0 / 0 and are excluded by the `> 0` half.
+    noise = result.noise_reference
+    assert noise.windows_collapsed == 0
+    assert noise.stream_restored is True
+    assert (noise.window_embedding_distance > 0.0).all()
+    assert (noise.embedding_distance_curve > 0.0).all()
+    readings = [result.arms["shuffled"], result.arms["resampled"], rung, *rung.held.values()]
+    for arm in readings:
+        np.testing.assert_array_equal(arm.window_embedding_distance, 0.0, err_msg=arm.name)
+        np.testing.assert_array_equal(arm.embedding_distance_curve, 0.0, err_msg=arm.name)
+        assert arm.noise_median() > 0.0, arm.name
+        assert arm.embedding_median() == 0.0, arm.name
+        assert arm.embedding_ratio() == 0.0, arm.name
 
 
 def test_every_rung_moves_under_a_model_whose_dynamics_use_the_action(
@@ -1168,6 +1207,20 @@ def test_adding_rungs_leaves_the_shuffled_rung_bitwise_where_it_was(tmp_path, de
         np.testing.assert_array_equal(
             getattr(whole.real, curve), getattr(alone.real, curve), err_msg=curve
         )
+    # The embedding-space reading and the noise reference are per-window
+    # functions of (seed, window) alone: the noise reference is drawn from the
+    # stream point the canonical pass leaves, never from wherever the last arm
+    # happened to stop, so it cannot move with the rungs selected.
+    np.testing.assert_array_equal(
+        whole.arms["shuffled"].window_embedding_distance,
+        alone.arms["shuffled"].window_embedding_distance,
+    )
+    np.testing.assert_array_equal(
+        whole.noise_reference.window_embedding_distance,
+        alone.noise_reference.window_embedding_distance,
+    )
+    assert alone.noise_reference.window_embedding_distance.min() > 0.0
+    assert whole.arms["shuffled"].windows_changed == whole.windows_total > 0
 
 
 def test_the_shuffled_rung_permutes_with_the_literal_stream_that_produced_the_shipped_records(
@@ -1706,6 +1759,543 @@ def test_the_ladder_records_the_seed_the_held_actions_and_the_contrast_it_used(t
         ActionSumModel(), [path], oracle_probe(episode), arms=("shuffled",)
     )
     assert without.held_actions is None and without.contrast is None
+
+
+# ---------------------------------------------------------------------------
+# The embedding-space reading and its noise reference.
+#
+# The position delta passes through a ridge probe whose selection R^2 is
+# 0.30-0.38 on the feature arms and -0.036 on the pixel arm, so the effect size
+# it reports is attenuated by probe quality and the pixel arm cannot be read
+# at all. The reading below is probe-free: per window, the L2 between the
+# intervened imagination's EMBEDDING and the real one's, per horizon step, and
+# a NOISE REFERENCE -- a second real-action imagination from a different stream
+# point -- as the ruler. The tests are arranged around the one way the ruler
+# can be wrong without any shape saying so: the second imagination moves the
+# global stream, so the NEXT window's snapshot moves and the canonical pass
+# drifts. Every stream test runs on both devices for the reason the module
+# docstring gives.
+# ---------------------------------------------------------------------------
+
+
+def _two_episode_rig(tmp_path, device):
+    """Two synthetic episodes on the real sampling RSSM: four windows, so the
+    stream tests below are cross-WINDOW and cross-EPISODE statements."""
+    paths = [write(tmp_path, synthetic_episode(), index) for index in range(2)]
+    model, probe = real_model_and_probe()
+    return model.to(device), paths, probe
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_noise_reference_leaves_the_stream_exactly_where_evaluate_rollout_does(
+    tmp_path, device
+):
+    """THE stream guard, on the generator state itself and not only on curves.
+
+    The noise reference is one more `imagine` per window. If it runs before the
+    canonical pass, or after it without putting the stream back, or restores
+    the CPU generator only on MPS, window `w + 1` starts from a different state
+    than `evaluate_rollout` started it from -- and every curve after window 1
+    moves. Asserted two ways in one test: the device-aware generator state at
+    the end of the traversal is bitwise the state `evaluate_rollout` leaves
+    (both keys), AND the real arm's curves are bitwise the rollout's. A curve
+    equality alone could pass on a one-window fixture; the state equality
+    cannot, and the fixture spans four windows besides.
+
+    The noise reference is asserted to have RUN in the same test -- positive
+    in every window, stream reported restored -- so the equality cannot be
+    explained by the reference not existing.
+    """
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+
+    reference = rollout(model, paths, probe, device=device)
+    left_by_rollout = diagnostics_module._rng_snapshot(device)
+    result = ladder(model, paths, probe, device=device)
+    left_by_ladder = diagnostics_module._rng_snapshot(device)
+
+    assert result.windows_total == 4
+    assert set(left_by_ladder) == set(left_by_rollout)
+    for key in left_by_rollout:
+        assert torch.equal(left_by_ladder[key], left_by_rollout[key]), (
+            f"the {key} generator ends somewhere else than evaluate_rollout leaves it"
+        )
+    np.testing.assert_array_equal(result.real.rssm_position, reference.rssm_position)
+    np.testing.assert_array_equal(result.real.rssm_angle, reference.rssm_angle)
+    np.testing.assert_array_equal(result.real.floor_position, reference.floor_position)
+    noise = result.noise_reference
+    assert noise.stream_restored is True
+    assert noise.windows_collapsed == 0
+    assert noise.window_embedding_distance.shape == (4,)
+    assert noise.window_embedding_distance.min() > 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_a_noise_reference_that_forgets_to_restore_the_stream_moves_the_canonical_pass(
+    tmp_path, device, monkeypatch
+):
+    """The proof that the guard above CAN fail -- the mutation, run inside the
+    test on both devices.
+
+    `_noise_reference` is wrapped so that after the real helper has drawn and
+    restored, one more `imagine` is consumed and NOT restored. The self-check
+    is computed by `_diagnose` from a snapshot taken BEFORE the helper was
+    called, so it must read False here -- a self-check computed inside the
+    helper, or hardcoded True, passes the test above and fails this one. And
+    the real arm must drift from `evaluate_rollout` from window 2 on, which is
+    what a real sampling rig shows and a deterministic one never would.
+    """
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    reference = rollout(model, paths, probe, device=device)
+    real_helper = diagnostics_module._noise_reference
+
+    def forgetful(model, handle, tail):
+        latent = real_helper(model, handle, tail)
+        model.rssm.imagine(handle.horizon_actions, handle.state)
+        return latent
+
+    monkeypatch.setattr(diagnostics_module, "_noise_reference", forgetful)
+    result = ladder(model, paths, probe, device=device)
+
+    assert result.noise_reference.stream_restored is False
+    assert not np.array_equal(result.real.rssm_position, reference.rssm_position), (
+        "an unrestored draw did not move the canonical pass; the real arm is not "
+        "being replayed from the per-window snapshot"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="the MPS half needs MPS"
+)
+def test_the_stream_restored_self_check_reads_false_under_a_cpu_only_restore_on_mps(
+    tmp_path, monkeypatch
+):
+    """The MPS half of the self-check: `torch.set_rng_state` alone restores the
+    CPU generator and leaves the MPS one where the noise draw left it.
+
+    Measured this session: an `imagine` on MPS moves ONLY the MPS state, so a
+    self-check that compared the `cpu` key alone would read True under a
+    CPU-only restore -- both keys must be compared. Unpatched in the same test,
+    the check reads True and the real arm is bitwise the rollout's.
+    """
+    device = torch.device("mps")
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    reference = rollout(model, paths, probe, device=device)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            diagnostics_module, "_rng_restore",
+            lambda state: torch.set_rng_state(state["cpu"]),
+        )
+        broken = ladder(model, paths, probe, device=device)
+    assert broken.noise_reference.stream_restored is False
+    assert not np.array_equal(broken.real.rssm_position, reference.rssm_position)
+
+    intact = ladder(model, paths, probe, device=device)
+    assert intact.noise_reference.stream_restored is True
+    np.testing.assert_array_equal(intact.real.rssm_position, reference.rssm_position)
+
+
+def test_every_rungs_embedding_distance_is_the_closed_form_of_the_actions_it_imagined(
+    tmp_path, monkeypatch
+):
+    """The positive half of the two-sided test, as exact per-window values.
+
+    On `ActionSumModel` the embedding head is the latent's first column, the
+    frame TAG, and the imagined tag after k steps is `h0 + cumsum(actions)[k]`
+    -- so the per-step L2 between an intervened imagination and the real one
+    is `|cumsum(a_int) - cumsum(a_real)|[k]`, and the window's numerator is
+    its mean over the horizon. Computed from the action tensors the spy caught
+    ON THE WAY INTO `imagine`, per window, in order; asserted on the SERIES and
+    never on its mean, so a reversed or sorted series is caught. The latent is
+    `cat[tag, tag]`, so an L2 taken in latent space rather than through the
+    head is exactly sqrt(2) too large -- the rig separates the two pipelines
+    by a known factor rather than by coincidence.
+
+    The constant rung's numerator is the L2 between the two HELD imaginations
+    directly -- `|cumsum(first) - cumsum(second)|`, the real arm cancelling as
+    it does in the position contrast -- and each held action keeps its own
+    distance to the real imagination beside it.
+
+    This rig draws no random numbers, so the noise reference is bitwise the
+    canonical pass in every window: `windows_collapsed == windows_total` and
+    every ratio is NaN, which is the documented "no spread to read against"
+    state and not a defect. The noise call is asserted to have received the
+    real actions by `_per_rung`.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    result = ladder(model, [path], oracle_probe(episode), contrast=SKEWED_CONTRAST)
+
+    arms, canonical = _per_rung(seen, _ladder_arms(result), windows=2)
+    closed_form = lambda a, b: np.array(  # noqa: E731
+        [np.mean(np.abs(np.cumsum(x) - np.cumsum(y))) for x, y in zip(a, b)]
+    )
+    curve = lambda a, b: np.mean(  # noqa: E731
+        [np.abs(np.cumsum(x) - np.cumsum(y)) for x, y in zip(a, b)], axis=0
+    )
+    noise = result.noise_reference
+    assert noise.windows_collapsed == noise.window_embedding_distance.size == 2
+    np.testing.assert_array_equal(noise.window_embedding_distance, 0.0)
+    varied = []
+    for name in ("shuffled", "resampled"):
+        arm = result.arms[name]
+        np.testing.assert_allclose(
+            arm.window_embedding_distance, closed_form(arms[name], canonical),
+            rtol=1e-12, err_msg=name,
+        )
+        np.testing.assert_allclose(
+            arm.embedding_distance_curve, curve(arms[name], canonical), rtol=1e-12,
+        )
+        assert arm.window_embedding_distance.min() > 0.0, name
+        assert np.isnan(arm.embedding_ratio()), name
+        varied.append(arm.window_embedding_distance[0] != arm.window_embedding_distance[1])
+    rung = result.arms["constant"]
+    for action, held in rung.held.items():
+        np.testing.assert_allclose(
+            held.window_embedding_distance,
+            closed_form(arms[("constant", action)], canonical), rtol=1e-12,
+            err_msg=str(action),
+        )
+        assert np.isnan(held.embedding_ratio()), action
+        varied.append(held.window_embedding_distance[0] != held.window_embedding_distance[1])
+    first, second = SKEWED_CONTRAST
+    np.testing.assert_allclose(
+        rung.window_embedding_distance,
+        closed_form(arms[("constant", first)], arms[("constant", second)]), rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        rung.embedding_distance_curve,
+        curve(arms[("constant", first)], arms[("constant", second)]), rtol=1e-12,
+    )
+    assert rung.window_embedding_distance.min() > 0.0
+    assert np.isnan(rung.embedding_ratio())
+    assert any(varied), "every per-window series is flat, so its order is untestable"
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_embedding_distance_is_positive_and_below_sampling_noise_on_a_real_model(
+    tmp_path, device
+):
+    """The positive half on the SAMPLING rig, where the ratio is finite.
+
+    A real `RSSM`'s `_step` sees the action one-hot, so every rung's numerator
+    is positive in every window -- and on this untrained model it is far
+    smaller than what a second draw of the same imagination produces: measured,
+    the ratio is ~0.05 on both devices. That is the `0 < ratio < 1` branch of
+    the documented interpretation, which no deterministic rig can reach (its
+    noise is exactly zero) and which is asserted here so the branch is
+    exercised rather than merely described. Asserted per rung AND per held
+    action, so a numerator computed real-against-real on one of them is caught
+    by name.
+    """
+    path = write(tmp_path, varied_action_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+    result = ladder(model, [path], probe, device=device)
+
+    rung = result.arms["constant"]
+    readings = [result.arms["shuffled"], result.arms["resampled"], rung, *rung.held.values()]
+    for arm in readings:
+        assert arm.windows_changed == arm.windows_total > 0, arm.name
+        assert (arm.window_embedding_distance > 0.0).all(), arm.name
+        assert (arm.embedding_distance_curve > 0.0).all(), arm.name
+        ratio = arm.embedding_ratio()
+        assert np.isfinite(ratio), arm.name
+        assert 0.0 < ratio < 1.0, (arm.name, ratio)
+
+
+def test_the_noise_rulers_per_window_series_and_curve_are_the_means_of_its_per_step_distances(
+    tmp_path, monkeypatch
+):
+    """The denominator of every ratio, pinned to the per-step matrix it is
+    reduced from -- on the SAMPLING rig, where that matrix varies over both
+    axes. Every other assertion on the noise series is a shape, a `> 0`, or
+    an equality between two ladders, and the deterministic rig's noise is
+    exactly 0 whatever the reduction; so `max(axis=1)`, `[:, 0]` and
+    `max(axis=0)` all passed until this test existed.
+
+    `_embedding_distance` is spied; the noise call is the LAST per window
+    (`_diagnose` draws the reference after every arm and the canonical pass),
+    so the captured rows are sliced at the per-window stride. The matrix is
+    asserted to vary along both axes first, or the reductions could coincide
+    on it; then the per-window ruler is its horizon mean and the curve its
+    window mean, bitwise. And every rung carries the same ruler and the same
+    curve, so a rung's ratio is computable from the rung alone.
+    """
+    model, paths, probe = _two_episode_rig(tmp_path, torch.device("cpu"))
+    captured: list[np.ndarray] = []
+    real_distance = diagnostics_module._embedding_distance
+    monkeypatch.setattr(
+        diagnostics_module, "_embedding_distance",
+        lambda a, b: _tee(captured, real_distance(a, b)),
+    )
+    result = ladder(model, paths, probe)
+
+    per_window = len(captured) // result.windows_total
+    assert len(captured) == per_window * result.windows_total == 10 * 4, len(captured)
+    per_step = np.stack(captured[per_window - 1 :: per_window])
+    assert per_step.shape == (4, HORIZON)
+    assert (per_step.std(axis=1) > 0.0).all(), "flat over the horizon: the reduction is untestable"
+    assert (per_step.std(axis=0) > 0.0).all(), "flat over windows: the reduction is untestable"
+
+    noise = result.noise_reference
+    np.testing.assert_array_equal(noise.window_embedding_distance, per_step.mean(axis=1))
+    np.testing.assert_array_equal(noise.embedding_distance_curve, per_step.mean(axis=0))
+    rung = result.arms["constant"]
+    for arm in (result.arms["shuffled"], result.arms["resampled"], rung, *rung.held.values()):
+        np.testing.assert_array_equal(arm.window_noise_distance, per_step.mean(axis=1), err_msg=arm.name)
+        np.testing.assert_array_equal(arm.noise_distance_curve, per_step.mean(axis=0), err_msg=arm.name)
+
+
+def _tee(sink: list, value):
+    sink.append(value)
+    return value
+
+
+def test_the_standalone_shuffle_carries_the_shuffled_rungs_embedding_reading(
+    tmp_path, monkeypatch
+):
+    """`action_shuffled_rollout` is the ladder's shuffled rung under the field
+    names the shipped records were written from, and it carries the rung's
+    probe-free reading too -- asserted through THAT entry point, on the closed
+    form, because nothing in `src/` or `scripts/` consumes it there and a
+    dropped kwarg would leave the standalone view with `None` in three fields
+    and every test green.
+
+    On `ActionSumModel` the numerator is `|cumsum(permuted) - cumsum(real)|`
+    per step, horizon-meaned per window; the rig draws nothing, so the noise
+    series and its curve are exactly 0 in every window and step.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    result = shuffle(model, [path], oracle_probe(episode))
+
+    assert len(seen) == 3 * 2
+    permuted, canonical = seen[0::3], seen[1::3]
+    distances = [np.abs(np.cumsum(a) - np.cumsum(b)) for a, b in zip(permuted, canonical)]
+    np.testing.assert_allclose(
+        result.window_embedding_distance, [d.mean() for d in distances], rtol=1e-12
+    )
+    np.testing.assert_allclose(result.embedding_distance_curve, np.mean(distances, axis=0), rtol=1e-12)
+    assert result.window_embedding_distance.min() > 0.0
+    np.testing.assert_array_equal(result.window_noise_distance, np.zeros(2))
+    np.testing.assert_array_equal(result.noise_distance_curve, np.zeros(HORIZON))
+    assert np.isnan(result.embedding_ratio())
+
+
+def test_the_embedding_distance_is_computed_on_rows_the_embedding_head_emitted(
+    tmp_path, monkeypatch
+):
+    """The single-pipeline rule, for the new reading.
+
+    Every row handed to `_embedding_distance` -- both arguments, every call --
+    must be a row the embedding head emitted: the intervened imagination, the
+    real one, or the noise reference, all through `model.heads`. An L2 taken
+    on the raw latent is caught by rows the head never produced. The call
+    count is typed first: two sequence rungs, six held actions and the noise
+    reference against the real imagination, plus the contrast's held pair,
+    per window over two windows. And `apply_probe` is called exactly as often
+    as before -- the noise reference is NOT probed; it is an embedding-space
+    ruler only.
+    """
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+
+    head_rows: set[bytes] = set()
+    real_heads = model.heads.forward
+
+    def spy_heads(latent):
+        out = real_heads(latent)
+        for row in out["embedding"].reshape(-1, out["embedding"].shape[-1]):
+            head_rows.add(row.cpu().numpy().astype(np.float32).tobytes())
+        return out
+
+    distances: list[tuple[np.ndarray, np.ndarray]] = []
+    real_distance = diagnostics_module._embedding_distance
+    probed: list[int] = []
+    real_apply = diagnostics_module.apply_probe
+    monkeypatch.setattr(model.heads, "forward", spy_heads)
+    monkeypatch.setattr(
+        diagnostics_module, "_embedding_distance",
+        lambda a, b: distances.append((np.asarray(a), np.asarray(b))) or real_distance(a, b),
+    )
+    monkeypatch.setattr(
+        diagnostics_module, "apply_probe",
+        lambda p, rows: probed.append(1) or real_apply(p, rows),
+    )
+    result = ladder(model, [path], probe)
+
+    assert result.windows_total == 2
+    assert len(result.held_actions) == 6
+    assert len(distances) == (2 + 6 + 1 + 1) * 2, len(distances)
+    assert len(probed) == (3 + 2 + 6) * 2, len(probed)
+    for a, b in distances:
+        assert a.shape == b.shape == (HORIZON, 2048), (a.shape, b.shape)
+        for row in np.concatenate([a, b]):
+            assert row.astype(np.float32).tobytes() in head_rows
+
+
+def test_the_noise_reference_imagines_the_real_actions_from_the_context_state_at_a_different_stream_point(
+    tmp_path, monkeypatch
+):
+    """What ELSE gives a nonzero noise reference: an intervened sequence, or a
+    cold state. Neither is a sampling-noise ruler, so both are excluded here.
+
+    Per window, the canonical `imagine` and the noise `imagine` must receive
+    the SAME action tensor and the SAME `(h, z)` state -- bitwise -- and return
+    DIFFERENT latents, because the only thing allowed to differ between them
+    is the point in the sampling stream. A noise reference replayed from the
+    per-window snapshot returns the canonical latent and is caught by the
+    inequality; one handed a permuted sequence or `state=None` is caught by
+    the equalities.
+    """
+    path = write(tmp_path, varied_action_episode())
+    model, probe = real_model_and_probe()
+    calls: list[tuple] = []
+    real = model.rssm.imagine
+
+    def spy(actions, state):
+        out = real(actions, state)
+        calls.append((actions.clone(), tuple(s.clone() for s in state), out["latent"].clone()))
+        return out
+
+    monkeypatch.setattr(model.rssm, "imagine", spy)
+    result = ladder(model, [path], probe, arms=("shuffled",))
+
+    stride = 1 + 2
+    assert len(calls) == stride * result.windows_total
+    for window in range(result.windows_total):
+        canonical = calls[window * stride + 1]
+        noise = calls[window * stride + 2]
+        assert torch.equal(canonical[0], noise[0]), window
+        assert all(torch.equal(a, b) for a, b in zip(canonical[1], noise[1])), window
+        assert not torch.equal(canonical[2], noise[2]), (
+            f"window {window}: the noise reference is the canonical imagination bitwise"
+        )
+    assert result.noise_reference.windows_collapsed == 0
+
+
+def _hand_built_arm(numerator, changed, noise):
+    """An `ArmResult` with only what the embedding reading consumes."""
+    numerator = None if numerator is None else np.asarray(numerator, float)
+    changed = np.asarray(changed, bool)
+    return diagnostics_module.ArmResult(
+        name="shuffled",
+        position=np.zeros(HORIZON), angle=np.zeros(HORIZON),
+        window_position_delta=np.zeros((changed.size, HORIZON)),
+        window_angle_delta=np.zeros((changed.size, HORIZON)),
+        window_steps_changed=np.where(changed, HORIZON, 0),
+        window_multiset_distance=np.zeros(changed.size, int),
+        horizon=HORIZON,
+        window_embedding_distance=numerator,
+        embedding_distance_curve=None if numerator is None else np.zeros(HORIZON),
+        window_noise_distance=None if noise is None else np.asarray(noise, float),
+    )
+
+
+def test_the_embedding_ratio_is_a_ratio_of_medians_over_the_changed_windows_and_undefined_without_spread():
+    """The statistic, pinned by values chosen so every wrong summary is a
+    different number.
+
+    Numerator [1, 2, 9, 100] over changed [T, T, T, F], noise [3, 4, 5, 100]:
+    the medians over the CHANGED windows are 2 and 4, ratio 0.5. Over ALL
+    windows they would be 5.5 and 4.5; the means over the changed windows are
+    4 and 4, ratio 1.0. Both series are taken over the same windows -- the
+    ones the intervention changed -- so the ratio is a paired comparison and
+    a noisier unchanged window cannot move its denominator.
+
+    Three ways to have no ratio, each on its own: no changed window (NaN, not
+    0), a noise median of exactly 0 -- a deterministic rig -- (NaN, never inf
+    and never 0), and a rung that was never measured in embedding space
+    (ValueError naming it, so a hand-built result cannot print as a null).
+    A zero numerator over a POSITIVE noise median is exactly 0.0.
+    """
+    arm = _hand_built_arm([1.0, 2.0, 9.0, 100.0], [True, True, True, False], [3.0, 4.0, 5.0, 100.0])
+    assert arm.embedding_median() == 2.0
+    assert arm.noise_median() == 4.0
+    assert arm.embedding_ratio() == 0.5
+
+    zero = _hand_built_arm([0.0, 0.0, 0.0, 0.0], [True] * 4, [3.0, 4.0, 5.0, 100.0])
+    assert zero.embedding_ratio() == 0.0
+
+    no_spread = _hand_built_arm([1.0, 2.0, 9.0, 100.0], [True] * 4, [0.0] * 4)
+    assert np.isnan(no_spread.embedding_ratio()) and not np.isinf(no_spread.embedding_ratio())
+    both_zero = _hand_built_arm([0.0] * 4, [True] * 4, [0.0] * 4)
+    assert np.isnan(both_zero.embedding_ratio())
+
+    unchanged = _hand_built_arm([1.0, 2.0, 9.0, 100.0], [False] * 4, [3.0, 4.0, 5.0, 100.0])
+    assert np.isnan(unchanged.embedding_ratio())
+    assert np.isnan(unchanged.embedding_median())
+
+    with pytest.raises(ValueError, match="not measured"):
+        _hand_built_arm(None, [True] * 4, [3.0, 4.0, 5.0, 100.0]).embedding_ratio()
+    with pytest.raises(ValueError, match="not measured"):
+        _hand_built_arm([1.0] * 4, [True] * 4, None).embedding_ratio()
+
+
+def test_the_median_of_per_window_ratios_is_the_second_summary_and_differs_from_the_first():
+    """Two summaries of the same per-window series, both persisted, because on
+    the shipped frozen_ssl cells they straddle the 1.0 landmark (0.97 against
+    1.06 on the held contrast). The ratio of medians is the decision-bearing
+    one -- each window's denominator is a SINGLE draw of a distance, so a
+    per-window division uses a very noisy ruler and carries the E[1/X] > 1/E[X]
+    bias, while the population median is well estimated from 229 draws -- and
+    the median of ratios is kept beside it so the sensitivity is readable.
+
+    Numerator [1, 4, 9, 100] over noise [2, 4, 1, 100], changed [T, T, T, F]:
+    the medians are 4 and 2, ratio 2.0; the per-window ratios are 0.5, 1.0
+    and 9.0, median 1.0. Chosen so the two DIFFER -- on the first fixture
+    above they coincide at 0.5, which is the L1 trap. NaN, never inf, when
+    any changed window's noise is exactly 0; NaN when no window changed;
+    exactly 0.0 on a zero numerator over positive noise.
+    """
+    arm = _hand_built_arm([1.0, 4.0, 9.0, 100.0], [True, True, True, False], [2.0, 4.0, 1.0, 100.0])
+    assert arm.embedding_ratio() == 2.0
+    assert arm.median_of_ratios() == 1.0
+
+    zero = _hand_built_arm([0.0] * 4, [True] * 4, [3.0, 4.0, 5.0, 100.0])
+    assert zero.median_of_ratios() == 0.0
+    one_zero = _hand_built_arm([1.0, 4.0, 9.0, 100.0], [True] * 4, [2.0, 0.0, 1.0, 100.0])
+    assert np.isnan(one_zero.median_of_ratios()) and not np.isinf(one_zero.median_of_ratios())
+    # The zero sits in an UNCHANGED window: it is not in the ratio's support.
+    unchanged_zero = _hand_built_arm([1.0, 4.0, 9.0, 100.0], [True, True, True, False], [2.0, 4.0, 1.0, 0.0])
+    assert unchanged_zero.median_of_ratios() == 1.0
+    assert np.isnan(_hand_built_arm([1.0] * 4, [False] * 4, [2.0] * 4).median_of_ratios())
+    with pytest.raises(ValueError, match="not measured"):
+        _hand_built_arm([1.0] * 4, [True] * 4, None).median_of_ratios()
+
+
+def test_the_ladder_reads_the_feature_cache_for_the_embedding_distance_as_well(
+    tmp_path, monkeypatch
+):
+    """Both encoder input kinds reach the new path. Under the feature backbone
+    the +100 tag cache is what the oracle's context state carries, so every
+    REAL-side row handed to `_embedding_distance` is at least 100 -- a ladder
+    that read `episode.obs` for the feature arms would hand rows below it.
+
+    What this does NOT show, said so it is not read into it: the numerator
+    series itself is invariant to the offset (both sides carry it), so only
+    the rows, not the distances, can tell the two sources apart.
+    """
+    episode = synthetic_episode()
+    path = write(tmp_path, episode)
+    tags = np.arange(episode.length + 1, dtype=np.float32) + 100.0
+    np.save(path.with_suffix(".features_random_vit.npy"), tags.reshape(-1, 1, 1, 1))
+    model = OracleModel()
+    model.input_kind = "features"
+    real_rows: list[np.ndarray] = []
+    real_distance = diagnostics_module._embedding_distance
+    monkeypatch.setattr(
+        diagnostics_module, "_embedding_distance",
+        lambda a, b: real_rows.append(np.asarray(b)) or real_distance(a, b),
+    )
+    result = ladder(model, [path], oracle_probe(episode), feature_backbone="random_vit")
+    assert real_rows and all(rows.min() >= 100.0 for rows in real_rows)
+    assert result.windows_total == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2397,6 +2987,15 @@ def test_the_ladder_on_a_shipped_checkpoint_leaves_the_shuffled_rung_bitwise_the
     every shape, every window count and every self-check stayed right. The
     other rungs are asserted to have changed every window in the same test, so
     the equality cannot be explained by the ladder having done nothing.
+
+    THE EMBEDDING-SPACE READING RUNS ON THIS CELL TOO, in the same body, so the
+    fixture pin above is a pin WITH the noise reference drawing one more
+    imagination per window: the stream must come back after every one of the
+    229 draws, none may be the canonical latent bitwise, and every rung's
+    ratio must be finite. The ratio VALUES are not pinned -- they are new
+    information about the pixel arm, which the position probe (R^2 -0.036)
+    could not read -- they are printed. Measured on this box: shuffled
+    0.309, resampled 0.401, held FORWARD-vs-NOOP 1.022.
     """
     import json
 
@@ -2432,3 +3031,15 @@ def test_the_ladder_on_a_shipped_checkpoint_leaves_the_shuffled_rung_bitwise_the
     assert result.held_actions == (0, 1, 2, 3, 4, 5)
     for action, held in result.arms["constant"].held.items():
         assert held.windows_changed == SHIPPED_WINDOWS, action
+
+    noise = result.noise_reference
+    assert noise.stream_restored is True
+    assert noise.windows_collapsed == 0
+    assert noise.window_embedding_distance.shape == (SHIPPED_WINDOWS,)
+    assert noise.window_embedding_distance.min() > 0.0
+    assert shuffled.window_embedding_distance.shape == (SHIPPED_WINDOWS,)
+    ratios = {name: result.arms[name].embedding_ratio() for name in LADDER}
+    assert all(np.isfinite(ratio) for ratio in ratios.values()), ratios
+    assert all(ratio > 0.0 for ratio in ratios.values()), ratios
+    # Not pinned -- printed, so a `-s` run carries the reading in its log.
+    print(f"cnn/seed0 embedding ratios: {ratios}")
