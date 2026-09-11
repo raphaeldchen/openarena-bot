@@ -2089,6 +2089,83 @@ a probe-free embedding-space reading of each rung (removing the ridge probe's R�
 0.30–0.38 from the effect size), and a pooled cross-cell statistic in place of nine per-cell
 verdicts that disagree across `random_vit` seeds.
 
+#### Both follow-ups, run (2026-09-11, same nine checkpoints, MPS, torch 2.13.0)
+
+Same records, re-run with the two readings added; every pre-existing field of all nine
+records — every rung's position and angle delta, the reference curve, the three self-checks,
+the family of 54 — is bitwise what it was (checked key by key against copies taken before
+the change), and the shuffled rung is still bitwise the pre-ladder fixture. Only fields were
+added: each rung's per-window horizon-mean delta, the window → episode index, and the
+embedding-space reading below.
+
+**The probe-free reading.** Per window, the L2 in embedding space (`heads(latent)["embedding"]`,
+the row every probe reads) between the intervened imagination and the real one, per step,
+horizon-meaned; the ruler is a second imagination over the *real* actions from the same
+context state at a different stream point, put back afterwards (the stream is checked
+restored on all 229 windows × 9 cells; the reference was never bitwise the canonical
+imagination). The statistic is the ratio of medians over windows. Because intervened and real
+share the snapshot, an action-blind prior gives exactly 0; 1 is the **two-draw distance**
+(about √2 times one draw's own spread), not "one unit of noise". Ratio of medians, with the
+median of per-window ratios in parentheses on the contrast, and the contrast's per-step ratio
+at step 1 → 45, and how much the ruler itself grows over the horizon:
+
+| cell | shuffled | resampled | held FWD vs real | held NOOP vs real | FWD vs NOOP (contrast) | contrast step 1 → 45 | ruler growth |
+|---|---|---|---|---|---|---|---|
+| cnn/s0 | 0.309 | 0.401 | 0.355 | 0.740 | 1.022 (1.021) | 0.83 → 1.00 | ×1.7 |
+| cnn/s1 | 0.179 | 0.282 | 0.391 | 0.846 | 1.206 (1.205) | 0.48 → 1.28 | ×1.5 |
+| cnn/s2 | 0.290 | 0.359 | 0.369 | 0.723 | 0.978 (0.977) | 0.74 → 0.96 | ×1.9 |
+| frozen_ssl/s0 | 0.212 | 0.351 | 0.756 | 0.525 | 0.970 (1.060) | 0.67 → 1.14 | ×5.9 |
+| frozen_ssl/s1 | 0.135 | 0.241 | 0.429 | 0.401 | 0.667 (0.771) | 0.51 → 0.86 | ×5.1 |
+| frozen_ssl/s2 | 0.537 | 0.946 | 1.588 | 1.011 | 1.796 (1.504) | 0.68 → 1.26 | ×5.4 |
+| random_vit/s0 | 0.074 | 0.105 | 0.172 | 0.257 | 0.331 (0.352) | 0.22 → 0.72 | ×3.3 |
+| random_vit/s1 | 0.093 | 0.140 | 0.308 | 0.239 | 0.537 (0.763) | 0.35 → 0.82 | ×5.7 |
+| random_vit/s2 | 0.084 | 0.137 | 0.205 | 0.350 | 0.533 (0.554) | 0.29 → 0.62 | ×4.5 |
+
+Two cautions on reading the table. The **contrast column is a different estimand** from the
+four to its left: it is the distance between two counterfactual imaginations (held FORWARD
+against held NOOP), which by the triangle inequality is structurally larger than either's
+distance to real, so it does not sit on top of the rungs as a fourth step of one ladder — the
+same-axis reading of the top rung is the two held-vs-real columns. And the two summaries of the
+contrast straddle 1.0 on `frozen_ssl` (0.97 or 1.06 on s0, depending on the summary); the
+ratio of medians is the decision-bearing one because each window's ruler is a single draw of
+a distance, but the interval covers 1 either way.
+
+**The pixel arm can now be read, and it is not action-blind.** Every `cnn` numerator is
+bitwise > 0 in every window (an action-blind prior would give exactly 0), and its
+shuffled/resampled ratios (0.18–0.40) are in the same band as `frozen_ssl`'s (0.14–0.95) and
+above `random_vit`'s (0.07–0.14). What separates the arms is the *shape*: `cnn`'s ruler grows
+only ×1.5–1.9 over 45 steps (0.08 → 0.13) where `frozen_ssl`'s grows ×5–6 (2.1 → 12.5) and
+`random_vit`'s ×3–6, and `cnn` is flat at 0.3–0.4 across every rung of the same-axis ladder.
+So: the pixel arm responds to the action at every step, but its imagination does not diverge
+with the horizon — a one-step response on a near-memoryless latent — which is also why its
+bootstrap intervals are ±0.005 wide. Note the 70× scale difference between arms' embeddings;
+the ratio is scale-free, the shape reading is what the raw curves add.
+
+**The pooled statistic** (`scripts/pool_dynamics.py`; `src/mbfps/eval/pooling.py`). Per arm and
+rung the three seeds are averaged per window and the 229 seed-mean deltas are read against an
+episode-clustered SE over the 24 clusters — for *these three seeds, over episodes*; the seeds
+are a fixed factor and the effective replication is 24, so z is read against t(23):
+Bonferroni over the 24 comparisons the table prints gives z = 3.47 (family 6 would be 2.89,
+54 would be 3.80). Position, held contrast, pooled: `cnn` +1.96 ± 1.07 (z 1.83),
+`frozen_ssl` **+28.98 ± 2.74 (z 10.59)**, `random_vit` +11.15 ± 3.35 (z 3.33 — above the
+nominal 2.07, below the family threshold; the three per-cell verdicts collapse to one
+under-powered positive). Shuffled and resampled are null in every arm (|z| ≤ 1.8). The
+embedding ratios pool (each cell in units of its own noise median, so the pool is scale-free)
+to `cnn` 0.25 / 0.35 / 1.02, `frozen_ssl` 0.25 / 0.43 / 1.04 [0.90, 1.21], `random_vit`
+0.08 / 0.12 / 0.48 [0.43, 0.53] up the ladder.
+
+**The between-arm contrast, `frozen_ssl` − `random_vit`, paired per window.** On position it is
++17.8 ± 3.9 (z +4.52) on the held contrast and null on the two rungs below — but this is the
+pathway *as read through each arm's own probe* (R² 0.36 vs 0.30), so part of it is a probe
+difference. The probe-free contrast is the embedding ratio: +0.20 [0.17, 0.22] shuffled,
++0.37 [0.32, 0.42] resampled, +0.55 [0.45, 0.64] on the held contrast — every interval
+excludes 0, both arms are nonzero at every rung. Read as (treatment responds, control
+responds, contrast sign): the treatment **exceeds** the control on the probe-free estimand at
+every rung and on the probed position at the held contrast; it neither merely shares the
+pathway nor lacks it. This is a statement about the size of the imagination's response to the
+action relative to its own sampling spread, not about whether that response is *useful* — the
+open loop still loses to persistence under the real actions in both arms.
+
 ### The treatment is below the control, and the study cannot say why
 
 On the gate metric the **treatment loses to the control**: `frozen_ssl` −0.7161 against
