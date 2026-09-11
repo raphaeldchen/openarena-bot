@@ -1973,6 +1973,122 @@ and no retraining:
 Neither was run. They are the two cheapest things that would turn a two-arm inference into
 a mechanism, and they head the ranked next-actions list at the end.
 
+### Addendum (2026-09-11): the action pathway, measured
+
+The two re-scores the previous section stops short of were run (commits `3688311` and
+`0f03915`; `scripts/diagnose_dynamics.py`, `src/mbfps/eval/diagnostics.py`) on the nine
+shipped checkpoints, no retraining, MPS, torch 2.13.0. Both are paired: every intervened
+imagination is replayed from the same per-window RNG snapshot as the real one, so a delta is
+a difference between action sequences and not a reading of sampling noise. The pairing is
+proven rather than assumed — `stream_drift`, `open_loop_divergence` and `record_reproduction`
+read exactly `0.0` on all nine cells, i.e. the real arm is bitwise the shipped
+`curves["rssm_position"]`.
+
+**The first reading was wrong and is retracted.** The action-shuffle result alone (`3688311`)
+was read as "the prior ignores actions; M4 is blocked." A permutation preserves the action
+multiset, so it tests order sensitivity only, and the follow-up ladder shows the prior is
+action-conditioned — just not to order. The retraction is recorded here so the shape of the
+error survives: one null rung, read as a null pathway.
+
+**The ladder.** Three interventions of strictly increasing perturbation on the 45 horizon
+actions of each of the 229 scored windows. Every rung changed all 229 windows in every cell
+(steps moved per window, mean / min: shuffled 30.6 / 14, resampled 35.2 / 24, held 45 / 45),
+so no null below is a no-op. Position, horizon-mean delta (intervened − real) ± 2 SE
+(episode-clustered, 24 clusters); family-wise threshold z = 3.31 over 54 comparisons:
+
+| cell | shuffled (order) | resampled (counts) | held FWD − held NOOP | z | |
+|---|---|---|---|---|---|
+| cnn/s0 | −0.01 ± 0.01 | +0.04 ± 0.30 | +1.31 ± 1.43 | 1.82 | unmeasurable |
+| cnn/s1 | −0.01 ± 0.03 | +0.04 ± 0.59 | +2.79 ± 2.95 | 1.89 | unmeasurable |
+| cnn/s2 | −0.01 ± 0.02 | +0.09 ± 0.46 | +1.79 ± 2.07 | 1.73 | unmeasurable |
+| frozen_ssl/s0 | +0.99 ± 3.95 | +5.21 ± 7.90 | **+42.59 ± 11.47** | **7.42** | responds |
+| frozen_ssl/s1 | +0.03 ± 2.23 | −3.33 ± 4.81 | **+26.70 ± 12.53** | **4.26** | responds |
+| frozen_ssl/s2 | +1.93 ± 2.73 | −5.72 ± 6.34 | **+17.66 ± 8.40** | **4.20** | responds |
+| random_vit/s0 | −0.08 ± 0.54 | +2.30 ± 2.75 | +10.12 ± 7.78 | 2.60 | nominal |
+| random_vit/s1 | +2.03 ± 2.87 | −0.48 ± 2.05 | +12.89 ± 8.90 | 2.90 | nominal |
+| random_vit/s2 | −0.11 ± 1.67 | +1.09 ± 4.46 | +10.43 ± 15.16 | 1.38 | null |
+
+*Shuffled* (same multiset, permuted order) and *resampled* (i.i.d. from the scored windows'
+own action marginal — 959 / 2134 / 1802 / 3559 / 941 / 910 over NOOP, TURN_LEFT, TURN_RIGHT,
+MOVE_FORWARD, MOVE_LEFT, MOVE_RIGHT) are null in 9 of 9. The equivalence bounds those nulls
+license, as a fraction of the persistence-to-floor range at h=45: shuffled 1.2–8.1%,
+resampled 3.7–16.2% across the six feature cells. An order or count effect larger than that
+would have been seen; none was.
+
+*Held* replaces the whole horizon with one action, for each of the six, and the reported
+statistic is the pre-registered contrast between the two most physically distinct: hold
+MOVE_FORWARD minus hold NOOP. `frozen_ssl` clears the family-wise threshold in 3 of 3;
+`random_vit` is nominal (> 2 SE) in 2 of 3 and below in 1 — under-powered per cell but
+positive in every seed; the sign is positive in **9 of 9** cells (two-sided sign test
+p = 0.004; the cells share windows, so this is a pattern, not nine independent tests). The
+pixel arm is null and unmeasurable for the reason already given — its probe reads a constant.
+
+**The sign is physical.** Per held action on `frozen_ssl`/s0, delta ± 2 SE:
+
+| held | delta |
+|---|---|
+| NOOP | −11.60 ± 7.91 |
+| TURN_LEFT | +22.93 ± 16.55 |
+| TURN_RIGHT | +11.78 ± 9.10 |
+| MOVE_FORWARD | **+30.99 ± 12.04** |
+| MOVE_LEFT | +1.31 ± 8.78 |
+| MOVE_RIGHT | −0.66 ± 6.18 |
+
+Holding FORWARD runs the imagined position away from the truth; holding NOOP holds it
+nearer. The prior knows that forward moves and noop does not.
+
+**Why the first ladder produced a false null, so the next reader does not repeat it.** The
+first held rung held only the globally rarest action, chosen to maximise distance from the
+real sequence. That action is MOVE_RIGHT, and it is the one the model barely responds to
+(−0.66 ± 6.18 above). A null under it was the fixture answering the question by accident —
+the L1 species in a new costume. Holding every action and contrasting FORWARD against NOOP
+is what turned a false null into a z = 7.4 response on the same checkpoints, windows and seed.
+
+**What the three rungs say together.** The prior conditions on a coarse horizon-average of
+the actions — which a permutation preserves exactly, a resample from the same marginal
+preserves in expectation, and only a held action moves far. It responds to the gist of the
+plan and not the plan. That is why the open loop still loses to persistence *under the real
+actions*: a mixed 45-step sequence averages to something the prior tracks too crudely to
+follow step by step.
+
+**The k-step re-grounding sweep** (imagine k steps, re-observe the real frame, repeat)
+localises where the crude pathway stops being enough. Position error at h=45, the six
+feature cells:
+
+| cell | floor | k=1 | k=3 | k=5 | k=15 | k=45 | persistence |
+|---|---|---|---|---|---|---|---|
+| frozen_ssl/s0 | 124.5 | 126.7 | 128.5 | 128.8 | 153.2 | 214.9 | 173.3 |
+| frozen_ssl/s1 | 117.7 | 124.2 | 128.7 | 139.0 | 152.6 | 232.0 | 187.1 |
+| frozen_ssl/s2 | 122.6 | 121.9 | 128.6 | 127.2 | 141.2 | 190.5 | 163.8 |
+| random_vit/s0 | 157.1 | 159.2 | 163.2 | 167.0 | 180.7 | 221.5 | 201.7 |
+| random_vit/s1 | 138.2 | 140.3 | 139.3 | 140.4 | 163.5 | 215.7 | 194.0 |
+| random_vit/s2 | 155.3 | 159.3 | 163.7 | 160.1 | 184.0 | 238.4 | 209.1 |
+
+Re-grounding every 1–5 steps sits at the floor; by k=15 roughly half the recoverable error
+is gone; k=45 is the open loop and is worse than persistence. k=45 reproduces
+`curves["rssm_position"]` bitwise, and k=1 is never bitwise the floor (it is one prior step
+above it, not the posterior of the scored step), so the sweep's two endpoints are checked
+against numbers this write-up already carries. The pixel arm sits at 298.7–299.4 for every
+k, floor and persistence: nothing.
+
+**What this changes for M4.** The blocker is not action-blindness. It is the one the gate
+already found — compounding error past k ≈ 5 under every action sequence tested, including
+the real one. That moves the remedy from "add an action pathway" (a design problem) to
+"stop the compounding" (a modelling problem: RSSM capacity, the free-bits schedule that
+starved the prior on the pixel arm and left it at 75–90% on the feature arms, the 20,000-step
+budget on which the loss was still rising in 7 of 7 logged cells). The pixel arm's
+checkpoints remain unusable for imagination regardless.
+
+**What the ladder does NOT establish.** It does not show that the pathway is *sufficient*
+for control — a prior that resolves the plan's gist may still be too coarse for an actor to
+plan through. It does not rank the feature arms: `random_vit`'s per-cell nominal readings
+are consistent with the same pathway at lower power, not with its absence. And every
+interval here is the same within-cell, evaluation-window interval as elsewhere in this
+write-up — it covers no seed, fit or sampling variation. Two follow-ups would tighten it:
+a probe-free embedding-space reading of each rung (removing the ridge probe's R² of
+0.30–0.38 from the effect size), and a pooled cross-cell statistic in place of nine per-cell
+verdicts that disagree across `random_vit` seeds.
+
 ### The treatment is below the control, and the study cannot say why
 
 On the gate metric the **treatment loses to the control**: `frozen_ssl` −0.7161 against
@@ -2656,9 +2772,20 @@ Cheapest first, so the ordering is usable rather than a list.
    the nine shipped checkpoints at 2–3 extra sampling seeds. Until this exists, the
    treatment/control ordering is not separated from imagination noise, which is a stronger and
    more honest limit than the permutation p-floor argument.
-4. **Action-shuffled imagination and teacher-forced rollout** — *~2 min per cell each.* The two
-   tests that turn the shared-setup attribution into a mechanism. If shuffling the actions
-   leaves the error unchanged, the dynamics prior ignores actions and M4 is blocked outright.
+4. **Action-shuffled imagination and k-step re-grounding** — *RUN, 2026-09-11; see the
+   Addendum above.* Shuffled and resampled actions are null in 9/9; a held-action contrast
+   (FORWARD − NOOP) responds in 3/3 `frozen_ssl` cells at z = 4.2–7.4 with the physical
+   sign. The prior is action-conditioned to the horizon-average and blind to order and
+   counts. M4 is not blocked by action-blindness; the blocker is compounding error past
+   k ≈ 5. Two follow-ups the ladder itself surfaced:
+   - **Probe-free embedding-space reading of each rung** — *~2 min per cell.* Per-window L2
+     between intervened and real head embeddings against a two-real-imaginations noise
+     reference. Gives the ladder an effect size that does not pass through a ridge probe
+     whose R² is 0.30–0.38 on the feature arms and −0.036 on the pixel arm.
+   - **Pooled cross-cell statistic for the ladder** — *minutes, no re-scoring.* The per-cell
+     verdicts disagree across `random_vit` seeds (nominal, nominal, null) while the
+     cross-cell sign is 9/9. A meta-analytic z over cells, or a mixed model over the shared
+     windows, would replace nine verdicts with one.
 5. **Continue-head accuracy / AUC on the same 20 val episodes** — *minutes, one forward pass.*
    The head M4 terminates imagined trajectories with, currently trained and never measured.
 6. **Persist `history["loss"]` and `history["parts"]`** — *one line in `study.py:440-443`, zero
@@ -2723,6 +2850,11 @@ The open questions themselves:
   free-bits floor the dynamics prior receives no gradient, `imagine()` runs at
   initialisation, and every downstream number measures the initialisation. Check it before
   reading a gap, a band, or a probe.
+- **The dynamics prior is action-conditioned to the horizon-average and blind to order and
+  counts** (Addendum above). An M4 actor will find that holding an action moves the imagined
+  agent with the right sign, and that two plans with the same action histogram imagine the
+  same future. Do not attribute an actor's failure to plan to a missing action pathway; the
+  pathway exists and is coarse.
 - **Do not imagine with the pixel checkpoints as they stand.** `imagine()` there samples `z`
   from an essentially uniform 32×32 categorical (prior entropy within 0.003 nat of an
   untrained RSSM driven by the same trained encoder). Any M4 actor built on them would be
@@ -2734,6 +2866,11 @@ The open questions themselves:
   common positive horizon exists; the best case is h ≤ 2 at 5 of 6; and one control cell
   (`random_vit`/s0) is already behind persistence at the first imagined step. An M4 actor has
   to re-measure the usable horizon per checkpoint rather than adopt a range from here.
+- **The re-grounded horizon is ~5 steps, not 45.** Re-observing the real frame every 1–5
+  steps holds the six feature cells at their floor; every 15 loses about half the
+  recoverable error; the 45-step open loop is worse than persistence (Addendum above). An
+  M4 design that imagines in short re-grounded segments has a usable horizon this study
+  measured; one that imagines 45 steps open-loop does not.
 - **The `continue` head is trained and unmeasured.** M4 terminates and discounts imagined
   trajectories with it, and M3 recorded nothing about it — no field, no column, no criterion.
   Given a 0.03% terminal rate and a reward head that is indistinguishable from a constant
