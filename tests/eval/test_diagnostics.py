@@ -1,4 +1,4 @@
-"""The two M3b diagnostics: action-shuffled imagination, and the k-step sweep.
+"""The two M3b diagnostics: the action-intervention ladder, and the k-step sweep.
 
 Both run on the SHIPPED checkpoints under `evaluate_rollout`'s exact protocol,
 so the tests here are arranged around the three ways their numbers can be
@@ -36,8 +36,11 @@ import mbfps.eval.diagnostics as diagnostics_module
 import mbfps.eval.rollout as rollout_module
 from mbfps.data.episode import save_episode
 from mbfps.eval.diagnostics import (
+    LADDER,
+    LADDER_PERTURBS,
     REGROUNDING_KS,
     RegroundingSweep,
+    action_intervention_ladder,
     action_shuffled_rollout,
     regrounding_sweep,
 )
@@ -900,6 +903,18 @@ def test_the_delta_averages_only_the_windows_the_permutation_actually_changed(
     np.testing.assert_allclose(both.position_delta(), alone.position_delta(), rtol=1e-6)
     assert np.abs(alone.position_delta()).max() > 0.0
 
+    # The same exclusion through the LADDER's own result type, which is what
+    # the CLI reads for every rung's `position_delta` curve, final step and
+    # per-step exceedance count. A diluting mean there would drag those toward
+    # the null while the aggregate `delta_summary` computes separately would
+    # not, and the record would carry two inconsistent statistics.
+    ladder_both = ladder(model, paths, probe, arms=("shuffled",)).arms["shuffled"]
+    assert ladder_both.windows_total == 2 and ladder_both.windows_changed == 1
+    np.testing.assert_allclose(
+        ladder_both.position_delta(), alone.position_delta(), rtol=1e-6
+    )
+    np.testing.assert_allclose(ladder_both.angle_delta(), alone.angle_delta(), rtol=1e-6)
+
 
 def test_the_permutation_is_reproducible_under_its_seed_and_moves_with_it(tmp_path):
     """Both halves. Without the seed the diagnostic is not reproducible; with a
@@ -927,11 +942,778 @@ def test_the_shuffle_records_the_permutation_seed_it_used(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic 1b: the intervention LADDER (shuffled -> resampled -> constant).
+#
+# A permutation preserves the action MULTISET, so the shuffled rung tests ORDER
+# sensitivity and nothing else: dynamics that read the COUNTS of each action
+# rather than their sequence are action-conditioned and still bit-identical
+# under it. The two rungs added here close that gap, and the tests below are
+# arranged around the three ways a rung can look like a null result without
+# being one -- it was a no-op, it never reached `imagine`, or it moved the
+# sampling stream the arms are matched on.
+# ---------------------------------------------------------------------------
+
+
+def ladder(model, paths, probe, *, device=None, arms=LADDER, **kwargs):
+    return action_intervention_ladder(
+        model, paths, probe, arms=arms, context=CONTEXT, horizon=HORIZON,
+        device=device or torch.device("cpu"), **kwargs,
+    )
+
+
+def action_skewed_episode(length=T_SYNTHETIC):
+    """Horizon actions dominated by ONE value, with a unique rarest one.
+
+    Three separable actions, so a test can tell which distribution a rung
+    read and how far each held action travels:
+
+      * the SCORED WINDOWS' modal action is 1 (7 of the 10 horizon steps);
+      * the SCORED WINDOWS' rarest action is 4 (1 of 10);
+      * the WHOLE EPISODE's rarest action is 0 (1 of 20), and it never appears
+        in a scored horizon at all -- the rest of the episode is filled with 4,
+        which is the whole episode's MOST common action.
+
+    That last pair is what makes "the marginal is taken over the scored
+    windows" a claim with a failing case rather than a restatement: a marginal
+    counted over `episode.actions` has 0 in its support, one counted over the
+    horizon slices does not, and the two rank rarity in opposite directions.
+    The scored support is {1, 2, 4}, so the default MOVE_FORWARD-minus-NOOP
+    contrast is outside it and every constant-rung test here holds
+    `SKEWED_CONTRAST` instead.
+
+    The domination is the point of the fixture. Holding the window's own most
+    frequent action leaves 4 of window 0's 5 steps untouched -- a near-no-op
+    wearing the name of the ladder's MAXIMAL perturbation, which is the L1
+    fixture coincidence in a new costume -- and the held-action accounting is
+    what has to make that visible.
+    """
+    episode = synthetic_episode(length=length)
+    windows = window_starts(length, CONTEXT, HORIZON)
+    assert len(windows) == 2, "fixture assumes exactly two windows"
+    actions = np.full(length, 4, dtype=np.int32)
+    actions[0] = 0
+    for start, values in zip(windows, ([1, 1, 1, 1, 2], [1, 1, 1, 2, 4])):
+        actions[start + CONTEXT : start + CONTEXT + HORIZON] = values
+    episode.actions = actions
+    return episode
+
+
+def _imagined_actions(monkeypatch, model):
+    """Every action tensor `imagine` was handed, in call order."""
+    seen: list[np.ndarray] = []
+    real = model.rssm.imagine
+    monkeypatch.setattr(
+        model.rssm,
+        "imagine",
+        lambda actions, state: seen.append(actions[0].cpu().numpy().copy())
+        or real(actions, state),
+    )
+    return seen
+
+
+def _per_rung(seen, arms, windows):
+    """Split `imagine`'s call log into one list per intervention arm.
+
+    `arms` is every arm in CALL order -- a rung name, or `("constant", a)` for
+    the held action `a`, since the constant rung holds every action in the
+    support and each is its own call. Each window makes one call per arm plus
+    the canonical pass LAST, so the stride is `len(arms) + 1` and the canonical
+    calls are the remainder. An arm whose actions never reached `imagine`
+    shows up here as the wrong tensor in its own slot rather than as a missing
+    call.
+    """
+    arms = list(arms)
+    stride = len(arms) + 1
+    assert len(seen) == stride * windows, (len(seen), stride, windows)
+    return (
+        {name: seen[index::stride] for index, name in enumerate(arms)},
+        seen[len(arms) :: stride],
+    )
+
+
+def _ladder_arms(result):
+    """The arms of a `LadderResult` in the order `imagine` was called with them."""
+    arms = []
+    for name in result.order:
+        if name == "constant":
+            arms.extend(("constant", action) for action in result.held_actions)
+        else:
+            arms.append(name)
+    return arms
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_every_rung_is_bit_identical_on_a_model_whose_dynamics_ignore_actions(
+    tmp_path, device
+):
+    """The two-sided model test, extended to the whole ladder.
+
+    On a real sampling RSSM whose `_step` provably discards the action, EVERY
+    rung must be bitwise the real arm -- not merely the permutation. A rung
+    that is only close is a rung whose sampling stream moved, which is the
+    artefact the per-window snapshot exists to prevent and which no shape or
+    window count would reveal.
+
+    `windows_changed == windows_total > 0` is asserted per rung IN THE SAME
+    TEST, so the equality can never be explained by "the intervention did
+    nothing".
+    """
+    path = write(tmp_path, varied_action_episode())
+    model, probe = action_blind_model()
+    model = model.to(device)
+    result = ladder(model, [path], probe, device=device)
+
+    assert result.order == LADDER
+    for name in ("shuffled", "resampled"):
+        arm = result.arms[name]
+        np.testing.assert_array_equal(arm.position, result.real.rssm_position, name)
+        np.testing.assert_array_equal(arm.angle, result.real.rssm_angle, name)
+        assert arm.windows_changed == arm.windows_total > 0, name
+    # The constant rung: EVERY held action is bitwise the real arm, so the
+    # contrast between any two of them is exactly zero in every window --
+    # which is what makes the contrast's null exact rather than approximate.
+    rung = result.arms["constant"]
+    assert len(rung.held) >= 2
+    for action, held in rung.held.items():
+        np.testing.assert_array_equal(held.position, result.real.rssm_position, action)
+        np.testing.assert_array_equal(held.angle, result.real.rssm_angle, action)
+        assert held.windows_changed == held.windows_total > 0, action
+    np.testing.assert_array_equal(rung.window_position_delta, 0.0)
+    np.testing.assert_array_equal(rung.window_angle_delta, 0.0)
+    assert rung.windows_changed == rung.windows_total > 0
+
+
+def test_every_rung_moves_under_a_model_whose_dynamics_use_the_action(
+    tmp_path, monkeypatch
+):
+    """The positive half, as exact closed-form values per rung.
+
+    `ActionSumModel` advances the frame tag by the action's own value, so each
+    arm's curve is a closed form of the action tensor THAT ARM handed
+    `imagine` -- captured by the spy. An arm that computed a sequence and
+    imagined a different one, or that shared a buffer with its neighbour, lands
+    on the wrong curve rather than merely "differing".
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    result = ladder(model, [path], oracle_probe(episode), contrast=SKEWED_CONTRAST)
+
+    arms, canonical = _per_rung(seen, _ladder_arms(result), windows=2)
+    steps = np.arange(1, HORIZON + 1)
+    expected = lambda arms: np.mean(  # noqa: E731
+        [STEP * np.abs(np.cumsum(a) - steps) for a in arms], axis=0
+    )
+    np.testing.assert_allclose(
+        result.real.rssm_position, expected(canonical), rtol=1e-5, atol=1e-6
+    )
+    curves = []
+    for name in ("shuffled", "resampled"):
+        np.testing.assert_allclose(
+            result.arms[name].position, expected(arms[name]), rtol=1e-5, atol=1e-6,
+            err_msg=name,
+        )
+        assert not np.array_equal(
+            result.arms[name].position, result.real.rssm_position
+        ), name
+        curves.append(tuple(result.arms[name].position))
+    for action, held in result.arms["constant"].held.items():
+        np.testing.assert_allclose(
+            held.position, expected(arms[("constant", action)]), rtol=1e-5, atol=1e-6,
+            err_msg=str(action),
+        )
+        curves.append(tuple(held.position))
+    assert np.abs(result.arms["constant"].position_delta()).max() > 0.0
+    # And every arm is a DIFFERENT intervention, not one computed under
+    # several names.
+    assert len(set(curves)) == len(curves), curves
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_adding_rungs_leaves_the_shuffled_rung_bitwise_where_it_was(tmp_path, device):
+    """THE regression guard, at unit scale: the new rungs must not move the old.
+
+    Every rung replays from ONE per-window RNG snapshot, so the arms are
+    order-independent BY CONSTRUCTION -- but only as long as no rung draws from
+    a stream another rung depends on. The permutation comes from a numpy
+    generator seeded at `intervention_seed`; a resampled rung that drew from
+    that SAME generator would leave every window after the first permuted
+    differently, and nothing about the shapes, the window counts or the
+    self-checks would say so.
+
+    A REAL sampling model, because on an oracle rig no stream exists to move
+    and on an action-blind one every rung is identical anyway.
+    """
+    path = write(tmp_path, varied_action_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+
+    alone = ladder(model, [path], probe, arms=("shuffled",), device=device)
+    whole = ladder(model, [path], probe, device=device)
+
+    np.testing.assert_array_equal(
+        whole.arms["shuffled"].position, alone.arms["shuffled"].position
+    )
+    np.testing.assert_array_equal(
+        whole.arms["shuffled"].angle, alone.arms["shuffled"].angle
+    )
+    np.testing.assert_array_equal(
+        whole.arms["shuffled"].window_position_delta,
+        alone.arms["shuffled"].window_position_delta,
+    )
+    # And the shared brackets too: the reference, the floor and persistence are
+    # the record's own numbers, and a moved stream shifts them as well.
+    for curve in ("rssm_position", "floor_position", "persistence_position"):
+        np.testing.assert_array_equal(
+            getattr(whole.real, curve), getattr(alone.real, curve), err_msg=curve
+        )
+
+
+def test_the_shuffled_rung_permutes_with_the_literal_stream_that_produced_the_shipped_records(
+    tmp_path, monkeypatch
+):
+    """The shipped permutations are `np.random.default_rng(seed).permutation(H)`,
+    drawn ONCE PER WINDOW in traversal order from ONE generator, and this is
+    the portable pin on that contract.
+
+    The standalone-versus-ladder equality cannot carry it: `action_shuffled_
+    rollout` delegates to the ladder, so the two agree whatever stream either
+    uses, and the only other guard runs on a shipped checkpoint under MPS. A
+    ladder that re-derived the generator -- `default_rng([seed, 7])`, a
+    SeedSequence child, a per-window reseed -- would re-permute all nine
+    records while every shape, count and self-check stayed right.
+
+    The permutation INDEX is recovered from what `imagine` was handed, on the
+    fixture whose windows carry distinct actions for exactly this purpose, and
+    compared draw for draw. `default_rng([0, 0])` equals `default_rng(0)`, so
+    the seed is 3 rather than the default: at seed 0 a trailing-zero
+    re-derivation would be invisible.
+    """
+    episode = varied_action_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    ladder(model, [path], oracle_probe(episode), arms=("shuffled",), intervention_seed=3)
+
+    starts = window_starts(episode.length, CONTEXT, HORIZON)
+    assert len(starts) >= 2, "fixture must span more than one window"
+    rungs, _ = _per_rung(seen, ("shuffled",), windows=len(starts))
+    stream = np.random.default_rng(3)
+    for index, start in enumerate(starts):
+        window = episode.actions[start + CONTEXT : start + CONTEXT + HORIZON]
+        lookup = {int(value): position for position, value in enumerate(window)}
+        recovered = [lookup[int(value)] for value in rungs["shuffled"][index]]
+        np.testing.assert_array_equal(
+            recovered, stream.permutation(HORIZON), err_msg=f"window {index}"
+        )
+
+
+def test_the_resampled_rung_draws_i_i_d_from_the_scored_windows_action_marginal(
+    tmp_path, monkeypatch
+):
+    """The rung's whole claim: a DIFFERENT multiset from the same marginal.
+
+    Three things, and each has its own way of being wrong. The marginal is
+    counted over the horizon actions of the SCORED WINDOWS -- the fixture's
+    whole-episode counts disagree with it in both directions. Every drawn
+    action lies in that support, so each individual action stays plausible.
+    And at least one window's drawn MULTISET differs from the real one, or the
+    rung has collapsed into the permutation it exists to go beyond.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    result = ladder(model, [path], oracle_probe(episode), arms=("resampled",))
+
+    horizon_actions = np.concatenate([
+        episode.actions[start + CONTEXT : start + CONTEXT + HORIZON]
+        for start in window_starts(episode.length, CONTEXT, HORIZON)
+    ])
+    values, counts = np.unique(horizon_actions, return_counts=True)
+    np.testing.assert_array_equal(result.action_marginal_values, values)
+    np.testing.assert_array_equal(result.action_marginal_counts, counts)
+    # Counted over the whole episode instead, the support would include 0 and
+    # be dominated by 4 -- a different distribution, and the test says so.
+    assert 0 in set(episode.actions.tolist()) and 0 not in set(values.tolist())
+
+    rungs, _ = _per_rung(seen, ("resampled",), windows=2)
+    drawn = rungs["resampled"]
+    for index, sequence in enumerate(drawn):
+        assert set(sequence.tolist()) <= set(values.tolist()), (index, sequence)
+    real_multisets = [
+        sorted(episode.actions[start + CONTEXT : start + CONTEXT + HORIZON].tolist())
+        for start in window_starts(episode.length, CONTEXT, HORIZON)
+    ]
+    assert any(
+        sorted(sequence.tolist()) != real
+        for sequence, real in zip(drawn, real_multisets)
+    ), "every resampled window was a permutation of the real one"
+    # And the draws are i.i.d. ACROSS windows, not one sequence dealt to every
+    # window: a per-window reseed, or a generator that drew once and handed
+    # the same array out again, would leave the shipped 229 windows reading
+    # 229/229 changed and a plausible null on a single draw.
+    assert len({tuple(sequence.tolist()) for sequence in drawn}) > 1, (
+        "every window was handed the identical resampled sequence"
+    )
+
+
+def test_the_resampled_rung_draws_with_the_marginals_own_probabilities(
+    tmp_path, monkeypatch
+):
+    """"Same marginal, different multiset" is the rung's whole claim over the
+    permutation, and it is a claim about the PROBABILITIES handed to the draw.
+
+    Support membership and a differing multiset are both satisfied by a draw
+    that is uniform over the support -- which on the 7:2:1 fixture would hand
+    the rarest action seven times its real frequency and the `action_marginal`
+    written to the record would be a distribution nothing drew from. So the
+    generator is stubbed to capture `p` and it is pinned to `counts / sum`.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    captured: list[tuple[np.ndarray, np.ndarray]] = []
+
+    class _CapturingRng:
+        def choice(self, values, size, p):
+            captured.append((np.asarray(values).copy(), np.asarray(p).copy()))
+            return np.asarray(values)[np.argmax(p)].repeat(size).astype(np.int64)
+
+    monkeypatch.setattr(diagnostics_module, "default_rng", lambda seed: _CapturingRng())
+    result = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("resampled",),
+        contrast=(4, 1),
+    )
+
+    assert len(captured) == result.windows_total == 2
+    for values, p in captured:
+        np.testing.assert_array_equal(values, [1, 2, 4])
+        np.testing.assert_allclose(p, [0.7, 0.2, 0.1])
+    assert not np.allclose(captured[0][1], np.full(3, 1.0 / 3.0)), (
+        "the fixture's marginal is uniform; it cannot separate the two draws"
+    )
+
+
+# The fixture's scored support is {1, 2, 4}, so the default MOVE_FORWARD-minus-
+# NOOP contrast is outside it. Every constant-rung test on that fixture holds
+# 4 against 1: 4 is the rarest scored action and 1 the modal one, so the two
+# held sequences differ from the real windows by very different amounts.
+SKEWED_CONTRAST = (4, 1)
+
+
+def test_the_constant_rung_holds_every_action_in_the_support_and_decides_on_the_contrast(
+    tmp_path, monkeypatch
+):
+    """The top rung is a CONTRAST between two held actions, not one held action
+    against the real sequence.
+
+    Measured on the shipped checkpoints, holding STRAFE_RIGHT -- the rarest
+    scored action -- for the whole horizon reads as a null while holding
+    MOVE_FORWARD through the identical machinery moves the error by +31 map
+    units (frozen_ssl/0): a single held action asks "does the prior respond"
+    with whichever action it happens to hold. Every action in the scored
+    support is held, from the same per-window snapshot, and the decision is
+    the paired difference between two NAMED held actions, so the sequence-level
+    off-distribution confound -- 45 identical steps, where the data's longest
+    run is 13 -- is the same on both sides and cancels.
+
+    On `ActionSumModel` each held arm's curve is a closed form of the tensor
+    THAT arm handed `imagine`, and the contrast's per-window delta is the
+    difference of the two named arms' per-window errors -- asserted by value,
+    so a contrast built from the wrong pair, or from one arm twice, lands on
+    the wrong numbers rather than merely "differing".
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    seen = _imagined_actions(monkeypatch, model)
+    result = ladder(
+        model, [path], oracle_probe(episode), arms=("constant",), contrast=SKEWED_CONTRAST
+    )
+
+    rung = result.arms["constant"]
+    assert result.held_actions == (1, 2, 4)
+    assert result.contrast == rung.contrast == SKEWED_CONTRAST
+    assert set(rung.held) == {1, 2, 4}
+    # Every held action reached `imagine` as a full-horizon constant, once per
+    # window, in support order, before the canonical pass.
+    arms, canonical = _per_rung(seen, [("constant", a) for a in (1, 2, 4)], windows=2)
+    for action in (1, 2, 4):
+        for index, sequence in enumerate(arms[("constant", action)]):
+            assert sequence.tolist() == [action] * HORIZON, (action, index, sequence)
+    steps = np.arange(1, HORIZON + 1)
+    expected = lambda arms: np.mean(  # noqa: E731
+        [STEP * np.abs(np.cumsum(a) - steps) for a in arms], axis=0
+    )
+    for action in (1, 2, 4):
+        np.testing.assert_allclose(
+            rung.held[action].position, expected(arms[("constant", action)]),
+            rtol=1e-5, atol=1e-6, err_msg=str(action),
+        )
+    np.testing.assert_allclose(result.real.rssm_position, expected(canonical), rtol=1e-5, atol=1e-6)
+    # The contrast is held-4 minus held-1, per window, on both channels.
+    np.testing.assert_allclose(
+        rung.window_position_delta,
+        rung.held[4].window_position_delta - rung.held[1].window_position_delta,
+    )
+    np.testing.assert_allclose(
+        rung.window_angle_delta,
+        rung.held[4].window_angle_delta - rung.held[1].window_angle_delta,
+    )
+    assert np.abs(rung.window_position_delta).max() > 0.0
+    assert not np.allclose(
+        rung.window_position_delta, rung.held[4].window_position_delta
+    ), "the contrast is one held arm against the real sequence, not against the other arm"
+
+
+def test_the_constant_rung_reports_how_far_each_held_action_is_from_the_real_windows(
+    tmp_path,
+):
+    """A held action is a no-op exactly where the window already held it, and
+    on the shipped data nothing would ever reveal that it had been. So every
+    held arm reports its per-window STEP distance from the real sequence, the
+    minimum over windows beside the mean, and its multiset distance -- and the
+    numbers here are the fixture's own, computed independently.
+
+    Window 0 is `[1,1,1,1,2]` and window 1 is `[1,1,1,2,4]`: holding 4 changes
+    5 and 4 steps, holding the modal 1 changes 1 and 2, holding 2 changes 4 and
+    4. The CONTRAST's own count is the number of steps at which the two held
+    sequences differ from EACH OTHER -- every step, since 4 is not 1 -- because
+    that, not the distance from the real window, is what would make the
+    comparison a no-op.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    rung = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("constant",),
+        contrast=SKEWED_CONTRAST,
+    ).arms["constant"]
+
+    np.testing.assert_array_equal(rung.held[4].window_steps_changed, [5, 4])
+    np.testing.assert_array_equal(rung.held[1].window_steps_changed, [1, 2])
+    np.testing.assert_array_equal(rung.held[2].window_steps_changed, [4, 4])
+    assert rung.held[4].mean_steps_changed == pytest.approx(4.5)
+    # `min_steps_changed` is NOT pinned here: on this fixture every held arm's
+    # windows differ by one step, so `int(mean)` equals the minimum and the
+    # assertion would be satisfied by the wrong statistic. It is pinned in
+    # `test_each_rung_carries_its_own_counts_and_its_own_delta`, on `[0, 4]`.
+    # Multiset distance: how many steps must change to turn the real multiset
+    # into the held one. Holding 1 on [1,1,1,1,2] is one step; on [1,1,1,2,4]
+    # two.
+    np.testing.assert_array_equal(rung.held[1].window_multiset_distance, [1, 2])
+    np.testing.assert_array_equal(rung.held[4].window_multiset_distance, [5, 4])
+    np.testing.assert_array_equal(rung.window_steps_changed, [HORIZON, HORIZON])
+    assert rung.windows_changed == rung.windows_total == 2
+    assert rung.is_interpretable() is True
+
+
+@pytest.mark.parametrize(
+    "contrast,match",
+    [((4, 4), "distinct"), ((3, 1), "3"), ((4, 0), "0")],
+)
+def test_a_contrast_that_cannot_be_held_is_refused_rather_than_run(tmp_path, contrast, match):
+    """Two held actions that are the same action compare a sequence with
+    itself; a held action outside the SCORED support is one the model never
+    saw in a horizon, so a null under it says nothing about the dynamics. Both
+    are refused BEFORE the traversal, by name, rather than run to a
+    meaningless number. The fixture's whole-episode actions include 0, so the
+    third case also pins that the support is the scored windows' and not the
+    episode's."""
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    assert 0 in set(episode.actions.tolist())
+    with pytest.raises(ValueError, match=match):
+        ladder(ActionSumModel(), [path], oracle_probe(episode), contrast=contrast)
+
+
+def test_the_default_contrast_is_move_forward_minus_noop_and_names_both():
+    """The contrast is pre-registered, not chosen from the data: the
+    displacement-carrying action against the stationary one, in the
+    my_way_home button order the shipped episodes were collected under
+    (`build_action_set`'s no-op, then TURN_LEFT, TURN_RIGHT, MOVE_FORWARD,
+    MOVE_LEFT, MOVE_RIGHT). Its sign is therefore a physical prediction -- an
+    action-conditioned prior must run the imagined position further under
+    MOVE_FORWARD than under NOOP -- which is what makes a response at this
+    rung readable as conditioning rather than as confusion."""
+    from mbfps.eval.diagnostics import ACTION_NAMES, CONTRAST, action_name
+
+    assert CONTRAST == (3, 0)
+    assert ACTION_NAMES[CONTRAST[0]] == "MOVE_FORWARD"
+    assert ACTION_NAMES[CONTRAST[1]] == "NOOP"
+    assert action_name(5) == "MOVE_RIGHT"
+    assert action_name(6) == "action 6", "an index outside the set is named as an index"
+    assert inspect.signature(action_intervention_ladder).parameters["contrast"].default is CONTRAST
+
+
+def test_a_rung_that_is_a_no_op_on_every_window_is_uninterpretable_not_null(tmp_path):
+    """The accounting that makes a no-op impossible to mistake for a null.
+
+    Every horizon action is the same value, so the permutation rearranges
+    nothing and the marginal is a point mass, so every resample reproduces the
+    real sequence. Both rungs are genuine no-ops, and each must report it in
+    its own counts and hand back an UNDEFINED delta rather than the exact zero
+    that reads as "the model ignored the action". The constant rung cannot run
+    here at all -- a point-mass support has no two actions to contrast -- and
+    is refused by name in the same test, so the ladder on a degenerate split
+    fails loudly rather than reporting a contrast of one action with itself.
+    """
+    episode = uniform_action_episode()
+    path = write(tmp_path, episode)
+    result = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("shuffled", "resampled")
+    )
+
+    for name in ("shuffled", "resampled"):
+        arm = result.arms[name]
+        assert arm.windows_total > 0, name
+        assert arm.windows_changed == 0, name
+        assert arm.is_interpretable() is False, name
+        assert np.isnan(arm.position_delta()).all(), name
+        assert np.isnan(arm.angle_delta()).all(), name
+        np.testing.assert_array_equal(arm.window_steps_changed, [0] * arm.windows_total)
+        np.testing.assert_array_equal(arm.window_multiset_distance, [0] * arm.windows_total)
+        # The CURVES are still real numbers: it is the delta that is undefined.
+        np.testing.assert_array_equal(arm.position, result.real.rssm_position, name)
+    with pytest.raises(ValueError, match="support"):
+        ladder(ActionSumModel(), [path], oracle_probe(episode), contrast=(3, 0))
+
+
+def test_a_resample_that_reproduces_the_real_multiset_is_still_counted_by_sequence(
+    tmp_path, monkeypatch
+):
+    """"The counts were randomised" is not the same claim as "the intervention
+    intervened", and the two come apart exactly when a draw happens to be a
+    rearrangement of the real window.
+
+    Forced with a stub generator that returns a ROTATION of the window's own
+    actions: the multiset is identical, the sequence is not, and a `changed`
+    computed from the multiset -- the obvious thing to reach for on a rung
+    whose point is the multiset -- reports 0 where the truth is 1.
+    """
+    episode = varied_action_episode(length=ONE_WINDOW)
+    path = write(tmp_path, episode)
+    window = episode.actions[CONTEXT : CONTEXT + HORIZON]
+    rotated = np.roll(window, 1)
+    assert not np.array_equal(rotated, window)
+
+    class _RotatingRng:
+        def choice(self, values, size, p):
+            return rotated.astype(np.int64)
+
+    monkeypatch.setattr(
+        diagnostics_module, "default_rng", lambda seed: _RotatingRng()
+    )
+    arm = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("resampled",)
+    ).arms["resampled"]
+
+    assert arm.windows_total == 1
+    assert arm.windows_changed == 1
+    assert int(arm.window_steps_changed.sum()) == int((rotated != window).sum())
+    # And the multiset distance -- the number the resampled rung is FOR -- is
+    # exactly zero here, which is what separates "the sequence moved" from
+    # "the counts moved" in the record.
+    np.testing.assert_array_equal(arm.window_multiset_distance, [0])
+
+
+def test_the_multiset_distance_is_the_steps_needed_to_turn_one_multiset_into_the_other(
+    tmp_path, monkeypatch
+):
+    """The resampled rung's steps-moved count is SEQUENCE distance, and on the
+    shipped split it reads 35 of 45 while the counts moved by only 15 -- a
+    reader of the table cannot tell that the multiset moved by less than half
+    of what the row suggests. So every arm also carries the multiset distance,
+    half the L1 between the two bincounts, pinned here on a hand-built draw:
+    the window's actions are a permutation of `[0..4]` and the draw is
+    `[0, 0, 0, 2, 2]`, so the bincounts differ by |1-3|+|1-0|+|1-2|+|1-0|+|1-0|
+    = 6 and the distance is 3, while the sequence distance is 4 or 5.
+    """
+    episode = varied_action_episode(length=ONE_WINDOW)
+    path = write(tmp_path, episode)
+    window = episode.actions[CONTEXT : CONTEXT + HORIZON]
+    assert sorted(window.tolist()) == [0, 1, 2, 3, 4]
+    draw = np.array([0, 0, 0, 2, 2], dtype=np.int64)
+
+    class _FixedRng:
+        def choice(self, values, size, p):
+            return draw
+
+    monkeypatch.setattr(diagnostics_module, "default_rng", lambda seed: _FixedRng())
+    arm = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("resampled",)
+    ).arms["resampled"]
+    np.testing.assert_array_equal(arm.window_multiset_distance, [3])
+    assert arm.mean_multiset_distance == pytest.approx(3.0)
+    assert int(arm.window_steps_changed[0]) == int((draw != window).sum()) >= 4
+    # The shuffled rung's is zero by construction, on a window it did change.
+    monkeypatch.undo()
+    shuffled = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("shuffled",)
+    ).arms["shuffled"]
+    assert shuffled.windows_changed == 1
+    np.testing.assert_array_equal(shuffled.window_multiset_distance, [0])
+
+
+def test_each_rung_carries_its_own_counts_and_its_own_delta(tmp_path):
+    """Two episodes on which the rungs DISAGREE, so a single shared `changed`
+    mask -- or one delta reported under three names -- is caught.
+
+    The uniform window (all MOVE_FORWARD) is a genuine no-op for the
+    permutation, which can only rearrange; for the constant rung it is where
+    the held-MOVE_FORWARD arm is itself a no-op while the held-NOOP arm moves
+    every step -- and the contrast between them is a genuine intervention. A
+    `changed` mask computed once for the ladder cannot be right for all of
+    them.
+    """
+    uniform = uniform_action_episode(length=ONE_WINDOW, action=3)
+    varied = varied_action_episode(length=ONE_WINDOW)
+    paths = [write(tmp_path, uniform, 0), write(tmp_path, varied, 1)]
+    result = ladder(ActionSumModel(), paths, oracle_probe(varied))
+
+    assert result.contrast == (3, 0)
+    counts = {name: result.arms[name].windows_changed for name in LADDER}
+    assert counts["shuffled"] == 1, counts
+    assert counts["constant"] == 2, counts
+    # The permutation left the uniform window alone; so did holding its own
+    # action, and each says so in its own count, while holding NOOP there and
+    # the contrast between the two did not.
+    np.testing.assert_array_equal(result.arms["shuffled"].window_steps_changed[:1], [0])
+    rung = result.arms["constant"]
+    assert rung.held[3].window_steps_changed[0] == 0
+    # The MINIMUM, on windows where it is not the integer part of the mean:
+    # holding MOVE_FORWARD moved 0 steps on the uniform window and 4 on the
+    # varied one, so `int(mean)` is 2 and the minimum is 0.
+    np.testing.assert_array_equal(rung.held[3].window_steps_changed, [0, HORIZON - 1])
+    assert rung.held[3].min_steps_changed == 0
+    assert rung.held[3].mean_steps_changed == pytest.approx((HORIZON - 1) / 2)
+    assert rung.held[0].window_steps_changed[0] == HORIZON
+    assert rung.window_steps_changed[0] == HORIZON
+    deltas = [tuple(result.arms[name].position_delta()) for name in LADDER]
+    assert len(set(deltas)) == len(LADDER), deltas
+
+
+def test_only_the_imagination_sees_the_intervened_actions(tmp_path, monkeypatch):
+    """The intervention's SCOPE, for the whole ladder.
+
+    The context filter and the floor are the fixed brackets of every comparison
+    here, and the floor consumes the horizon actions too -- a rung that wrote
+    through `_Window.horizon_actions` instead of building its own tensor would
+    move both, and the floor would stop being the record's own.
+
+    The canonical `imagine` call is checked in the same test: it must still be
+    handed the REAL horizon actions after three rungs have run, which is what
+    rules out one rung's buffer leaking into another's or into the reference.
+    """
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model = ActionSumModel()
+    imagined = _imagined_actions(monkeypatch, model)
+    observed: list[np.ndarray] = []
+    real = model.rssm.observe
+    monkeypatch.setattr(
+        model.rssm,
+        "observe",
+        lambda embeddings, actions, state=None: observed.append(
+            actions[0].cpu().numpy().copy()
+        )
+        or real(embeddings, actions, state=state),
+    )
+    result = ladder(model, [path], oracle_probe(episode), contrast=SKEWED_CONTRAST)
+
+    _, canonical = _per_rung(imagined, _ladder_arms(result), windows=2)
+    context_calls, floor_calls = observed[0::2], observed[1::2]
+    for index, start in enumerate(window_starts(episode.length, CONTEXT, HORIZON)):
+        horizon = episode.actions[start + CONTEXT : start + CONTEXT + HORIZON]
+        np.testing.assert_array_equal(
+            context_calls[index], episode.actions[start : start + CONTEXT]
+        )
+        np.testing.assert_array_equal(floor_calls[index], horizon)
+        np.testing.assert_array_equal(canonical[index], horizon)
+
+
+def test_the_ladder_is_reported_in_increasing_perturbation_order(tmp_path):
+    """The ladder's order is the reader's only way to see monotonicity, so it
+    is the LADDER's order and not the caller's argument order -- a report whose
+    columns came out in whatever sequence the flag was typed in invites reading
+    a non-monotone ladder as a monotone one."""
+    episode = varied_action_episode()
+    path = write(tmp_path, episode)
+    model, probe = ActionSumModel(), oracle_probe(episode)
+
+    assert LADDER == ("shuffled", "resampled", "constant")
+    assert ladder(model, [path], probe, arms=("constant", "shuffled")).order == (
+        "shuffled", "constant",
+    )
+    assert ladder(model, [path], probe, arms=tuple(reversed(LADDER))).order == LADDER
+
+
+def test_every_rung_names_what_it_perturbs_and_nothing_else_does():
+    """The verdict says "action-conditioned but insensitive to <what the null
+    rungs perturb>", and that phrase is the ONLY place the rungs are described
+    to a reader. A rung without a phrase would leave a hole in the sentence
+    that decides M4; a phrase without a rung is a description of nothing. So
+    the two are pinned to be the same set, and the phrases pinned distinct --
+    two rungs described identically cannot be told apart in the verdict."""
+    assert set(LADDER_PERTURBS) == set(LADDER)
+    phrases = [LADDER_PERTURBS[name] for name in LADDER]
+    assert len(set(phrases)) == len(LADDER), phrases
+    assert all(phrase and phrase == phrase.strip() for phrase in phrases)
+
+
+@pytest.mark.parametrize("arms", [(), ("shuffled", "nonesuch")])
+def test_the_ladder_refuses_a_rung_it_does_not_have_and_an_empty_ladder(tmp_path, arms):
+    """An unknown rung silently dropped leaves a report that is missing a
+    column nobody asked after; an empty ladder produces a full-looking run with
+    no intervention in it at all."""
+    episode = varied_action_episode()
+    path = write(tmp_path, episode)
+    with pytest.raises(ValueError, match="rung"):
+        ladder(ActionSumModel(), [path], oracle_probe(episode), arms=arms)
+
+
+def test_the_resampled_rung_is_reproducible_under_the_seed_and_moves_with_it(tmp_path):
+    """Both halves. Without the seed the rung is not reproducible; with a seed
+    that no longer reaches the draw it is not an intervention. Asserted on the
+    resampled rung specifically, because it is the only NEW rung that draws."""
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    model, probe = ActionSumModel(), oracle_probe(episode)
+    curve = lambda seed: ladder(  # noqa: E731
+        model, [path], probe, arms=("resampled",), intervention_seed=seed
+    ).arms["resampled"].position
+
+    np.testing.assert_array_equal(curve(0), curve(0))
+    assert not np.array_equal(curve(0), curve(1))
+
+
+def test_the_ladder_records_the_seed_the_held_actions_and_the_contrast_it_used(tmp_path):
+    """All three are choices the reader cannot recover from the numbers, and
+    the contrast in particular decides what the top rung's sign means -- see
+    `action_skewed_episode`. When the constant rung does not run, the two that
+    belong to it are None rather than a default that reads as a choice made."""
+    episode = action_skewed_episode()
+    path = write(tmp_path, episode)
+    result = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), intervention_seed=7,
+        contrast=SKEWED_CONTRAST,
+    )
+    assert result.intervention_seed == 7
+    assert result.held_actions == (1, 2, 4)
+    assert result.contrast == SKEWED_CONTRAST
+
+    without = ladder(
+        ActionSumModel(), [path], oracle_probe(episode), arms=("shuffled",)
+    )
+    assert without.held_actions is None and without.contrast is None
+
+
+# ---------------------------------------------------------------------------
 # Shared guards.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("diagnostic", ["shuffle", "sweep"])
+@pytest.mark.parametrize("diagnostic", ["shuffle", "ladder", "sweep"])
 def test_the_diagnostics_read_the_arms_own_namespaced_feature_cache(
     tmp_path, diagnostic
 ):
@@ -942,7 +1724,10 @@ def test_the_diagnostics_read_the_arms_own_namespaced_feature_cache(
 
     The cache carries the frame tag OFFSET BY +100, so reading the wrong source
     is a closed-form 100 map-index units of error rather than merely wrong
-    provenance.
+    provenance. The whole ladder is run under the feature backbone as well as
+    the shuffled rung alone: the two new rungs share `_diagnose` with it and
+    their marginal pre-pass reads only `actions`, so nothing SHOULD differ --
+    which is a claim covered by construction until a test runs it.
     """
     episode = synthetic_episode()
     path = write(tmp_path, episode)
@@ -955,22 +1740,23 @@ def test_the_diagnostics_read_the_arms_own_namespaced_feature_cache(
     model.input_kind = "features"
     probe = oracle_probe(episode)
 
-    run = (
-        (lambda: shuffle(model, [path], probe, feature_backbone="random_vit").real)
-        if diagnostic == "shuffle"
-        else (
-            lambda: sweep(
-                model, [path], probe, ks=(HORIZON,), feature_backbone="random_vit"
-            ).reference
-        )
-    )
-    reference = run()
+    if diagnostic == "shuffle":
+        reference = shuffle(model, [path], probe, feature_backbone="random_vit").real
+    elif diagnostic == "ladder":
+        result = ladder(model, [path], probe, feature_backbone="random_vit")
+        reference = result.real
+        for name in LADDER:
+            assert result.arms[name].windows_changed > 0, name
+    else:
+        reference = sweep(
+            model, [path], probe, ks=(HORIZON,), feature_backbone="random_vit"
+        ).reference
     np.testing.assert_allclose(
         reference.rssm_position, np.full(HORIZON, 100.0 * STEP), rtol=1e-4
     )
 
 
-@pytest.mark.parametrize("diagnostic", ["shuffle", "sweep"])
+@pytest.mark.parametrize("diagnostic", ["shuffle", "ladder", "sweep"])
 def test_every_arm_is_probed_by_the_same_probe_through_the_embedding_head(
     tmp_path, monkeypatch, diagnostic
 ):
@@ -1010,6 +1796,12 @@ def test_every_arm_is_probed_by_the_same_probe_through_the_embedding_head(
     if diagnostic == "shuffle":
         shuffle(model, [path], probe)
         expected = (3 + 1) * 2       # three references plus one arm, two windows
+    elif diagnostic == "ladder":
+        result = ladder(model, [path], probe)
+        # Three references, the two sequence rungs, and one held arm per
+        # action in the support -- each probed once per window.
+        assert len(result.held_actions) == 6, result.held_actions
+        expected = (3 + 2 + len(result.held_actions)) * 2
     else:
         sweep(model, [path], probe, ks=ks)
         expected = (3 + len(ks)) * 2
@@ -1021,20 +1813,29 @@ def test_every_arm_is_probed_by_the_same_probe_through_the_embedding_head(
             assert row.astype(np.float32).tobytes() in head_rows
 
 
-@pytest.mark.parametrize("diagnostic", ["shuffle", "sweep"])
+@pytest.mark.parametrize("diagnostic", ["shuffle", "ladder", "sweep"])
 def test_the_diagnostics_raise_when_no_window_is_long_enough(tmp_path, diagnostic):
-    """A silently empty or zero-filled curve would be read as a measurement."""
+    """A silently empty or zero-filled curve would be read as a measurement.
+
+    The ladder reaches this FIRST, in its own pre-pass over the action
+    marginal, and must raise the same refusal there: a marginal counted over no
+    window at all has no support to draw from and no action to hold, and the
+    contrast check on an empty support would surface as a different error
+    rather than as the split/horizon problem it is.
+    """
     episode = synthetic_episode(length=CONTEXT + HORIZON)  # exactly `need`: excluded
     path = write(tmp_path, episode)
     probe = oracle_probe(episode)
     with pytest.raises(ValueError, match="no diagnostic window"):
         if diagnostic == "shuffle":
             shuffle(OracleModel(), [path], probe)
+        elif diagnostic == "ladder":
+            ladder(OracleModel(), [path], probe)
         else:
             sweep(OracleModel(), [path], probe, ks=(HORIZON,))
 
 
-@pytest.mark.parametrize("diagnostic", ["shuffle", "sweep"])
+@pytest.mark.parametrize("diagnostic", ["shuffle", "ladder", "sweep"])
 def test_the_diagnostics_run_in_eval_mode_and_take_no_gradient(
     tmp_path, monkeypatch, diagnostic
 ):
@@ -1058,6 +1859,8 @@ def test_the_diagnostics_run_in_eval_mode_and_take_no_gradient(
     probe = oracle_probe(episode)
     if diagnostic == "shuffle":
         shuffle(model, [path], probe)
+    elif diagnostic == "ladder":
+        ladder(model, [path], probe)
     else:
         sweep(model, [path], probe, ks=(1, HORIZON))
     assert states
@@ -1071,7 +1874,7 @@ def test_the_diagnostics_defaults_are_the_spec_values():
     parametrises over TEST-LOCAL ks, so shrinking this tuple cannot silently
     shrink the test matrix -- this is the one test that reads it."""
     assert REGROUNDING_KS == (1, 3, 5, 15, 45)
-    for function in (action_shuffled_rollout, regrounding_sweep):
+    for function in (action_shuffled_rollout, action_intervention_ladder, regrounding_sweep):
         defaults = {
             name: parameter.default
             for name, parameter in inspect.signature(function).parameters.items()
@@ -1086,6 +1889,13 @@ def test_the_diagnostics_defaults_are_the_spec_values():
         inspect.signature(action_shuffled_rollout).parameters["permutation_seed"].default
         == 0
     )
+    ladder_defaults = inspect.signature(action_intervention_ladder).parameters
+    assert ladder_defaults["intervention_seed"].default == 0
+    # The default ladder is ALL THREE rungs. Defaulting to the shuffled rung
+    # alone would leave the two arms that close the multiset blind spot off
+    # unless a flag was typed, and the shipped conclusion would be the old one
+    # under a new name.
+    assert ladder_defaults["arms"].default is LADDER
 
 
 # ---------------------------------------------------------------------------
@@ -1566,3 +2376,59 @@ def test_the_shuffle_on_a_shipped_checkpoint_reports_both_window_counts(shipped_
     assert result.windows_total == expected
     assert result.windows_changed == expected
     assert result.is_interpretable() is True
+
+
+@pytest.mark.slow
+@shipped
+def test_the_ladder_on_a_shipped_checkpoint_leaves_the_shuffled_rung_bitwise_the_record(
+    shipped_cell,
+):
+    """THE regression guard on the artifact: adding rungs must not move the old.
+
+    `tests/eval/fixtures/shuffled_cnn_seed0_pre_ladder.json` is the shuffled
+    arm's curve and per-window delta as `scripts/diagnose_dynamics.py` wrote
+    them at commit 3688311 (pre-ladder), when the permutation was the ONLY intervention --
+    copied verbatim before the ladder existed, and committed, because the
+    record under `runs/` is gitignored and is rewritten by every run of the
+    new code, so it cannot be the reference for the code that rewrites it.
+    With every rung running, the shuffled rung must be bitwise the fixture: a
+    resampled rung that drew from the permutation's generator, any rung that
+    drew from torch, or a re-derived permutation stream would move it while
+    every shape, every window count and every self-check stayed right. The
+    other rungs are asserted to have changed every window in the same test, so
+    the equality cannot be explained by the ladder having done nothing.
+    """
+    import json
+
+    model, val, probe, record, device, backbone, reference = shipped_cell
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "shuffled_cnn_seed0_pre_ladder.json").read_text()
+    )
+    assert (fixture["arm"], fixture["seed"]) == (SHIPPED_ARM, SHIPPED_SEED)
+    assert fixture["device"] == str(device) and fixture["torch_version"] == torch.__version__
+    result = action_intervention_ladder(
+        model, val, probe, context=5, horizon=45, seed=SHIPPED_SEED,
+        device=device, feature_backbone=backbone,
+        intervention_seed=fixture["permutation_seed"],
+    )
+
+    assert result.order == LADDER
+    np.testing.assert_array_equal(
+        result.real.rssm_position, np.asarray(record["curves"]["rssm_position"])
+    )
+    shuffled = result.arms["shuffled"]
+    np.testing.assert_array_equal(
+        shuffled.position, np.asarray(fixture["shuffled_position"])
+    )
+    np.testing.assert_array_equal(
+        shuffled.position_delta(), np.asarray(fixture["position_delta"])
+    )
+    for name in LADDER:
+        arm = result.arms[name]
+        assert arm.windows_total == SHIPPED_WINDOWS == fixture["windows_total"], name
+        assert arm.windows_changed == SHIPPED_WINDOWS, name
+        assert arm.mean_steps_changed > 0.0, name
+    assert result.contrast == (3, 0)
+    assert result.held_actions == (0, 1, 2, 3, 4, 5)
+    for action, held in result.arms["constant"].held.items():
+        assert held.windows_changed == SHIPPED_WINDOWS, action

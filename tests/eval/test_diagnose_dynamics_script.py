@@ -23,7 +23,14 @@ import numpy as np
 import pytest
 import torch
 
-from mbfps.eval.diagnostics import RegroundingSweep, ShuffleResult
+from mbfps.eval.diagnostics import (
+    LADDER,
+    LADDER_PERTURBS,
+    ArmResult,
+    ContrastResult,
+    LadderResult,
+    RegroundingSweep,
+)
 from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.study import StudyJob, job_record_path, load_record, write_record
 
@@ -80,23 +87,94 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
     )
 
 
-def _shuffle(
-    reference: RolloutResult, shuffled, changed, deltas=None, episodes=None
-) -> ShuffleResult:
-    shuffled = np.asarray(shuffled, dtype=float)
+def _arm(
+    name, reference: RolloutResult, curve, changed, deltas=None, episodes=None,
+    steps_changed=None, multiset=None, angle_deltas=None,
+) -> ArmResult:
+    """One fabricated intervened arm against `reference`.
+
+    `steps_changed` defaults to "every step, or none" from `changed`, which is
+    what a real permutation of distinct actions produces; a test about the
+    steps-moved accounting passes its own so the count and the flag are
+    separable. The multiset distance defaults to the step count -- a test
+    about the multiset row passes its own. The angle deltas default to the
+    position deltas over ten, so the two channels are numerically distinct.
+    """
+    curve = np.asarray(curve, dtype=float)
     changed = np.asarray(changed, dtype=bool)
     if deltas is None:
-        deltas = np.tile(shuffled - reference.rssm_position, (changed.size, 1))
+        deltas = np.tile(curve - reference.rssm_position, (changed.size, 1))
     deltas = np.asarray(deltas, dtype=float)
-    return ShuffleResult(
-        real=reference,
-        shuffled_position=shuffled,
-        shuffled_angle=shuffled / 10.0,
-        changed=changed,
+    if steps_changed is None:
+        steps_changed = np.where(changed, curve.size, 0)
+    steps_changed = np.asarray(steps_changed, dtype=int)
+    return ArmResult(
+        name=name,
+        position=curve,
+        angle=curve / 10.0,
         window_position_delta=deltas,
-        window_angle_delta=deltas / 10.0,
-        permutation_seed=0,
+        window_angle_delta=deltas / 10.0 if angle_deltas is None else np.asarray(angle_deltas, float),
+        window_steps_changed=steps_changed,
+        window_multiset_distance=(
+            steps_changed.copy() if multiset is None else np.asarray(multiset, dtype=int)
+        ),
+        horizon=curve.size,
         window_episode=(None if episodes is None else np.asarray(episodes, int)),
+    )
+
+
+def _shuffle(
+    reference: RolloutResult, shuffled, changed, deltas=None, episodes=None
+) -> ArmResult:
+    """The shuffled rung alone, for the statistics tests that need one rung."""
+    return _arm("shuffled", reference, shuffled, changed, deltas, episodes)
+
+
+def _contrast(
+    reference: RolloutResult, held: dict, contrast=(3, 0), changed=None, steps_changed=None,
+) -> ContrastResult:
+    """The constant rung: `held` maps an action to its `ArmResult`, and the
+    contrast's deltas are the difference of the two named ones -- exactly as
+    the library builds it. Its own count is every step, since the two held
+    sequences differ everywhere, unless a test says otherwise."""
+    first, second = contrast
+    n = held[first].windows_total
+    if changed is None:
+        changed = [True] * n
+    changed = np.asarray(changed, dtype=bool)
+    if steps_changed is None:
+        steps_changed = np.where(changed, held[first].horizon, 0)
+    steps_changed = np.asarray(steps_changed, dtype=int)
+    return ContrastResult(
+        name="constant",
+        held=held,
+        contrast=tuple(contrast),
+        window_position_delta=(
+            held[first].window_position_delta - held[second].window_position_delta
+        ),
+        window_angle_delta=held[first].window_angle_delta - held[second].window_angle_delta,
+        window_steps_changed=steps_changed,
+        window_multiset_distance=steps_changed.copy(),
+        horizon=held[first].horizon,
+        window_episode=held[first].window_episode,
+    )
+
+
+def _ladder(reference: RolloutResult, arms: dict) -> LadderResult:
+    """`arms` maps a rung name to its result; the order is `LADDER`'s."""
+    order = tuple(name for name in LADDER if name in arms)
+    constant = arms.get("constant")
+    return LadderResult(
+        real=reference,
+        arms={name: arms[name] for name in order},
+        order=order,
+        intervention_seed=0,
+        held_actions=None if constant is None else tuple(sorted(constant.held)),
+        contrast=None if constant is None else constant.contrast,
+        action_marginal_values=np.array([1, 2, 4]),
+        action_marginal_counts=np.array([7, 2, 1]),
+        windows_total=next(iter(arms.values())).windows_total,
+        window_episode=next(iter(arms.values())).window_episode,
     )
 
 
@@ -119,18 +197,34 @@ class _TinyModel(torch.nn.Module):
 
 TRAINED = [11.0, 13.0, 17.0]
 TRAINED_SIGNATURE = float(sum(TRAINED))
+PROBE_R2 = 0.31
+"""The study record's `embedding_selection_r2`, as the stub writes it: a
+recognisable non-round number, so the self-check column and the record are
+asserted against a value that nothing else in the fixture equals."""
 
 
-def _write_record(out_dir, arm, seed, curve, val_names=None):
+def _write_record(out_dir, arm, seed, curve, val_names=None, probe_r2=PROBE_R2):
     write_record(
         job_record_path(out_dir, StudyJob(arm=arm, seed=seed)),
         {
             "arm": arm,
             "seed": seed,
             "episodes": {"val": list(VAL_NAMES if val_names is None else val_names)},
+            "probe": {"embedding_selection_r2": probe_r2},
             "curves": {"rssm_position": [float(v) for v in curve]},
         },
     )
+
+
+STUB_STEPS = {"shuffled": (3, 1), "resampled": (2, 3), "constant": (3, 3)}
+"""Each stub rung's per-window steps moved, DISTINCT per rung, so a record or
+table that reported one rung's count under every rung's name is caught by
+which value lands where -- the same discipline the +4/+5/+6 curve offsets
+apply to the deltas."""
+
+STUB_HELD = (3, 0, 1)
+"""The actions the stub's constant rung holds: the default contrast pair plus
+one more, so the held table has a row that is neither side of the contrast."""
 
 
 def _stub(
@@ -145,12 +239,19 @@ def _stub(
     smallest_k_is_floor=False,
     shuffle_offset=0.0,
     changed=(True, True),
+    rung_changed=None,
+    rung_steps=None,
     shuffle_deltas=None,
+    rung_deltas=None,
     state=None,
 ):
     """Everything `main` touches, replaced; the checkpoint and record are real files.
 
-    `state` collects the calls a test wants to inspect.
+    `state` collects the calls a test wants to inspect. `shuffle_deltas` sets
+    the shuffled rung's per-window deltas alone; `rung_deltas` maps a rung name
+    to its own, so a test can make the rungs disagree. `changed` is every
+    rung's mask unless `rung_changed` gives a rung its own; `rung_steps` does
+    the same for the steps moved, over `STUB_STEPS`.
     """
     state = {} if state is None else state
     state.setdefault("fit_probes", [])
@@ -200,15 +301,53 @@ def _stub(
         return _sweep(reference, curves, spreads={k: 1.0 / (i + 1) ** 2
                                                   for i, k in enumerate(sorted(ks))})
 
-    def fake_shuffle(model, val, probe, **kwargs):
-        state["diagnostics"].append(("shuffle", kwargs, None))
+    def fake_ladder(model, val, probe, arms=LADDER, **kwargs):
+        state["diagnostics"].append(("ladder", kwargs, tuple(arms)))
         reference = _rollout([model.signature()] * H)
-        return _shuffle(
-            _rollout(reference.rssm_position + shuffle_offset),
-            reference.rssm_position + 4.0,
-            changed,
-            deltas=shuffle_deltas,
-        )
+        deltas = dict(rung_deltas or {})
+        if shuffle_deltas is not None:
+            deltas["shuffled"] = shuffle_deltas
+        masks = {name: changed for name in LADDER} | dict(rung_changed or {})
+        # A window the mask says is unchanged moved no steps, whatever the
+        # per-rung count says -- the two must not disagree in a fixture.
+        steps = {
+            name: np.where(masks[name], (dict(STUB_STEPS) | dict(rung_steps or {}))[name], 0)
+            for name in LADDER
+        }
+        # Each rung gets its OWN curve offset -- +4, +5, +6 in `LADDER` order --
+        # so a table or record that reports one rung's number under every
+        # rung's name is caught by WHICH value lands where, not only by a gap.
+        # The rungs are built in REVERSED order so the ladder's order cannot
+        # be the dict's insertion order by coincidence.
+        real = _rollout(reference.rssm_position + shuffle_offset)
+        rungs = {}
+        for name in reversed(LADDER):
+            if name not in arms:
+                continue
+            offset = 4.0 + LADDER.index(name)
+            if name != "constant":
+                rungs[name] = _arm(
+                    name, real, reference.rssm_position + offset, masks[name],
+                    deltas=deltas.get(name), steps_changed=steps[name],
+                )
+                continue
+            # Held arms at +6 (the constant rung's own offset) for held
+            # MOVE_FORWARD, +1.5 for held NOOP and +0.5 for the third, so the
+            # contrast is +4.5 -- distinct from every sequence rung's number
+            # and from every held arm's -- unless a test hands the contrast
+            # its own deltas.
+            held = {
+                action: _arm(
+                    name, real, reference.rssm_position + (offset, 1.5, 0.5)[i],
+                    masks[name], steps_changed=steps[name],
+                )
+                for i, action in enumerate(STUB_HELD)
+            }
+            rungs[name] = _contrast(real, held, steps_changed=steps[name])
+            if deltas.get(name) is not None:
+                rungs[name].window_position_delta = np.asarray(deltas[name], float)
+                rungs[name].window_angle_delta = np.asarray(deltas[name], float) / 10.0
+        return _ladder(real, rungs)
 
     def fake_split(paths, **kwargs):
         state["split"].append(kwargs)
@@ -233,7 +372,7 @@ def _stub(
     monkeypatch.setattr(script, "fit_probes", fake_fit_probes)
     monkeypatch.setattr(script, "evaluate_rollout", fake_evaluate)
     monkeypatch.setattr(script, "regrounding_sweep", fake_sweep)
-    monkeypatch.setattr(script, "action_shuffled_rollout", fake_shuffle)
+    monkeypatch.setattr(script, "action_intervention_ladder", fake_ladder)
     return state
 
 
@@ -329,18 +468,24 @@ def test_the_verdict_reads_the_shuffles_own_spread_and_not_the_sweeps(
 
     So the fixture makes the two numbers far apart and requires the verdict to
     quote the SHUFFLE's: the per-window deltas here have a standard error of
-    50, while the sweep's is 0.5.
+    50, while the sweep's is 0.5. Run at the shuffled rung alone, so the
+    ladder's decision IS that rung's. A band of 100 against the stub's
+    persistence-to-floor range of 9 is wider than the range, so the honest
+    verdict is that nothing could register -- and the band it quotes there is
+    the shuffle's, which is the assertion.
     """
     _stub(
         monkeypatch, tmp_path,
         shuffle_deltas=np.array([[0.0] * H, [100.0] * H]),
     )
-    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    assert script.main(_argv(tmp_path) + ["--rungs", "shuffled"]) == script.EXIT_OK
     out = capsys.readouterr().out
-    assert "+-2 SE (100.000)" in out, out[out.index("--- verdicts ---"):]
-    assert "M4 is BLOCKED" in out, (
+    verdict = out[out.index("--- verdicts ---"):]
+    assert "+-2 SE (100.000)" in verdict, verdict
+    assert "widest null band of 100.000" in verdict, (
         "the verdict decided on a spread that is not the shuffle's"
     )
+    assert "M4 is BLOCKED" not in verdict and "RESPONDS" not in verdict
 
 
 def test_a_clean_run_exits_ok(monkeypatch, tmp_path, capsys):
@@ -434,13 +579,50 @@ def test_the_probe_and_both_diagnostics_run_at_the_parsed_context_and_horizon(
         assert kwargs["seed"] == 7
 
 
-def test_the_permutation_seed_reaches_the_shuffle(monkeypatch, tmp_path):
-    """One permutation is one draw; which draw it was has to be controllable, or
-    a null distribution cannot be built from repeated runs."""
+@pytest.mark.parametrize("flag", ["--intervention-seed", "--permutation-seed"])
+def test_the_intervention_seed_reaches_the_ladder_under_either_flag(
+    monkeypatch, tmp_path, flag
+):
+    """One draw per rung is one draw; which draw it was has to be controllable,
+    or a null distribution cannot be built from repeated runs. `--permutation-
+    seed` is the name the nine shipped records were produced under and it seeds
+    the shuffled rung IDENTICALLY, so it stays accepted."""
     state = _stub(monkeypatch, tmp_path)
-    script.main(_argv(tmp_path) + ["--permutation-seed", "3"])
-    shuffles = [kwargs for kind, kwargs, _ in state["diagnostics"] if kind == "shuffle"]
-    assert shuffles and shuffles[0]["permutation_seed"] == 3
+    script.main(_argv(tmp_path) + [flag, "3"])
+    ladders = [kwargs for kind, kwargs, _ in state["diagnostics"] if kind == "ladder"]
+    assert ladders and ladders[0]["intervention_seed"] == 3
+
+
+def test_the_rungs_flag_selects_the_ladder_and_defaults_to_all_three(
+    monkeypatch, tmp_path
+):
+    """The default is the WHOLE ladder. Defaulting to the shuffled rung alone
+    would leave the two rungs that close the multiset blind spot off unless a
+    flag was typed, and the shipped conclusion would be the old one under a
+    new name. The selection is passed through in `LADDER`'s order whatever
+    order it was typed in -- the library refuses nothing here, so the script
+    has to hand it the order the table will print."""
+    state = _stub(monkeypatch, tmp_path)
+    script.main(_argv(tmp_path))
+    assert [arms for kind, _, arms in state["diagnostics"] if kind == "ladder"] == [
+        LADDER
+    ]
+
+    state = _stub(monkeypatch, tmp_path)
+    script.main(_argv(tmp_path) + ["--rungs", "constant", "shuffled"])
+    assert [arms for kind, _, arms in state["diagnostics"] if kind == "ladder"] == [
+        ("shuffled", "constant")
+    ]
+
+
+def test_a_rung_the_ladder_does_not_have_is_an_argparse_usage_error(capsys):
+    """Refused as a bad FLAG (argparse's status 2) rather than as the
+    ValueError the library raises twenty seconds into the probe refit, which
+    would surface as the uncaught-traceback status 1."""
+    with pytest.raises(SystemExit) as exit_info:
+        script.parse_args(["--rungs", "nonesuch"])
+    assert exit_info.value.code == 2
+    assert "nonesuch" in capsys.readouterr().err
 
 
 def test_a_ks_that_omits_the_horizon_is_an_argparse_usage_error(capsys):
@@ -519,13 +701,108 @@ def test_the_checkpoint_path_carries_both_the_arm_and_the_seed(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# The report itself.
+# ---------------------------------------------------------------------------
+
+
+FAMILY = 1
+"""The family most verdict tests decide under: ONE comparison, whose
+Bonferroni threshold is the nominal 1.96, so "outside +-2 SE" and "responds"
+coincide and each test is about the ladder logic and not the correction. The
+correction has its own tests below, at families where the two rulers differ.
+"""
+
+
+def _channel(delta, band, mean=None, se=0.5, outside=0):
+    """One channel's block of a fabricated rung: the aggregate the verdict
+    decides on and the per-step curves it reports beside that."""
+    delta = np.asarray(delta, float)
+    return {
+        "delta": delta, "band": np.asarray(band, float),
+        "mean": (float(np.nanmean(delta)) if delta.size and not np.isnan(delta).all()
+                 else float("nan")) if mean is None else mean,
+        "se": se, "se_independent": se,
+        "delta_final": float(delta[-1]) if delta.size else float("nan"),
+        "steps_outside": outside, "expected_outside": 0.05 * delta.size,
+    }
+
+
+def _rung(
+    delta, band, changed=4, total=4, mean=None, se=0.5, outside=0, episodes=4,
+    steps_changed_mean=None, steps_changed_min=None, multiset=None, angle=None,
+    contrast=None, held=None,
+):
+    """One rung's block of a fabricated cell: the counts that say whether the
+    statistics mean anything, then one channel block each for position and
+    angle. The angle channel is a clean null unless the test hands one in, so
+    a position-only test is not accidentally decided on the angle.
+
+    The counts default to values that DIFFER from one another and from the
+    step count, so a row that printed one under another's name is not
+    satisfied by the fixture: 4 changed of 4 total, 2.5 steps moved of `len(
+    delta)`, minimum 1, multiset 0.5.
+    """
+    delta = np.asarray(delta, float)
+    block = {
+        "windows_total": total, "windows_changed": changed, "episodes": episodes,
+        "steps": int(delta.size),
+        "steps_changed_mean": (
+            (2.5 if changed else 0.0) if steps_changed_mean is None else steps_changed_mean
+        ),
+        "steps_changed_min": (
+            (1 if changed else 0) if steps_changed_min is None else steps_changed_min
+        ),
+        "multiset_distance_mean": (
+            (0.5 if changed else 0.0) if multiset is None else multiset
+        ),
+        "position": _channel(delta, band, mean, se, outside),
+        "angle": (
+            _channel(np.zeros(delta.size), np.full(delta.size, 1.0), mean=0.0, se=1.0)
+            if angle is None else angle
+        ),
+    }
+    if contrast is not None:
+        block["contrast"] = tuple(contrast)
+        block["held"] = {} if held is None else held
+    return block
+
+
+def _ladder_cell(
+    rungs: dict, open_loop=0.0, record=0.0, stream=0.0, smallest_k_is_floor=False,
+    floor=1.0, persistence=9.0, total=4, probe_r2=PROBE_R2,
+):
+    """A fabricated cell over several rungs. `rungs` maps a name to `_rung(...)`,
+    and its INSERTION order is deliberately not consulted for `rung_order`: the
+    order is `LADDER`'s, which is what the report has to print in. A
+    `constant` rung without a contrast is given the default one."""
+    rungs = dict(rungs)
+    if "constant" in rungs and "contrast" not in rungs["constant"]:
+        rungs["constant"] = rungs["constant"] | {"contrast": (3, 0), "held": {}}
+    return {
+        "open_loop": open_loop, "record": record, "stream": stream,
+        "smallest_k_is_floor": smallest_k_is_floor,
+        "probe_selection_r2": probe_r2,
+        "windows_total": total,
+        "rung_order": tuple(name for name in LADDER if name in rungs),
+        "rungs": rungs,
+        "held_actions": (3, 0) if "constant" in rungs else None,
+        "contrast": rungs["constant"]["contrast"] if "constant" in rungs else None,
+        "k": {1: 5.0, 3: 7.0}, "floor": floor, "persistence": persistence,
+        "spread_final": 0.25,
+        "paired": {"1v3": 0.125},
+        "floor_margin": 4.0, "floor_margin_se": 0.75, "smallest_k": 1,
+    }
+
+
 def _cell(
     delta, band, changed=4, total=4, mean=None, se=0.5, outside=0,
     open_loop=0.0, record=0.0, stream=0.0, smallest_k_is_floor=False,
-    floor=1.0, persistence=9.0, episodes=4,
+    floor=1.0, persistence=9.0, episodes=4, rung="shuffled",
 ):
-    """A fabricated cell. `mean`/`se` are the AGGREGATE the verdict decides on;
-    `delta`/`band` are the per-step curves it reports beside that.
+    """A fabricated cell with ONE rung. `mean`/`se` are the AGGREGATE the
+    verdict decides on; `delta`/`band` are the per-step curves it reports
+    beside that.
 
     The three self-check numbers are PARAMETERS rather than a shared 0.0. Left
     equal they make every column of `selfcheck_table` interchangeable, so
@@ -534,23 +811,31 @@ def _cell(
     that is the clean-run rendering most tests want; the column test passes
     three different ones.
     """
-    delta = np.asarray(delta, float)
-    return {
-        "open_loop": open_loop, "record": record, "stream": stream,
-        "smallest_k_is_floor": smallest_k_is_floor,
-        "windows_total": total, "windows_changed": changed,
-        "delta": delta, "band": np.asarray(band, float),
-        "mean": (float(np.nanmean(delta)) if delta.size and not np.isnan(delta).all()
-                 else float("nan")) if mean is None else mean,
-        "se": se, "se_independent": se, "episodes": episodes,
-        "steps_outside": outside, "steps": delta.size,
-        "expected_outside": 0.05 * delta.size,
-        "delta_final": float(delta[-1]) if delta.size else float("nan"),
-        "k": {1: 5.0, 3: 7.0}, "floor": floor, "persistence": persistence,
-        "spread_final": 0.25,
-        "paired": {"1v3": 0.125},
-        "floor_margin": 4.0, "floor_margin_se": 0.75, "smallest_k": 1,
+    return _ladder_cell(
+        {rung: _rung(delta, band, changed, total, mean, se, outside, episodes)},
+        open_loop=open_loop, record=record, stream=stream,
+        smallest_k_is_floor=smallest_k_is_floor, floor=floor, persistence=persistence,
+        total=total,
+    )
+
+
+def _null_ladder(**overrides):
+    """All three rungs inside their bands, each with its own numbers -- the
+    clean null the BLOCKED headline needs, with a contrast in it."""
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "resampled": _rung([0.0] * 4, [0.2] * 4, mean=0.02, se=0.20),
+        "constant": _rung([0.0] * 4, [0.2] * 4, mean=0.03, se=0.30),
     }
+    return _ladder_cell(rungs, **overrides)
+
+
+def _verdict(cell, family=FAMILY, arm="cnn", seed=0):
+    return script.verdict_block(arm, seed, cell, family=family)
+
+
+def _line(text: str, name: str) -> str:
+    return next(line for line in text.splitlines() if line.strip().startswith(name))
 
 
 ROW_SHAPED = {
@@ -579,7 +864,26 @@ def test_the_row_shaped_tables_print_a_row_per_cell_and_MISSING_for_a_gap(table)
         assert "42.000" not in rows["1"], "seed 2's number landed in seed 1's row"
 
 
-def test_the_shuffle_table_puts_every_seeds_number_in_its_own_column():
+LADDER_WIDTH, LADDER_PREFIX = 18, 12 + 11 + 22
+"""`ladder_table`'s geometry: arm, rung and row labels, then 18 per seed."""
+ROWS_PER_RUNG = len(script.LADDER_ROWS)
+
+
+def _seed_columns(row: str) -> list[str]:
+    return [
+        row[LADDER_PREFIX + i * LADDER_WIDTH : LADDER_PREFIX + (i + 1) * LADDER_WIDTH]
+        for i in range(3)
+    ]
+
+
+def _rung_rows(table: str, index: int) -> dict[str, str]:
+    """The block of rows for the `index`-th rung, keyed by row label."""
+    body = table.splitlines()[1:]
+    rows = body[ROWS_PER_RUNG * index : ROWS_PER_RUNG * (index + 1)]
+    return {row[23:45].strip(): row for row in rows}
+
+
+def test_the_ladder_table_puts_every_seeds_number_in_its_own_column():
     """`report_study.py`'s first rule, on the one table with per-seed COLUMNS.
 
     With seed 1 absent, rendering the cells that DID run by list position puts
@@ -596,29 +900,114 @@ def test_the_shuffle_table_puts_every_seeds_number_in_its_own_column():
         ("cnn", 0): _cell([1.0, 5.0], [0.5, 0.5], mean=1.0),
         ("cnn", 2): _cell([2.0, 6.0], [0.5, 0.5], mean=2.0, changed=3, total=5),
     }
-    header, delta_row, final_row, counts_row = script.shuffle_table(
-        cells, ["cnn"], [0, 1, 2]
-    ).splitlines()
-    width, prefix = 18, 12 + 16
-    columns = lambda row: [  # noqa: E731
-        row[prefix + i * width : prefix + (i + 1) * width] for i in range(3)
-    ]
-    columns_of = lambda row: [c.strip() for c in columns(row)]  # noqa: E731
+    table = script.ladder_table(cells, ["cnn"], [0, 1, 2], ("shuffled",))
+    header = table.splitlines()[0]
+    rows = _rung_rows(table, 0)
+    columns_of = lambda row: [c.strip() for c in _seed_columns(row)]  # noqa: E731
     assert columns_of(header) == ["seed 0", "seed 1", "seed 2"], header
-    assert "+1.000" in columns(delta_row)[0]
-    assert columns(delta_row)[1].strip() == "MISSING"
-    assert "+2.000" in columns(delta_row)[2], "seed 2's delta is not in seed 2's column"
-    assert columns_of(final_row)[0] == "+5.000", final_row
-    assert columns_of(final_row)[1] == "MISSING"
-    assert columns_of(final_row)[2] == "+6.000", "seed 2's endpoint is in the wrong column"
-    assert "4/4" in columns(counts_row)[0].replace(" ", "")
-    assert columns(counts_row)[1].strip() == "MISSING"
-    assert "3/5" in columns(counts_row)[2].replace(" ", "")
+    assert "+1.000" in _seed_columns(rows["horizon-mean"])[0]
+    assert columns_of(rows["horizon-mean"])[1] == "MISSING"
+    assert "+2.000" in _seed_columns(rows["horizon-mean"])[2], (
+        "seed 2's delta is not in seed 2's column"
+    )
+    assert columns_of(rows["final step"])[0] == "+5.000", rows["final step"]
+    assert columns_of(rows["final step"])[1] == "MISSING"
+    assert columns_of(rows["final step"])[2] == "+6.000", "seed 2's endpoint is in the wrong column"
+    assert "4/4" in columns_of(rows["changed/total"])[0].replace(" ", "")
+    assert columns_of(rows["changed/total"])[1] == "MISSING"
+    assert "3/5" in columns_of(rows["changed/total"])[2].replace(" ", "")
+    # The steps-moved row is the rung's DISTANCE from the real sequence, with
+    # the least any window moved beside the mean -- what separates "changed"
+    # from "changed by one step out of forty-five".
+    assert "2.5(min1)/2" in columns_of(rows["steps moved/horizon"])[0].replace(" ", ""), rows
+    assert columns_of(rows["steps moved/horizon"])[1] == "MISSING"
 
 
-def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se(
-    capsys,
-):
+def test_the_ladder_table_prints_the_rungs_in_increasing_perturbation_order():
+    """The ladder's monotonicity is only readable if the rungs are printed in
+    `LADDER`'s order under one arm, each with its OWN rows -- and the fixture
+    inserts them backwards and gives each a different number in every row, so
+    a renderer that took the cell's insertion order, or printed one rung's
+    numbers under every rung's name, is caught by which value lands where.
+    Every count row is asserted by value: the multiset row is the one that
+    reads 0 / 15 / 45 up the shipped ladder, and the minimum is the one that
+    would show a held action leaving a window one step from where it was.
+    """
+    rungs = {
+        "constant": _rung([3.0, 3.0], [0.5, 0.5], mean=3.0, changed=4, total=4,
+                          steps_changed_mean=2.0, steps_changed_min=2, multiset=2.0,
+                          angle=_channel([0.3, 0.3], [0.05, 0.05], mean=0.3, se=0.025)),
+        "resampled": _rung([2.0, 2.0], [0.5, 0.5], mean=2.0, changed=3, total=4,
+                           steps_changed_mean=1.5, steps_changed_min=1, multiset=1.0,
+                           angle=_channel([0.2, 0.2], [0.05, 0.05], mean=0.2, se=0.025)),
+        "shuffled": _rung([1.0, 1.0], [0.5, 0.5], mean=1.0, changed=2, total=4,
+                          steps_changed_mean=1.0, steps_changed_min=0, multiset=0.0,
+                          angle=_channel([0.1, 0.1], [0.05, 0.05], mean=0.1, se=0.025)),
+    }
+    cells = {("cnn", 0): _ladder_cell(rungs)}
+    table = script.ladder_table(cells, ["cnn"], [0], LADDER)
+    lines = table.splitlines()
+    assert len(lines) == 1 + ROWS_PER_RUNG * len(LADDER), lines
+    labelled = [line for line in lines[1:] if line[12:23].strip()]
+    assert [line[12:23].strip() for line in labelled] == list(LADDER), labelled
+    for index, name in enumerate(LADDER):
+        rows = _rung_rows(table, index)
+        assert list(rows) == list(script.LADDER_ROWS), rows
+        assert rows["horizon-mean"][12:23].strip() == name
+        assert f"+{index + 1}.000" in rows["horizon-mean"], (name, rows)
+        # The angle row is degrees, its own number, not the position row's.
+        assert f"+0.{index + 1}00 +-0.05" in rows["angle horizon-mean"], (name, rows)
+        assert f"+{index + 1}.000" in rows["final step"]
+        assert f"{index + 2}/4" in rows["changed/total"].replace(" ", ""), (name, rows)
+        moved = rows["steps moved/horizon"].replace(" ", "")
+        assert f"{1.0 + 0.5 * index:.1f}(min{index})/2" in moved, (name, moved)
+        assert f"{index:.1f}/2" in rows["multiset dist/horizon"].replace(" ", ""), (name, rows)
+
+
+def test_the_ladder_table_prints_MISSING_for_a_rung_a_cell_did_not_run():
+    """A cell that ran fewer rungs than the table has rows for -- a partial
+    re-run under `--rungs` beside full cells -- must say so per rung rather
+    than being padded with another rung's numbers or dropped."""
+    cells = {
+        ("cnn", 0): _ladder_cell({"shuffled": _rung([1.0], [0.5], mean=1.0)}),
+    }
+    lines = script.ladder_table(cells, ["cnn"], [0], LADDER).splitlines()
+    body = lines[1:]
+    assert "+1.000" in body[0] and "MISSING" not in body[0]
+    for line in body[ROWS_PER_RUNG:]:
+        assert "MISSING" in line, line
+        assert "1.000" not in line, "the shuffled rung's number was padded into another rung"
+
+
+def test_the_held_table_prints_every_held_action_against_the_real_sequence():
+    """The contrast is a difference of two held rows, and the held rows are
+    what let a reader see WHICH actions move the imagined position and in
+    which direction -- measured, held MOVE_FORWARD reads +31 where the
+    single-held-action rung read -0.7. Each action is a named row with its
+    own delta, band and steps moved (with the minimum), in action order, and
+    the table is empty when the constant rung did not run.
+    """
+    held = {
+        3: _rung([31.0] * 2, [12.0] * 2, mean=31.0, se=6.0, steps_changed_mean=41.0,
+                 steps_changed_min=22),
+        0: _rung([-11.6] * 2, [7.9] * 2, mean=-11.6, se=3.95, steps_changed_mean=38.0,
+                 steps_changed_min=7),
+    }
+    cells = {("cnn", 0): _ladder_cell({
+        "constant": _rung([42.6] * 2, [14.0] * 2, mean=42.6, se=7.0, contrast=(3, 0), held=held),
+    })}
+    table = script.held_table(cells, ["cnn"], [0], LADDER)
+    lines = table.splitlines()
+    assert len(lines) == 1 + 2 * len(held), lines
+    noop, forward = lines[1:3], lines[3:5]
+    assert noop[0][12:25].strip() == "NOOP" and forward[0][12:25].strip() == "MOVE_FORWARD"
+    assert "-11.600 +-7.90" in noop[0] and "+31.000 +-12.00" in forward[0], lines
+    assert "38.0(min 7)/2" in noop[1] and "41.0(min 22)/2" in forward[1], lines
+    assert "42.6" not in table, "the contrast's own number was printed as a held row"
+    assert script.held_table(cells, ["cnn"], [0], ("shuffled", "resampled")) == ""
+
+
+def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se():
     """Both branches, in one test: either alone leaves the other unexercised.
 
     The decision is the AGGREGATE -- the mean per-window delta against its own
@@ -628,9 +1017,9 @@ def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se(
     call almost every cell responsive. The count is still printed, next to what
     chance alone gives, so a reader can see an effect the aggregate cancels.
     """
-    inside = script.verdict_block(
-        "cnn", 0, _cell([0.4, -0.4, 0.0] * 15, [0.2] * 45, mean=0.05, se=0.1, outside=3)
-    )
+    inside = _verdict(_null_ladder() | {"rungs": _null_ladder()["rungs"] | {
+        "shuffled": _rung([0.4, -0.4, 0.0] * 15, [0.2] * 45, mean=0.05, se=0.1, outside=3),
+    }})
     assert "M4 is BLOCKED" in inside
     assert "NOT blocked" not in inside
     assert "3/45" in inside and "2.2 expected by chance" in inside, (
@@ -638,8 +1027,8 @@ def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se(
         "the aggregate"
     )
 
-    outside = script.verdict_block(
-        "cnn", 0, _cell([0.4, -0.4, 0.0] * 15, [0.2] * 45, mean=9.0, se=0.1, outside=3)
+    outside = _verdict(
+        _cell([0.4, -0.4, 0.0] * 15, [0.2] * 45, mean=9.0, se=0.1, outside=3)
     )
     assert "M4 is NOT blocked" in outside
     assert "M4 is BLOCKED" not in outside
@@ -654,14 +1043,298 @@ def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se(
         assert "was 0.200" not in text, "the band's width was reported as the effect"
 
 
-def test_a_single_step_outside_its_band_is_not_by_itself_a_verdict(capsys):
+def test_a_ladder_that_is_null_at_every_rung_blocks_m4_and_names_every_rung():
+    """The clean null: nothing moved at any rung including the held-action
+    contrast, on a probe that could have registered it, so M4 is blocked on
+    this evidence -- and the verdict has to say WHICH rungs it rests on, each
+    with its own numbers, or a null on one rung reads as a null on three. The
+    equivalence sentence bounds the perturbations RUN, by name, and says so.
+    """
+    text = _verdict(_null_ladder())
+    assert "M4 is BLOCKED" in text
+    assert "NOT blocked" not in text
+    assert "NOT USING THE ACTION" not in text, "the retracted headline is back"
+    for name, two_se in (("shuffled", "0.200"), ("resampled", "0.400"), ("constant", "0.600")):
+        line = _line(text, name)
+        assert f"+-2 SE ({two_se})" in line, (name, line)
+        assert LADDER_PERTURBS[name] in line, "the rung's perturbation was not named"
+    assert "shuffled, resampled, constant" in text, text
+    assert "bounds those perturbations and no other" in text, text
+    assert "held MOVE_FORWARD minus held NOOP" in _line(text, "constant")
+
+
+def test_a_null_ladder_without_the_contrast_does_not_license_blocking_m4():
+    """A null on order and counts alone is exactly what an action-conditioned
+    prior that reads the action's identity produces -- measured, the
+    per-action contrast found +42.6 map units on a cell where the shuffled and
+    resampled rungs were both null. So the BLOCKED headline requires the
+    contrast among the rungs, and without it the verdict says what was and
+    was not tested."""
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "resampled": _rung([0.0] * 4, [0.2] * 4, mean=0.02, se=0.20),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    assert "NO RESPONSE TO THE PERTURBATIONS RUN" in text
+    assert "M4 is BLOCKED" not in text and "NOT blocked" not in text
+    assert "contrast was NOT among the rungs" in text
+    assert "does not license blocking M4" in text
+    # The single-rung fixture every older test used is this case too.
+    alone = _verdict(_cell([0.0] * 4, [0.2] * 4, mean=0.01, se=0.2))
+    assert "M4 is BLOCKED" not in alone and "does not license blocking M4" in alone
+
+
+def test_a_ladder_where_a_later_rung_resolves_reports_action_conditioned_but_insensitive():
+    """THE better finding, reported exactly and not smoothed into the null story.
+
+    The shuffled rung is null and the two above it resolve with the sign
+    conditioning predicts: the model is action-conditioned but insensitive to
+    what the shuffled rung perturbs -- the ORDER -- and that is what the
+    verdict must say. It must not say the prior ignores the action, and it
+    must not present the responding rungs as if the whole ladder had
+    responded.
+    """
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "resampled": _rung([5.0] * 4, [0.2] * 4, mean=5.0, se=0.20),
+        "constant": _rung([9.0] * 4, [0.2] * 4, mean=9.0, se=0.30),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    assert "M4 is NOT blocked" in text
+    assert "M4 is BLOCKED" not in text
+    assert "DOES NOT MEASURABLY USE" not in text and "NOT USING THE ACTION" not in text
+    assert "RESPONDS TO THE ACTION" in text
+    assert "resampled, constant" in text and "not at shuffled" in text, text
+    assert "action-conditioned but insensitive to " + LADDER_PERTURBS["shuffled"] in text, text
+    assert "NON-MONOTONE" not in text
+    assert "WRONG-SIGNED" not in text
+
+
+def test_a_ladder_that_resolves_below_a_null_rung_is_flagged_as_non_monotone():
+    """The rungs are in strictly increasing order of perturbation, so a lower
+    rung resolving while a higher one is null is not a ladder reading at all.
+    It must be flagged rather than folded into either finding -- and M4 is
+    still not blocked, because something did respond with the right sign.
+    Nothing is below the response, so the "insensitive to" clause must be
+    ABSENT: a verdict that is simultaneously NON-MONOTONE and "insensitive
+    to the counts" is two findings that contradict each other."""
+    rungs = {
+        "shuffled": _rung([5.0] * 4, [0.2] * 4, mean=5.0, se=0.10),
+        "resampled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.20),
+        "constant": _rung([0.0] * 4, [0.2] * 4, mean=0.02, se=0.30),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    assert "NON-MONOTONE" in text
+    assert "resampled, constant" in text, "the null rungs above the response were not named"
+    assert "action-conditioned but insensitive" not in text, text
+    assert "M4 is NOT blocked" in text and "M4 is BLOCKED" not in text
+
+
+def test_a_sandwich_ladder_names_only_the_middle_rung_as_non_monotone():
+    """Responds at shuffled and constant, null at resampled -- a pattern one
+    seed can easily produce. The lowest response is the SHUFFLED rung, so
+    nothing sits below it and the middle rung sits above it: NON-MONOTONE
+    names `resampled` alone and no "insensitive to" clause is printed. A
+    decision that took the HIGHEST response as its reference would file
+    `resampled` below it and print "action-conditioned but insensitive to
+    the counts" -- the exact smoothing the ladder forbids."""
+    rungs = {
+        "shuffled": _rung([5.0] * 4, [0.2] * 4, mean=5.0, se=0.10),
+        "resampled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.20),
+        "constant": _rung([9.0] * 4, [0.2] * 4, mean=9.0, se=0.30),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    verdict = text.splitlines()[-1]
+    assert "NON-MONOTONE: resampled perturb" in verdict, verdict
+    assert "action-conditioned but insensitive" not in verdict, verdict
+    assert "at rung(s) shuffled, constant" in verdict and "not at resampled" in verdict
+    assert "M4 is NOT blocked" in verdict and "M4 is BLOCKED" not in verdict
+
+
+def test_a_wrong_signed_response_unblocks_nothing_and_is_named_as_such():
+    """The sign is read. A response whose intervened sequence imagined a
+    SMALLER error than the real one is not conditioning an actor can use --
+    measured, the single-held-action rung was negative in 9 of 9 cells and
+    the one cell that cleared 2 SE did so at -10.6 -- so it neither blocks
+    nor unblocks M4, and the verdict says so where the sign is. A positive
+    response at the same magnitude does unblock, in the same test, so the
+    assertion is about the sign and not the magnitude."""
+    wrong = _verdict(_ladder_cell({
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "constant": _rung([-9.0] * 4, [0.2] * 4, mean=-9.0, se=0.30),
+    }))
+    assert "WRONG-SIGNED" in wrong and "constant" in wrong
+    assert "not conditioning an actor can use" in wrong
+    assert "neither blocked nor unblocked" in wrong
+    assert "M4 is NOT blocked" not in wrong and "M4 is BLOCKED" not in wrong
+    assert "sign on position - (BETTER under the intervention)" in _line(wrong, "constant")
+
+    right = _verdict(_ladder_cell({
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "constant": _rung([9.0] * 4, [0.2] * 4, mean=9.0, se=0.30),
+    }))
+    assert "M4 is NOT blocked" in right and "WRONG-SIGNED" not in right
+    assert "has the sign conditioning predicts" in right
+    assert "sign on position + (worse under the intervention)" in _line(right, "constant")
+
+
+def test_a_response_on_the_angle_channel_alone_is_a_response():
+    """38% of the actions turn rather than move, and the angle probe is the
+    one channel any shipped model beats persistence on -- a prior whose
+    action pathway drives heading passes every position-only rung. So the
+    verdict reads both channels: a rung null on position and clear on angle
+    responds, the line names the channel, and the record and table carry the
+    angle statistic under its own name."""
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "constant": _rung(
+            [0.0] * 4, [0.2] * 4, mean=0.02, se=0.30,
+            angle=_channel([6.3] * 4, [1.0] * 4, mean=6.3, se=0.5),
+        ),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    assert "RESPONDS TO THE ACTION at rung(s) constant" in text
+    line = _line(text, "constant")
+    assert "on angle" in line and "angle +6.300 deg" in line, line
+    assert "sign on angle +" in line
+    assert "M4 is NOT blocked" in text
+
+
+def test_family_threshold_is_bonferroni_over_the_whole_run():
+    """z for two-sided 5% over the family: 1.96 at one comparison, 3.31 at
+    the shipped run's 54 (3 rungs x 9 cells x 2 channels), monotone in the
+    family, and refused at zero."""
+    assert script.family_threshold(1) == pytest.approx(1.95996, abs=1e-4)
+    assert script.family_threshold(54) == pytest.approx(3.3121, abs=1e-3)
+    assert script.family_threshold(27) < script.family_threshold(54)
+    with pytest.raises(ValueError):
+        script.family_threshold(0)
+
+
+def test_an_excursion_inside_the_family_wise_threshold_is_inconclusive_not_a_response():
+    """One rejection at 2 SE in a family of 54 is what 1.35 expected false
+    positives look like -- measured, that is exactly the frozen_ssl/1
+    "RESPONDS at constant" (p = 0.007, Holm rejects nothing) the uncorrected
+    verdict turned into "M4 NOT blocked". So a rung with z=2.5 responds at a
+    family of one and is NOMINAL at a family of 54: the verdict then reads
+    INCONCLUSIVE, blocks nothing, unblocks nothing and makes no equivalence
+    claim. The threshold and the family size are printed beside it."""
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "resampled": _rung([0.0] * 4, [0.2] * 4, mean=0.02, se=0.20),
+        "constant": _rung([2.5] * 4, [0.2] * 4, mean=2.5, se=1.0),
+    }
+    alone = _verdict(_ladder_cell(rungs), family=1)
+    assert "RESPONDS TO THE ACTION" in alone and "M4 is NOT blocked" in alone
+
+    corrected = _verdict(_ladder_cell(rungs), family=54)
+    assert "INCONCLUSIVE" in corrected, corrected
+    assert "M4 is BLOCKED" not in corrected and "M4 is NOT blocked" not in corrected
+    assert "RESPONDS TO THE ACTION" not in corrected
+    assert "bounds those perturbations" not in corrected, "an equivalence bound was claimed"
+    assert "z=3.31 for 54 comparisons" in corrected
+    assert "2.70 such excursions are expected" in corrected
+    line = _line(corrected, "constant")
+    assert "outside the +-2 SE band on position but inside the family-wise" in line
+    assert "z=2.50" in line
+
+
+def test_a_nominal_excursion_below_a_family_wise_response_is_named_but_not_a_response():
+    """With a response above it, a nominal excursion is neither a null nor a
+    second response: it is named as nominal, it counts as "did not respond"
+    for the ladder's shape, and the "insensitive to" clause still covers it.
+    """
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "resampled": _rung([2.5] * 4, [0.2] * 4, mean=2.5, se=1.0),
+        "constant": _rung([9.0] * 4, [0.2] * 4, mean=9.0, se=0.30),
+    }
+    text = _verdict(_ladder_cell(rungs), family=54)
+    verdict = text.splitlines()[-1]
+    assert "at rung(s) constant" in verdict and "not at shuffled, resampled" in verdict
+    assert "nominal excursion only at resampled" in verdict, verdict
+    assert "insensitive to " + LADDER_PERTURBS["shuffled"] in verdict
+    assert LADDER_PERTURBS["resampled"] in verdict
+    assert "M4 is NOT blocked" in verdict
+
+
+def test_an_uninterpretable_rung_is_named_and_excluded_from_the_ladder_decision():
+    """A rung that changed no window -- or one, so its spread is undefined --
+    says nothing about the dynamics, so it is neither a null nor a response.
+    It is reported as UNINTERPRETABLE with its count, and the decision is
+    taken over the rungs that did intervene. Both routes to uninterpretable
+    are in one ladder so neither can pass by the other's guard."""
+    rungs = {
+        "shuffled": _rung([np.nan] * 4, [np.nan] * 4, changed=0, total=7),
+        "resampled": _rung([1.0] * 4, [np.inf] * 4, changed=1, total=7,
+                           mean=float("nan"), se=float("inf"),
+                           angle=_channel([np.nan] * 4, [np.inf] * 4, mean=float("nan"),
+                                          se=float("inf"))),
+        "constant": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10, changed=7, total=7),
+    }
+    text = _verdict(_ladder_cell(rungs))
+    shuffled, resampled = _line(text, "shuffled"), _line(text, "resampled")
+    assert "UNINTERPRETABLE" in shuffled and "0/7" in shuffled, shuffled
+    assert "UNINTERPRETABLE" in resampled and "1/7" in resampled, resampled
+    assert "nan" not in text.lower(), text
+    assert "M4 is BLOCKED" in text
+    # And the rung the decision rests on is the ONLY one the sentence names.
+    verdict = text.splitlines()[-1]
+    assert "constant" in verdict and "shuffled" not in verdict and "resampled" not in verdict, verdict
+
+
+def test_a_ladder_with_no_interpretable_rung_gets_no_verdict_at_all():
+    rungs = {
+        "shuffled": _rung([np.nan] * 3, [np.nan] * 3, changed=0, total=7),
+        "constant": _rung([np.nan] * 3, [np.nan] * 3, changed=0, total=7),
+    }
+    text = _verdict(_ladder_cell(rungs), seed=1)
+    assert "UNINTERPRETABLE" in text
+    assert "M4" not in text
+    assert "No verdict" in text
+
+
+def test_the_equivalence_bound_is_quoted_at_the_widest_null_band():
+    """Accepting the null over a ladder needs ONE bound, and the honest one is
+    the widest band among the rungs the null rests on: an effect smaller than
+    the widest band could have hidden at that rung. Quoting the narrowest
+    would claim the tightest rung's precision for the whole ladder."""
+    rungs = {
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+        "constant": _rung([0.0] * 4, [0.2] * 4, mean=0.02, se=1.00),
+    }
+    text = _verdict(_ladder_cell(rungs, floor=1.0, persistence=21.0))
+    # 2*se = 2.0 against a range of 20.0 -> 10.0%, not the shuffled rung's 1.0%.
+    assert "10.0%" in text, text
+    assert "1.0%" not in text, "the narrowest rung's band was quoted for the ladder"
+
+
+def test_the_verdict_line_prints_the_steps_moved_and_the_windows_changed_by_value():
+    """The reader-facing half of "a no-op cannot be mistaken for a null": the
+    line carries how many windows changed AND how many steps moved per window
+    with the minimum, and the multiset distance. The counts are chosen so no
+    two of them, nor the step count, nor the integer part of the mean,
+    coincide -- 3 of 7 windows, 1.5 of 4 steps, minimum 0, multiset 0.75 --
+    so a clause that printed one under another's name cannot pass."""
+    text = _verdict(_ladder_cell({
+        "shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10, changed=3, total=7,
+                          steps_changed_mean=1.5, steps_changed_min=0, multiset=0.75),
+        "constant": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10),
+    }))
+    line = _line(text, "shuffled")
+    assert "3/7 windows changed" in line, line
+    assert "1.5/4 steps moved per window (min 0)" in line, line
+    assert "multiset distance 0.8/4" in line, line
+
+
+def test_a_single_step_outside_its_band_is_not_by_itself_a_verdict():
     """The 45-comparison error, pinned. A cell whose aggregate sits inside two
     standard errors must still read as BLOCKED even when several individual
     steps exceed their own per-step bands -- which is what chance produces at
     this horizon."""
-    text = script.verdict_block(
-        "cnn", 1, _cell([0.0] * 45, [0.2] * 45, mean=0.01, se=0.2, outside=4)
-    )
+    cell = _null_ladder()
+    cell["rungs"]["shuffled"] = _rung([0.0] * 45, [0.2] * 45, mean=0.01, se=0.2, outside=4)
+    text = _verdict(cell, seed=1)
     assert "M4 is BLOCKED" in text
     assert "4/45" in text
 
@@ -696,8 +1369,28 @@ def test_the_aggregate_delta_is_a_paired_window_level_statistic():
     assert summary["se"] != pytest.approx(
         deltas.mean(axis=0).std(ddof=1) / np.sqrt(H)
     ), "the horizon axis was averaged first; the spread is over WINDOWS"
-    assert summary["steps"] == H
     assert summary["expected_outside"] == pytest.approx(0.05 * H)
+
+
+def test_the_angle_summary_is_the_same_statistic_over_the_angle_deltas():
+    """The angle channel is `delta_summary` with the other array, and the
+    fixture gives the two channels deltas that are not a scalar multiple of
+    each other -- so a summary that read the position rows under the angle
+    name lands on the wrong mean AND the wrong spread."""
+    reference = _rollout([1.0] * H)
+    position = np.array([[1.0, 1.0, 1.0], [3.0, 3.0, 3.0]])
+    angle = np.array([[0.0, 6.0, 0.0], [0.0, 0.0, 12.0]])
+    result = _shuffle(reference, [2.0] * H, [True, True], deltas=position)
+    result.window_angle_delta = angle
+
+    got = script.delta_summary(result, "angle")
+    per_window = angle.mean(axis=1)
+    assert got["mean"] == pytest.approx(per_window.mean()) == pytest.approx(3.0)
+    assert got["se"] == pytest.approx(per_window.std(ddof=1) / np.sqrt(2))
+    assert got["mean"] != pytest.approx(script.delta_summary(result, "position")["mean"])
+    np.testing.assert_allclose(got["delta"], angle.mean(axis=0))
+    with pytest.raises(KeyError, match="channel"):
+        script.delta_summary(result, "heading")
 
 
 def test_the_aggregate_delta_skips_the_windows_the_permutation_left_alone():
@@ -715,9 +1408,7 @@ def test_a_cell_with_no_changed_windows_gets_no_verdict_at_all():
     """An all-NaN delta must not fall through to "no difference". A permutation
     of an already-uniform action sequence is a no-op, and nothing about the
     dynamics follows from it."""
-    text = script.verdict_block(
-        "cnn", 1, _cell([np.nan] * 3, [np.nan] * 3, changed=0, total=7)
-    )
+    text = _verdict(_cell([np.nan] * 3, [np.nan] * 3, changed=0, total=7), seed=1)
     assert "UNINTERPRETABLE" in text
     assert "0/7" in text
     assert "M4" not in text
@@ -742,12 +1433,13 @@ def test_each_self_check_lands_in_its_own_column():
     passes. The block is the one the module docstring says invalidates
     everything below it, and its three statuses are deliberately distinct
     because they call for different actions: reporting a stream divergence as a
-    protocol divergence sends the reader to the wrong code.
+    protocol divergence sends the reader to the wrong code. The probe's
+    selection R^2 is the last column, and it is the study record's own number.
     """
     cells = {("cnn", 0): _cell([1.0], [0.5], open_loop=1e-1, record=2e-2, stream=3e-3)}
     header, row = script.selfcheck_table(cells, ["cnn"], [0], 1).splitlines()
     assert header.split() == [
-        "arm", "seed", "open_loop_k", "record_repro", "stream_drift", "k1_is_floor"
+        "arm", "seed", "open_loop_k", "record_repro", "stream_drift", "k1_is_floor", "probe_r2",
     ], header
     # Sliced by the header's own column offsets, so the assertion is about
     # WHERE each number is printed and not merely that it appears somewhere.
@@ -758,6 +1450,7 @@ def test_each_self_check_lands_in_its_own_column():
     assert columns["open_loop_k"] == "1.000e-01", columns
     assert columns["record_repro"] == "2.000e-02", columns
     assert columns["stream_drift"] == "3.000e-03", columns
+    assert row.split()[-1] == f"{PROBE_R2:.3f}", row
 
 
 def test_the_self_check_column_names_the_k_the_alarm_was_computed_at():
@@ -788,11 +1481,12 @@ def test_the_verdict_is_refused_when_the_spread_cannot_be_estimated():
 
     So the gate is on the STATISTIC being defined, not on the count.
     """
-    text = script.verdict_block(
-        "cnn", 1,
-        _cell([1.0, 2.0, 3.0], [np.inf] * 3, changed=1, total=229,
-              mean=float("nan"), se=float("inf")),
+    cell = _cell([1.0, 2.0, 3.0], [np.inf] * 3, changed=1, total=229,
+                 mean=float("nan"), se=float("inf"))
+    cell["rungs"]["shuffled"]["angle"] = _channel(
+        [np.nan] * 3, [np.inf] * 3, mean=float("nan"), se=float("inf")
     )
+    text = _verdict(cell, seed=1)
     assert "UNINTERPRETABLE" in text
     assert "1/229" in text
     assert "M4" not in text, text
@@ -805,32 +1499,60 @@ def test_the_verdict_scales_the_effect_against_the_actionable_band():
 
     Measured across the nine shipped cells the band the verdict is read against
     spans 0.014 to 3.45 map units, i.e. 1.6% to 8.4% of the persistence-to-floor
-    band on the feature arms. "The prior is not using the action" is the same
-    words for all of them; "no action effect larger than X% of the actionable
-    range is detectable" is not.
+    band on the feature arms. "The prior does not use the action" is the same
+    words for all of them; "no effect of these perturbations larger than X% of
+    the actionable range is detectable" is not.
     """
-    text = script.verdict_block(
-        "cnn", 0,
-        _cell([0.0] * 4, [0.2] * 4, mean=0.05, se=0.5, floor=1.0, persistence=21.0),
-    )
+    text = _verdict(_null_ladder(floor=1.0, persistence=21.0))
     assert "M4 is BLOCKED" in text
-    # 2*se = 1.0 against a band of 20.0 -> 5.0%.
-    assert "5.0%" in text, text
+    # The widest null band is the constant rung's 2*0.3 = 0.6 against 20.0 -> 3.0%.
+    assert "3.0%" in text, text
     assert "20.000" in text, "the band the effect was scaled against was not named"
-
-
-def test_a_non_positive_band_is_said_to_have_no_scale_rather_than_scaled_anyway():
-    """On every `cnn` cell the floor EXCEEDS persistence at the final horizon
-    step, so the "actionable range" is negative and a percentage of it is
-    meaningless -- and would print as a negative or absurd percent beside a
-    confident verdict. Named as absent instead."""
-    text = script.verdict_block(
-        "cnn", 0,
-        _cell([0.0] * 4, [0.2] * 4, mean=0.05, se=0.5, floor=9.0, persistence=8.91),
+    assert "an effect of " + LADDER_PERTURBS["shuffled"] in text, (
+        "the bound does not name the perturbations it bounds"
     )
-    assert "M4 is BLOCKED" in text
-    assert "no actionable range" in text, text
-    assert "%" not in text, "a percentage was printed against a non-positive band"
+
+
+@pytest.mark.parametrize(
+    "floor,persistence,reason",
+    [
+        (9.0, 8.91, "the floor sits above persistence, so the range is negative"),
+        (1.0, 1.5, "the range is 0.5 and the widest null band is 0.6: over 100%"),
+    ],
+)
+def test_a_null_through_a_probe_that_cannot_register_an_effect_is_unmeasurable(
+    floor, persistence, reason
+):
+    """On every `cnn` cell the floor EXCEEDS persistence at the final horizon
+    step: the position probe is a constant predictor (selection R^2 -0.036)
+    and no action effect of any size can register through it -- the FWD/NOOP
+    contrast reads +0.6 there with the right sign and nothing to scale it. A
+    null through such a probe used to print "NOT USING THE ACTION ... M4 is
+    BLOCKED" beside a note that there was no range to scale it against. It
+    must read UNMEASURABLE THROUGH THIS PROBE, quote the probe's R^2, and
+    contain neither headline. The second case is the same defect at a
+    positive range the widest band exceeds."""
+    text = _verdict(_null_ladder(floor=floor, persistence=persistence, probe_r2=-0.036))
+    assert "UNMEASURABLE THROUGH THIS PROBE" in text, (reason, text)
+    assert "M4 is BLOCKED" not in text and "NOT blocked" not in text, reason
+    assert "NOT USING" not in text and "DOES NOT MEASURABLY USE" not in text, reason
+    assert "%" not in text, "a percentage was printed against a range the band exceeds"
+    assert "-0.036" in text, "the probe's own R^2 was not quoted"
+    assert "licenses no claim about M4" in text
+
+
+def test_a_response_is_still_reported_through_an_unmeasurable_probe():
+    """The probe gate is on the NULL headline only. A response that reached
+    the ladder despite a degenerate position probe -- on the angle channel,
+    say -- is a response, and must not be swallowed by the probe caveat."""
+    cell = _null_ladder(floor=9.0, persistence=8.91)
+    cell["rungs"]["constant"] = _rung(
+        [0.0] * 4, [0.2] * 4, mean=0.02, se=0.30,
+        angle=_channel([6.3] * 4, [1.0] * 4, mean=6.3, se=0.5),
+    )
+    text = _verdict(cell)
+    assert "RESPONDS TO THE ACTION at rung(s) constant" in text
+    assert "UNMEASURABLE" not in text
 
 
 def test_the_verdict_carries_a_qualifier_when_the_shipped_record_did_not_reproduce():
@@ -842,9 +1564,9 @@ def test_the_verdict_carries_a_qualifier_when_the_shipped_record_did_not_reprodu
     number the verdict interprets is not stable across devices at the precision
     it is being interpreted at. So the verdict says so where it is read.
     """
-    text = script.verdict_block("cnn", 0, _cell([0.0] * 4, [0.2] * 4, record=12.4))
+    text = _verdict(_cell([0.0] * 4, [0.2] * 4, record=12.4))
     assert "1.240e+01" in text, text
-    clean = script.verdict_block("cnn", 0, _cell([0.0] * 4, [0.2] * 4, record=0.0))
+    clean = _verdict(_cell([0.0] * 4, [0.2] * 4, record=0.0))
     assert "1.240e+01" not in clean and "does not reproduce" not in clean
 
 
@@ -870,14 +1592,20 @@ def test_the_aggregate_delta_is_clustered_by_the_episode_each_window_came_from()
         _shuffle(reference, [2.0] * H, [True] * 4, deltas=deltas)
     )
     assert clustered["mean"] == pytest.approx(20.0)
-    assert clustered["episodes"] == 2
-    assert naive["episodes"] == 0, "unknown clustering must not be reported as any"
     assert clustered["se_independent"] == pytest.approx(naive["se"])
     # Two clusters of two identical values: every within-cluster residual is
     # +-20, so the clustered SE is exactly 20 while the naive one is 11.55.
     assert clustered["se"] == pytest.approx(20.0)
     assert clustered["se"] > clustered["se_independent"], (
         "the clustered ruler collapsed onto the independent one"
+    )
+    # The cluster count is the rung's, beside its other counts.
+    with_labels = script.rung_block(
+        _shuffle(reference, [2.0] * H, [True] * 4, deltas=deltas, episodes=[0, 0, 1, 1])
+    )
+    assert with_labels["episodes"] == 2
+    assert script.rung_block(_shuffle(reference, [2.0] * H, [True] * 4, deltas=deltas))["episodes"] == 0, (
+        "unknown clustering must not be reported as any"
     )
 
 
@@ -895,6 +1623,79 @@ def test_the_bands_spread_is_the_sample_standard_deviation():
         script.delta_band(result),
         2.0 * rows.std(axis=0, ddof=1) / np.sqrt(2),
     )
+
+
+def test_the_rung_block_of_a_contrast_carries_every_held_action_and_the_pair():
+    """`rung_block` is what both the record and the tables read, so the
+    contrast's block must carry the pair and one full block per held action
+    -- each with its OWN counts and channels, not the contrast's. The held
+    arms are given distinct step counts so a block that copied the contrast's
+    count into every held action is caught by value."""
+    reference = _rollout([1.0] * H)
+    held = {
+        3: _arm("constant", reference, [4.0] * H, [True, True], steps_changed=[3, 2]),
+        0: _arm("constant", reference, [2.0] * H, [True, True], steps_changed=[1, 3]),
+    }
+    block = script.rung_block(_contrast(reference, held))
+    assert block["contrast"] == (3, 0)
+    assert set(block["held"]) == {3, 0}
+    assert block["position"]["mean"] == pytest.approx(2.0)      # (4 - 1) - (2 - 1)
+    assert block["held"][3]["position"]["mean"] == pytest.approx(3.0)
+    assert block["held"][0]["position"]["mean"] == pytest.approx(1.0)
+    assert block["steps_changed_mean"] == pytest.approx(3.0)     # every step
+    assert block["held"][3]["steps_changed_mean"] == pytest.approx(2.5)
+    assert block["held"][0]["steps_changed_min"] == 1
+    assert "held" not in block["held"][3], "a held block carries no held blocks of its own"
+
+
+def test_the_cross_cell_table_counts_excursions_and_prints_every_cells_sign():
+    """The pattern a per-cell verdict cannot see. Three cells, one rung: the
+    position deltas are +0.01 (null), +2.5 at se 1 (outside 2 SE, inside the
+    family-wise threshold) and -9 at se 0.3 (clears it), so the row reads 3
+    cells, 2 outside, 1 clear, signs `++-` in cell order -- and the header
+    carries the family, its threshold and the chance expectation. The
+    angle row is asserted separately with its own numbers, so a table that
+    read the position channel for both is caught: two of its cells are the
+    fixture's EXACT-zero angle null, which prints as `0` -- the sign an
+    action-blind prior produces bitwise, and neither + nor -."""
+    cells = {
+        ("cnn", 0): _ladder_cell({"shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10)}),
+        ("cnn", 1): _ladder_cell({"shuffled": _rung(
+            [2.5] * 4, [0.2] * 4, mean=2.5, se=1.0,
+            angle=_channel([-0.5] * 4, [0.2] * 4, mean=-0.5, se=0.1),
+        )}),
+        ("cnn", 2): _ladder_cell({"shuffled": _rung([-9.0] * 4, [0.2] * 4, mean=-9.0, se=0.3)}),
+    }
+    text = script.cross_cell_table(cells, ["cnn"], [0, 1, 2], ("shuffled",), family=54)
+    header, columns, position, angle = text.splitlines()
+    assert "family: 54 comparisons (1 rungs x 3 cells x 2 channels)" in header
+    assert "z=3.31" in header and "0.15 excursions" in header, header
+    # The last column is the exact two-sided sign test over the cells whose
+    # sign is defined: `++-` is 2 of 3, p = 1.0; the angle row has one
+    # signed cell, p = 1.0 as well -- the unanimous case is pinned below.
+    assert position.split() == ["shuffled", "position", "3", "2", "1", "++-", "1.000"], position
+    assert angle.split() == ["shuffled", "angle", "3", "1", "1", "0-0", "1.000"], angle
+
+
+def test_the_cross_cell_sign_test_is_the_exact_binomial_over_the_signed_cells():
+    """Nine cells all positive is a pattern no per-cell z can see -- measured,
+    the constant rung's contrast is positive in 9 of 9 -- and its exact
+    two-sided sign-test probability under a symmetric null is 2 * 0.5^9 =
+    0.0039. Pinned by value against the closed form, with the caveat the
+    header carries: the cells share windows, so this is a pattern statistic
+    and not an independent replication."""
+    assert script.sign_test_p(9, 9) == pytest.approx(2 * 0.5**9)
+    assert script.sign_test_p(5, 9) == pytest.approx(1.0)
+    assert script.sign_test_p(8, 9) == pytest.approx(2 * (1 + 9) * 0.5**9)
+    assert script.sign_test_p(0, 0) == pytest.approx(1.0)
+    cells = {
+        ("cnn", seed): _ladder_cell({"constant": _rung([1.0] * 4, [0.2] * 4, mean=1.0, se=1.0)})
+        for seed in (0, 1, 2)
+    }
+    text = script.cross_cell_table(cells, ["cnn"], [0, 1, 2], ("constant",), family=6)
+    header, columns, position, angle = text.splitlines()
+    assert "share windows" in header, header
+    assert position.split() == ["constant", "position", "3", "0", "0", "+++", "0.250"], position
 
 
 def test_the_sweep_ruler_table_prints_the_paired_bar_for_each_adjacent_pair():
@@ -963,9 +1764,9 @@ def test_the_floor_alarm_is_computed_at_the_smallest_k_and_reaches_the_record(
 
     Two failures were possible at once and neither was covered: `min(args.ks)`
     could be `max(args.ks)` -- at k == horizon the curve IS the open loop,
-    which can never be the floor, so the alarm would read False forever and the
-    check would be silently off in the table AND in all nine records -- and the
-    True path was never rendered anywhere, because every stub produced False.
+    which can never be the floor, so the alarm would read False forever and
+    the check would be silently off in the table AND in all nine records -- and
+    the True path was never rendered anywhere, because every stub produced False.
 
     The stub collapses the SMALLEST k onto the floor and leaves the largest
     alone, so `min` and `max` are separated by the value that comes back.
@@ -974,7 +1775,7 @@ def test_the_floor_alarm_is_computed_at_the_smallest_k_and_reaches_the_record(
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
     out = capsys.readouterr().out
     row = out[out.index("self-checks") :].splitlines()[2]
-    assert row.split()[-1] == "True", row
+    assert row.split()[-2] == "True", row
     written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
     assert written["self_checks"]["smallest_k_is_bitwise_the_floor"] is True
     assert written["self_checks"]["smallest_k"] == 1
@@ -999,14 +1800,149 @@ def test_the_written_record_carries_its_self_checks_and_a_curve_for_every_k(
         "smallest_k": 1,
         "smallest_k_is_bitwise_the_floor": False,
     }
-    expected = {"reference_position", "shuffled_position", "floor_position",
-                "persistence_position", "k1_position", "k3_position"}
+    # The probe the ladder was read through, from the study record.
+    assert written["probe"] == {"embedding_selection_r2": PROBE_R2}
+    expected = {"reference_position", "shuffled_position", "resampled_position",
+                "constant_held3_position", "constant_held0_position", "constant_held1_position",
+                "floor_position", "persistence_position", "k1_position", "k3_position"}
     assert set(written["curves"]) == expected, written["curves"].keys()
     assert all(len(curve) == H for curve in written["curves"].values())
     # Distinct per k, so an assembly that reported one k's curve under every k's
     # name is caught here as well as in the table.
     assert written["curves"]["k1_position"] != written["curves"]["k3_position"]
     assert written["curves"]["k3_position"] == written["curves"]["reference_position"]
+    # And distinct per ARM: the stub offsets each rung's and each held action's
+    # curve by its own amount, so one curve written under every name is caught.
+    names = ("shuffled", "resampled", "constant_held3", "constant_held0", "constant_held1")
+    arm_curves = [tuple(written["curves"][f"{name}_position"]) for name in names]
+    assert len(set(arm_curves)) == len(names), arm_curves
+    assert written["curves"]["shuffled_position"] == [TRAINED_SIGNATURE + 4.0] * H
+    assert written["curves"]["constant_held3_position"] == [TRAINED_SIGNATURE + 6.0] * H
+    assert written["curves"]["constant_held0_position"] == [TRAINED_SIGNATURE + 1.5] * H
+
+
+def test_the_written_record_carries_every_rung_with_its_own_counts_and_the_choices_made(
+    monkeypatch, tmp_path
+):
+    """The record is what a later reader diffs the nine shipped cells against,
+    so every rung is in it under its own name with its OWN counts and delta,
+    in the ladder's order -- and the CHOICES the numbers cannot be recovered
+    from are recorded beside them: the seed every rung was derived from, the
+    actions the constant rung held and the pair it contrasted, and the family
+    the verdict was corrected over.
+
+    The rungs are given deltas AND changed masks AND step counts that
+    disagree, so a record that wrote one rung's block -- or one rung's counts
+    -- under three names is caught by the values, not the keys. The shuffled
+    rung changes two windows of three; the other two change all three.
+    """
+    _stub(
+        monkeypatch, tmp_path,
+        changed=(True, True, True),
+        rung_deltas={
+            "shuffled": np.array([[1.0] * H] * 3),
+            "resampled": np.array([[2.0] * H] * 3),
+            "constant": np.array([[3.0] * H] * 3),
+        },
+        rung_changed={"shuffled": (True, True, False)},
+        rung_steps={"shuffled": (2, 1, 0), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
+    )
+    assert script.main(_argv(tmp_path) + ["--intervention-seed", "5"]) == script.EXIT_OK
+    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+
+    assert written["ladder"]["rungs"] == list(LADDER)
+    assert written["ladder"]["intervention_seed"] == 5
+    assert written["ladder"]["held_actions"] == sorted(STUB_HELD)
+    assert written["ladder"]["contrast"] == [3, 0]
+    assert written["ladder"]["action_marginal"] == {"values": [1, 2, 4], "counts": [7, 2, 1]}
+    # One cell, three rungs, two channels.
+    assert written["ladder"]["family"] == 6
+    assert written["ladder"]["family_threshold_z"] == pytest.approx(script.family_threshold(6))
+    assert written["windows"] == {"total": 3}
+    assert list(written["interventions"]) == list(LADDER)
+    expected_counts = {
+        "shuffled": (2, 1.0, 0), "resampled": (3, 2.0, 1), "constant": (3, 3.0, 3),
+    }
+    for index, name in enumerate(LADDER):
+        block = written["interventions"][name]
+        assert block["position"]["delta_mean"] == pytest.approx(index + 1.0), name
+        assert block["position"]["delta"] == [index + 1.0] * H, name
+        assert block["angle"]["delta_mean"] == pytest.approx((index + 1.0) / 10.0), name
+        changed, mean, minimum = expected_counts[name]
+        assert block["windows_changed"] == changed, name
+        assert block["steps_changed_mean"] == pytest.approx(mean), name
+        assert block["steps_changed_min"] == minimum, name
+        assert block["episodes_changed"] == 0, name
+        assert "delta_se" in block["position"] and "band" in block["angle"], name
+    # The contrast's held actions, each with its OWN block, under the pair.
+    constant = written["interventions"]["constant"]
+    assert constant["contrast"] == [3, 0]
+    assert set(constant["held"]) == {str(a) for a in STUB_HELD}
+    assert constant["held"]["3"]["position"]["delta_mean"] == pytest.approx(6.0)
+    assert constant["held"]["0"]["position"]["delta_mean"] == pytest.approx(1.5)
+    assert constant["held"]["3"]["steps_changed_mean"] == pytest.approx(3.0)
+    # No `shuffle` block under the old name: a record carrying the shuffled
+    # rung twice invites a reader to diff the wrong copy.
+    assert "shuffle" not in written and "permutation_seed" not in written
+
+
+def test_the_family_the_verdict_is_corrected_over_is_the_whole_planned_run(
+    monkeypatch, tmp_path, capsys
+):
+    """rungs x cells x channels, counted over the cells that WILL run, and
+    printed. Two cells, two rungs, two channels: 8. A family of one -- the
+    uncorrected verdict -- would print z=1.96; a family counted per cell would
+    print 4."""
+    _stub(monkeypatch, tmp_path, cells=(("cnn", 0), ("cnn", 1)))
+    assert script.main(_argv(tmp_path) + ["--rungs", "shuffled", "constant"]) == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert "family: 8 comparisons (2 rungs x 2 cells x 2 channels)" in out, out
+    assert f"z={script.family_threshold(8):.2f}" in out
+    assert "z=1.96" not in out and "for 4 comparisons" not in out
+    for seed in (0, 1):
+        written = load_record(script.diagnostic_record_path(tmp_path, "cnn", seed))
+        assert written["ladder"]["family"] == 8
+
+
+def test_the_contrast_flag_reaches_the_ladder_and_a_self_contrast_is_a_usage_error(
+    monkeypatch, tmp_path, capsys
+):
+    """The pair the top rung is decided on is a CHOICE and the CLI carries
+    it; the default is the pre-registered `CONTRAST`. A contrast of an action
+    with itself is refused as a bad flag (argparse's 2) rather than as the
+    library's ValueError twenty seconds into the probe refit."""
+    state = _stub(monkeypatch, tmp_path)
+    script.main(_argv(tmp_path))
+    ladders = [kwargs for kind, kwargs, _ in state["diagnostics"] if kind == "ladder"]
+    assert ladders and ladders[0]["contrast"] == script.CONTRAST == (3, 0)
+
+    state = _stub(monkeypatch, tmp_path)
+    script.main(_argv(tmp_path) + ["--contrast", "1", "2"])
+    ladders = [kwargs for kind, kwargs, _ in state["diagnostics"] if kind == "ladder"]
+    assert ladders and ladders[0]["contrast"] == (1, 2)
+
+    with pytest.raises(SystemExit) as exit_info:
+        script.parse_args(["--contrast", "4", "4"])
+    assert exit_info.value.code == 2
+    assert "same held action twice" in capsys.readouterr().err
+
+
+def test_the_report_prints_the_held_table_and_the_cross_cell_block(
+    monkeypatch, tmp_path, capsys
+):
+    """Both new blocks are assembled from a real `main` run: the held table
+    carries the stub's held MOVE_FORWARD (+6) and NOOP (+1.5) rows by name,
+    and the cross-cell block follows the verdicts."""
+    _stub(monkeypatch, tmp_path)
+    assert script.main(_argv(tmp_path)) == script.EXIT_OK
+    out = capsys.readouterr().out
+    held = out[out.index("held actions of the constant rung") :].splitlines()
+    forward = next(line for line in held if "MOVE_FORWARD" in line)
+    noop = next(line for line in held if "NOOP" in line)
+    assert "+6.000" in forward and "+1.500" in noop, (forward, noop)
+    assert out.index("--- verdicts ---") < out.index("across cells, per rung and channel")
+    block = out[out.index("across cells, per rung and channel") :]
+    assert "constant   position" in block and "constant   angle" in block
 
 
 def test_the_paired_bars_in_the_report_come_from_the_paired_statistic(
@@ -1052,10 +1988,10 @@ def test_a_horizon_too_large_for_the_data_is_not_reported_as_a_mislabelled_check
     """The catch was far broader than the condition it named.
 
     `diagnose_cell` calls `fit_probes`, `evaluate_rollout`, `regrounding_sweep`
-    and `action_shuffled_rollout`, and ValueError is raised from at least eight
-    places under them -- the no-window guards in both `evaluate_rollout` and
-    `_diagnose`, and probe.py's context/horizon/empty-path/zero-variance
-    checks. Every one of them printed "MISLABELLED CHECKPOINT" and exited
+    and `action_intervention_ladder`, and ValueError is raised from at least
+    nine places under them -- the no-window guards in `evaluate_rollout`,
+    `_diagnose` and the ladder's marginal pre-pass, and probe.py's
+    context/horizon/empty-path/zero-variance checks. Every one of them printed "MISLABELLED CHECKPOINT" and exited
     EXIT_MISLABELLED_CHECKPOINT, sending the reader to look at checkpoint
     labels for what is a flag or a data problem. Reachable today with
     `--horizon 500` against the shipped 525-transition episodes.
@@ -1092,7 +2028,7 @@ def test_an_unsupported_device_is_a_named_refusal_before_any_work_is_done(
     assert state["fit_probes"] == [], "the probe was refit for a run that cannot run"
 
 
-def test_the_shuffle_section_names_the_statistic_it_actually_prints(
+def test_the_ladder_section_names_the_statistic_it_actually_prints(
     monkeypatch, tmp_path, capsys
 ):
     """The section was headed "final horizon step" while the number under it
@@ -1109,12 +2045,12 @@ def test_the_shuffle_section_names_the_statistic_it_actually_prints(
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
     out = capsys.readouterr().out
     heading = next(
-        line for line in out.splitlines() if "action-shuffled imagination" in line
+        line for line in out.splitlines() if "action-intervention ladder" in line
     )
     assert "horizon-mean" in heading, heading
     assert "final horizon step" not in heading, heading
-    block = out[out.index("action-shuffled imagination") :]
-    assert "final step" in block.splitlines()[2] or "final" in block, block
+    block = out[out.index("action-intervention ladder") :]
+    assert "final step" in block.splitlines()[4], block
 
 
 def test_the_diagnostic_record_names_both_arm_and_seed_and_carries_its_device(
@@ -1134,10 +2070,15 @@ def test_the_diagnostic_record_names_both_arm_and_seed_and_carries_its_device(
     assert written["device"] == "cpu"
     assert written["torch_version"] == torch.__version__
     assert written["episodes"]["val"] == VAL_NAMES
-    assert written["windows"] == {"total": 2, "changed": 0, "episodes_changed": 0}
-    # The delta is undefined when nothing changed, and must come back as NaN --
-    # not as None and not as 0.0, which are different findings about a cell.
-    assert all(np.isnan(v) for v in written["shuffle"]["position_delta"])
+    assert written["windows"] == {"total": 2}
+    for name in LADDER:
+        block = written["interventions"][name]
+        assert block["windows_changed"] == 0 and block["episodes_changed"] == 0, name
+        # The delta is undefined when nothing changed, and must come back as
+        # NaN -- not as None and not as 0.0, which are different findings
+        # about a cell.
+        for metric in script.CHANNELS:
+            assert all(np.isnan(v) for v in block[metric]["delta"]), (name, metric)
     # And it reaches disk as STRICT json: Python writes a NaN as the bare token
     # `NaN`, which is not JSON and which strict parsers reject, while Python's
     # own loader accepts it -- so a round trip through `json` alone cannot see
