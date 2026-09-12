@@ -23,6 +23,7 @@ policy and `load_record` for the inverse.
 import json
 import math
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -314,6 +315,62 @@ def load_record(path: Path) -> dict:
     return record
 
 
+UNKNOWN_GIT_SHA = "unknown"
+"""What `_git_sha` reports when git cannot answer. Never an exception."""
+
+
+def _git_sha() -> str:
+    """The commit the code that is running was checked out from, or "unknown".
+
+    Asked of the directory THIS FILE lives in, not of the process's working
+    directory. The record exists to say "one code state produced all nine
+    cells", and the code state is wherever `mbfps` was imported from -- the
+    editable install on the laptop, or a checkout on the rented box. A run
+    launched from somewhere else (`cd /scratch && python .../run_study.py`)
+    must not report the sha of /scratch.
+
+    NEVER RAISES. A rented box without git installed, a checkout unpacked from
+    a tarball with no `.git`, a `git` that hangs on a stale lock: every one of
+    those is a provenance gap, not a reason to lose a 1.5-hour cell. The
+    provenance field says "unknown" and the cell is still written. Only the
+    two failures a subprocess call can actually produce are caught -- `OSError`
+    (no such executable, permissions) and `subprocess.SubprocessError`
+    (`TimeoutExpired`) -- so a programming error in this function is still a
+    traceback and not a quiet "unknown" in all nine records.
+
+    The sha alone does not say the tree was clean. That is deliberate: this is
+    a label for grouping records by code state, and a `-dirty` suffix would
+    make two cells from one uncommitted tree look like two code states.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return UNKNOWN_GIT_SHA
+    if completed.returncode != 0:
+        return UNKNOWN_GIT_SHA
+    # `or`: a zero status with nothing on stdout is not a sha either. Written
+    # as a second guard rather than folded into the one above so each half
+    # can be mutation-tested alone.
+    return completed.stdout.strip() or UNKNOWN_GIT_SHA
+
+
+def _trainable_parameters(module: torch.nn.Module) -> int:
+    """How many parameters `module` trains: `requires_grad` ones only.
+
+    Every study arm's encoder is a `BottleneckEncoder` whose parameters are all
+    trainable, so on the study's own models the `requires_grad` filter is a
+    numerical no-op -- which is exactly why it is a separate function with its
+    own test: the day an encoder carries a frozen sub-module, `encoder_params`
+    must still report what the arm TRAINS, because that is the asymmetry the
+    spec records it for (1,056 for `pixel_ae` against 12,320 for the ViT arms).
+    """
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
 def _probe_summary(latent_probe: dict, embedding_probe: dict) -> dict:
     """The measuring instrument's own settings.
 
@@ -370,6 +427,28 @@ def run_job(
     probe is applied to latents filtered from a zero state for exactly
     `context` frames, and fitting it at a different depth is a distribution
     mismatch worth ~25 map units of position error.
+
+    FOUR PROVENANCE FIELDS, added for the M3c re-run and each answering a
+    question the M3b write-up had to reconstruct after the fact:
+
+      * `git_sha`        -- "one code state produced all nine cells" is a
+                            field to compare, not an inference from mtimes;
+      * `device`         -- where the cell actually RAN (`str(torch_device)`),
+                            which on a box without CUDA is "cpu" however the
+                            command line spelled it. The request string is
+                            already in the log; the record holds the answer;
+      * `encoder_params` -- the one place the arms are not byte-identical:
+                            `pixel_ae`'s bottleneck is `Linear(32 -> 32)`,
+                            the ViT arms' `Linear(384 -> 32)`. Recorded so it
+                            is visible in every record rather than hidden;
+      * `history`        -- the FULL per-step `loss` and `parts`, so the next
+                            "the pixel arm's KL never cleared the floor" is a
+                            measurement read off nine files instead of a
+                            reconstruction. ~3 MB per record at 20,000 steps
+                            with `indent=2`; the aggregation reads the scalar
+                            fields and never touches it, and `_sanitise` maps
+                            a non-finite loss at step k to `history.loss.k`
+                            like any other nested field.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -397,6 +476,9 @@ def run_job(
         )
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
+    # Counted on the EVALUATED model's encoder, after the load: the same
+    # object every number below is measured on.
+    encoder_params = _trainable_parameters(model.encoder)
 
     latent_probe, embedding_probe = fit_probes(
         model, train_paths, backbone, torch_device,
@@ -436,11 +518,25 @@ def run_job(
         "context": context,
         "horizon": horizon,
         "split_seed": SPLIT_SEED,
+        "git_sha": _git_sha(),
+        "device": str(torch_device),
+        "encoder_params": int(encoder_params),
         "seconds": float(time.perf_counter() - started),
         "steps_per_second": float(history["steps"] / history["seconds"]),
         "kl_rate_above_free_bits": float(history["kl_rate_above_free_bits"]),
         "kl_dyn_max": float(history["kl_dyn_max"]),
         "loss_last20": float(np.mean(history["loss"][-20:])),
+        # The whole curve, every step, both the total and its five terms.
+        # Coerced element by element so the record holds plain floats whatever
+        # `train_world_model` appended (a non-finite one survives the coercion
+        # and is written through the `nonfinite` map, never dropped).
+        "history": {
+            "loss": [float(v) for v in history["loss"]],
+            "parts": [
+                {str(k): float(v) for k, v in part.items()}
+                for part in history["parts"]
+            ],
+        },
         # The held-out episodes by name, so "all nine cells were scored on the
         # same episodes" is checkable after the fact rather than assumed.
         "episodes": {

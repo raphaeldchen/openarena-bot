@@ -273,17 +273,31 @@ EXPECTED_RECORD_KEYS = frozenset({
     "arm", "seed", "steps", "seq_len", "context", "horizon", "split_seed",
     "seconds", "steps_per_second", "kl_rate_above_free_bits", "episodes",
     "probe", "position", "angle", "filtering", "reward", "curves",
+    "git_sha", "device", "encoder_params", "history",
     "nonfinite",
 })
 """Spelled out, `NONFINITE_KEY` included, so a RENAME is caught as well."""
 
+M3C_RECORD_KEYS = frozenset({"git_sha", "device", "encoder_params", "history"})
+"""The four provenance keys the M3c re-run added, as their own literal.
+
+REQUIRED, NOT OPTIONAL. `runs/m3_study_v2` is a fresh directory and the M3b
+cells are not reused (spec 2.4), so no record the driver will ever resume
+off legitimately lacks them -- and requiring them is what makes "one code
+state produced all nine cells" a field every finished cell must carry rather
+than one some of them happen to. A second literal beside
+`EXPECTED_RECORD_KEYS` rather than a slice of it, so that the four can be
+named in a parametrisation without deriving the cases from the collection
+under test; `test_the_m3c_keys_are_in_both_literals` ties the two together.
+"""
+
 OPTIONAL_RECORD_KEYS = frozenset({"kl_dyn_max", "loss_last20"})
 """The top-level keys `run_job` writes that a record is allowed to lack.
 
-`run_job` writes twenty top-level keys; eighteen of them are required. These
-two are training diagnostics printed in the log, and a record without them is
-still a finished cell. Naming them here is what lets the drift guard below be
-an EQUALITY against a real record instead of a subset test.
+`run_job` writes twenty-four top-level keys; twenty-two of them are required.
+These two are training diagnostics printed in the log, and a record without
+them is still a finished cell. Naming them here is what lets the drift guard
+below be an EQUALITY against a real record instead of a subset test.
 """
 
 # ---------------------------------------------------------------------------
@@ -350,6 +364,22 @@ def _record_body(job: StudyJob, **overrides) -> dict:
         "kl_rate_above_free_bits": 0.412,
         "kl_dyn_max": 1.25,
         "loss_last20": 0.75,
+        # The M3c provenance fields. Synthetic values no implementation would
+        # produce, in the spirit of CLI_DEVICE: nothing here is compared
+        # against a real `git rev-parse` or a real parameter count (that is
+        # `tests/eval/test_study.py`'s job); the driver only needs them PRESENT.
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
+        "device": "device-from-the-record",
+        "encoder_params": 4242,
+        "history": {
+            "loss": [0.9, 0.8],
+            "parts": [
+                {"embedding": 0.5, "reward": 0.1, "continue": 0.2,
+                 "kl_dyn": 0.05, "kl_rep": 0.05},
+                {"embedding": 0.4, "reward": 0.1, "continue": 0.2,
+                 "kl_dyn": 0.05, "kl_rep": 0.05},
+            ],
+        },
         "episodes": {"train": ["ep_a.npz", "ep_b.npz"], "val": ["ep_c.npz"]},
         "probe": {
             "latent_ridge": 1.0, "latent_ridge_selected": True,
@@ -894,10 +924,54 @@ def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     assert INCOMPLETE_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
 
     # The control. Without it, an implementation that calls everything
-    # incomplete would pass all eighteen parametrisations above.
+    # incomplete would pass all twenty-two parametrisations above.
     path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
     assert run_study.record_is_complete(path, INCOMPLETE_JOB)
     assert INCOMPLETE_JOB not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+
+
+def test_the_m3c_keys_are_in_both_literals():
+    """The four are a slice of `EXPECTED_RECORD_KEYS` AND of the driver's set.
+
+    `M3C_RECORD_KEYS` is what the parametrisation below reads. If it drifted
+    from `EXPECTED_RECORD_KEYS` -- a key renamed in one literal and not the
+    other -- the parametrised guard would be exercising a key the driver was
+    never asked to require, and pass because deleting an absent key from a
+    record changes nothing. Pinned against the driver's own set too, so the
+    four cannot quietly become optional.
+    """
+    assert M3C_RECORD_KEYS == {"git_sha", "device", "encoder_params", "history"}
+    assert M3C_RECORD_KEYS <= EXPECTED_RECORD_KEYS
+    assert M3C_RECORD_KEYS <= run_study.REQUIRED_RECORD_KEYS
+    assert not (M3C_RECORD_KEYS & OPTIONAL_RECORD_KEYS)
+
+
+@pytest.mark.parametrize("missing", sorted(M3C_RECORD_KEYS))
+def test_a_record_missing_a_provenance_field_is_treated_as_pending(
+    tmp_path, missing
+):
+    """Each of the four M3c keys, ALONE. A record from the M3b code state --
+    every field the gate reads, none of the provenance -- is exactly what a
+    stale checkout on the box would write, and it must be re-run, not
+    reported: the whole point of `git_sha` is that a record without it
+    cannot be shown to come from the same code as the other eight.
+
+    Parametrised over the LITERAL `M3C_RECORD_KEYS`, never over the driver's
+    set: derive the cases from `REQUIRED_RECORD_KEYS` and dropping `history`
+    from it deletes the case that would have caught the drop.
+    """
+    assert missing in _record_body(INCOMPLETE_JOB), (
+        f"the fixture record never carried {missing!r}, so deleting it is a "
+        "no-op and this case cannot fail")
+    path = job_record_path(tmp_path, INCOMPLETE_JOB)
+    damaged = _sanitised(INCOMPLETE_JOB)
+    del damaged[missing]
+    path.write_text(json.dumps(damaged))
+    assert not run_study.record_is_complete(path, INCOMPLETE_JOB)
+    assert INCOMPLETE_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+
+    path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
+    assert run_study.record_is_complete(path, INCOMPLETE_JOB)
 
 
 def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
@@ -905,10 +979,11 @@ def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
 
     `complete_record` asks `REQUIRED_RECORD_KEYS <= set(record)`. Turning that
     subset test into a PROPER subset (`<`) survived the whole suite, because
-    `_record_body` always writes all twenty top-level keys and a proper-subset
-    relation holds for every fixture in this file. The one record shape that
-    tells `<` from `<=` is the one with exactly the eighteen required keys and
-    neither optional diagnostic -- a finished cell that legitimately lacks
+    `_record_body` always writes all twenty-four top-level keys and a
+    proper-subset relation holds for every fixture in this file. The one
+    record shape that tells `<` from `<=` is the one with exactly the
+    twenty-two required keys and neither optional diagnostic -- a finished
+    cell that legitimately lacks
     `kl_dyn_max` and `loss_last20`, which `OPTIONAL_RECORD_KEYS` above declares
     a record is allowed to lack.
 

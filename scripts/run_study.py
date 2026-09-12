@@ -102,6 +102,7 @@ REQUIRED_RECORD_KEYS = frozenset({
     "arm", "seed", "steps", "seq_len", "context", "horizon", "split_seed",
     "seconds", "steps_per_second", "kl_rate_above_free_bits", "episodes",
     "probe", "position", "angle", "filtering", "reward", "curves",
+    "git_sha", "device", "encoder_params", "history",
     NONFINITE_KEY,
 })
 """Every top-level key `run_job` writes. A record missing one is not done.
@@ -110,6 +111,14 @@ This is the completeness test that "the file parses" is not. `NONFINITE_KEY` is
 in the set on purpose: only `write_record` adds it, so a hand-made or
 half-converted JSON blob at a record path is treated as pending rather than
 mistaken for a finished 8.3-hour cell.
+
+THE FOUR M3c PROVENANCE KEYS ARE REQUIRED, NOT OPTIONAL. `git_sha`, `device`,
+`encoder_params` and `history` were added so that "one code state produced
+all nine cells" is a field rather than a reconstruction from file mtimes. A
+record without them is what a stale checkout on the box writes, and it is
+precisely the record that cannot be shown to belong with the other eight --
+so it is re-run. Nothing legitimate lacks them: the M3c study runs into a
+fresh `--out`, and the M3b records are not reused (spec 2.4).
 
 DRIFT IN EITHER DIRECTION IS A DISASTER WITH NO SYMPTOM: a key listed here that
 `run_job` never writes makes EVERY cell permanently pending, so the study
