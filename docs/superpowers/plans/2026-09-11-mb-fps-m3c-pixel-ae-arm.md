@@ -6116,3 +6116,54 @@ three decades above the ~0.0007 a random-init `CNNEncoder` emits (§1), and the 
 sits beside the 1.06 measured on the first three episodes before the cache existed. Both
 floors of the Step 8 check (`min > 0.01`, `median > 0.1`) clear with two decades to spare.
 This is the direct measurement that licenses the Task 7 spike.
+
+## Task 7 results
+
+**Run:** `runs/m3c_spike/spike_pixel_ae_seed0.json`, log `runs/m3c_spike/spike.log`.
+git SHA `b4e903aa6808b6e583a54c4ad78ac244e5483e6e` · device `mps` · 2,000 steps · seq_len 64 · batch 16 · 4.00 steps/s · 500.5 s wall.
+Run 2026-09-12 under `caffeinate -dimsu`; exit status 0; `nonfinite` `{}`; `history["loss"]` and
+`history["parts"]` both 2,000 entries long, on disk in full.
+Probe protocol: `fit_probe` ridge selection on the flattened `(T+1, 2048)` cache; fit 16 / select 4 training
+episodes, scored on 20 validation episodes of `episode_split(seed=0)`, 9,969 rows; selected ridge 1e3;
+selection R² 0.3458.
+
+| check | value | must read | verdict |
+|---|---|---|---|
+| 1 `embedding_loss` at step 0 (`history["parts"][0]["embedding"]`) | 0.3602 | in [0.1, 1.0] | PASS |
+| 2 `kl_rate_above_free_bits` over 2,000 steps (`kl_dyn_max` 1.3457) | 0.5865 | > 0.5 | PASS |
+| 3 held-out probe R² on the cached `pixel_ae` features | +0.3052 | > 0 | PASS |
+
+**Side-by-side, embedding loss at step 0** (one forward pass each, seed 0, same split and loader draw):
+
+| arm | this run | M3c design §1 |
+|---|---|---|
+| `pixel_ae` | 0.360220730304718 (side-by-side) / 0.360220730304718 (history) | — (new) |
+| `frozen_ssl` | 0.3165 | 0.3165 |
+| `random_vit` | 0.4104 | 0.4104 |
+| `cnn` (retired) | not run | 0.0008 |
+
+The two `pixel_ae` step-0 numbers are bit-identical on MPS, so the check judged the number the
+side-by-side printed (the one mutation the CPU tests cannot see). `frozen_ssl` and `random_vit`
+reproduce §1 to every printed decimal: the caches, the split and the seeding are the ones §1 measured.
+
+Read from the full history, for the record: the dyn KL starts at 0.0338 (step 0), first clears the
+0.20 floor at step 11, and sits at 0.40–0.55 over the last ten steps; the embedding loss falls from
+0.3602 to 0.1938 and the total loss from 1.155 to 0.436. The training log printed no free-bits
+warning, and the check-2 rate of 0.5865 is a margin of 0.0865 over the floor of 0.5, not a wide one:
+it says the prior trained on 1,173 of 2,000 steps, and Task 8's first read of the new study
+(`kl_rate_above_free_bits > 0.5` for all three `pixel_ae` cells, at 20,000 steps) is where that
+margin gets measured properly.
+
+**Decision:** `RUN_STUDY` (the script's own verdict; exit status 0).
+
+Decision rule, spec §3:
+- all three PASS → **Task 8**: run the nine cells into `runs/m3_study_v2`.
+- check 2 FAILS alone → **STOP**. Do not run the study. Re-plan `KL_FREE_BITS` as a genuine
+  three-arm calibration with the KL trajectory recorded per step; `history["parts"][i]["kl_dyn"]`
+  from this record is the `pixel_ae` trajectory for it.
+- check 1 or 3 FAILS (with or without 2) → **STOP**. The frozen `pixel_ae` backbone is not
+  informative under this objective; §1's argument says no floor can fix that. Do not run the study;
+  the next step is a different backbone (the `pixel_ae_conv` alternative in §2.1 is the named
+  candidate), not a different floor.
+
+All three passed: Task 8 runs.
