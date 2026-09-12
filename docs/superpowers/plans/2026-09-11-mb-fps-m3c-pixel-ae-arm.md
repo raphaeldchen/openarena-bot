@@ -4371,7 +4371,7 @@ This is a run-and-record task like M3b Task 7, with one small script in front of
 - Modify: this plan — the `## Task 7 results` section at the end (create it; template in Step 9)
 
 > Read before writing, so the pieces this script reuses are reused and not re-implemented:
-> `src/mbfps/training/world_model.py` lines 102–181 (`train_world_model`: what `history` carries, and lines 111–133 for exactly how step 0's batch is produced — the side-by-side below replicates that sequence to the draw);
+> `src/mbfps/training/world_model.py` lines 102–181 (`train_world_model`: what `history` carries; the side-by-side calls it at `steps=1`, so step 0's batch is produced by that code, not by a copy of it);
 > `src/mbfps/eval/study.py` lines 44–52 (`SPLIT_SEED`) and 245–286 (`write_record`: atomic, strict-JSON, non-finite-safe — `history["parts"]` can carry a NaN and this is the only writer that survives it);
 > `src/mbfps/eval/probe.py` lines 35–50 (`probe_targets`), 53–95 (`RIDGES`, `fit_probe` with ridge selection), 138–149 (`probe_r2`), and 298–383 (`fit_probes`, whose 16-fit / 4-select episode split this task mirrors);
 > `src/mbfps/data/loader.py` lines 40–51 (`feature_suffix`) and 54–99 (`SequenceLoader`'s constructor);
@@ -4389,7 +4389,7 @@ This is a run-and-record task like M3b Task 7, with one small script in front of
   - `check_embedding_loss(parts: list[dict]) -> dict`, `check_kl_rate(history: dict) -> dict`, `check_probe_r2(r2: float) -> dict` — each `{"value", ..., "passed"}`
   - `evaluate_checks(history: dict, feature_probe_r2: float) -> dict[str, dict]` keyed by `CHECK_KEYS`
   - `all_passed(checks: dict) -> bool`, `decision(checks: dict) -> str`, `exit_status(checks: dict) -> int`
-  - `step0_embedding_loss(cfg, buffer) -> float` — one forward pass, no training, seeded exactly as `train_world_model`'s step 0
+  - `step0_embedding_loss(cfg, buffer) -> float` — `train_world_model` itself, at `steps=1` and `out_dir=None`; returns `history["parts"][0]["embedding"]` (pre-flight 2026-09-12: the plan's original hand copy of the setup block was verbatim duplication; the user chose this form)
   - `load_cached_features(path: Path, backbone: str) -> np.ndarray` — `(T+1, n_patches * patch_dim)` float64, validated against `BACKBONE_GEOMETRY`
   - `cached_feature_probe(train_paths, val_paths, backbone, limit=PROBE_LIMIT, select_episodes=PROBE_SELECT_EPISODES) -> dict` with keys `"backbone"`, `"r2"`, `"ridge"`, `"selection_r2"`, `"n_fit_episodes"`, `"n_select_episodes"`, `"n_scored_episodes"`, `"n_scored_rows"`, `"n_columns"`
   - `spike_record_path(out_dir) -> Path`, `report(record: dict) -> str`, `git_sha() -> str`, `main(argv=None) -> int`
@@ -4758,6 +4758,33 @@ def test_step0_embedding_loss_matches_train_world_model_step_zero_on_every_arm(
         "the per-arm equality assertions cannot distinguish them")
 
 
+def test_step0_embedding_loss_runs_one_step_saves_nothing_and_reads_step_zero(
+        monkeypatch):
+    """The equality test above cannot see three things, because on the TINY
+    fixture they change nothing: a helper that forgot `steps=1` (20,000 steps
+    per arm on the real run, three times), one that passed an `out_dir` (a
+    checkpoint written under the spike directory), and one that read
+    `parts[-1]` (equal to `parts[0]` at one step). A spy in place of
+    `train_world_model` pins all three."""
+    calls = []
+
+    def spy(cfg, buffer, out_dir, log_every=100):
+        calls.append((cfg, buffer, out_dir, log_every))
+        return {"parts": [{"embedding": 0.31}, {"embedding": 0.17}]}
+
+    monkeypatch.setattr(script, "train_world_model", spy)
+    cfg = get_config("frozen_ssl", seed=0, **TINY)
+    assert script.step0_embedding_loss(cfg, "the buffer") == 0.31
+    (seen_cfg, seen_buffer, seen_out_dir, seen_log_every), = calls
+    assert seen_cfg.train.steps == 1
+    assert seen_cfg.arm == "frozen_ssl" and seen_cfg.train.seed == 0
+    assert replace(seen_cfg.train, steps=cfg.train.steps) == cfg.train, (
+        "every TrainConfig field but steps must reach train_world_model unchanged")
+    assert seen_buffer == "the buffer"
+    assert seen_out_dir is None
+    assert seen_log_every == 0
+
+
 # --------------------------------------------------------------------------
 # check 3's probe on the cache itself
 # --------------------------------------------------------------------------
@@ -4948,9 +4975,10 @@ next 4, scored on the first 20 validation episodes of the study's own split.
 THE SIDE-BY-SIDE. Check 1's band is only meaningful next to the arms it was
 taken from, so the script also prints the step-0 embedding loss for
 `frozen_ssl` and `random_vit`, from one forward pass each with no training.
-`step0_embedding_loss` replicates `train_world_model`'s step 0 to the draw --
-same `seed_everything`, same split, same loader seed, same posterior sample --
-and is tested equal to `history["parts"][0]["embedding"]` on every arm.
+`step0_embedding_loss` is `train_world_model` run for exactly one step with
+nothing saved: the same seed, split, loader draw and posterior sample by
+construction, and tested equal to `history["parts"][0]["embedding"]` on every
+arm -- a copy of the setup block would have to be kept in step by hand.
 
 EXIT STATUS: 0 iff all three checks pass, 10 otherwise. 10 is
 `report_study.py`'s `EXIT_GATE_NOT_PASSED` and means the same thing here -- a
@@ -4960,8 +4988,11 @@ attended, unlike the study driver, and a traceback is the right report.
 """
 
 import argparse
+import contextlib
+import io
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -4970,16 +5001,14 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import load_episode
 from mbfps.data.features import BACKBONE_GEOMETRY
-from mbfps.data.loader import SequenceLoader, feature_suffix
+from mbfps.data.loader import feature_suffix
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.probe import fit_probe, probe_r2, probe_targets
 from mbfps.eval.study import SPLIT_SEED, write_record
 from mbfps.models.encoders import encoder_backbone
 from mbfps.models.rssm import KL_FREE_BITS
-from mbfps.training.world_model import WorldModel, train_world_model
+from mbfps.training.world_model import train_world_model
 from mbfps.utils.config import ARMS, get_config
-from mbfps.utils.device import get_device, to_device
-from mbfps.utils.seeding import seed_everything
 
 SPIKE_ARM = "pixel_ae"
 SPIKE_SEED = 0
@@ -5102,36 +5131,21 @@ def exit_status(checks: dict) -> int:
 # the side-by-side
 # --------------------------------------------------------------------------
 
-@torch.no_grad()
 def step0_embedding_loss(cfg, buffer: ReplayBuffer) -> float:
-    """`train_world_model`'s step-0 embedding loss for `cfg`, without training.
+    """`train_world_model`'s step-0 embedding loss for `cfg`, from `train_world_model`.
 
-    THE SEQUENCE OF RNG DRAWS IS `train_world_model`'S, LINE FOR LINE:
-    `seed_everything`, then the model (the encoder draws from the global RNG;
-    RSSM and heads fork their own), then the split at `SPLIT_SEED`, then a
-    loader seeded at `cfg.train.seed`, then one forward whose posterior sample
-    draws from the global RNG. Reordering any of these gives a different batch
-    or a different sample and the number stops being the one the check judges.
-    The Adam constructor in the original draws nothing and is omitted.
+    One step of the real training loop with nothing saved. The seed, the split,
+    the loader draw and the posterior sample are the ones the check judges
+    BECAUSE THIS IS THAT CODE PATH -- there is no copy of the setup block to
+    keep in step with `world_model.py`. The price is one backward pass and one
+    Adam step per arm, which is seconds. The one-step run's own "kl_dyn
+    exceeded the floor on only x% of steps" warning is meaningless at a single
+    step and is swallowed; the 2,000-step run's warning is not.
     """
-    seed_everything(cfg.train.seed)
-    device = get_device(prefer=cfg.train.device)
-    model = WorldModel(cfg).to(device)
-    train_paths, _ = episode_split(
-        buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED
-    )
-    loader = SequenceLoader(
-        buffer,
-        batch_size=cfg.train.batch_size,
-        seq_len=cfg.train.seq_len,
-        seed=cfg.train.seed,
-        load_obs=model.input_kind == "obs",
-        load_features=model.input_kind == "features",
-        feature_backbone=encoder_backbone(cfg.encoder) or "dinov2",
-        paths=train_paths,
-    )
-    _, parts = model(to_device(loader.sample(), device))
-    return float(parts["embedding"])
+    one_step = replace(cfg, train=replace(cfg.train, steps=1))
+    with contextlib.redirect_stdout(io.StringIO()):
+        history = train_world_model(one_step, buffer, out_dir=None, log_every=0)
+    return float(history["parts"][0]["embedding"])
 
 
 # --------------------------------------------------------------------------
@@ -5403,8 +5417,10 @@ Then, one row at a time (mutate, `run`, confirm the named test is in the failure
 | `report` prints `PASS` for every check | `test_report_marks_each_check_with_its_own_verdict` |
 | `report` prints the pixel_ae value under every arm's name | `test_report_marks_each_check_with_its_own_verdict` cannot see it — **add** an assertion that `frozen_ssl=0.3165` and `random_vit=0.4104` appear verbatim before committing |
 | `step0_embedding_loss` builds `get_config(SPIKE_ARM, ...)` regardless of `cfg` | `test_step0_embedding_loss_matches_train_world_model_step_zero_on_every_arm` (the `frozen_ssl` and `random_vit` rows) |
-| `step0_embedding_loss` omits `seed_everything` | `test_step0_embedding_loss_matches_train_world_model_step_zero_on_every_arm` |
-| `step0_embedding_loss` builds the loader over `buffer.episode_paths()` instead of the training split | `test_step0_embedding_loss_matches_train_world_model_step_zero_on_every_arm` (the window draw changes) |
+| `step0_embedding_loss` passes `cfg` unchanged (no `steps=1`) | `test_step0_embedding_loss_runs_one_step_saves_nothing_and_reads_step_zero` (`steps == 1`); the equality test cannot -- at TINY's 3 steps `parts[0]` is the same number |
+| `step0_embedding_loss` passes `out_dir=Path(".")` | `test_step0_embedding_loss_runs_one_step_saves_nothing_and_reads_step_zero` (`out_dir is None`) |
+| `step0_embedding_loss` returns `parts[-1]["embedding"]` | `test_step0_embedding_loss_runs_one_step_saves_nothing_and_reads_step_zero` (the spy's two parts differ) |
+| `step0_embedding_loss` builds `replace(cfg.train, steps=1, seed=0)` | `test_step0_embedding_loss_runs_one_step_saves_nothing_and_reads_step_zero` (`replace(seen.train, steps=...) == cfg.train`) -- **run this row with the fixture's seed changed to 1 first**, or the mutation is invisible |
 | `cached_feature_probe` scores on `x_fit, y_fit` | `test_cached_feature_probe_scores_the_validation_episodes_not_the_fit_ones` |
 | `load_cached_features` reads `feature_suffix("dinov2")` | `test_cached_feature_probe_recovers_position_planted_in_the_pixel_ae_cache` (geometry `(64, 384)` is refused) |
 | `load_cached_features` drops the geometry guard | `test_cached_feature_probe_refuses_a_cache_of_the_wrong_geometry` |
