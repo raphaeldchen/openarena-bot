@@ -18,14 +18,27 @@ from pathlib import Path
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.features import (
+    BACKBONE_GEOMETRY,
     BACKBONES,
-    FEATURE_DIM,
-    N_PATCHES,
     FeatureExtractor,
     cache_episode_features,
     require_free_bytes,
 )
 from mbfps.data.loader import feature_suffix
+
+
+def cache_bytes(frames: int, backbone: str) -> int:
+    """Bytes the float16 cache of `frames` frames will occupy for `backbone`.
+
+    Reads the backbone's own `(n_patches, patch_dim)`: a backbone with rows
+    narrower than the ViTs' 384 must not be sized as if it were 384 wide, or
+    a disk with room for its cache refuses to start the run.
+
+    Raises:
+        KeyError: if `backbone` has no registered geometry.
+    """
+    n_patches, patch_dim = BACKBONE_GEOMETRY[backbone]
+    return frames * n_patches * patch_dim * 2  # float16
 
 
 def main() -> None:
@@ -55,7 +68,7 @@ def main() -> None:
         return
 
     frames = sum(ep.length + 1 for ep in buffer.load_all())
-    needed = frames * N_PATCHES * FEATURE_DIM * 2  # float16
+    needed = cache_bytes(frames, args.backbone)
     print(f"episodes={len(paths)} frames={frames} needs={needed / 1e9:.2f} GB")
     require_free_bytes(args.data, needed)
 

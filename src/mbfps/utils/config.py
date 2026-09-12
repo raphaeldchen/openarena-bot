@@ -20,12 +20,22 @@ ARMS: tuple[str, ...] = ("cnn", "frozen_ssl", "random_vit")
 
 @dataclass(frozen=True)
 class EncoderConfig:
-    """Encoder settings. `kind` is the ONLY field that may differ across arms."""
+    """Encoder settings. `kind` is the ONLY field that may differ across arms.
+
+    There is deliberately no `patch_dim` here. The width of a cached feature
+    row is the frozen BACKBONE's property, not an arm-level setting, and lives
+    in `mbfps.data.features.BACKBONE_GEOMETRY` beside its patch count. A
+    shared 384 used to sit here and was read by exactly two lines of
+    `BottleneckEncoder`; a backbone with narrower rows would have been built
+    against 384 with no error until the first matmul. `bottleneck_dim` and
+    `embed_dim` stay: they are the study's choices, held identical across
+    arms, and the encoder checks `n_patches * bottleneck_dim == embed_dim`
+    against each backbone's own patch count.
+    """
 
     kind: str
     embed_dim: int = 2048
     cnn_depth: int = 32
-    patch_dim: int = 384
     bottleneck_dim: int = 32
     standardise_features: bool = True
     """Normalise each cached patch vector before the bottleneck.

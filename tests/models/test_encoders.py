@@ -3,8 +3,9 @@ from dataclasses import replace
 import pytest
 import torch
 
+import mbfps.models.encoders as encoders
+from mbfps.data.features import BACKBONE_GEOMETRY
 from mbfps.envs.protocol import OBS_SHAPE
-from mbfps.utils.config import get_config
 from mbfps.models.encoders import (
     BottleneckEncoder,
     CNNEncoder,
@@ -12,7 +13,7 @@ from mbfps.models.encoders import (
     encoder_backbone,
     encoder_input_kind,
 )
-from mbfps.utils.config import ARMS, EncoderConfig
+from mbfps.utils.config import ARMS, EncoderConfig, get_config
 
 
 def cfg(kind: str) -> EncoderConfig:
@@ -83,9 +84,16 @@ def test_bottleneck_encoder_output_shape():
 
 
 def test_bottleneck_flattens_patch_grid_to_embed_dim():
-    """64 patches x 32 bottleneck dims = 2048, matching the CNN arm exactly."""
+    """64 patches x 32 bottleneck dims = 2048, matching the CNN arm exactly.
+
+    The patch count is the BACKBONE's, read from the registry, not a number
+    this test knows: a backbone with a different grid must satisfy the same
+    identity with its own row count.
+    """
     c = cfg("frozen_ssl")
-    assert 64 * c.bottleneck_dim == c.embed_dim
+    n_patches, _ = BACKBONE_GEOMETRY[encoder_backbone(c)]
+    assert n_patches == 64
+    assert n_patches * c.bottleneck_dim == c.embed_dim
 
 
 @pytest.mark.parametrize("arm", ARMS)
@@ -199,6 +207,105 @@ def test_bottleneck_gradients_flow_to_every_parameter():
     enc(torch.randn(2, 64, 384)).square().mean().backward()
     missing = [n for n, p in enc.named_parameters() if p.grad is None]
     assert not missing, f"no gradient reached: {missing}"
+
+
+# --- Backbone geometry ------------------------------------------------------
+# `(n_patches, patch_dim)` is a property of the frozen backbone whose cache the
+# arm reads, not a choice the study makes per arm. Before this block the
+# encoder carried a module constant `_N_PATCHES = 64` and `EncoderConfig` a
+# shared `patch_dim = 384`, both describing the ViT backbones' output. A third
+# backbone with a different row width would have been built against 384 with
+# no error until the first matmul. The geometry now lives in ONE registry,
+# `mbfps.data.features.BACKBONE_GEOMETRY`, and the encoder reads it.
+
+
+def test_bottleneck_takes_its_geometry_from_the_backbone_registry(monkeypatch):
+    """Both numbers must come from the registry -- neither may be hardcoded.
+
+    Both registered backbones today are (64, 384), so building the real arms
+    cannot tell a registry read from a literal 64 or 384 (fixture coincidence).
+    Rebinding one backbone's entry to a geometry that matches NEITHER constant
+    is what makes a hardcoded value fail: 128 rows of 16 still multiply out to
+    2048 with `bottleneck_dim=16`, so the only way this build and forward pass
+    succeed is if the encoder read the registry for both values.
+    """
+    monkeypatch.setitem(BACKBONE_GEOMETRY, "random_vit", (128, 16))
+    enc = BottleneckEncoder(EncoderConfig(kind="random_vit", bottleneck_dim=16))
+    assert enc.bottleneck.in_features == 16, "patch_dim must come from the registry"
+    assert enc.bottleneck.out_features == 16
+    assert tuple(enc.norm.normalized_shape) == (16,), (
+        "the LayerNorm must be sized by the registry's patch_dim too"
+    )
+    assert enc(torch.randn(2, 128, 16)).shape == (2, 2048), (
+        "n_patches must come from the registry"
+    )
+
+
+def test_bottleneck_guard_uses_the_registry_patch_count(monkeypatch):
+    """`n_patches * bottleneck_dim == embed_dim` runs per backbone.
+
+    With 128 rows the default `bottleneck_dim=32` gives 4096, not 2048, and
+    the guard must say so. A guard still multiplying a literal 64 would accept
+    this config and build an encoder that emits the wrong width.
+    """
+    monkeypatch.setitem(BACKBONE_GEOMETRY, "random_vit", (128, 16))
+    with pytest.raises(ValueError, match=r"128 patches x bottleneck_dim 32"):
+        BottleneckEncoder(cfg("random_vit"))
+
+
+def test_bottleneck_guard_names_the_backbone_geometry():
+    """The unchanged real-arm case: 64 x 33 != 2048, and the message says so."""
+    with pytest.raises(ValueError, match=r"64 patches x bottleneck_dim 33.*embed_dim 2048"):
+        BottleneckEncoder(EncoderConfig(kind="frozen_ssl", bottleneck_dim=33))
+
+
+@pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
+def test_bottleneck_forward_rejects_the_wrong_row_count(arm):
+    """A cache with the wrong number of rows must not silently reshape.
+
+    This is the dangerous case: `Linear(384, 32)` happily consumes
+    `(N, 32, 384)` and emits `(N, 1024)`, which is the wrong embedding width
+    and would only surface as a shape error deep inside the RSSM. The
+    encoder must refuse at its own boundary and name what it expected.
+    """
+    enc = build_encoder(cfg(arm))
+    backbone = encoder_backbone(cfg(arm))
+    with pytest.raises(ValueError) as excinfo:
+        enc(torch.randn(2, 32, 384))
+    message = str(excinfo.value)
+    assert backbone in message, "the error must name the backbone"
+    assert "(64, 384)" in message, "the error must name the expected geometry"
+    assert "(32, 384)" in message, "the error must name what it got"
+
+
+def test_bottleneck_forward_rejects_the_wrong_row_width():
+    """Wrong width would be a matmul error anyway; it must be OUR error."""
+    enc = BottleneckEncoder(cfg("frozen_ssl"))
+    with pytest.raises(ValueError, match=r"dinov2.*\(64, 384\).*\(64, 32\)"):
+        enc(torch.randn(2, 64, 32))
+
+
+def test_bottleneck_forward_rejects_a_flat_input():
+    """`(N, 24576)` is the right number of values in the wrong shape."""
+    enc = BottleneckEncoder(cfg("frozen_ssl"))
+    with pytest.raises(ValueError, match=r"dinov2"):
+        enc(torch.randn(2, 64 * 384))
+
+
+def test_bottleneck_refuses_a_kind_that_reads_pixels():
+    """`cnn` has no backbone and therefore no geometry to read."""
+    with pytest.raises(ValueError, match=r"'cnn'.*pixels"):
+        BottleneckEncoder(cfg("cnn"))
+
+
+def test_no_second_source_of_truth_for_the_patch_count():
+    """Every reader goes through the registry, so the module constant is gone.
+
+    A leftover `_N_PATCHES` is how a future reader bypasses the dict. (The
+    matching removal of `EncoderConfig.patch_dim` is guarded in
+    tests/utils/test_config.py.)
+    """
+    assert not hasattr(encoders, "_N_PATCHES")
 
 
 # --- Feature standardisation ------------------------------------------------

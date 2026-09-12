@@ -1,9 +1,10 @@
-"""Frozen DINOv2 patch-feature cache.
+"""Frozen-backbone patch-feature cache.
 
 The backbone never updates, so each frame is encoded once at collection time and
 the features are reused for every training step. The learned bottleneck lives
-downstream, so this cache holds the raw 64x384 patch grid rather than a
-bottlenecked vector.
+downstream, so this cache holds the raw `(n_patches, patch_dim)` grid rather
+than a bottlenecked vector. The grid's shape is the BACKBONE's property, read
+from `BACKBONE_GEOMETRY`, never a constant a reader copies.
 """
 
 import shutil
@@ -16,12 +17,6 @@ from transformers import AutoConfig, AutoModel
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.utils.device import get_device
 
-N_PATCHES = 64
-"""112 / 14 = 8, so DINOv2's patch grid is 8x8."""
-
-FEATURE_DIM = 384
-"""Hidden size of DINOv2-small."""
-
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -29,6 +24,25 @@ BACKBONES: tuple[str, ...] = ("dinov2", "random_vit")
 """Frozen backbones. `dinov2` is the treatment arm's pretrained encoder;
 `random_vit` is the control -- identical architecture, random weights, which is
 what separates "pretraining helps" from "a stationary target helps"."""
+
+BACKBONE_GEOMETRY: dict[str, tuple[int, int]] = {
+    "dinov2": (64, 384),
+    "random_vit": (64, 384),
+}
+"""`(n_patches, patch_dim)` of each backbone's cached rows, per frame.
+
+Both ViT backbones tile 112x112 at patch 14 into an 8x8 = 64 grid and emit
+DINOv2-small's 384-wide hidden state. That is a fact about the backbone, not
+a choice the study makes per arm, so it lives here beside `BACKBONES` and
+every reader -- `FeatureExtractor.encode`'s output check, the encoder's
+bottleneck width and its `n_patches * bottleneck_dim == embed_dim` guard, the
+cache-size estimate in scripts/cache_features.py -- takes it from this dict.
+Before this registry the same two numbers were a module constant here, a
+module constant in encoders.py and a field on `EncoderConfig`; a backbone
+whose rows are not 384 wide would have been built against 384 with no error
+until the first matmul. Every key of this dict is in `BACKBONES` and vice
+versa; tests/data/test_features.py pins both the literal and that identity.
+"""
 
 _MODEL_NAME = "facebook/dinov2-small"
 
@@ -85,10 +99,12 @@ class FeatureExtractor:
 
     @torch.no_grad()
     def encode(self, frames: np.ndarray) -> np.ndarray:
-        """Encode `(N, 112, 112, 3)` uint8 frames to `(N, 64, 384)` float16.
+        """Encode `(N, 112, 112, 3)` uint8 frames to `(N, n_patches, patch_dim)`
+        float16, with the geometry taken from `BACKBONE_GEOMETRY[self.backbone]`.
 
         Raises:
-            ValueError: if `frames` does not match the expected shape.
+            ValueError: if `frames` does not match the expected shape, or the
+                backbone emits a grid other than the one registered for it.
         """
         if frames.ndim != 4 or frames.shape[1:] != OBS_SHAPE:
             raise ValueError(
@@ -99,10 +115,15 @@ class FeatureExtractor:
         tensor = torch.from_numpy(x).permute(0, 3, 1, 2).to(self.device)
         out = self.model(pixel_values=tensor).last_hidden_state
         patches = out[:, 1:, :]  # drop the CLS token
-        if patches.shape[1] != N_PATCHES:
+        # The registry is the contract every downstream reader builds against,
+        # so a backbone that emits anything else is refused HERE, before a
+        # single cache file is written with the wrong rows in it.
+        expected = BACKBONE_GEOMETRY[self.backbone]
+        if tuple(patches.shape[1:]) != expected:
             raise ValueError(
-                f"expected {N_PATCHES} patch tokens, got {patches.shape[1]}; "
-                f"check that the input is 112x112 and the patch size is 14"
+                f"backbone {self.backbone!r} is registered as {expected} per frame "
+                f"but emitted {tuple(patches.shape[1:])}; check that the input is "
+                f"112x112 and the patch size is 14"
             )
         return patches.to(torch.float16).cpu().numpy()
 

@@ -87,3 +87,33 @@ def test_seq_len_default_matches_the_dataset():
     """119 of 122 episodes support a 64-step window; a larger default would
     silently discard usable episodes."""
     assert get_config("cnn").train.seq_len == 64
+
+
+# --- patch_dim is not an arm-level setting ---------------------------------
+# It described the ViT backbones' 384-wide rows and was consumed in exactly two
+# lines of BottleneckEncoder. A third backbone with a different width would
+# have been built against 384 with no error. The width now lives with the
+# backbone (`mbfps.data.features.BACKBONE_GEOMETRY`), and a dead field left
+# here is how a future arm gets built against the wrong number.
+
+
+def test_encoder_config_has_no_patch_dim_field():
+    names = {f.name for f in dataclasses.fields(EncoderConfig)}
+    assert "patch_dim" not in names, names
+
+
+def test_encoder_config_rejects_patch_dim_at_construction():
+    """The field must be GONE, not merely unused: a config that silently
+    accepts `patch_dim=512` is the exact failure the removal exists to stop."""
+    with pytest.raises(TypeError, match="patch_dim"):
+        EncoderConfig(kind="frozen_ssl", patch_dim=512)
+
+
+def test_encoder_config_keeps_the_shared_bottleneck_fields():
+    """The removal must take ONLY patch_dim; the two shared numbers the
+    per-backbone guard `n_patches * bottleneck_dim == embed_dim` reads stay."""
+    c = EncoderConfig(kind="frozen_ssl")
+    assert c.embed_dim == 2048
+    assert c.bottleneck_dim == 32
+    assert c.cnn_depth == 32
+    assert c.standardise_features is True

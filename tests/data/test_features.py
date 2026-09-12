@@ -3,9 +3,10 @@ import pytest
 import torch
 
 from mbfps.data.episode import Episode, save_episode
+import mbfps.data.features as features
 from mbfps.data.features import (
-    FEATURE_DIM,
-    N_PATCHES,
+    BACKBONE_GEOMETRY,
+    BACKBONES,
     FeatureExtractor,
     cache_episode_features,
 )
@@ -19,14 +20,54 @@ def extractor():
     return FeatureExtractor(device="cpu")
 
 
-def test_patch_grid_is_8x8():
-    assert N_PATCHES == 64
-    assert FEATURE_DIM == 384
+# --- Backbone geometry ------------------------------------------------------
+# `(n_patches, patch_dim)` belongs to the backbone, not to the study. The two
+# ViT backbones share 112 / 14 = 8, an 8x8 = 64 patch grid, at DINOv2-small's
+# hidden size of 384. Both numbers used to be module constants that every
+# reader -- the encoder, the cache-size estimate, these tests -- copied; a
+# third backbone with a different width would have been built against 384
+# with no error until the first matmul. There is now one registry.
+
+
+def test_backbone_geometry_registry():
+    """Pins the literal geometry AND that every backbone has exactly one entry.
+
+    The literal is deliberate: a registry that silently grows or loses a key
+    is the failure mode, so a new backbone must edit this assertion by hand.
+    """
+    assert BACKBONE_GEOMETRY == {"dinov2": (64, 384), "random_vit": (64, 384)}
+    assert set(BACKBONE_GEOMETRY) == set(BACKBONES), (
+        "every registered backbone needs a geometry and vice versa"
+    )
+
+
+def test_the_old_module_constants_are_gone():
+    """Every reader goes through the dict. A leftover `N_PATCHES` or
+    `FEATURE_DIM` is a second source of truth that a future reader will copy."""
+    assert not hasattr(features, "N_PATCHES")
+    assert not hasattr(features, "FEATURE_DIM")
+
+
+def test_encode_checks_its_output_against_the_registry(monkeypatch):
+    """`encode`'s patch-count check must read the registry, not a literal 64.
+
+    DINOv2 emits 64 patches, so on the real registry a hardcoded 64 and a
+    registry read are indistinguishable. Rebinding the entry to a count the
+    backbone cannot produce forces the difference: only a registry read
+    raises. Built fresh rather than via the module fixture so the patched
+    registry is what the extractor sees at encode time.
+    """
+    extractor = FeatureExtractor(device="cpu")
+    frames = np.zeros((1, *OBS_SHAPE), dtype=np.uint8)
+    assert extractor.encode(frames).shape == (1, 64, 384)  # sanity: unpatched passes
+    monkeypatch.setitem(BACKBONE_GEOMETRY, "dinov2", (63, 384))
+    with pytest.raises(ValueError, match=r"dinov2.*\(63, 384\).*\(64, 384\)"):
+        extractor.encode(frames)
 
 
 def test_encode_output_shape(extractor):
     frames = np.random.randint(0, 256, (3, *OBS_SHAPE), dtype=np.uint8)
-    assert extractor.encode(frames).shape == (3, N_PATCHES, FEATURE_DIM)
+    assert extractor.encode(frames).shape == (3, *BACKBONE_GEOMETRY[extractor.backbone])
 
 
 def test_encode_output_dtype_is_float16(extractor):
@@ -126,7 +167,7 @@ def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
     out = cache_episode_features(path, extractor)
     assert out.is_file()
     saved = np.load(out)
-    assert saved.shape == (4, N_PATCHES, FEATURE_DIM)
+    assert saved.shape == (4, *BACKBONE_GEOMETRY[extractor.backbone])
     # Mutation-testing gap-fill: shape alone doesn't catch writing float32
     # instead of float16, which would blow the ~49KB/frame storage budget
     # per spec §3.3.
@@ -146,7 +187,7 @@ def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
         backbone = "random_vit"
 
         def encode(self, frames):
-            return np.zeros((len(frames), N_PATCHES, FEATURE_DIM), dtype=np.float16)
+            return np.zeros((len(frames), *BACKBONE_GEOMETRY[self.backbone]), dtype=np.float16)
 
     keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
     episode = Episode(
@@ -166,7 +207,7 @@ def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
 
     # A pre-existing dinov2 cache that must survive untouched.
     dinov2_cache = path.with_suffix(".features.npy")
-    np.save(dinov2_cache, np.full((4, N_PATCHES, FEATURE_DIM), 7, dtype=np.float16))
+    np.save(dinov2_cache, np.full((4, *BACKBONE_GEOMETRY["dinov2"]), 7, dtype=np.float16))
 
     out_path = cache_episode_features(path, _StubExtractor())
 
@@ -174,12 +215,10 @@ def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
     assert out_path.is_file()
     assert dinov2_cache.is_file(), "the dinov2 cache was deleted"
     assert np.load(dinov2_cache)[0, 0, 0] == 7, "the dinov2 cache was overwritten"
-    assert np.load(out_path).shape == (4, N_PATCHES, FEATURE_DIM)
+    assert np.load(out_path).shape == (4, *BACKBONE_GEOMETRY["random_vit"])
 
 
 def test_backbones_registered():
-    from mbfps.data.features import BACKBONES
-
     assert BACKBONES == ("dinov2", "random_vit")
 
 
@@ -195,7 +234,7 @@ def test_random_vit_has_the_same_output_shape_as_dinov2():
     """Arm 3 must be Arm 2 with different weights, not a different shape."""
     ext = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
     frames = np.random.default_rng(0).integers(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
-    assert ext.encode(frames).shape == (2, N_PATCHES, FEATURE_DIM)
+    assert ext.encode(frames).shape == (2, *BACKBONE_GEOMETRY["random_vit"])
 
 
 @pytest.mark.slow
@@ -270,7 +309,7 @@ class _CountingExtractor:
         self.chunk_sizes.append(len(frames))
         markers = frames[:, 0, 0, 0].astype(np.float16)
         return np.broadcast_to(
-            markers[:, None, None], (len(frames), N_PATCHES, FEATURE_DIM)
+            markers[:, None, None], (len(frames), *BACKBONE_GEOMETRY[self.backbone])
         ).copy()
 
 
@@ -303,7 +342,7 @@ def test_cache_episode_features_batches_and_preserves_frame_order(tmp_path):
         "batching loop is not covering the episode as claimed"
     )
     written = np.load(out_path)
-    assert written.shape == (n, N_PATCHES, FEATURE_DIM)
+    assert written.shape == (n, *BACKBONE_GEOMETRY["random_vit"])
     # Frame order must survive concatenation across chunk boundaries.
     np.testing.assert_array_equal(
         written[:, 0, 0].astype(np.int64), np.arange(n)
