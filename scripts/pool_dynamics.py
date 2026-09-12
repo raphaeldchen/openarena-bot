@@ -209,7 +209,7 @@ def pathway_table(pooled: dict, rungs, treatment: str, control: str, threshold: 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=Path("runs/m3_study"))
+    parser.add_argument("--out", type=Path, default=Path("runs/m3_study_v2"))
     parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
     parser.add_argument("--rungs", nargs="+", default=list(LADDER), choices=list(LADDER))

@@ -2423,7 +2423,10 @@ def test_the_record_carries_the_full_history_at_the_jobs_own_length(record):
     assert isinstance(history["parts"], list)
     assert len(history["loss"]) == JOB_KW["steps"]
     assert len(history["parts"]) == JOB_KW["steps"]
-    assert JOB_KW["steps"] != 20, "a [-20:] slice would be invisible at 20 steps"
+    # The length check alone cannot see a `[-20:]` slice over `study.py`: at
+    # JOB_KW["steps"] == 5 (as at 20) the slice is the whole list. The slice
+    # mutation is caught by exact equality against a 23-step history in
+    # test_the_history_is_the_one_training_returned_and_not_a_summary_of_it.
     for value in history["loss"]:
         assert isinstance(value, float)
     for part in history["parts"]:

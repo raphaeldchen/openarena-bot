@@ -2056,7 +2056,9 @@ def test_the_out_flag_stays_the_string_argparse_produces():
     args = report_study._parser().parse_args(["--out", "runs/somewhere"])
     assert args.out == "runs/somewhere"
     assert isinstance(args.out, str)
-    assert report_study._parser().parse_args([]).out == "runs/m3_study"
+    assert report_study._parser().parse_args([]).out == "runs/m3_study_v2", (
+        "the report must read the directory the driver writes; runs/m3_study "
+        "is M3b's and holds no cell of this study")
     assert report_study._parser().parse_args([]).figure is None
 
 
@@ -2942,7 +2944,7 @@ def test_main_names_the_directory_it_ACTUALLY_read(tmp_path, capsys):
     out = capsys.readouterr().out
     assert _row(out, "  --out") == f"  --out       {where}"
     assert "runs/m3_study" not in out, (
-        "the parser's DEFAULT is runs/m3_study; a header hard-coded to it "
+        "the parser's DEFAULT is runs/m3_study_v2; a header hard-coded to it "
         "would render correctly on every run that used the default")
 
 

@@ -684,6 +684,15 @@ def test_the_rungs_flag_selects_the_ladder_and_defaults_to_all_three(
     ]
 
 
+def test_the_default_out_is_the_m3c_study_directory():
+    """`runs/m3_study` is M3b's directory, and this script OVERWRITES
+    `diagnostic_*.json` in `--out`; the default must be the directory the M3c
+    driver writes, and a revert would point nine diagnostics at M3b's
+    checkpoints, whose `cnn` arm is not even in `ARMS`."""
+    assert script.parse_args([]).out == Path("runs/m3_study_v2")
+    assert script.parse_args([]).out != Path("runs/m3_study")
+
+
 def test_a_rung_the_ladder_does_not_have_is_an_argparse_usage_error(capsys):
     """Refused as a bad FLAG (argparse's status 2) rather than as the
     ValueError the library raises twenty seconds into the probe refit, which

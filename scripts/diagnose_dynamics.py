@@ -1611,7 +1611,7 @@ def _require_window_series(block: dict, name: str, total: int) -> None:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--out", type=Path, default=Path("runs/m3_study"))
+    parser.add_argument("--out", type=Path, default=Path("runs/m3_study_v2"))
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))

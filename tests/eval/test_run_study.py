@@ -787,9 +787,14 @@ def test_the_parser_defaults_name_the_studys_own_directories():
     episodes, where every cell fails identically.
     """
     defaults = vars(run_study._parser().parse_args([]))
-    assert defaults["out"] == "runs/m3_study", (
+    assert defaults["out"] == "runs/m3_study_v2", (
         "the nine records are the study's only artifact and this is where the "
-        "aggregation and the plan's own commands look for them")
+        "aggregation and the plan's own commands look for them. It is NOT "
+        "runs/m3_study: that directory holds M3b's nine records, which carry "
+        "none of the four provenance keys, so a bare invocation defaulting "
+        "there finds every M3b cell pending and overwrites six unrecoverable "
+        "checkpoints and records")
+    assert defaults["out"] != "runs/m3_study"
     assert defaults["data"] == "data/my_way_home"
 
     # `--data` has a second home, and the two drifting apart would train the

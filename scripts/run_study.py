@@ -378,7 +378,7 @@ def acquire_lock(out_dir):
     with no start time is exactly the claim an operator will not dare delete.
 
     `parents=True` IS LOAD-BEARING. `runs/` is gitignored with zero tracked
-    files, so on a fresh clone on the rented box `--out runs/m3_study` has no
+    files, so on a fresh clone on the rented box `--out runs/m3_study_v2` has no
     parent, and this mkdir is the FIRST thing in the whole driver that creates
     `--out` -- `pending_jobs` and `stale_records` only build paths. Without it
     the plan's own Step 3 command dies at second zero inside this helper with a
@@ -565,7 +565,7 @@ def _parser() -> argparse.ArgumentParser:
     # and leaving them as argparse hands them over means the study exercises
     # the same path the tests do rather than a `Path`-only one.
     parser.add_argument("--data", default="data/my_way_home")
-    parser.add_argument("--out", default="runs/m3_study")
+    parser.add_argument("--out", default="runs/m3_study_v2")
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--device", default="cuda")

@@ -62,6 +62,14 @@ CONTRAST_ROWS = [
 ]
 
 
+def test_the_default_out_is_the_m3c_study_directory():
+    """The pool reads the diagnostics the M3c driver and `diagnose_dynamics`
+    wrote; `runs/m3_study` is M3b's directory and a revert there reads (or
+    refuses, exit 18) the wrong study."""
+    assert script.parse_args([]).out == Path("runs/m3_study_v2")
+    assert script.parse_args([]).out != Path("runs/m3_study")
+
+
 def test_the_pool_prints_every_arm_rung_and_statistic_and_the_between_arm_block(tmp_path, capsys):
     """One report, three blocks, every row present and typed here rather
     than enumerated from the module: 27 per-arm rows, 9 contrast rows, then

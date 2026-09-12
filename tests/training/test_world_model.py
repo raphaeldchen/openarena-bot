@@ -179,11 +179,11 @@ def test_overfits_a_single_fixed_batch(buffer):
         torch.device("cpu"),
     )
     optimiser = torch.optim.Adam(model.parameters(), lr=3e-4)
-    first = float(model(batch)[0])
+    first = model(batch)[0].item()
     for _ in range(120):
         loss, _ = model(batch)
         optimiser.zero_grad(); loss.backward(); optimiser.step()
-    assert float(loss) < 0.5 * first, f"did not overfit: {first:.4f} -> {float(loss):.4f}"
+    assert loss.item() < 0.5 * first, f"did not overfit: {first:.4f} -> {loss.item():.4f}"
 
 
 def test_privileged_state_never_enters_the_loss(buffer):
@@ -482,7 +482,7 @@ def test_total_loss_is_exactly_its_four_parts_under_the_default_kl_weights(buffe
         parts["kl_rep"], KL_FREE_BITS
     )
     expected = parts["embedding"] + parts["reward"] + parts["continue"] + expected_kl
-    assert float(loss) == pytest.approx(expected, rel=1e-5)
+    assert loss.item() == pytest.approx(expected, rel=1e-5)
 
 
 def test_the_kl_reaches_the_prior_at_dyn_scale_not_rep_scale(buffer):

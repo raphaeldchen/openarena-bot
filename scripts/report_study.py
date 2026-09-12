@@ -608,7 +608,7 @@ def _parser() -> argparse.ArgumentParser:
     # them: everything downstream coerces, and leaving them as argparse hands
     # them over means the report is exercised on the type the command line
     # really produces rather than on a `Path` the tests invented.
-    parser.add_argument("--out", default="runs/m3_study")
+    parser.add_argument("--out", default="runs/m3_study_v2")
     parser.add_argument("--figure", default=None)
     return parser
 
