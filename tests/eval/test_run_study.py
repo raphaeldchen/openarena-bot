@@ -901,6 +901,31 @@ def test_a_record_that_is_not_an_object_is_treated_as_pending(tmp_path, text):
     assert CORRUPT_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
 
 
+def _assert_missing_key_makes_the_cell_pending(tmp_path, missing: str) -> None:
+    """Delete `missing` from an otherwise complete record and check the driver
+    calls the cell pending; then write the record intact and check it does not.
+
+    The body shared by the two parametrised tests below, so the two cannot
+    drift: each keeps its own literal list of keys, and this is the one place
+    that says what "missing makes it pending" means -- including the control,
+    without which an implementation that calls everything incomplete would
+    pass every parametrisation of both.
+    """
+    path = job_record_path(tmp_path, INCOMPLETE_JOB)
+    damaged = _sanitised(INCOMPLETE_JOB)
+    del damaged[missing]
+    path.write_text(json.dumps(damaged))
+    assert not run_study.record_is_complete(path, INCOMPLETE_JOB)
+    assert INCOMPLETE_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+
+    # The control. Without it, an implementation that calls everything
+    # incomplete would pass all twenty-two parametrisations of the first
+    # caller and all four of the second.
+    path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
+    assert run_study.record_is_complete(path, INCOMPLETE_JOB)
+    assert INCOMPLETE_JOB not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+
+
 @pytest.mark.parametrize("missing", sorted(EXPECTED_RECORD_KEYS))
 def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     """THE DANGEROUS CASE: valid JSON that is not a complete record.
@@ -916,18 +941,7 @@ def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     stopped being generated, so the suite stayed green while a pixel_ae record with
     no position block became a finished cell.
     """
-    path = job_record_path(tmp_path, INCOMPLETE_JOB)
-    damaged = _sanitised(INCOMPLETE_JOB)
-    del damaged[missing]
-    path.write_text(json.dumps(damaged))
-    assert not run_study.record_is_complete(path, INCOMPLETE_JOB)
-    assert INCOMPLETE_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
-
-    # The control. Without it, an implementation that calls everything
-    # incomplete would pass all twenty-two parametrisations above.
-    path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
-    assert run_study.record_is_complete(path, INCOMPLETE_JOB)
-    assert INCOMPLETE_JOB not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
+    _assert_missing_key_makes_the_cell_pending(tmp_path, missing)
 
 
 def test_the_m3c_keys_are_in_both_literals():
@@ -963,15 +977,7 @@ def test_a_record_missing_a_provenance_field_is_treated_as_pending(
     assert missing in _record_body(INCOMPLETE_JOB), (
         f"the fixture record never carried {missing!r}, so deleting it is a "
         "no-op and this case cannot fail")
-    path = job_record_path(tmp_path, INCOMPLETE_JOB)
-    damaged = _sanitised(INCOMPLETE_JOB)
-    del damaged[missing]
-    path.write_text(json.dumps(damaged))
-    assert not run_study.record_is_complete(path, INCOMPLETE_JOB)
-    assert INCOMPLETE_JOB in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
-
-    path.write_text(json.dumps(_sanitised(INCOMPLETE_JOB)))
-    assert run_study.record_is_complete(path, INCOMPLETE_JOB)
+    _assert_missing_key_makes_the_cell_pending(tmp_path, missing)
 
 
 def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
