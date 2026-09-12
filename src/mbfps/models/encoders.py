@@ -1,10 +1,17 @@
 """Encoders -- the ONLY module that differs between the study's three arms.
 
-Arm 1 learns a CNN over pixels. Arms 2 and 3 apply a small learned bottleneck
-to features from a frozen backbone, cached at collection time so no vision
-transformer runs during training.
+Every study arm applies the same small learned bottleneck to rows cached from
+a frozen backbone: `pixel_ae` from the M2 pixel autoencoder's encoder,
+`frozen_ssl` from DINOv2, `random_vit` from an untrained ViT. The arms differ
+in exactly one thing -- what the backbone was pretrained on -- and the row
+geometry each reads comes from `BACKBONE_GEOMETRY`.
 
-All three emit a 2048-dimensional embedding from byte-identical 112x112 frames,
+`CNNEncoder`, the end-to-end pixel encoder, is M3b's retired `cnn` arm and
+M2's autoencoder encoder. It stays constructible under `kind="cnn"` (M2's
+scripts and tests build it, and the shipped M3b checkpoints load through it)
+but `cnn` is not in `ARMS`, so no M3 tool can select it.
+
+All four emit a 2048-dimensional embedding from byte-identical 112x112 frames,
 so resolution and embedding width are controlled and only the representation
 differs. If any other module ever needs to know which arm is running, the
 comparison has stopped being controlled.
@@ -46,28 +53,36 @@ class CNNEncoder(nn.Module):
 
 
 def encoder_input_kind(cfg: EncoderConfig) -> str:
-    """Whether this arm's encoder consumes `"obs"` or cached `"features"`."""
+    """Whether this encoder consumes `"obs"` or cached `"features"`.
+
+    `"obs"` iff `cfg.kind == "cnn"`. Every study arm -- `pixel_ae` included,
+    its M2 encoder having been run over the frames at cache time -- reads
+    features; the one pixel-consuming encoder is the retired kind.
+    """
     return "obs" if cfg.kind == "cnn" else "features"
 
 
 _ARM_BACKBONE: dict[str, str | None] = {
     "cnn": None,
+    "pixel_ae": "pixel_ae",
     "frozen_ssl": "dinov2",
     "random_vit": "random_vit",
 }
-"""Which cached feature set each arm reads. None means the arm reads pixels.
+"""Which cached feature set each kind reads. None means the encoder reads pixels.
 
 The arm name and the backbone name are deliberately not assumed equal:
 `frozen_ssl` reads the `dinov2` cache. Deriving one from the other by string
 identity would silently send the treatment arm to a cache that does not exist.
+`pixel_ae` and `random_vit` happen to share their backbone's name; that is a
+coincidence the tests name, not a rule this table relies on.
 """
 
 
 def encoder_backbone(cfg: EncoderConfig) -> str | None:
-    """Backbone whose cached features this arm consumes, or None for pixels.
+    """Backbone whose cached features this kind consumes, or None for pixels.
 
     Raises:
-        KeyError: if `cfg.kind` is not a registered arm.
+        KeyError: if `cfg.kind` is not a registered kind.
     """
     if cfg.kind not in _ARM_BACKBONE:
         raise KeyError(f"unknown encoder kind {cfg.kind!r}")
@@ -146,11 +161,17 @@ class BottleneckEncoder(nn.Module):
 def build_encoder(cfg: EncoderConfig) -> nn.Module:
     """Construct the encoder for `cfg.kind`.
 
+    `cnn` -> `CNNEncoder`; every study arm -> the one `BottleneckEncoder`
+    class, which reads its row geometry from `BACKBONE_GEOMETRY` for the
+    kind's backbone. The routing is by explicit name, not `kind != "cnn"`,
+    so an unregistered kind is a KeyError here rather than a KeyError from
+    inside the registry lookup.
+
     Raises:
-        KeyError: if `cfg.kind` is not a registered arm.
+        KeyError: if `cfg.kind` is not a registered kind.
     """
     if cfg.kind == "cnn":
         return CNNEncoder(cfg)
-    if cfg.kind in ("frozen_ssl", "random_vit"):
+    if cfg.kind in ("pixel_ae", "frozen_ssl", "random_vit"):
         return BottleneckEncoder(cfg)
     raise KeyError(f"unknown encoder kind {cfg.kind!r}")

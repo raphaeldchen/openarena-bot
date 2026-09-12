@@ -7,7 +7,7 @@ from mbfps.data.episode import Episode
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.models.rssm import KL_FREE_BITS
 from mbfps.training.world_model import WorldModel, train_world_model
-from mbfps.utils.config import get_config
+from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.seeding import seed_everything
 
 KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
@@ -230,14 +230,40 @@ def test_different_seeds_diverge(buffer):
     assert a["loss"] != b["loss"]
 
 
-@pytest.mark.parametrize("arm", ["cnn", "frozen_ssl", "random_vit"])
+def test_the_arms_this_file_trains_are_the_studys_three():
+    """L7 guard for the parametrisation below: iterating `ARMS` would let a
+    tuple that lost a member shrink the test instead of failing it, so the
+    three names are written out here, once. `cnn` is not among them -- it is
+    `tiny()`'s default above because the RSSM and loss tests are indifferent
+    to which encoder feeds them and a pixel encoder needs no feature file,
+    but it is not an arm the study trains."""
+    assert ARMS == ("pixel_ae", "frozen_ssl", "random_vit")
+    assert "cnn" not in ARMS
+
+
+#: The cache each study arm reads, by suffix and row width. `pixel_ae` rows
+#: are 32 wide (the M2 autoencoder's 2048-d projection cut into 64 rows);
+#: the ViT arms' are 384 (DINOv2-small's hidden size). Written here rather
+#: than derived from `BACKBONE_GEOMETRY`, so a registry that drifted would
+#: fail this test rather than be copied into it.
+_ARM_CACHE = {
+    "pixel_ae": (".features_pixel_ae.npy", 32),
+    "frozen_ssl": (".features.npy", 384),
+    "random_vit": (".features_random_vit.npy", 384),
+}
+
+
+@pytest.mark.parametrize("arm", ARMS)
 def test_all_three_arms_train(buffer, arm, tmp_path):
-    if arm != "cnn":
-        for path in buffer.episode_paths():
-            suffix = ".features.npy" if arm == "frozen_ssl" else ".features_random_vit.npy"
-            np.save(path.with_suffix(suffix), np.zeros((41, 64, 384), dtype=np.float16))
+    """Every study arm trains end to end through `train_world_model`, each on
+    a cache of ITS OWN geometry. Guarded against L7 by the test above."""
+    assert set(_ARM_CACHE) == set(ARMS)
+    suffix, width = _ARM_CACHE[arm]
+    for path in buffer.episode_paths():
+        np.save(path.with_suffix(suffix), np.zeros((41, 64, width), dtype=np.float16))
     history = train_world_model(tiny(arm), buffer, out_dir=None)
     assert history["steps"] == 3
+    assert history["arm"] == arm
     assert all(np.isfinite(history["loss"]))
 
 

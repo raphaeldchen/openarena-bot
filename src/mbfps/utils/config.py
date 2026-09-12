@@ -13,9 +13,25 @@ arm's settings drift silently; here a stray field is a TypeError at call time.
 import dataclasses
 from dataclasses import dataclass, replace
 
-ARMS: tuple[str, ...] = ("cnn", "frozen_ssl", "random_vit")
-"""The three arms. `cnn` is the baseline, `frozen_ssl` the treatment,
-`random_vit` the control that separates pretraining from target stability."""
+ARMS: tuple[str, ...] = ("pixel_ae", "frozen_ssl", "random_vit")
+"""The study's arms. Every M3 tool -- the driver, report, aggregation, rollout
+evaluation, diagnostics, pooling -- takes `choices=ARMS`.
+
+`pixel_ae` is the frozen M2 pixel autoencoder's encoder, `frozen_ssl` the
+DINOv2 treatment, `random_vit` the control that separates pretraining from
+target stability. M3b's end-to-end `cnn` arm is not here: measured, its
+embedding target was born collapsed (`embedding_loss` 0.0008 at step 0 against
+0.32-0.41 for the feature arms), its dynamics KL never cleared the free-bits
+floor, and its prior never received a gradient. The order here is the row
+order of every report table."""
+
+KINDS: tuple[str, ...] = ("cnn",) + ARMS
+"""Every encoder `build_encoder` can construct. `get_config` validates against
+this, not `ARMS`, because M2's autoencoder scripts and tests still build the
+end-to-end `CNNEncoder` under the name `cnn` and must keep doing so -- and the
+shipped M3b checkpoints (`runs/m3_study/world_model_cnn_seed*.pt`) load through
+`get_config("cnn")`. Buildable is not selectable: no M3 tool offers `cnn`, so
+no M3c artefact can be written under the old name."""
 
 
 @dataclass(frozen=True)
@@ -74,14 +90,17 @@ def get_config(arm: str, **overrides) -> Config:
     """Build the configuration for `arm`, applying `overrides` to TrainConfig.
 
     Args:
-        arm: one of `ARMS`.
+        arm: one of `KINDS` -- a study arm, or `cnn` for M2's autoencoder and
+            the shipped M3b artefacts.
         **overrides: field names of `TrainConfig`.
 
     Raises:
-        KeyError: if `arm` is not registered.
+        KeyError: if `arm` is not a registered kind. The message lists `KINDS`,
+            so a reader sees both that `cnn` is still a kind and which three
+            the study runs.
         TypeError: if an override names a field `TrainConfig` does not have.
     """
-    if arm not in ARMS:
-        raise KeyError(f"unknown arm {arm!r}; available: {list(ARMS)}")
+    if arm not in KINDS:
+        raise KeyError(f"unknown arm {arm!r}; available: {list(KINDS)}")
     train = replace(TrainConfig(), **overrides) if overrides else TrainConfig()
     return Config(arm=arm, encoder=EncoderConfig(kind=arm), train=train)

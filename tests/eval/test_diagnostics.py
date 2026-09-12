@@ -2812,6 +2812,12 @@ def test_an_episode_that_yields_no_window_does_not_consume_an_episode_label(tmp_
 
 SHIPPED_RUNS = Path("runs/m3_study")
 SHIPPED_DATA = Path("data/my_way_home")
+# The RETIRED end-to-end pixel arm, on purpose. These self-checks pin an M3b
+# artefact (`runs/m3_study/world_model_cnn_seed0.pt`, its record, and
+# `fixtures/shuffled_cnn_seed0_pre_ladder.json`) bitwise, so they must keep
+# naming the arm that produced it. `get_config("cnn")` below still builds it
+# because `cnn` is in KINDS; it is not in ARMS, so nothing in the M3c study
+# can write a `cnn` artefact this could be confused with.
 SHIPPED_ARM, SHIPPED_SEED = "cnn", 0
 SHIPPED_WINDOWS = 229
 """22 val episodes of 525 transitions give 10 windows each, one of 345 gives 6,

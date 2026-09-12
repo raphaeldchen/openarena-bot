@@ -3,9 +3,10 @@ from dataclasses import replace
 import pytest
 import torch
 
-import mbfps.models.encoders as encoders
+import mbfps.models.encoders as encoders  # Task 1's `test_no_second_source_of_truth_for_the_patch_count` reads it
 from mbfps.data.features import BACKBONE_GEOMETRY
 from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.utils.config import get_config
 from mbfps.models.encoders import (
     BottleneckEncoder,
     CNNEncoder,
@@ -13,7 +14,7 @@ from mbfps.models.encoders import (
     encoder_backbone,
     encoder_input_kind,
 )
-from mbfps.utils.config import ARMS, EncoderConfig, get_config
+from mbfps.utils.config import ARMS, KINDS, EncoderConfig
 
 
 def cfg(kind: str) -> EncoderConfig:
@@ -96,26 +97,50 @@ def test_bottleneck_flattens_patch_grid_to_embed_dim():
     assert n_patches * c.bottleneck_dim == c.embed_dim
 
 
-@pytest.mark.parametrize("arm", ARMS)
-def test_build_encoder_returns_something_for_every_arm(arm):
-    assert build_encoder(cfg(arm)) is not None
+def test_the_kinds_under_test_are_the_four_the_registry_knows():
+    """L7 guard for every test below that parametrises over KINDS or ARMS: a
+    tuple that silently lost a member would shrink those tests rather than
+    fail them. The names are spelled out once, here."""
+    assert KINDS == ("cnn", "pixel_ae", "frozen_ssl", "random_vit")
+    assert ARMS == ("pixel_ae", "frozen_ssl", "random_vit")
 
 
-@pytest.mark.parametrize("arm", ARMS)
-def test_every_arm_emits_the_same_embedding_width(arm):
-    c = cfg(arm)
+@pytest.mark.parametrize("kind", KINDS)
+def test_build_encoder_routes_every_kind_to_its_class(kind):
+    """Over KINDS, not ARMS: `cnn` must stay constructible for M2 and for the
+    shipped M3b checkpoints, and `pixel_ae` must route to the SAME bottleneck
+    class the ViT arms use -- the study's arms are one pipeline."""
+    built = build_encoder(cfg(kind))
+    expected = CNNEncoder if kind == "cnn" else BottleneckEncoder
+    assert type(built) is expected, (kind, type(built))
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_every_kind_emits_the_same_embedding_width(kind):
+    """The feature input is shaped from the backbone registry, not a literal
+    (64, 384): `pixel_ae`'s rows are 32 wide, and a hardcoded width would
+    make this test the one place the study's own geometry is not read."""
+    c = cfg(kind)
     enc = build_encoder(c)
     if encoder_input_kind(c) == "obs":
         x = torch.randint(0, 256, (3, *OBS_SHAPE), dtype=torch.uint8)
     else:
-        x = torch.randn(3, 64, 384)
+        n_patches, patch_dim = BACKBONE_GEOMETRY[encoder_backbone(c)]
+        x = torch.randn(3, n_patches, patch_dim)
     assert enc(x).shape == (3, 2048)
 
 
-def test_input_kind_is_obs_for_cnn_and_features_for_ssl_arms():
+def test_input_kind_is_obs_for_cnn_and_features_for_every_study_arm():
+    """Every study arm reads cached features. Written out by name AND over
+    the tuple: the tuple form is what the study relies on (`run_job` picks
+    the cache from this), the named form is what stops a shrunken ARMS from
+    passing it vacuously."""
     assert encoder_input_kind(cfg("cnn")) == "obs"
+    assert encoder_input_kind(cfg("pixel_ae")) == "features"
     assert encoder_input_kind(cfg("frozen_ssl")) == "features"
     assert encoder_input_kind(cfg("random_vit")) == "features"
+    assert {encoder_input_kind(cfg(arm)) for arm in ARMS} == {"features"}
+    assert "cnn" not in ARMS, "the one obs-kind encoder is not a study arm"
 
 
 def test_unknown_arm_rejected():
@@ -130,13 +155,16 @@ def test_each_arm_maps_to_its_own_backbone():
     naive identity mapping would send it to a cache that does not exist.
     """
     assert encoder_backbone(cfg("cnn")) is None
+    assert encoder_backbone(cfg("pixel_ae")) == "pixel_ae"
     assert encoder_backbone(cfg("frozen_ssl")) == "dinov2"
     assert encoder_backbone(cfg("random_vit")) == "random_vit"
 
 
-def test_feature_arms_map_to_distinct_backbones():
-    """If these collided, arms 2 and 3 would be the same experiment."""
-    assert encoder_backbone(cfg("frozen_ssl")) != encoder_backbone(cfg("random_vit"))
+def test_study_arms_map_to_three_distinct_backbones():
+    """If any two collided, two arms would be the same experiment."""
+    backbones = [encoder_backbone(cfg(arm)) for arm in ARMS]
+    assert len(set(backbones)) == 3 == len(ARMS), backbones
+    assert None not in backbones, "a study arm that reads pixels has no cache"
 
 
 @pytest.mark.parametrize("arm", ["frozen_ssl", "random_vit"])
@@ -192,6 +220,28 @@ def test_recorded_parameter_counts():
     """
     assert n_params(CNNEncoder(cfg("cnn"))) == 26_382_304
     assert n_params(BottleneckEncoder(cfg("frozen_ssl"))) == 12_320
+    assert n_params(BottleneckEncoder(cfg("pixel_ae"))) == 1_056
+
+
+def test_pixel_ae_builds_the_same_bottleneck_class_over_32_wide_rows():
+    """Spec section 2.2's one stated asymmetry: same class, same per-row
+    treatment, same state-dict keys as the ViT arms, but `Linear(32 -> 32)`
+    (1,056 parameters) against `Linear(384 -> 32)` (12,320), because the M2
+    autoencoder's `project` layer already reduced each row to 32. Pinned so
+    the asymmetry stays the one the design recorded and not a second, silent
+    one -- and driven through `build_encoder`, so a routing table that sent
+    `pixel_ae` to the ViT geometry fails here rather than at step 0."""
+    built = build_encoder(cfg("pixel_ae"))
+    reference = build_encoder(cfg("frozen_ssl"))
+    assert type(built) is BottleneckEncoder
+    assert built.state_dict().keys() == reference.state_dict().keys()
+    assert isinstance(built.bottleneck, torch.nn.Linear)
+    assert (built.bottleneck.in_features, built.bottleneck.out_features) == (32, 32)
+    assert (reference.bottleneck.in_features, reference.bottleneck.out_features) == (384, 32)
+    assert isinstance(built.norm, torch.nn.LayerNorm)
+    assert tuple(built.norm.normalized_shape) == (32,)
+    assert n_params(built.norm) == 0
+    assert built(torch.randn(3, 64, 32)).shape == (3, 2048)
 
 
 def test_cnn_gradients_flow_to_every_parameter():

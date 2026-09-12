@@ -6,12 +6,15 @@ from pathlib import Path
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.training.autoencoder import train_autoencoder
-from mbfps.utils.config import ARMS, get_config
+from mbfps.utils.config import KINDS, get_config
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm", choices=ARMS, required=True)
+    # KINDS, not ARMS: M3c retired `cnn` from the study, but this script is
+    # how the end-to-end CNNEncoder gets trained, and its checkpoint is the
+    # `pixel_ae` backbone.
+    parser.add_argument("--arm", choices=KINDS, required=True)
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--out", type=Path, default=Path("runs/m2"))
     parser.add_argument("--steps", type=int, default=2000)

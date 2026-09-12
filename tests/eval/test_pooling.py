@@ -46,7 +46,7 @@ from mbfps.eval.pooling import (
 from mbfps.eval.study import write_record
 
 RUNGS = ("shuffled", "resampled", "constant")
-ARMS = ("cnn", "frozen_ssl", "random_vit")
+ARMS = ("pixel_ae", "frozen_ssl", "random_vit")
 SEEDS = (0, 1, 2)
 EPISODES = (0, 0, 1, 1)
 VAL = ("ep_000001_len00051.npz", "ep_000002_len00051.npz")
@@ -174,7 +174,7 @@ def test_a_record_without_the_per_window_series_is_refused_by_name_and_never_rea
 
 
 def test_a_record_whose_series_disagree_in_length_is_refused():
-    record = synthetic_record("cnn", 0)
+    record = synthetic_record("pixel_ae", 0)
     record["interventions"]["shuffled"]["position"]["window_delta_mean"] = [1.0, 2.0]
     with pytest.raises(StaleRecord, match="shuffled"):
         read_series(record, "shuffled", "position")
@@ -200,9 +200,9 @@ def test_two_cells_that_do_not_score_the_same_windows_are_refused_naming_both(mu
     is triggered alone; the refusal names both cells and the field. A
     mismatched window count in particular is refused, never truncated to the
     shorter cell."""
-    other = synthetic_record("cnn", 1)
+    other = synthetic_record("pixel_ae", 1)
     mutate(other)
-    cells = [read_series(synthetic_record("cnn", 0), "constant", "position")]
+    cells = [read_series(synthetic_record("pixel_ae", 0), "constant", "position")]
     if field == "windows":
         other["windows"]["episode"] = [0, 0, 1, 1, 1]
         for rung in RUNGS:
@@ -215,7 +215,7 @@ def test_two_cells_that_do_not_score_the_same_windows_are_refused_naming_both(mu
     cells.append(read_series(other, "constant", "position"))
     with pytest.raises(IncompatibleCells, match=field) as raised:
         require_compatible(cells)
-    assert "cnn seed 0" in str(raised.value) and "cnn seed 1" in str(raised.value)
+    assert "pixel_ae seed 0" in str(raised.value) and "pixel_ae seed 1" in str(raised.value)
     with pytest.raises(IncompatibleCells):
         pool_arm(cells)
 
@@ -229,17 +229,17 @@ def test_cells_of_different_arms_or_the_same_cell_twice_are_refused_before_pooli
     mixed = [series(arm, seed, [1.0, 2.0, 3.0, 4.0]) for seed, arm in enumerate(ARMS)]
     with pytest.raises(IncompatibleCells, match="arm") as raised:
         require_compatible(mixed)
-    assert "cnn seed 0" in str(raised.value) and "frozen_ssl seed 1" in str(raised.value)
+    assert "pixel_ae seed 0" in str(raised.value) and "frozen_ssl seed 1" in str(raised.value)
     with pytest.raises(IncompatibleCells, match="arm"):
         pool_arm(mixed)
-    twice = [series("cnn", 0, [1.0, 2.0, 3.0, 4.0]) for _ in SEEDS]
-    with pytest.raises(IncompatibleCells, match="cnn seed 0 .*more than once") as raised:
+    twice = [series("pixel_ae", 0, [1.0, 2.0, 3.0, 4.0]) for _ in SEEDS]
+    with pytest.raises(IncompatibleCells, match="pixel_ae seed 0 .*more than once") as raised:
         require_compatible(twice)
     with pytest.raises(IncompatibleCells, match="more than once"):
         pool_ratio(twice, bootstrap=10)
-    same = [series("cnn", seed, [1.0, 2.0, 3.0, 4.0]) for seed in SEEDS]
-    with pytest.raises(IncompatibleCells, match="cnn.*against itself"):
-        paired_contrast(same, [series("cnn", seed, [1.0, 2.0, 3.0, 4.0]) for seed in SEEDS])
+    same = [series("pixel_ae", seed, [1.0, 2.0, 3.0, 4.0]) for seed in SEEDS]
+    with pytest.raises(IncompatibleCells, match="pixel_ae.*against itself"):
+        paired_contrast(same, [series("pixel_ae", seed, [1.0, 2.0, 3.0, 4.0]) for seed in SEEDS])
     with pytest.raises(IncompatibleCells, match="against itself"):
         paired_ratio_contrast(same, same, bootstrap=10)
 
@@ -248,8 +248,8 @@ def test_pool_ladder_refuses_a_treatment_or_control_that_is_not_among_the_arms()
     records = {(a, s): synthetic_record(a, s) for a in ARMS for s in SEEDS}
     with pytest.raises(MissingCell, match="treatment 'nonesuch'"):
         pool_ladder(records, ARMS, SEEDS, RUNGS, "nonesuch", "random_vit", bootstrap=10)
-    with pytest.raises(MissingCell, match="control 'cnn'"):
-        pool_ladder(records, ("frozen_ssl", "random_vit"), SEEDS, RUNGS, "frozen_ssl", "cnn", bootstrap=10)
+    with pytest.raises(MissingCell, match="control 'pixel_ae'"):
+        pool_ladder(records, ("frozen_ssl", "random_vit"), SEEDS, RUNGS, "frozen_ssl", "pixel_ae", bootstrap=10)
 
 
 def test_load_cells_reads_every_planned_cell_and_refuses_gaps_and_mislabels(tmp_path):
@@ -284,7 +284,7 @@ def test_load_cells_reads_every_planned_cell_and_refuses_gaps_and_mislabels(tmp_
     with pytest.raises(MislabelledRecord, match="seed") as raised:
         load_cells(tmp_path, ARMS, SEEDS)
     assert "random_vit seed 2" in str(raised.value) and "seed=0" in str(raised.value)
-    write_record(path("random_vit", 2), synthetic_record("cnn", 2))
+    write_record(path("random_vit", 2), synthetic_record("pixel_ae", 2))
     with pytest.raises(MislabelledRecord, match="arm"):
         load_cells(tmp_path, ARMS, SEEDS)
 
@@ -309,9 +309,9 @@ def test_pool_arm_averages_the_seeds_per_window_and_clusters_by_episode():
     still not the ruler. The seed offsets make the mean (21) differ from
     seed 0's (20), so a pool that read one seed is caught too.
     """
-    cells = [series("cnn", seed, np.array([0.0, 0.0, 40.0, 40.0]) + seed) for seed in SEEDS]
+    cells = [series("pixel_ae", seed, np.array([0.0, 0.0, 40.0, 40.0]) + seed) for seed in SEEDS]
     pooled = pool_arm(cells)
-    assert (pooled.arm, pooled.rung, pooled.channel, pooled.seeds) == ("cnn", "constant", "position", (0, 1, 2))
+    assert (pooled.arm, pooled.rung, pooled.channel, pooled.seeds) == ("pixel_ae", "constant", "position", (0, 1, 2))
     assert pooled.windows == 4 and pooled.clusters == 2 and pooled.windows_excluded == 0
     assert pooled.mean == 21.0
     assert pooled.se == pytest.approx(20.0)
@@ -332,20 +332,20 @@ def test_the_pooled_rows_exclude_unchanged_windows_and_the_z_never_falls_back_to
     so inclusion is loud, both when every seed left it and when ONE did.
     Below two clusters the clustered standard error is NaN and so is z:
     never the naive ruler under the clustered name."""
-    cells = [series("cnn", seed, [1.0, 1.0, 1.0, 1e6], changed=[True, True, True, False])
+    cells = [series("pixel_ae", seed, [1.0, 1.0, 1.0, 1e6], changed=[True, True, True, False])
              for seed in SEEDS]
     pooled = pool_arm(cells)
     assert pooled.windows == 3 and pooled.windows_excluded == 1 and pooled.excluded_windows == (3,)
     assert pooled.mean == 1.0
     one_seed = [
-        series("cnn", seed, [1.0, 1e6 if seed == 1 else 1.0, 1.0, 1.0],
+        series("pixel_ae", seed, [1.0, 1e6 if seed == 1 else 1.0, 1.0, 1.0],
                changed=[True, seed != 1, True, True])
         for seed in SEEDS
     ]
     pooled = pool_arm(one_seed)
     assert pooled.windows == 3 and pooled.excluded_windows == (1,) and pooled.mean == 1.0
 
-    one_episode = [series("cnn", seed, [1.0, 2.0, 3.0, 4.0], episodes=(0, 0, 0, 0)) for seed in SEEDS]
+    one_episode = [series("pixel_ae", seed, [1.0, 2.0, 3.0, 4.0], episodes=(0, 0, 0, 0)) for seed in SEEDS]
     pooled = pool_arm(one_episode)
     assert pooled.clusters == 1
     assert np.isnan(pooled.se) and np.isnan(pooled.z)
@@ -438,22 +438,22 @@ def test_pool_ratio_is_the_ratio_of_pooled_medians_with_a_cluster_bootstrap_inte
     interval's shape.
     """
     noise = [1.0, 2.0, 4.0, 8.0]
-    doubled = [series("cnn", seed, [0.0] * 4, embedding=[2.0 * v for v in noise], noise=noise)
+    doubled = [series("pixel_ae", seed, [0.0] * 4, embedding=[2.0 * v for v in noise], noise=noise)
                for seed in SEEDS]
     pooled = pool_ratio(doubled, bootstrap=200, seed=0)
-    assert (pooled.arm, pooled.rung, pooled.rows, pooled.clusters) == ("cnn", "constant", 12, 2)
+    assert (pooled.arm, pooled.rung, pooled.rows, pooled.clusters) == ("pixel_ae", "constant", 12, 2)
     assert pooled.ratio == 2.0
     assert (pooled.ci_low, pooled.ci_high) == (2.0, 2.0) and pooled.bootstrap_se == 0.0
     assert (pooled.bootstrap, pooled.seed) == (200, 0)
 
-    symmetric = [series("cnn", seed, [0.0] * 4, embedding=[1.0, 3.0, 1.0, 3.0], noise=[1.0] * 4)
+    symmetric = [series("pixel_ae", seed, [0.0] * 4, embedding=[1.0, 3.0, 1.0, 3.0], noise=[1.0] * 4)
                  for seed in SEEDS]
     pooled = pool_ratio(symmetric, bootstrap=500, seed=3)
     assert pooled.ratio == 2.0
     assert (pooled.ci_low, pooled.ci_high) == (2.0, 2.0), "the resample is not by episode"
 
     varied = [
-        series("cnn", seed, [0.0] * 4, embedding=[1.0 + seed, 5.0, 9.0 + seed, 100.0],
+        series("pixel_ae", seed, [0.0] * 4, embedding=[1.0 + seed, 5.0, 9.0 + seed, 100.0],
                noise=[2.0, 4.0, 4.0 + seed, 8.0], episodes=(0, 0, 1, 2))
         for seed in SEEDS
     ]
@@ -480,7 +480,7 @@ def test_pool_ratio_is_the_ratio_of_pooled_medians_with_a_cluster_bootstrap_inte
     assert other.bootstrap_se != pooled.bootstrap_se
 
 
-def _scaled_cells(scales, *, arm="cnn", episodes=EPISODES):
+def _scaled_cells(scales, *, arm="pixel_ae", episodes=EPISODES):
     """Three cells whose per-cell ratios of medians are 0.5, 0.5 and 2.0
     whatever `scales` says: seed s's rows are the same shape times
     `scales[s]`, standing in for an embedding head whose scale differs
@@ -547,11 +547,11 @@ def test_a_bootstrap_replicate_whose_noise_median_is_zero_is_refused_rather_than
     0 twice divides by zero, and a NaN in the replicates reaches the
     percentile as a NaN interval printed beside a finite ratio. Refused, as
     the same `DegenerateNoise`, naming the cell."""
-    cells = [series("cnn", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[0.0, 0.0, 3.0, 3.0])
+    cells = [series("pixel_ae", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[0.0, 0.0, 3.0, 3.0])
              for seed in SEEDS]
     with pytest.raises(DegenerateNoise, match="replicate") as raised:
         pool_ratio(cells, bootstrap=50, seed=0)
-    assert "cnn" in str(raised.value)
+    assert "pixel_ae" in str(raised.value)
     control = [series("random_vit", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[2.0] * 4)
                for seed in SEEDS]
     treatment = [series("frozen_ssl", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[0.0, 0.0, 3.0, 3.0])
@@ -562,7 +562,7 @@ def test_a_bootstrap_replicate_whose_noise_median_is_zero_is_refused_rather_than
 
 def test_pool_ratio_excludes_unchanged_windows_and_refuses_a_cell_whose_noise_measured_no_spread():
     cells = [
-        series("cnn", seed, [0.0] * 4, changed=[True, True, True, False],
+        series("pixel_ae", seed, [0.0] * 4, changed=[True, True, True, False],
                embedding=[1.0, 1.0, 1.0, 1e6], noise=[2.0, 2.0, 2.0, 2.0])
         for seed in SEEDS
     ]
@@ -570,13 +570,13 @@ def test_pool_ratio_excludes_unchanged_windows_and_refuses_a_cell_whose_noise_me
     assert pooled.rows == 9 and pooled.ratio == 0.5
 
     degenerate = [
-        series("cnn", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[0.0] * 4 if seed == 1 else [2.0] * 4)
+        series("pixel_ae", seed, [0.0] * 4, embedding=[1.0] * 4, noise=[0.0] * 4 if seed == 1 else [2.0] * 4)
         for seed in SEEDS
     ]
-    with pytest.raises(DegenerateNoise, match="cnn seed 1"):
+    with pytest.raises(DegenerateNoise, match="pixel_ae seed 1"):
         pool_ratio(degenerate, bootstrap=50, seed=0)
     unmeasured = [
-        read_series(synthetic_record("cnn", seed, embedding={"constant": None}), "constant")
+        read_series(synthetic_record("pixel_ae", seed, embedding={"constant": None}), "constant")
         for seed in SEEDS
     ]
     with pytest.raises(StaleRecord, match="embedding"):

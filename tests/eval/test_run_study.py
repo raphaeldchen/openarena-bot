@@ -242,7 +242,7 @@ PAIRWISE_DISTINCT_PARAMETERS = {
 # `frozen_ssl` is the arm Task 4's tests never ran and the only one whose
 # backbone is not its own name; leaving it out of a fixture is how three seeds
 # of the study died hours in.
-DONE_JOB = StudyJob("cnn", 1)
+DONE_JOB = StudyJob("pixel_ae", 1)
 CORRUPT_JOB = StudyJob("frozen_ssl", 2)
 INCOMPLETE_JOB = StudyJob("random_vit", 0)
 
@@ -260,7 +260,7 @@ UNEVEN_SEEDS = (0, 1, 2, CLI_SEED)
 # case, and one asserting the set was a SUBSET of a real record's keys, which a
 # smaller set satisfies just as well. Every one of "position", "curves",
 # "filtering", "reward" and "probe" could be removed with a green suite, and a
-# cnn record with no position block would then have been marked done: the
+# pixel_ae record with no position block would then have been marked done: the
 # 8.3-hour cell never re-runs and the gate is evaluated on a record carrying no
 # position metric.
 #
@@ -431,7 +431,7 @@ SUMMARY_JOB = StudyJob("frozen_ssl", 1)
 # off the job is invisible whenever they agree. `SUMMARY_JOB.seed` is also
 # neither `SPLIT_SEED` nor `SUMMARY_RECORD_JOB.seed`, so `split_seed` on the
 # next line can be told from both.
-SUMMARY_RECORD_JOB = StudyJob("cnn", 2)
+SUMMARY_RECORD_JOB = StudyJob("pixel_ae", 2)
 
 
 def _summary_record() -> dict:
@@ -509,7 +509,7 @@ def _summary_record() -> dict:
 # wrong place, a field replaced by a constant, a field dropped, a label
 # detached from its numbers, and `"\n".join` becoming `" ".join`.
 EXPECTED_SUMMARY = "\n".join([
-    "  cell      arm=cnn seed=2 (requested frozen_ssl/s1)",
+    "  cell      arm=pixel_ae seed=2 (requested frozen_ssl/s1)",
     "  recorded  steps=5101 seq_len=5102 context=5103 horizon=5104 "
     "split_seed=5105",
     "  timing    wall=42.5s recorded=5106.0s steps_per_second=5107.00",
@@ -702,8 +702,11 @@ def test_the_driver_uses_the_studys_own_arms_and_seeds():
     disagree about what the study is."""
     assert run_study.ARMS is ARMS
     assert run_study.SEEDS == SEEDS
-    assert set(run_study._SLOW_ARMS) < set(ARMS), (
-        "the expensive arms must be a proper subset, or nothing runs first")
+    assert run_study._SLOW_ARMS == (), (
+        "M3c retired the end-to-end pixel arm; every study arm now trains at "
+        "feature-arm speed (~1.5 h per cell), so no arm is deferred. An "
+        "arm listed here would be scheduled last for a cost it does not have")
+    assert "cnn" not in ARMS
     assert NONFINITE_KEY in run_study.REQUIRED_RECORD_KEYS, (
         "only `write_record` adds this key, so requiring it is what stops a "
         "hand-made JSON blob at a record path from being mistaken for a "
@@ -824,15 +827,15 @@ def test_pending_jobs_reads_the_arms_and_seeds_it_is_given(tmp_path):
     assert {j.arm for j in jobs} == set(UNEVEN_ARMS)
     assert {j.seed for j in jobs} == set(UNEVEN_SEEDS)
     assert all(isinstance(j.seed, int) for j in jobs)
-    assert "cnn" not in {j.arm for j in jobs}, (
+    assert "pixel_ae" not in {j.arm for j in jobs}, (
         "the excluded arm was run anyway; the defaults are being used instead "
         "of the caller's arguments")
 
 
 def test_a_repeated_arm_or_seed_does_not_buy_the_same_cell_twice(tmp_path):
-    """`--arms cnn cnn` is a typo, not a request for 16.6 GPU-hours."""
-    assert run_study.pending_jobs(tmp_path, ("cnn", "cnn"), (0, 0)) == [
-        StudyJob("cnn", 0)]
+    """`--arms pixel_ae pixel_ae` is a typo, not a request for 16.6 GPU-hours."""
+    assert run_study.pending_jobs(tmp_path, ("pixel_ae", "pixel_ae"), (0, 0)) == [
+        StudyJob("pixel_ae", 0)]
 
 
 def test_pending_jobs_accepts_the_string_argparse_hands_it(tmp_path):
@@ -880,7 +883,7 @@ def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     PARAMETRISED OVER `EXPECTED_RECORD_KEYS`, NOT OVER THE DRIVER'S OWN SET.
     Deriving the cases from the collection under test made this shrink with it:
     delete "position" from `REQUIRED_RECORD_KEYS` and the position case simply
-    stopped being generated, so the suite stayed green while a cnn record with
+    stopped being generated, so the suite stayed green while a pixel_ae record with
     no position block became a finished cell.
     """
     path = job_record_path(tmp_path, INCOMPLETE_JOB)
@@ -910,7 +913,7 @@ def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
     a record is allowed to lack.
 
     Under `<` such a cell is permanently pending: every resume re-runs it, an
-    8.3-hour `cnn` cell is paid for again on every attempt, and the study never
+    8.3-hour `pixel_ae` cell is paid for again on every attempt, and the study never
     converges. That is the disaster `REQUIRED_RECORD_KEYS`' own docstring calls
     one with no symptom, and the driver and its own tests would flatly disagree
     about what a finished cell is.
@@ -984,7 +987,7 @@ def test_a_byte_damaged_record_is_treated_as_pending(tmp_path):
     cell has started, and with the other eight records sitting there intact.
     """
     path = job_record_path(tmp_path, CORRUPT_JOB)
-    path.write_bytes(b'{"arm": "cnn", "seed": \xff\xfe\x00 not utf-8}')
+    path.write_bytes(b'{"arm": "pixel_ae", "seed": \xff\xfe\x00 not utf-8}')
     with pytest.raises(UnicodeDecodeError):
         path.read_text()
 
@@ -1035,13 +1038,24 @@ def test_a_real_record_from_run_job_is_recognised_as_complete(
 # ordering
 # ---------------------------------------------------------------------------
 
-def test_cheap_arms_run_first(tmp_path):
-    """Feature arms are 5.9x faster; running them first means an interruption
-    still leaves the treatment/control contrast complete."""
+def test_no_arm_is_deferred_and_the_order_is_arm_then_seed(tmp_path):
+    """With `_SLOW_ARMS` empty the whole schedule is `(arm, seed)`, arms in
+    string order. Under M3b the 8.3-hour pixel arm ran last so an interruption
+    still left the treatment/control contrast complete; every M3c arm costs
+    the same ~1.5 h, so there is nothing to defer and the order is pinned
+    here IN FULL rather than as "the slow one is last" -- the arm names are
+    spelled out so a shrunken ARMS cannot pass this by iterating less."""
     jobs = run_study.pending_jobs(tmp_path, ARMS, SEEDS)
-    cnn_positions = [i for i, j in enumerate(jobs) if j.arm == "cnn"]
-    other_positions = [i for i, j in enumerate(jobs) if j.arm != "cnn"]
-    assert min(cnn_positions) > max(other_positions)
+    assert sorted(ARMS) == ["frozen_ssl", "pixel_ae", "random_vit"]
+    assert jobs == [
+        StudyJob("frozen_ssl", 0), StudyJob("frozen_ssl", 1),
+        StudyJob("frozen_ssl", 2),
+        StudyJob("pixel_ae", 0), StudyJob("pixel_ae", 1),
+        StudyJob("pixel_ae", 2),
+        StudyJob("random_vit", 0), StudyJob("random_vit", 1),
+        StudyJob("random_vit", 2),
+    ]
+    assert len(jobs) == 9
 
 
 def test_the_order_is_fully_determined_and_seeds_ascend(tmp_path):
@@ -1052,24 +1066,25 @@ def test_the_order_is_fully_determined_and_seeds_ascend(tmp_path):
     follow the caller's arbitrary order. An interrupted study should always
     hold seeds 0..k of an arm, never an arbitrary subset of them.
     """
-    jobs = run_study.pending_jobs(tmp_path, ("cnn", "random_vit"), (2, 0, 1))
+    jobs = run_study.pending_jobs(tmp_path, ("random_vit", "pixel_ae"), (2, 0, 1))
     assert jobs == [
+        StudyJob("pixel_ae", 0), StudyJob("pixel_ae", 1), StudyJob("pixel_ae", 2),
         StudyJob("random_vit", 0), StudyJob("random_vit", 1),
         StudyJob("random_vit", 2),
-        StudyJob("cnn", 0), StudyJob("cnn", 1), StudyJob("cnn", 2),
     ]
 
 
 def test_the_order_holds_after_a_partial_resume(tmp_path):
-    """Resume and ordering interact: what is left must still be cheap-first."""
+    """Resume and ordering interact: what is left must still be in
+    `(arm, seed)` order, with the completed cells simply absent."""
     _write_complete(tmp_path, StudyJob("frozen_ssl", 0))
-    _write_complete(tmp_path, StudyJob("cnn", 0))
+    _write_complete(tmp_path, StudyJob("pixel_ae", 0))
     jobs = run_study.pending_jobs(tmp_path, ARMS, SEEDS)
     assert jobs == [
         StudyJob("frozen_ssl", 1), StudyJob("frozen_ssl", 2),
+        StudyJob("pixel_ae", 1), StudyJob("pixel_ae", 2),
         StudyJob("random_vit", 0), StudyJob("random_vit", 1),
         StudyJob("random_vit", 2),
-        StudyJob("cnn", 1), StudyJob("cnn", 2),
     ]
 
 
@@ -1429,7 +1444,7 @@ def test_main_forwards_the_documented_defaults(
     monkeypatch.setattr(run_study, "run_job", fake)
 
     run_study.main(["--data", str(episode_dir), "--out", str(tmp_path / "s"),
-                    "--arms", "cnn", "--seeds", "0"])
+                    "--arms", "pixel_ae", "--seeds", "0"])
 
     assert calls[0]["kwargs"] == {
         "steps": DEFAULT_STEPS, "seq_len": DEFAULT_SEQ_LEN,
@@ -1477,7 +1492,7 @@ def test_main_skips_the_cells_that_already_have_a_record(
 @pytest.mark.parametrize("error", [
     RuntimeError("cuda out of memory on this cell"),
     FileNotFoundError("no cached features for frozen_ssl on this box"),
-    ValueError("checkpoint is arm='cnn', not this job's"),
+    ValueError("checkpoint is arm='pixel_ae', not this job's"),
     KeyError("privileged"),
 ], ids=lambda e: type(e).__name__)
 def test_a_failing_cell_does_not_abort_the_other_eight(
@@ -1510,8 +1525,8 @@ def test_a_failing_cell_does_not_abort_the_other_eight(
 
     assert status == run_study.EXIT_JOB_FAILED == 1
     assert len(calls) == 9, "the run stopped at the failing cell"
-    assert [c["job"] for c in calls][-1].arm == "cnn", (
-        "the expensive arm was never reached after the failure")
+    assert [c["job"] for c in calls][-1] == StudyJob("random_vit", 2), (
+        "the cell after the failing one was never reached")
     printed = capsys.readouterr().out
     assert type(error).__name__ in printed, "no traceback logged"
     assert "8/9 job(s) completed" in printed
@@ -1578,7 +1593,7 @@ def test_a_keyboard_interrupt_stops_the_whole_run(
 
 
 @pytest.mark.parametrize("overrides, claimed", [
-    ({"arm": "cnn"}, "arm='cnn' seed=1"),          # wrong arm, RIGHT seed
+    ({"arm": "pixel_ae"}, "arm='pixel_ae' seed=1"),          # wrong arm, RIGHT seed
     ({"seed": CLI_SEED}, f"arm='frozen_ssl' seed={CLI_SEED}"),  # wrong seed
 ], ids=["wrong_arm", "wrong_seed"])
 def test_main_quarantines_a_record_that_names_another_cell(
@@ -1587,10 +1602,10 @@ def test_main_quarantines_a_record_that_names_another_cell(
 
     The driver printed MISLABELLED, counted the cell failed, exited 1 -- and
     left `result_frozen_ssl_seed1.json` sitting at the cell's own path with
-    `arm='cnn'` inside it, exactly where the aggregation's glob finds it. The
+    `arm='pixel_ae'` inside it, exactly where the aggregation's glob finds it. The
     driver's own resume is safe, but an operator who reads the log in the
     morning, fixes the cause and runs the AGGREGATION without re-running the
-    driver gets two `cnn` cells and no `frozen_ssl`/s1: one arm's numbers
+    driver gets two `pixel_ae` cells and no `frozen_ssl`/s1: one arm's numbers
     reported under another's name, which is the thing this branch's own comment
     calls the worst outcome the study has.
 
@@ -1648,7 +1663,7 @@ def test_the_quarantine_suffix_cannot_be_read_as_a_record(tmp_path):
     assert not run_study.MISLABELLED_SUFFIX.endswith(".json")
 
     record = job_record_path(tmp_path, DONE_JOB)
-    record.write_text('{"arm": "cnn"}')
+    record.write_text('{"arm": "pixel_ae"}')
     assert [p.name for p in tmp_path.glob("result_*.json")] == [record.name], (
         "the control: the glob really does find a record at this path, so an "
         "empty result below means the move worked and not that nothing was "
@@ -1731,6 +1746,28 @@ def test_main_refuses_an_arm_the_study_does_not_have(tmp_path, episode_dir):
         run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
                         "--arms", "cnn2"])
     assert excinfo.value.code == ARGPARSE_USAGE_STATUS
+
+
+def test_main_refuses_the_retired_pixel_arm_by_name(tmp_path, episode_dir,
+                                                    monkeypatch):
+    """`cnn` is a KIND `get_config` still builds, so the only thing that
+    keeps the study from training a cell of the retired arm is `--arms`
+    taking `choices=ARMS` rather than `choices=KINDS`. A driver that accepted
+    it would write `result_cnn_seed0.json` into the M3c directory and the
+    aggregation would read a fourth arm. `run_job` is stubbed so that if the
+    refusal is missing this fails on the exit status, not by training."""
+    from mbfps.utils.config import KINDS, get_config
+
+    assert "cnn" in KINDS and get_config("cnn").arm == "cnn", (
+        "the precondition: the name IS buildable, so only argparse refuses it")
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    with pytest.raises(SystemExit) as excinfo:
+        run_study.main(["--data", str(episode_dir), "--out", str(tmp_path),
+                        "--arms", "cnn", "--seeds", "0"])
+    assert excinfo.value.code == ARGPARSE_USAGE_STATUS
+    assert calls == [], "a cell of the retired arm was trained"
+    assert tuple(run_study._parser().parse_args([]).arms) == ARMS
 
 
 @pytest.mark.parametrize("argv", [
@@ -1855,7 +1892,7 @@ def test_a_deliberate_short_run_is_allowed_when_it_says_so(
     assert run_study.main([
         "--data", str(episode_dir), "--out", str(tmp_path / "smoke"),
         "--steps", str(SMOKE_STEPS), "--seq-len", "1", "--allow-short",
-        "--arms", "cnn", "--seeds", "0"]) == 0
+        "--arms", "pixel_ae", "--seeds", "0"]) == 0
     assert calls[0]["kwargs"]["steps"] == SMOKE_STEPS
     assert calls[0]["kwargs"]["seq_len"] == 1
 
@@ -2132,8 +2169,8 @@ def test_only_the_selected_arms_are_checked_for_staleness(
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
     out = tmp_path / "study"
-    _write_matching(out, DONE_JOB, steps=SMOKE_STEPS)   # cnn/s1
-    assert DONE_JOB.arm == "cnn"
+    _write_matching(out, DONE_JOB, steps=SMOKE_STEPS)   # pixel_ae/s1
+    assert DONE_JOB.arm == "pixel_ae"
 
     status = run_study.main(["--data", str(episode_dir), "--out", str(out),
                              "--arms", "frozen_ssl", *MATCHING_ARGV])
@@ -2433,10 +2470,10 @@ def test_out_two_levels_deep_is_created_rather_than_crashing(
     assert not out.parent.exists(), "the missing parent is the whole point"
 
     assert run_study.main(["--data", str(episode_dir), "--out", str(out),
-                           "--arms", "cnn", "--seeds", "0"]) == 0
+                           "--arms", "pixel_ae", "--seeds", "0"]) == 0
 
     assert len(calls) == 1
-    assert job_record_path(out, StudyJob("cnn", 0)).is_file()
+    assert job_record_path(out, StudyJob("pixel_ae", 0)).is_file()
 
 
 def test_an_out_that_cannot_be_created_is_not_reported_as_a_failed_cell(
@@ -2561,7 +2598,7 @@ def test_the_release_survives_a_claim_that_is_already_gone(
     monkeypatch.setattr(run_study, "run_job", fake)
 
     assert run_study.main(["--data", str(episode_dir), "--out", str(out),
-                           "--arms", "cnn", "--seeds", "0"]) == 0
+                           "--arms", "pixel_ae", "--seeds", "0"]) == 0
     assert len(calls) == 1
     assert not (out / run_study.LOCK_NAME).exists()
 

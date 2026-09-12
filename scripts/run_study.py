@@ -1,11 +1,11 @@
 """Run the 3 arms x 3 seeds study, resumably.
 
-Measured costs at seq_len=64 on the development Mac: feature arms 3.98 steps/s
-(1.4 h per 20k-step job), pixel arm 0.67 steps/s (8.3 h). The whole study is
-about 33 laptop-hours, of which the pixel arm is 25. Feature arms are therefore
-scheduled first: if the run is interrupted, the treatment/control contrast
-(`frozen_ssl` against `random_vit`) is already complete, and what is missing is
-the baseline rather than the comparison the study exists to make.
+Every arm reads cached frozen-backbone features and trains at the same speed:
+measured 3.98 steps/s at seq_len=64 on the development Mac, ~1.4 h per
+20k-step cell, ~13.5 h for the nine. Under M3b the end-to-end pixel arm ran
+at 0.67 steps/s (8.3 h per cell) and was scheduled last so an interruption
+still left the treatment/control contrast complete; M3c retired that arm, so
+`_SLOW_ARMS` is empty and cells run in plain `(arm, seed)` order.
 
 Resumable off the per-job JSON records, so an interrupted run costs at most one
 job rather than the whole study.
@@ -78,12 +78,16 @@ from mbfps.utils.config import ARMS
 SEEDS: tuple[int, ...] = (0, 1, 2)
 """The three seeds. Three cells per arm is what makes a spread reportable."""
 
-_SLOW_ARMS: tuple[str, ...] = ("cnn",)
-"""Arms that predict in pixel space, at 0.67 steps/s against the others' 3.98.
+_SLOW_ARMS: tuple[str, ...] = ()
+"""Arms scheduled after every other arm. EMPTY since M3c: the 0.67 steps/s
+end-to-end pixel arm was retired from the study and `pixel_ae` reads a cache
+like the other two, so nothing costs more than anything else.
 
 Membership of this tuple is the whole scheduling policy: everything not in it
-runs first. It is a tuple rather than a test on the arm name so that a fourth
-arm can be added on the correct side of the split by editing one line.
+runs first, and with it empty `_cost_key` reduces to `(arm, seed)`. Kept as a
+tuple rather than deleted so an arm that does cost more can be put on the
+correct side of the split by editing one line -- and so the driver's test can
+assert that today nothing is deferred.
 """
 
 BUFFER_CAPACITY = 10**9
@@ -330,7 +334,7 @@ def pending_jobs(out_dir, arms=ARMS, seeds=SEEDS) -> list[StudyJob]:
         for seed in seeds:
             job = StudyJob(arm, seed)
             if job in jobs:
-                continue  # `--arms cnn cnn` must not buy the same 8.3 h twice
+                continue  # `--arms pixel_ae pixel_ae` must not buy the same 1.4 h twice
             if record_is_complete(job_record_path(out_dir, job), job):
                 continue
             jobs.append(job)
@@ -409,12 +413,12 @@ def quarantine_record(path) -> Path | None:
     one arm and none of another.
 
     RENAMED RATHER THAN DELETED, AND THE RUN CONTINUES. Deleting is wrong: the
-    file is the output of a real 1.4-to-8.3-hour training run and may be the
-    only copy of whichever cell it actually describes. Refusing to continue is
-    also wrong: it contradicts the failure policy at the top of this file --
-    one bad cell must not throw away the eight that would still run, and 25 of
-    the study's 33 hours are the `cnn` arm. So the file is kept, under a name
-    the aggregation cannot read as a record, and the cell goes back to pending.
+    file is the output of a real ~1.4-hour training run and may be the only
+    copy of whichever cell it actually describes. Refusing to continue is also
+    wrong: it contradicts the failure policy at the top of this file -- one bad
+    cell must not throw away the eight that would still run. So the file is
+    kept, under a name the aggregation cannot read as a record, and the cell
+    goes back to pending.
 
     Never overwrites an earlier quarantined file, and never raises: this runs
     inside the per-cell loop, after the record is safely on disk, and must not

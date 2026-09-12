@@ -469,7 +469,7 @@ def test_the_fixture_values_are_pairwise_distinct_so_no_assertion_is_vacuous():
     # An arm's three seeds must not be equally spaced, or the mean over two of
     # them equals the mean over all three and every assertion about a
     # denominator that moved reads the same number either way.
-    gaps = [_value("position.gap_final", "cnn", seed) for seed in SEEDS]
+    gaps = [_value("position.gap_final", "pixel_ae", seed) for seed in SEEDS]
     assert (gaps[0] + gaps[2]) / 2 != sum(gaps) / 3
 
     # The two ridges share a table row and must not agree; see JOINT_RIDGE.
@@ -507,12 +507,12 @@ def test_the_fixture_values_are_pairwise_distinct_so_no_assertion_is_vacuous():
     # `context` equalled `horizon` could not tell that check from one against
     # `context`.
     assert FIXTURE_CONTEXT != FIXTURE_HORIZON
-    assert len(_curve("rssm_position", "cnn", 0)) == FIXTURE_HORIZON
+    assert len(_curve("rssm_position", "pixel_ae", 0)) == FIXTURE_HORIZON
 
     # All three arms, including `frozen_ssl` -- the arm whose backbone name
     # differs from its own and the one Task 4's tests never ran.
     assert {r["arm"] for r in _study()} == set(ARMS) == {
-        "cnn", "frozen_ssl", "random_vit"}
+        "pixel_ae", "frozen_ssl", "random_vit"}
     assert {r["seed"] for r in _study()} == set(SEEDS)
     assert len(_study()) == 9
 
@@ -613,10 +613,10 @@ def test_a_nan_record_survives_the_whole_aggregation(tmp_path):
     `TypeError` -- after the GPU hours, in the last step of the pipeline.
     """
     records = _study()
-    _cell(records, "cnn", 2)["position"]["gap_final"] = float("nan")
+    _cell(records, "pixel_ae", 2)["position"]["gap_final"] = float("nan")
     verdict = evaluate_gate(load_records(_write(tmp_path, records)))
     assert verdict["criteria"]["beats_persistence"] is False
-    assert verdict["per_arm"]["cnn"]["n_seeds_with_finite_gap"] == 2
+    assert verdict["per_arm"]["pixel_ae"]["n_seeds_with_finite_gap"] == 2
 
 
 def test_load_records_ignores_files_that_are_not_records(tmp_path):
@@ -624,9 +624,9 @@ def test_load_records_ignores_files_that_are_not_records(tmp_path):
     mislabelled records out of the aggregation."""
     _write(tmp_path, _study())
     (tmp_path / "study.lock").write_text('{"pid": 1}')
-    (tmp_path / "result_cnn_seed0.json.mislabelled").write_text(
+    (tmp_path / "result_pixel_ae_seed0.json.mislabelled").write_text(
         json.dumps(_record("random_vit", 1)))
-    (tmp_path / "world_model_cnn_seed0.pt").write_bytes(b"not json")
+    (tmp_path / "world_model_pixel_ae_seed0.pt").write_bytes(b"not json")
     (tmp_path / "notes.txt").write_text("hello")
     assert len(load_records(tmp_path)) == 9
 
@@ -636,11 +636,11 @@ def test_load_records_refuses_a_record_whose_arm_disagrees_with_its_filename(
     """Reporting one arm's numbers under another arm's name is the worst
     outcome this study has, and the only one with no symptom."""
     _write(tmp_path, _study())
-    path = tmp_path / "result_cnn_seed0.json"
+    path = tmp_path / "result_pixel_ae_seed0.json"
     path.write_text(json.dumps({**_record("frozen_ssl", 0), "nonfinite": {}}))
     with pytest.raises(MislabelledRecord) as error:
         load_records(tmp_path)
-    assert "result_cnn_seed0.json" in str(error.value)
+    assert "result_pixel_ae_seed0.json" in str(error.value)
     assert "arm='frozen_ssl'" in str(error.value)
     assert "result_frozen_ssl_seed0.json" in str(error.value)
 
@@ -668,8 +668,8 @@ def test_load_records_refuses_a_record_whose_seed_is_not_an_integer(tmp_path):
     a morning nobody gets back.
     """
     _write(tmp_path, _study())
-    path = tmp_path / "result_cnn_seed0.json"
-    path.write_text(json.dumps({**_record("cnn", 0), "seed": "0",
+    path = tmp_path / "result_pixel_ae_seed0.json"
+    path.write_text(json.dumps({**_record("pixel_ae", 0), "seed": "0",
                                 "nonfinite": {}}))
     with pytest.raises(MislabelledRecord) as error:
         load_records(tmp_path)
@@ -683,10 +683,10 @@ def test_load_records_refuses_a_file_it_cannot_read(tmp_path):
     table is missing, and a nine-cell study with eight records and no message
     is how a gate gets computed on a study nobody ran."""
     _write(tmp_path, _study())
-    (tmp_path / "result_cnn_seed1.json").write_text('{"arm": "cnn", ')
+    (tmp_path / "result_pixel_ae_seed1.json").write_text('{"arm": "pixel_ae", ')
     with pytest.raises(UnreadableRecord) as error:
         load_records(tmp_path)
-    assert "result_cnn_seed1.json" in str(error.value)
+    assert "result_pixel_ae_seed1.json" in str(error.value)
     assert isinstance(error.value, RecordsUnusable)
 
 
@@ -706,17 +706,17 @@ def test_load_records_refuses_a_file_it_cannot_read(tmp_path):
 UNREADABLE_SHAPES = [
     (
         "TypeError",
-        {"arm": "cnn", "seed": 1, "position": None,
+        {"arm": "pixel_ae", "seed": 1, "position": None,
          "nonfinite": {"position.gap_final": "nan"}},
     ),
     ("AttributeError", [1, 2, 3]),
     (
         "KeyError",
-        {"arm": "cnn", "seed": 1, "nonfinite": {"reward.mse": "nan"}},
+        {"arm": "pixel_ae", "seed": 1, "nonfinite": {"reward.mse": "nan"}},
     ),
     (
         "IndexError",
-        {"arm": "cnn", "seed": 1, "curves": {"rssm_position": []},
+        {"arm": "pixel_ae", "seed": 1, "curves": {"rssm_position": []},
          "nonfinite": {"curves.rssm_position.0": "nan"}},
     ),
 ]
@@ -736,11 +736,11 @@ def test_load_records_refuses_a_record_the_restore_step_cannot_rebuild(
     None of the four is an `OSError` or a `ValueError`.
     """
     _write(tmp_path, _study())
-    (tmp_path / "result_cnn_seed1.json").write_text(json.dumps(content))
+    (tmp_path / "result_pixel_ae_seed1.json").write_text(json.dumps(content))
     with pytest.raises(UnreadableRecord) as error:
         load_records(tmp_path)
     message = str(error.value)
-    assert "result_cnn_seed1.json" in message
+    assert "result_pixel_ae_seed1.json" in message
     assert expected_type in message, (
         "the message names the exception the file degraded from, so a guard "
         "that caught one of the four and let the others through fails here "
@@ -757,7 +757,7 @@ def test_a_json_scalar_where_a_record_belongs_is_unreadable_not_mislabelled(
     cell, or move the file by hand -- so a file that is not a record at all
     must not arrive as a mislabelling."""
     _write(tmp_path, _study())
-    (tmp_path / "result_cnn_seed1.json").write_text("42")
+    (tmp_path / "result_pixel_ae_seed1.json").write_text("42")
     with pytest.raises(UnreadableRecord) as error:
         load_records(tmp_path)
     assert "AttributeError" in str(error.value)
@@ -775,7 +775,7 @@ def test_the_mislabelled_refusal_names_the_directory_on_its_remedy_line(
     still pass.
     """
     _write(tmp_path, _study())
-    (tmp_path / "result_cnn_seed0.json").write_text(
+    (tmp_path / "result_pixel_ae_seed0.json").write_text(
         json.dumps({**_record("frozen_ssl", 0), "nonfinite": {}}))
     with pytest.raises(MislabelledRecord) as error:
         load_records(tmp_path)
@@ -792,15 +792,15 @@ def test_record_names_its_file_accepts_the_writers_own_name(tmp_path):
     record = _record("frozen_ssl", 2)
     path = job_record_path(tmp_path, StudyJob("frozen_ssl", 2))
     assert record_names_its_file(record, path) is True
-    assert record_names_its_file(record, tmp_path / "result_cnn_seed2.json") is False
+    assert record_names_its_file(record, tmp_path / "result_pixel_ae_seed2.json") is False
 
 
 def test_record_cell_reads_the_arm_and_the_seed():
     assert record_cell(_record("random_vit", 1)) == ("random_vit", 1)
-    assert record_cell({"arm": "cnn"}) is None
+    assert record_cell({"arm": "pixel_ae"}) is None
     assert record_cell({"seed": 0}) is None
-    assert record_cell({"arm": "cnn", "seed": "0"}) is None
-    assert record_cell({"arm": "cnn", "seed": True}) is None, (
+    assert record_cell({"arm": "pixel_ae", "seed": "0"}) is None
+    assert record_cell({"arm": "pixel_ae", "seed": True}) is None, (
         "True is an int in Python and would read as seed 1")
 
 
@@ -885,7 +885,7 @@ def test_the_aggregation_reads_a_record_run_job_really_wrote(
     assert "MISSING" not in _row(report_study.reward_table(records),
                                  "random_vit/s1")
     assert _row(report_study.metric_table(records, verdict["per_arm"]),
-                "cnn         position").count("MISSING") == 3
+                "pixel_ae    position").count("MISSING") == 3
 
 
 # ---------------------------------------------------------------------------
@@ -902,21 +902,21 @@ def test_per_arm_summarises_every_arm_including_frozen_ssl():
 def test_per_arm_orders_the_seeds_rather_than_the_directory_listing():
     """`gap_final_by_seed[0]` must be seed 0's number whatever order the
     records arrived in; the list is printed against seed headings."""
-    records = [_record("cnn", seed) for seed in (2, 0, 1)]
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in (2, 0, 1)]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["seeds"] == [0, 1, 2]
     assert summary["gap_final_by_seed"] == [
-        _value("position.gap_final", "cnn", seed) for seed in (0, 1, 2)]
+        _value("position.gap_final", "pixel_ae", seed) for seed in (0, 1, 2)]
 
 
 def test_per_arm_aggregation_is_nan_aware():
     """A NaN gap must not poison an arm's mean -- and must not be counted as a
     seed that beat persistence either."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["position"]["gap_final"] = float("nan")
-    summary = per_arm(records)["cnn"]
-    expected = (_value("position.gap_final", "cnn", 0)
-                + _value("position.gap_final", "cnn", 2)) / 2
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["position"]["gap_final"] = float("nan")
+    summary = per_arm(records)["pixel_ae"]
+    expected = (_value("position.gap_final", "pixel_ae", 0)
+                + _value("position.gap_final", "pixel_ae", 2)) / 2
     assert summary["gap_final_mean"] == pytest.approx(expected)
     assert summary["n_seeds_with_finite_gap"] == 2
     assert summary["n_seeds"] == 3, (
@@ -926,10 +926,10 @@ def test_per_arm_aggregation_is_nan_aware():
 
 
 def test_a_mean_over_no_finite_seed_is_nan_rather_than_an_exception():
-    records = [_record("cnn", seed) for seed in SEEDS]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["position"]["gap_final"] = float("nan")
-    summary = per_arm(records)["cnn"]
+        _cell(records, "pixel_ae", seed)["position"]["gap_final"] = float("nan")
+    summary = per_arm(records)["pixel_ae"]
     assert math.isnan(summary["gap_final_mean"])
     assert summary["n_seeds_with_finite_gap"] == 0
 
@@ -967,9 +967,9 @@ def test_a_none_where_a_number_belongs_does_not_crash_or_count_as_positive():
     """What a bare `json.loads` leaves behind. `load_records` restores the real
     float, but a caller that assembled records another way must degrade to
     "undefined", not raise `TypeError` inside a comparison."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 0)["position"]["gap_final"] = None
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 0)["position"]["gap_final"] = None
+    summary = per_arm(records)["pixel_ae"]
     assert summary["all_seeds_positive"] is False
     assert summary["n_seeds_with_finite_gap"] == 2
 
@@ -1010,8 +1010,8 @@ def test_a_bool_where_a_number_belongs_is_a_flag_and_not_a_measurement():
     aggregation, not just here.
     """
     records = _study()
-    _cell(records, "cnn", 0)["position"]["gap_final"] = True
-    summary = per_arm(records)["cnn"]
+    _cell(records, "pixel_ae", 0)["position"]["gap_final"] = True
+    summary = per_arm(records)["pixel_ae"]
     assert math.isnan(summary["gap_final_by_seed"][0])
     assert summary["n_seeds_with_finite_gap"] == 2
     assert summary["all_seeds_positive"] is False
@@ -1025,7 +1025,7 @@ def test_the_flat_keys_are_the_gate_metrics_own_and_not_angles():
     """The flat `gap_final_*` keys are position's. Position and angle carry
     different numbers in the fixture, so a flat view that came to hold angle's
     fails here rather than reading plausibly."""
-    summary = per_arm(_study())["cnn"]
+    summary = per_arm(_study())["pixel_ae"]
     position = summary["metrics"]["position"]
     angle = summary["metrics"]["angle"]
     assert summary["gap_final_by_seed"] == position["gap_final_by_seed"]
@@ -1046,17 +1046,17 @@ def test_per_arm_reports_angle_beside_position_without_mixing_them():
 
 
 def test_an_angle_gap_does_not_move_the_position_mean():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 0)["angle"]["gap_final"] = float("nan")
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 0)["angle"]["gap_final"] = float("nan")
+    summary = per_arm(records)["pixel_ae"]
     assert summary["n_seeds_with_finite_gap"] == 3
     assert summary["metrics"]["angle"]["n_seeds_with_finite_gap"] == 2
 
 
 def test_per_arm_counts_a_degenerate_position_band():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["position"]["steps_degenerate"] = 7
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["position"]["steps_degenerate"] = 7
+    summary = per_arm(records)["pixel_ae"]
     assert summary["metrics"]["position"]["max_degenerate_steps"] == 7
     assert summary["metrics"]["angle"]["max_degenerate_steps"] == 0
     assert summary["max_degenerate_steps"] == 7
@@ -1067,9 +1067,9 @@ def test_per_arm_counts_a_degenerate_angle_band():
     """Angle alone. Task 1 of this plan exists because the degeneracy guards
     were computed for position only; a gate that re-checked position alone
     would reintroduce that at the last step of the study."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["angle"]["steps_degenerate"] = 5
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["angle"]["steps_degenerate"] = 5
+    summary = per_arm(records)["pixel_ae"]
     assert summary["metrics"]["position"]["max_degenerate_steps"] == 0
     assert summary["metrics"]["angle"]["max_degenerate_steps"] == 5
     assert summary["max_degenerate_steps"] == 5
@@ -1077,9 +1077,9 @@ def test_per_arm_counts_a_degenerate_angle_band():
 
 
 def test_a_record_missing_its_degeneracy_count_has_not_shown_a_usable_band():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    del _cell(records, "cnn", 2)["position"]["steps_degenerate"]
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    del _cell(records, "pixel_ae", 2)["position"]["steps_degenerate"]
+    summary = per_arm(records)["pixel_ae"]
     assert math.isnan(summary["max_degenerate_steps"])
     assert summary["any_degenerate"] is True
 
@@ -1096,8 +1096,8 @@ def test_a_record_missing_its_ANGLE_degeneracy_count_is_no_different():
     where only the explicit NaN check can catch it.
     """
     records = _study()
-    del _cell(records, "cnn", 2)["angle"]["steps_degenerate"]
-    summary = per_arm(records)["cnn"]
+    del _cell(records, "pixel_ae", 2)["angle"]["steps_degenerate"]
+    summary = per_arm(records)["pixel_ae"]
     assert math.isnan(summary["metrics"]["angle"]["max_degenerate_steps"])
     assert summary["metrics"]["position"]["max_degenerate_steps"] == 0, (
         "position's count is present and zero, so it is the NaN in SECOND "
@@ -1143,22 +1143,22 @@ def test_per_arm_reads_criterion_4_out_of_its_nested_block():
     """`run_job` writes `filtering: {criterion_4: {...}, gain: {...}}`, and
     criterion 4's flag is inside the first. A reader of
     `filtering["latent_beats_embedding"]` finds nothing on a real record."""
-    summary = per_arm(_study())["cnn"]
+    summary = per_arm(_study())["pixel_ae"]
     assert summary["filtering_all_pass"] is True
     assert summary["latent_r2_by_seed"] == [
-        _value("filtering.criterion_4.latent_r2", "cnn", seed)
+        _value("filtering.criterion_4.latent_r2", "pixel_ae", seed)
         for seed in SEEDS]
     assert summary["embedding_r2_by_seed"] == [
-        _value("filtering.criterion_4.embedding_r2", "cnn", seed)
+        _value("filtering.criterion_4.embedding_r2", "pixel_ae", seed)
         for seed in SEEDS]
     assert summary["latent_beats_embedding_by_seed"] == [True, True, True]
 
 
 def test_one_losing_seed_costs_the_arm_criterion_4():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["filtering"]["criterion_4"][
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = False
-    summary = per_arm(records)["cnn"]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["filtering_all_pass"] is False
     assert summary["latent_beats_embedding_by_seed"] == [True, False, True]
 
@@ -1167,10 +1167,10 @@ def test_a_missing_criterion_4_flag_is_not_a_pass():
     """"The record does not say" and "the record says no" are different
     findings and only one of them is a measurement; both fail the criterion,
     and `all()` over an absent key would have passed it."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    del _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    del _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"]
-    summary = per_arm(records)["cnn"]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["filtering_all_pass"] is False
     assert summary["latent_beats_embedding_by_seed"] == [None, True, True]
 
@@ -1188,9 +1188,9 @@ def test_a_criterion_4_flag_that_is_not_a_boolean_is_not_an_answer(not_a_bool):
     disclosure, so a non-boolean there becomes a measured answer too.
     """
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+    _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = not_a_bool
-    summary = per_arm(records)["cnn"]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["latent_beats_embedding_by_seed"] == [None, True, True]
     assert summary["filtering_all_pass"] is False
     assert evaluate_gate(records)["criteria"][
@@ -1215,25 +1215,25 @@ def test_per_arm_reports_the_gain_with_its_interval():
 def test_a_confidence_interval_entirely_below_zero_excludes_zero():
     """The `high < 0` half of the disjunction, alone. This is the sign the real
     study measured: gain -0.0208, 95% CI [-0.0395, -0.0040]."""
-    records = [_record("cnn", 0)]
+    records = [_record("pixel_ae", 0)]
     records[0]["filtering"]["gain"].update(
         gain=-0.0208, ci_low=-0.0395, ci_high=-0.0040)
-    assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [True]
+    assert per_arm(records)["pixel_ae"]["gain_ci_excludes_zero_by_seed"] == [True]
 
 
 def test_a_confidence_interval_entirely_above_zero_excludes_zero():
     """The `low > 0` half, alone."""
-    records = [_record("cnn", 0)]
+    records = [_record("pixel_ae", 0)]
     records[0]["filtering"]["gain"].update(
         gain=0.0325, ci_low=0.0040, ci_high=0.0610)
-    assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [True]
+    assert per_arm(records)["pixel_ae"]["gain_ci_excludes_zero_by_seed"] == [True]
 
 
 def test_a_confidence_interval_straddling_zero_does_not_exclude_it():
-    records = [_record("cnn", 0)]
+    records = [_record("pixel_ae", 0)]
     records[0]["filtering"]["gain"].update(
         gain=0.001, ci_low=-0.0100, ci_high=0.0200)
-    assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [False]
+    assert per_arm(records)["pixel_ae"]["gain_ci_excludes_zero_by_seed"] == [False]
 
 
 @pytest.mark.parametrize("ci_low,ci_high", [
@@ -1252,10 +1252,10 @@ def test_an_interval_with_one_end_is_not_an_interval(ci_low, ci_high):
     The aggregation -- which is the API a write-up or a later task reads --
     said `True`. The two disagreed with no test comparing them.
     """
-    records = [_record("cnn", 0)]
+    records = [_record("pixel_ae", 0)]
     records[0]["filtering"]["gain"].update(
         gain=-0.0208, ci_low=ci_low, ci_high=ci_high)
-    assert per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"] == [None]
+    assert per_arm(records)["pixel_ae"]["gain_ci_excludes_zero_by_seed"] == [None]
 
 
 def test_the_api_and_the_column_read_the_interval_the_same_way():
@@ -1272,9 +1272,9 @@ def test_the_api_and_the_column_read_the_interval_the_same_way():
     ]
     rendered = {None: "n/a", True: "True", False: "False"}
     for low, high in cases:
-        records = [_record("cnn", 0)]
+        records = [_record("pixel_ae", 0)]
         records[0]["filtering"]["gain"].update(ci_low=low, ci_high=high)
-        api = per_arm(records)["cnn"]["gain_ci_excludes_zero_by_seed"][0]
+        api = per_arm(records)["pixel_ae"]["gain_ci_excludes_zero_by_seed"][0]
         assert rendered[api] == report_study._excludes_zero(low, high), (
             f"the API and the column disagree about [{low}, {high}]")
     assert {report_study._excludes_zero(low, high)
@@ -1290,10 +1290,10 @@ def test_per_arm_flags_seeds_that_selected_different_ridges():
     decade -- measured -0.0706, -0.0208 and +0.0325 for one model. A mean over
     seeds that selected different decades is a mean over different estimators
     and nothing in the number itself says so."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 2)["filtering"]["gain"][
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 2)["filtering"]["gain"][
         "joint_ridge"] = ALT_JOINT_RIDGE
-    summary = per_arm(records)["cnn"]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["gain_ridges_agree"] is False
     assert summary["gain_ridges"][2]["joint_ridge"] == ALT_JOINT_RIDGE
     assert summary["gain_ridges"][0]["joint_ridge"] == JOINT_RIDGE
@@ -1302,16 +1302,16 @@ def test_per_arm_flags_seeds_that_selected_different_ridges():
 def test_per_arm_says_the_ridges_agree_when_they_do():
     """The other half: a flag that was always False would satisfy the test
     above and warn on every real study."""
-    summary = per_arm([_record("cnn", seed) for seed in SEEDS])["cnn"]
+    summary = per_arm([_record("pixel_ae", seed) for seed in SEEDS])["pixel_ae"]
     assert summary["gain_ridges_agree"] is True
     assert [r["embedding_ridge"] for r in summary["gain_ridges"]] == [
         EMBEDDING_RIDGE] * 3
 
 
 def test_a_seed_that_skipped_ridge_selection_disagrees_with_one_that_did_not():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 0)["filtering"]["gain"]["ridge_selected"] = False
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 0)["filtering"]["gain"]["ridge_selected"] = False
+    summary = per_arm(records)["pixel_ae"]
     assert summary["gain_ridges_agree"] is False
     assert summary["gain_ridges"][0]["ridge_selected"] is False
     assert summary["gain_ridges"][1]["ridge_selected"] is True
@@ -1330,7 +1330,7 @@ def test_per_arm_reports_the_reward_numbers_and_the_degenerate_flag():
 
 
 def test_a_degenerate_reward_target_is_flagged_without_hiding_the_numbers():
-    summary = per_arm(_study(reward_degenerate=True))["cnn"]
+    summary = per_arm(_study(reward_degenerate=True))["pixel_ae"]
     assert summary["any_reward_degenerate"] is True
     assert summary["reward_reported"] is True, (
         "spec criterion 3 asks for the accuracy to be REPORTED, and "
@@ -1348,13 +1348,13 @@ def test_a_record_with_no_reward_block_has_not_reported_one():
     its target was constant has not earned the benefit of the doubt, and this
     is what says so.
     """
-    records = [_record("cnn", seed, reward_degenerate=False)
+    records = [_record("pixel_ae", seed, reward_degenerate=False)
                for seed in SEEDS]
-    del _cell(records, "cnn", 1)["reward"]
-    summary = per_arm(records)["cnn"]
+    del _cell(records, "pixel_ae", 1)["reward"]
+    summary = per_arm(records)["pixel_ae"]
     assert summary["reward_reported"] is False
     assert summary["any_reward_degenerate"] is True
-    assert per_arm([_record("cnn", 0, reward_degenerate=False)])["cnn"][
+    assert per_arm([_record("pixel_ae", 0, reward_degenerate=False)])["pixel_ae"][
         "any_reward_degenerate"] is False, (
         "and the flag must be able to say False, or the assertion above is "
         "satisfied by a constant")
@@ -1364,9 +1364,9 @@ def test_a_reward_block_scored_over_no_steps_has_not_reported_one():
     """An MSE over zero steps is a number with nothing behind it. `mse` and
     `baseline_mse` are both present and finite here, so the `n_steps > 0` half
     of the check is the only thing that can fail."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 2)["reward"]["n_steps"] = 0
-    summary = per_arm(records)["cnn"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 2)["reward"]["n_steps"] = 0
+    summary = per_arm(records)["pixel_ae"]
     assert summary["reward_reported"] is False
     assert not math.isnan(summary["reward_mse_by_seed"][2])
 
@@ -1383,13 +1383,13 @@ def test_a_reward_mse_that_never_computed_has_not_reported_accuracy():
     that reported no usable accuracy would then read `reward_reported PASS`.
     """
     records = _study()
-    _cell(records, "cnn", 1)["reward"]["mse"] = float("nan")
-    summary = per_arm(records)["cnn"]
+    _cell(records, "pixel_ae", 1)["reward"]["mse"] = float("nan")
+    summary = per_arm(records)["pixel_ae"]
     assert summary["reward_reported"] is False
     assert not math.isnan(summary["reward_baseline_mse_by_seed"][1]), (
         "the baseline is finite here, so this test turns on the mse term and "
         "not on its neighbour")
-    assert summary["reward_r2_by_seed"][1] == _value("reward.r2", "cnn", 1)
+    assert summary["reward_r2_by_seed"][1] == _value("reward.r2", "pixel_ae", 1)
     assert evaluate_gate(records)["criteria"]["reward_reported"] is False
 
 
@@ -1420,29 +1420,29 @@ def test_per_arm_reports_throughput_and_the_worst_kl_rate():
 
 
 def test_curves_are_checked_for_every_reference_and_both_metrics():
-    assert per_arm(_study())["cnn"]["curves_ok"] is True
+    assert per_arm(_study())["pixel_ae"]["curves_ok"] is True
     for name in CURVE_NAMES:
-        records = [_record("cnn", seed) for seed in SEEDS]
-        del _cell(records, "cnn", 0)["curves"][name]
-        assert per_arm(records)["cnn"]["curves_ok"] is False, (
+        records = [_record("pixel_ae", seed) for seed in SEEDS]
+        del _cell(records, "pixel_ae", 0)["curves"][name]
+        assert per_arm(records)["pixel_ae"]["curves_ok"] is False, (
             f"{name} is one of the three references spec criterion 2 asks to "
             "be drawn on the same axes")
 
 
 def test_a_curve_shorter_than_the_horizon_is_not_a_complete_rollout():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
-    assert per_arm(records)["cnn"]["curves_ok"] is False
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["curves"]["rssm_position"] = [1.0, 2.0]
+    assert per_arm(records)["pixel_ae"]["curves_ok"] is False
 
 
 def test_curves_all_shorter_than_the_horizon_are_still_incomplete():
     """The `lengths == {horizon}` check, not merely `len(lengths) == 1`: six
     curves that agree with each other and disagree with the horizon are a
     truncated rollout plotted as a complete one."""
-    records = [_record("cnn", seed) for seed in SEEDS]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
     for name in CURVE_NAMES:
-        _cell(records, "cnn", 1)["curves"][name] = [1.0, 2.0]
-    assert per_arm(records)["cnn"]["curves_ok"] is False
+        _cell(records, "pixel_ae", 1)["curves"][name] = [1.0, 2.0]
+    assert per_arm(records)["pixel_ae"]["curves_ok"] is False
 
 
 @pytest.mark.parametrize("block", [None, 7, [1, 2], "x"])
@@ -1463,9 +1463,9 @@ def test_a_curves_block_that_is_not_a_dict_has_produced_no_curves(block):
     reason would satisfy a bare `is False`.
     """
     records = _study()
-    _cell(records, "cnn", 1)["curves"] = block
-    assert aggregate.curve_gaps(_cell(records, "cnn", 1)) == list(CURVE_NAMES)
-    assert per_arm(records)["cnn"]["curves_ok"] is False
+    _cell(records, "pixel_ae", 1)["curves"] = block
+    assert aggregate.curve_gaps(_cell(records, "pixel_ae", 1)) == list(CURVE_NAMES)
+    assert per_arm(records)["pixel_ae"]["curves_ok"] is False
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["curves_produced"] is False
     assert verdict["passed"] is False
@@ -1494,7 +1494,7 @@ def test_curve_gaps_names_only_the_curves_that_are_short():
     """`curves_produced` is the one criterion the report cannot attribute to a
     cell from a table, so the gate carries the NAMES. A list that named all six
     whenever any one was short would be no more use than the bare boolean."""
-    record = _record("cnn", 0)
+    record = _record("pixel_ae", 0)
     assert aggregate.curve_gaps(record) == []
     del record["curves"]["floor_angle"]
     record["curves"]["rssm_position"] = [1.0, 2.0]
@@ -1519,7 +1519,7 @@ def test_a_curve_that_is_not_a_LIST_has_not_been_produced(curve, why):
     `write_figure` then hands `plt.plot` four characters where a rollout
     belongs.
     """
-    record = _record("cnn", 0)
+    record = _record("pixel_ae", 0)
     assert len(curve) == FIXTURE_HORIZON, (
         f"{why} of exactly the horizon's length is the point: a shorter one "
         "would be caught by the length term and prove nothing")
@@ -1538,7 +1538,7 @@ def test_six_EMPTY_curves_at_a_horizon_of_zero_are_still_no_curves():
     record carrying six empty curves would otherwise report a complete
     error-vs-horizon curve set with nothing at all to draw.
     """
-    record = _record("cnn", 0)
+    record = _record("pixel_ae", 0)
     record["horizon"] = 0
     record["curves"] = {name: [] for name in CURVE_NAMES}
     assert aggregate.curve_gaps(record) == list(CURVE_NAMES)
@@ -1570,19 +1570,19 @@ def test_a_horizon_that_is_not_an_INT_leaves_every_curve_unverifiable(
     it rolled out.
     """
     records = _study()
-    broken = _cell(records, "cnn", 1)
+    broken = _cell(records, "pixel_ae", 1)
     broken["horizon"] = horizon
     broken["curves"] = {
         name: [float(step) for step in range(length)] for name in CURVE_NAMES}
     assert aggregate.curve_gaps(broken) == list(CURVE_NAMES), (
         "a horizon nothing can be checked against makes every curve "
         "unverifiable, which is not the same as none being short")
-    assert per_arm(records)["cnn"]["curves_ok"] is False
+    assert per_arm(records)["pixel_ae"]["curves_ok"] is False
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["curves_produced"] is False
     assert verdict["passed"] is False
     assert _row(report_study.gate_block(verdict), "  CURVES INCOMPLETE") == (
-        "  CURVES INCOMPLETE (1 of 9): cnn/s1 "
+        "  CURVES INCOMPLETE (1 of 9): pixel_ae/s1 "
         f"({', '.join(CURVE_NAMES)})")
 
 
@@ -1617,7 +1617,7 @@ def test_ridge_groups_splits_cells_that_selected_different_decades():
 def test_ridge_groups_reports_each_groups_own_mean_gain():
     records = _study()
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["filtering"]["gain"]["gain"] = -0.0706
+        _cell(records, "pixel_ae", seed)["filtering"]["gain"]["gain"] = -0.0706
     groups = ridge_groups(records)
     means = {g["joint_ridge"]: g["gain_mean"] for g in groups}
     assert len(groups) == 1
@@ -1654,7 +1654,7 @@ def test_two_cells_that_used_different_EMBEDDING_ridges_are_two_groups():
     groups, so the split can only have come from the embedding half.
     """
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["gain"][
+    _cell(records, "pixel_ae", 0)["filtering"]["gain"][
         "embedding_ridge"] = ALT_EMBEDDING_RIDGE
     groups = ridge_groups(records)
     assert len(groups) == 2
@@ -1664,7 +1664,7 @@ def test_two_cells_that_used_different_EMBEDDING_ridges_are_two_groups():
     assert {g["embedding_ridge"] for g in groups} == {
         EMBEDDING_RIDGE, ALT_EMBEDDING_RIDGE}
     assert sorted(g["n_cells"] for g in groups) == [1, 8]
-    assert [g["cells"] for g in groups if g["n_cells"] == 1] == [[("cnn", 0)]]
+    assert [g["cells"] for g in groups if g["n_cells"] == 1] == [[("pixel_ae", 0)]]
 
 
 def test_a_cell_that_skipped_selection_is_not_grouped_with_one_that_did_not():
@@ -1679,7 +1679,7 @@ def test_a_cell_that_skipped_selection_is_not_grouped_with_one_that_did_not():
     nine cells, which is one group either way.
     """
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["gain"]["ridge_selected"] = False
+    _cell(records, "pixel_ae", 0)["filtering"]["gain"]["ridge_selected"] = False
     groups = ridge_groups(records)
     assert len(groups) == 2
     assert {g["joint_ridge"] for g in groups} == {JOINT_RIDGE}
@@ -1702,13 +1702,13 @@ def test_a_group_publishes_the_denominator_its_mean_was_taken_over():
     """
     records = _study()
     for seed in SEEDS:
-        del _cell(records, "cnn", seed)["filtering"]["gain"]["gain"]
+        del _cell(records, "pixel_ae", seed)["filtering"]["gain"]["gain"]
     [group] = ridge_groups(records)
     assert group["n_cells"] == 9
     assert group["n_finite_gains"] == 6
     survivors = [
         _value("filtering.gain.gain", arm, seed)
-        for arm in ARMS if arm != "cnn" for seed in SEEDS
+        for arm in ARMS if arm != "pixel_ae" for seed in SEEDS
     ]
     assert group["gain_mean"] == pytest.approx(sum(survivors) / 6)
     assert group["gain_mean"] != pytest.approx(
@@ -1735,20 +1735,20 @@ def test_a_group_whose_every_gain_is_undefined_reports_a_zero_denominator():
 
 
 def test_mean_curve_averages_across_the_seeds_of_one_arm():
-    records = [_record("cnn", seed) for seed in SEEDS]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
     curve = mean_curve(records, "rssm_position")
     expected = np.mean(
-        [_curve("rssm_position", "cnn", seed) for seed in SEEDS], axis=0)
+        [_curve("rssm_position", "pixel_ae", seed) for seed in SEEDS], axis=0)
     assert curve.tolist() == pytest.approx(expected.tolist())
     assert len(curve) == FIXTURE_HORIZON
-    assert curve.tolist() != _curve("rssm_position", "cnn", 0), (
+    assert curve.tolist() != _curve("rssm_position", "pixel_ae", 0), (
         "if the seeds' curves were equal this would pass on a mean that "
         "returned the first record's curve")
 
 
 def test_mean_curve_refuses_a_ragged_set_rather_than_averaging_horizons():
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 1)["curves"]["rssm_position"] = [1.0, 2.0]
     with pytest.raises(ValueError, match="different lengths"):
         mean_curve(records, "rssm_position")
 
@@ -1764,11 +1764,11 @@ def test_mean_curve_names_the_cell_whose_curve_is_MISSING():
     AFTER the verdict has been printed and the exit status is lost. The
     ragged-set test above covers the `ValueError` half only.
     """
-    records = [_record("cnn", seed) for seed in SEEDS]
-    del _cell(records, "cnn", 1)["curves"]["rssm_position"]
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    del _cell(records, "pixel_ae", 1)["curves"]["rssm_position"]
     with pytest.raises(ValueError) as error:
         mean_curve(records, "rssm_position")
-    assert str(error.value) == "no 'rssm_position' curve for [('cnn', 1)]", (
+    assert str(error.value) == "no 'rssm_position' curve for [('pixel_ae', 1)]", (
         "the cell is named; 'a curve is missing somewhere in nine records' is "
         "not a message anyone can act on")
     assert "different lengths" not in str(error.value), (
@@ -1779,18 +1779,18 @@ def test_mean_curve_survives_a_curves_block_that_is_not_a_dict():
     """`record.get("curves", {})` answers with the block that IS there, so a
     `curves` key holding a null or a scalar reached `.get(name)` and raised
     `AttributeError` -- which `write_figure` does not catch either."""
-    records = [_record("cnn", seed) for seed in SEEDS]
-    _cell(records, "cnn", 0)["curves"] = None
-    _cell(records, "cnn", 2)["curves"] = 7
+    records = [_record("pixel_ae", seed) for seed in SEEDS]
+    _cell(records, "pixel_ae", 0)["curves"] = None
+    _cell(records, "pixel_ae", 2)["curves"] = 7
     with pytest.raises(ValueError) as error:
         mean_curve(records, "rssm_position")
     assert str(error.value) == (
-        "no 'rssm_position' curve for [('cnn', 0), ('cnn', 2)]")
+        "no 'rssm_position' curve for [('pixel_ae', 0), ('pixel_ae', 2)]")
 
 
 def test_mean_curve_refuses_a_name_that_is_not_one_of_the_six():
     with pytest.raises(ValueError):
-        mean_curve([_record("cnn", 0)], "rssm_health")
+        mean_curve([_record("pixel_ae", 0)], "rssm_health")
 
 
 # ---------------------------------------------------------------------------
@@ -1811,7 +1811,7 @@ def test_a_passing_study_still_reports_its_degenerate_reward_target():
     before the study started, and it must not hide it either."""
     verdict = evaluate_gate(_study(reward_degenerate=True))
     assert verdict["passed"] is True
-    assert verdict["per_arm"]["cnn"]["any_reward_degenerate"] is True
+    assert verdict["per_arm"]["pixel_ae"]["any_reward_degenerate"] is True
 
 
 def test_the_gate_fails_when_one_seed_of_one_arm_is_negative():
@@ -1832,7 +1832,7 @@ def test_the_gate_fails_when_a_whole_arm_is_missing():
     """`all()` over the arms that HAVE records is True for an arm with none.
     The expensive arm is 25 of the study's 33 hours and is the one that does
     not finish."""
-    records = [r for r in _study() if r["arm"] != "cnn"]
+    records = [r for r in _study() if r["arm"] != "pixel_ae"]
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["beats_persistence"] is False
     assert verdict["criteria"]["band_is_usable"] is False
@@ -1858,10 +1858,10 @@ def test_the_gate_fails_when_one_seed_is_missing_and_names_the_cell():
 def test_the_gate_fails_on_a_duplicated_cell():
     """One cell counted twice is a mean over a denominator nobody chose."""
     records = _study()
-    records.append(_record("cnn", 0))
+    records.append(_record("pixel_ae", 0))
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["no_duplicate_cells"] is False
-    assert verdict["duplicate_cells"] == [("cnn", 0)]
+    assert verdict["duplicate_cells"] == [("pixel_ae", 0)]
     assert verdict["criteria"]["all_nine_cells_present"] is True, (
         "a duplicate must cost its own criterion and not be reported as a "
         "missing cell")
@@ -1873,17 +1873,17 @@ def test_the_gate_fails_on_a_record_that_is_not_a_study_cell():
     and silently ignoring it is how a directory nobody checked gets
     aggregated."""
     records = _study()
-    records.append(_record("cnn", 0) | {"seed": 17})
+    records.append(_record("pixel_ae", 0) | {"seed": 17})
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["every_record_is_a_study_cell"] is False
-    assert verdict["unexpected_cells"] == ["arm='cnn' seed=17"]
+    assert verdict["unexpected_cells"] == ["arm='pixel_ae' seed=17"]
     assert verdict["passed"] is False
 
 
 def test_a_missing_cell_beside_a_stray_file_is_not_a_complete_study():
     """Nine records is not nine CELLS, and this is the shape the study will
-    actually meet: `result_cnn_seed2.json` never got written and a
-    `result_cnn_seed7.json` is left over from an earlier `--arms cnn --seeds 7`
+    actually meet: `result_pixel_ae_seed2.json` never got written and a
+    `result_pixel_ae_seed7.json` is left over from an earlier `--arms pixel_ae --seeds 7`
     run into the same directory.
 
     Completeness is `expected - present`, deliberately not a count: a superset
@@ -1891,11 +1891,11 @@ def test_a_missing_cell_beside_a_stray_file_is_not_a_complete_study():
     two existing completeness tests can tell the two forms apart -- one removes
     a record (eight, both forms fail) and one adds a tenth (ten, both forms
     pass). Under the count form the gate reports `all_nine_cells_present` PASS
-    while the very next lines of the same block print `MISSING CELLS: cnn/s2`,
+    while the very next lines of the same block print `MISSING CELLS: pixel_ae/s2`,
     a self-contradictory verdict naming the wrong cause for a NOT PASSED.
     """
-    records = [r for r in _study() if (r["arm"], r["seed"]) != ("cnn", 2)]
-    records.append(_record("cnn", 0) | {"seed": 7})
+    records = [r for r in _study() if (r["arm"], r["seed"]) != ("pixel_ae", 2)]
+    records.append(_record("pixel_ae", 0) | {"seed": 7})
     verdict = evaluate_gate(records)
     assert verdict["n_records"] == 9, (
         "nine records, so a criterion that counted rather than compared sets "
@@ -1905,8 +1905,8 @@ def test_a_missing_cell_beside_a_stray_file_is_not_a_complete_study():
     assert verdict["criteria"]["no_duplicate_cells"] is True, (
         "the stray cell is its own finding and must not be reported as a "
         "duplicate of the one it stands in for")
-    assert verdict["missing_cells"] == [("cnn", 2)]
-    assert verdict["unexpected_cells"] == ["arm='cnn' seed=7"]
+    assert verdict["missing_cells"] == [("pixel_ae", 2)]
+    assert verdict["unexpected_cells"] == ["arm='pixel_ae' seed=7"]
     assert verdict["passed"] is False
 
 
@@ -1914,16 +1914,16 @@ def test_the_gate_fails_on_a_record_that_names_no_cell_at_all():
     """The other half of the same criterion: a record whose seed is a string
     names no cell, which is different from naming one outside the study."""
     records = _study()
-    records.append(_record("cnn", 0) | {"seed": "0"})
+    records.append(_record("pixel_ae", 0) | {"seed": "0"})
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["every_record_is_a_study_cell"] is False
-    assert verdict["unexpected_cells"] == ["arm='cnn' seed='0'"]
+    assert verdict["unexpected_cells"] == ["arm='pixel_ae' seed='0'"]
 
 
 def test_the_gate_fails_on_a_degenerate_position_band():
     """A ratio over a numerically degenerate denominator is not evidence."""
     records = _study()
-    _cell(records, "cnn", 2)["position"]["steps_degenerate"] = 7
+    _cell(records, "pixel_ae", 2)["position"]["steps_degenerate"] = 7
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["band_is_usable"] is False
     assert verdict["criteria"]["beats_persistence"] is True, (
@@ -1946,7 +1946,7 @@ def test_the_degenerate_threshold_is_zero_steps():
     would make every band "usable" and the criterion vacuous."""
     assert MAX_DEGENERATE_STEPS == 0
     records = _study()
-    _cell(records, "cnn", 0)["position"]["steps_degenerate"] = 1
+    _cell(records, "pixel_ae", 0)["position"]["steps_degenerate"] = 1
     assert evaluate_gate(records)["criteria"]["band_is_usable"] is False
 
 
@@ -1970,7 +1970,7 @@ def test_the_gate_fails_when_a_record_reports_no_reward_accuracy():
 
 def test_the_gate_fails_when_an_arms_curves_are_incomplete():
     records = _study()
-    del _cell(records, "cnn", 1)["curves"]["floor_angle"]
+    del _cell(records, "pixel_ae", 1)["curves"]["floor_angle"]
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["curves_produced"] is False
     assert verdict["passed"] is False
@@ -2069,11 +2069,11 @@ def test_the_metric_table_puts_each_seeds_gap_in_its_own_column():
     assert _row(table, "arm ") == (
         "arm         metric          seed 0      seed 1      seed 2"
         "        mean  finite  unanimous  degenerate  floor>=pers")
-    assert _row(table, "cnn         position") == (
-        "cnn         position    +1000.0000  +1001.0000  +1003.0000"
+    assert _row(table, "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000  +1001.0000  +1003.0000"
         "  +1001.3333     3/3       True           0         3403")
-    assert _row(table, "cnn         angle") == (
-        "cnn         angle       +1300.0000  +1301.0000  +1303.0000"
+    assert _row(table, "pixel_ae    angle") == (
+        "pixel_ae    angle       +1300.0000  +1301.0000  +1303.0000"
         "  +1301.3333     3/3       True           0         3503")
     assert _row(table, "random_vit  position") == (
         "random_vit  position    +1010.0000  +1011.0000  +1013.0000"
@@ -2086,10 +2086,10 @@ def test_the_metric_table_marks_a_missing_cell_in_its_own_column():
     seed headings puts SEED 2'S NUMBER IN SEED 1'S COLUMN -- a full-looking
     table describing a study nobody ran."""
     records = [r for r in _rendering_study()
-               if (r["arm"], r["seed"]) != ("cnn", 1)]
+               if (r["arm"], r["seed"]) != ("pixel_ae", 1)]
     table = report_study.metric_table(records, per_arm(records))
-    assert _row(table, "cnn         position") == (
-        "cnn         position    +1000.0000     MISSING  +1003.0000"
+    assert _row(table, "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000     MISSING  +1003.0000"
         "  +1001.5000     2/3       True           0         3403")
 
 
@@ -2107,10 +2107,10 @@ def test_the_metric_table_shows_a_nan_cell_and_the_denominator_that_moved():
     denominator moving CHANGES THE NUMBER, rather than the two agreeing and the
     assertion reading the same value either way."""
     records = _rendering_study()
-    _cell(records, "cnn", 1)["position"]["gap_final"] = float("nan")
+    _cell(records, "pixel_ae", 1)["position"]["gap_final"] = float("nan")
     table = report_study.metric_table(records, per_arm(records))
-    assert _row(table, "cnn         position") == (
-        "cnn         position    +1000.0000        +nan  +1003.0000"
+    assert _row(table, "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000        +nan  +1003.0000"
         "  +1001.5000     2/3      False           0         3403")
 
 
@@ -2160,10 +2160,10 @@ def test_the_gain_table_says_n_a_for_an_interval_with_one_end_missing():
     """An interval with one end is not an interval, and rendering that as
     `False` would say "the interval covers zero", which nobody measured."""
     records = _rendering_study()
-    _cell(records, "cnn", 0)["filtering"]["gain"]["ci_high"] = float("nan")
-    row = _row(report_study.gain_table(records), "cnn/s0")
+    _cell(records, "pixel_ae", 0)["filtering"]["gain"]["ci_high"] = float("nan")
+    row = _row(report_study.gain_table(records), "pixel_ae/s0")
     assert row == (
-        "cnn/s0            +2600.0000  +2700.0000  +2300.0000"
+        "pixel_ae/s0       +2600.0000  +2700.0000  +2300.0000"
         "         [+2400.0000, +nan]        n/a      1.0e+03      1.0e+05"
         "      True     2800")
 
@@ -2190,26 +2190,26 @@ def test_the_CI_column_reads_an_interval_below_zero_AND_one_above():
     neighbour.
     """
     records = _rendering_study()
-    _cell(records, "cnn", 0)["filtering"]["gain"].update(
+    _cell(records, "pixel_ae", 0)["filtering"]["gain"].update(
         gain=-0.0208, ci_low=-0.0395, ci_high=-0.0040)
-    _cell(records, "cnn", 1)["filtering"]["gain"].update(
+    _cell(records, "pixel_ae", 1)["filtering"]["gain"].update(
         gain=0.0325, ci_low=0.0040, ci_high=0.0610)
-    _cell(records, "cnn", 2)["filtering"]["gain"].update(
+    _cell(records, "pixel_ae", 2)["filtering"]["gain"].update(
         gain=-0.0100, ci_low=-0.0300, ci_high=0.0200)
     table = report_study.gain_table(records)
-    assert _row(table, "cnn/s0") == (
-        "cnn/s0            +2600.0000  +2700.0000     -0.0208"
+    assert _row(table, "pixel_ae/s0") == (
+        "pixel_ae/s0       +2600.0000  +2700.0000     -0.0208"
         "         [-0.0395, -0.0040]       True      1.0e+03      1.0e+05"
         "      True     2800"), (
         "the MEASURED study: the interval is entirely below zero, so only "
         "`high < 0.0` can be what decided this row")
-    assert _row(table, "cnn/s1") == (
-        "cnn/s1            +2601.0000  +2701.0000     +0.0325"
+    assert _row(table, "pixel_ae/s1") == (
+        "pixel_ae/s1       +2601.0000  +2701.0000     +0.0325"
         "         [+0.0040, +0.0610]       True      1.0e+03      1.0e+05"
         "      True     2801"), (
         "entirely above zero, so only `low > 0.0` can be what decided it")
-    assert _row(table, "cnn/s2") == (
-        "cnn/s2            +2603.0000  +2703.0000     -0.0100"
+    assert _row(table, "pixel_ae/s2") == (
+        "pixel_ae/s2       +2603.0000  +2703.0000     -0.0100"
         "         [-0.0300, +0.0200]      False      1.0e+03      1.0e+05"
         "      True     2803"), (
         "straddling zero: neither term is true, so a column that always said "
@@ -2226,7 +2226,7 @@ def test_the_ridge_block_lists_the_decade_every_gain_was_computed_at():
         "  members")
     assert _row(block, "True") == (
         "True            1.0e+03      1.0e+05      9       9 +2306.3333  "
-        "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
         "random_vit/s0 random_vit/s1 random_vit/s2")
     assert "WARNING" not in block, (
         "nine cells that agree must not be warned about, or the warning "
@@ -2237,12 +2237,12 @@ def test_the_ridge_block_warns_when_the_cells_did_not_agree():
     """R1. There is no correction for this, only the disclosure."""
     records = _rendering_study()
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["filtering"]["gain"][
+        _cell(records, "pixel_ae", seed)["filtering"]["gain"][
             "joint_ridge"] = ALT_JOINT_RIDGE
     block = report_study.ridge_block(ridge_groups(records))
     assert _row(block, "True            1.0e+07") == (
         "True            1.0e+07      1.0e+05      3       3 +2301.3333  "
-        "cnn/s0 cnn/s1 cnn/s2"), (
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2"), (
         "the EMBED column reads 1.0e+05 in both rows, so only the joint half "
         "of the decade key can be what split them")
     warning = _row(block, "WARNING: the nine cells")
@@ -2261,7 +2261,7 @@ def test_the_ridge_block_warns_when_the_cells_split_on_the_EMBEDDING_decade():
     of the key left all 847 green.
 
     What that costs is R1's entire disclosure on a study that split on the
-    embedding decade. With cnn's three cells at `ALT_EMBEDDING_RIDGE` the
+    embedding decade. With pixel_ae's three cells at `ALT_EMBEDDING_RIDGE` the
     block prints two rows whose `embed_ridge` columns read 1.0e+01 and
     1.0e+05 -- two decades, on the page -- and with the embedding half gone it
     prints those SAME two rows and no warning, publishing a nine-cell mean
@@ -2275,12 +2275,12 @@ def test_the_ridge_block_warns_when_the_cells_split_on_the_EMBEDDING_decade():
     """
     records = _rendering_study()
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["filtering"]["gain"][
+        _cell(records, "pixel_ae", seed)["filtering"]["gain"][
             "embedding_ridge"] = ALT_EMBEDDING_RIDGE
     block = report_study.ridge_block(ridge_groups(records))
     assert _row(block, "True            1.0e+03      1.0e+01") == (
         "True            1.0e+03      1.0e+01      3       3 +2301.3333  "
-        "cnn/s0 cnn/s1 cnn/s2")
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2")
     assert _row(block, "True            1.0e+03      1.0e+05") == (
         "True            1.0e+03      1.0e+05      6       6 +2308.8333  "
         "frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
@@ -2321,11 +2321,11 @@ def test_the_ridge_block_warns_when_a_cell_does_not_SAY_whether_it_selected():
     """
     records = _rendering_study()
     for seed in SEEDS:
-        del _cell(records, "cnn", seed)["filtering"]["gain"]["ridge_selected"]
+        del _cell(records, "pixel_ae", seed)["filtering"]["gain"]["ridge_selected"]
     block = report_study.ridge_block(ridge_groups(records))
     assert _row(block, "n/a") == (
         "n/a             1.0e+03      1.0e+05      3       3 +2301.3333  "
-        "cnn/s0 cnn/s1 cnn/s2")
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2")
     assert "NO ridge selection" in _row(block, "WARNING: at least one cell")
 
 
@@ -2346,12 +2346,12 @@ def test_the_ridge_block_does_not_warn_about_a_decade_its_own_table_refutes():
     """
     records = _rendering_study()
     for seed in SEEDS:
-        _cell(records, "cnn", seed)["filtering"]["gain"][
+        _cell(records, "pixel_ae", seed)["filtering"]["gain"][
             "ridge_selected"] = False
     block = report_study.ridge_block(ridge_groups(records))
     assert _row(block, "False") == (
         "False           1.0e+03      1.0e+05      3       3 +2301.3333  "
-        "cnn/s0 cnn/s1 cnn/s2")
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2")
     assert _row(block, "True") == (
         "True            1.0e+03      1.0e+05      6       6 +2308.8333  "
         "frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
@@ -2372,14 +2372,14 @@ def test_the_ridge_block_prints_the_denominator_beside_the_count_of_cells():
     named as members, which is why the two columns have to differ."""
     records = _rendering_study()
     for seed in SEEDS:
-        del _cell(records, "cnn", seed)["filtering"]["gain"]["gain"]
+        del _cell(records, "pixel_ae", seed)["filtering"]["gain"]["gain"]
     block = report_study.ridge_block(ridge_groups(records))
     assert _row(block, "selected") == (
         "selected    joint_ridge  embed_ridge  cells  finite  gain_mean"
         "  members")
     assert _row(block, "True") == (
         "True            1.0e+03      1.0e+05      9       6 +2308.8333  "
-        "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
         "random_vit/s0 random_vit/s1 random_vit/s2"), (
         "nine cells, six of them in the mean, all nine named -- and the mean "
         "is +2308.8333 rather than the nine-cell +2306.3333, so a mean taken "
@@ -2393,15 +2393,15 @@ def test_the_ridge_block_names_a_record_that_names_no_cell():
     is drawn after the verdict is already on the operator's screen.
 
     The stray carries seed "7", not "0": a record that renamed itself after
-    the cell it was copied from would render `cnn/s0` twice and the row would
+    the cell it was copied from would render `pixel_ae/s0` twice and the row would
     read the same whether the fallback ran or not.
     """
     records = _rendering_study()
-    records.append(_record("cnn", 0) | {"seed": "7"})
+    records.append(_record("pixel_ae", 0) | {"seed": "7"})
     assert _row(report_study.ridge_block(ridge_groups(records)), "True") == (
         "True            1.0e+03      1.0e+05     10      10 +2305.7000  "
-        "cnn/s0 cnn/s1 cnn/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
-        "random_vit/s0 random_vit/s1 random_vit/s2 cnn/s7")
+        "pixel_ae/s0 pixel_ae/s1 pixel_ae/s2 frozen_ssl/s0 frozen_ssl/s1 frozen_ssl/s2 "
+        "random_vit/s0 random_vit/s1 random_vit/s2 pixel_ae/s7")
 
 
 def test_the_reward_table_reports_the_numbers_and_the_target_flag():
@@ -2429,7 +2429,7 @@ def test_the_training_table_reports_throughput_per_cell():
 
 def test_the_gate_block_renders_a_failing_verdict():
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+    _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = False
     block = report_study.gate_block(evaluate_gate(records))
     assert _row(block, "  [FAIL]") == "  [FAIL] filtering_beats_embedding"
@@ -2464,20 +2464,20 @@ def test_the_gate_block_names_the_criteria_it_could_not_evaluate():
 
 def test_the_gate_block_names_every_missing_cell():
     records = [r for r in _study()
-               if (r["arm"], r["seed"]) not in {("cnn", 1), ("random_vit", 2)}]
+               if (r["arm"], r["seed"]) not in {("pixel_ae", 1), ("random_vit", 2)}]
     block = report_study.gate_block(evaluate_gate(records))
     assert _row(block, "  MISSING CELLS") == (
-        "  MISSING CELLS (2 of 9): cnn/s1, random_vit/s2")
+        "  MISSING CELLS (2 of 9): pixel_ae/s1, random_vit/s2")
 
 
 def test_the_gate_block_names_a_duplicated_and_an_unexpected_cell():
     records = _study()
-    records.append(_record("cnn", 0))
-    records.append(_record("cnn", 0) | {"seed": 17})
+    records.append(_record("pixel_ae", 0))
+    records.append(_record("pixel_ae", 0) | {"seed": 17})
     block = report_study.gate_block(evaluate_gate(records))
-    assert _row(block, "  DUPLICATE CELLS") == "  DUPLICATE CELLS: cnn/s0"
+    assert _row(block, "  DUPLICATE CELLS") == "  DUPLICATE CELLS: pixel_ae/s0"
     assert _row(block, "  RECORDS THAT ARE NOT") == (
-        "  RECORDS THAT ARE NOT STUDY CELLS: arm='cnn' seed=17")
+        "  RECORDS THAT ARE NOT STUDY CELLS: arm='pixel_ae' seed=17")
 
 
 def test_the_gate_block_names_the_cell_and_the_curve_that_came_up_short():
@@ -2494,22 +2494,22 @@ def test_the_gate_block_names_the_cell_and_the_curve_that_came_up_short():
     """
     records = _study()
     del _cell(records, "frozen_ssl", 1)["curves"]["floor_angle"]
-    _cell(records, "cnn", 0)["curves"]["rssm_position"] = [1.0, 2.0]
+    _cell(records, "pixel_ae", 0)["curves"]["rssm_position"] = [1.0, 2.0]
     # A record that names NO cell, also short a curve. `record_cell` answers
     # None for it, and `f"{cell[0]}/s{cell[1]}"` cannot unpack a None -- so the
     # line that is supposed to name a broken record has to be able to name the
     # most broken one. It is listed by its own self-description, the same text
     # the RECORDS THAT ARE NOT STUDY CELLS line uses, with the seed's `repr`
     # visible so `seed=7` and `seed='7'` cannot read alike.
-    stray = _record("cnn", 0) | {"seed": "7"}
+    stray = _record("pixel_ae", 0) | {"seed": "7"}
     del stray["curves"]["floor_position"]
     records.append(stray)
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["curves_produced"] is False
     block = report_study.gate_block(verdict)
     assert _row(block, "  CURVES INCOMPLETE") == (
-        "  CURVES INCOMPLETE (3 of 9): cnn/s0 (rssm_position), "
-        "frozen_ssl/s1 (floor_angle), arm='cnn' seed='7' (floor_position)"), (
+        "  CURVES INCOMPLETE (3 of 9): frozen_ssl/s1 (floor_angle), "
+        "pixel_ae/s0 (rssm_position), arm='pixel_ae' seed='7' (floor_position)"), (
         "each cell with the name of ITS OWN short curve: a line that named "
         "all six for any of them would be no more use than the bare FAIL. "
         "The count is of incomplete records against the nine cells EXPECTED, "
@@ -2662,7 +2662,7 @@ def test_every_section_of_the_report_is_actually_in_the_report():
     than as two `in` checks: a header line and a row that both appear
     somewhere is satisfied by a report whose sections have been shuffled.
     """
-    assert ARMS == ("cnn", "frozen_ssl", "random_vit"), (
+    assert ARMS == ("pixel_ae", "frozen_ssl", "random_vit"), (
         "the row expectations are built from ARMS, METRICS and SEEDS, which "
         "the renderer reads too; pinned literally here so that a constant "
         "losing an entry cannot move both sides of the comparison together")
@@ -2696,7 +2696,7 @@ def test_all_five_per_cell_tables_MARK_a_missing_cell_rather_than_dropping_it():
     `gain_table` or `reward_table` -- each of which prints it for a cell with
     no record and then `continue`s -- left the whole suite green. With
     frozen_ssl's three records absent the shipped criterion-4 table prints
-    three MISSING rows between the cnn and the random_vit rows; without that
+    three MISSING rows between the pixel_ae and the random_vit rows; without that
     line it prints six rows and nothing else: a full-looking, evenly spaced
     table describing a study nobody ran, in the table carrying the number the
     milestone fails on, two lines under a header that still says how many
@@ -2742,7 +2742,7 @@ def test_all_five_per_cell_tables_MARK_a_missing_cell_rather_than_dropping_it():
             marker.replace("/s0", "/s2"),
         ], (
             f"the three cells of the arm that never ran are marked MISSING, "
-            f"in their own rows, between cnn's and random_vit's, under "
+            f"in their own rows, between pixel_ae's and random_vit's, under "
             f"{header!r}:\n" + "\n".join(body))
 
 
@@ -2789,23 +2789,23 @@ def test_a_non_numeric_leaf_costs_its_own_column_and_not_the_report():
         "the None branch and the except branch are two different guards; "
         "spelled out here so a fix that collapsed them shows up")
     records = _rendering_study()
-    _cell(records, "cnn", 1)["position"]["gap_final"] = "1.2.3"
-    _cell(records, "cnn", 2)["filtering"]["gain"]["n_scored_windows"] = "many"
+    _cell(records, "pixel_ae", 1)["position"]["gap_final"] = "1.2.3"
+    _cell(records, "pixel_ae", 2)["filtering"]["gain"]["n_scored_windows"] = "many"
     verdict = evaluate_gate(records)
     text = report_study.report(records, verdict, "runs/x")
-    assert _row(text, "cnn         position") == (
-        "cnn         position    +1000.0000       1.2.3  +1003.0000"
+    assert _row(text, "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000       1.2.3  +1003.0000"
         "  +1001.5000     2/3      False           0         3403"), (
         "the bad leaf is printed as the text it holds, in its own column, and "
         "the two good seeds either side of it are untouched")
-    assert _row(text, "cnn/s2            +2603.0000").endswith("     many")
+    assert _row(text, "pixel_ae/s2       +2603.0000").endswith("     many")
     assert _row(text, "GATE:") == "GATE: NOT PASSED", (
         "a string where a number belongs is not a measurement, so the "
         "criterion that read it fails -- the report is what must survive")
 
 
 def test_the_report_says_how_many_of_the_nine_cells_it_found():
-    records = [r for r in _study() if r["arm"] != "cnn"]
+    records = [r for r in _study() if r["arm"] != "pixel_ae"]
     text = report_study.report(records, evaluate_gate(records), "runs/x")
     assert _row(text, "  records") == (
         "  records     6 of 9 expected cells (3 arms x 3 seeds)")
@@ -2819,22 +2819,22 @@ def test_main_prints_the_report_and_exits_ok_on_a_passing_study(
     out = capsys.readouterr().out
     assert status == report_study.EXIT_OK
     assert _row(out, "GATE:") == "GATE: PASSED"
-    assert _row(out, "cnn         position").startswith(
-        "cnn         position    +1000.0000  +1001.0000  +1003.0000")
+    assert _row(out, "pixel_ae    position").startswith(
+        "pixel_ae    position    +1000.0000  +1001.0000  +1003.0000")
 
 
 def test_main_exits_gate_not_passed_when_the_gate_does_not_pass(
         tmp_path, capsys):
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+    _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = False
     status = report_study.main(["--out", str(_write(tmp_path, records))])
     out = capsys.readouterr().out
     assert status == report_study.EXIT_GATE_NOT_PASSED
     assert _row(out, "GATE:") == "GATE: NOT PASSED"
     assert _row(out, "  [FAIL]") == "  [FAIL] filtering_beats_embedding"
-    assert _row(out, "cnn         position").startswith(
-        "cnn         position    +1000.0000"), (
+    assert _row(out, "pixel_ae    position").startswith(
+        "pixel_ae    position    +1000.0000"), (
         "the whole report is printed BEFORE the status is decided; a gate "
         "that did not pass is a result, not an error that suppresses output")
 
@@ -2852,7 +2852,7 @@ def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
     returns EXIT_OK, reports "6 of 9" as "6 of 6", lists no missing cells and
     marks every criterion PASS.
 
-    The cnn arm is 25 of the study's 33 hours and is the one that does not
+    The pixel_ae arm is 25 of the study's 33 hours and is the one that does not
     finish on a rented box. The only main-level incomplete-study test removes
     a single SEED, which leaves all three arm names present and therefore
     cannot tell the two calls apart.
@@ -2861,7 +2861,7 @@ def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
     arm with no record fails all five, and it is the five that would otherwise
     be read off the two cheap arms that did finish.
     """
-    records = [r for r in _study() if r["arm"] != "cnn"]
+    records = [r for r in _study() if r["arm"] != "pixel_ae"]
     status = report_study.main(["--out", str(_write(tmp_path, records))])
     out = capsys.readouterr().out
     assert status == report_study.EXIT_GATE_NOT_PASSED
@@ -2869,7 +2869,7 @@ def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
     assert _row(out, "  records") == (
         "  records     6 of 9 expected cells (3 arms x 3 seeds)")
     assert _row(out, "  MISSING CELLS") == (
-        "  MISSING CELLS (3 of 9): cnn/s0, cnn/s1, cnn/s2")
+        "  MISSING CELLS (3 of 9): pixel_ae/s0, pixel_ae/s1, pixel_ae/s2")
     for criterion in ("all_nine_cells_present", "beats_persistence",
                       "band_is_usable", "filtering_beats_embedding",
                       "reward_reported", "curves_produced"):
@@ -2878,8 +2878,8 @@ def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
         "the two arms that DID finish still pass what they can -- a report "
         "that failed everything would satisfy this test without judging "
         "anything over the missing arm")
-    assert _row(out, "cnn         position") == (
-        "cnn         position       MISSING     MISSING     MISSING"
+    assert _row(out, "pixel_ae    position") == (
+        "pixel_ae    position       MISSING     MISSING     MISSING"
         "         n/a     0/3        n/a         n/a          n/a"), (
         "the arm that never ran has a row of MISSING, not an absent row: an "
         "arm that is not in the table is an arm nobody looks for")
@@ -2905,11 +2905,11 @@ def test_main_gates_over_the_STUDYS_seeds_not_over_the_ones_that_ran(
     assert _row(out, "  records") == (
         "  records     6 of 9 expected cells (3 arms x 3 seeds)")
     assert _row(out, "  MISSING CELLS") == (
-        "  MISSING CELLS (3 of 9): cnn/s2, frozen_ssl/s2, random_vit/s2")
+        "  MISSING CELLS (3 of 9): frozen_ssl/s2, pixel_ae/s2, random_vit/s2")
     assert _row(out, "  [FAIL] all_nine_cells_present") == (
         "  [FAIL] all_nine_cells_present")
-    assert _row(out, "cnn         position") == (
-        "cnn         position    +1000.0000  +1001.0000     MISSING"
+    assert _row(out, "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000  +1001.0000     MISSING"
         "  +1000.5000     2/3       True           0         3401"), (
         "the seed the study owes is still a column, and the finite "
         "denominator is still 3 -- 2/2 would read as a complete arm")
@@ -2917,11 +2917,11 @@ def test_main_gates_over_the_STUDYS_seeds_not_over_the_ones_that_ran(
 
 def test_main_reports_an_incomplete_study_rather_than_aggregating_it(
         tmp_path, capsys):
-    records = [r for r in _study() if (r["arm"], r["seed"]) != ("cnn", 2)]
+    records = [r for r in _study() if (r["arm"], r["seed"]) != ("pixel_ae", 2)]
     status = report_study.main(["--out", str(_write(tmp_path, records))])
     out = capsys.readouterr().out
     assert status == report_study.EXIT_GATE_NOT_PASSED
-    assert _row(out, "  MISSING CELLS") == "  MISSING CELLS (1 of 9): cnn/s2"
+    assert _row(out, "  MISSING CELLS") == "  MISSING CELLS (1 of 9): pixel_ae/s2"
     assert _row(out, "  records") == (
         "  records     8 of 9 expected cells (3 arms x 3 seeds)")
 
@@ -2972,7 +2972,7 @@ def test_the_script_exits_with_the_status_main_returned(tmp_path):
     assert status(_write(tmp_path / "passing", _study())) == (
         report_study.EXIT_OK) == 0
     failing = _study()
-    _cell(failing, "cnn", 0)["filtering"]["criterion_4"][
+    _cell(failing, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = False
     assert status(_write(tmp_path / "failing", failing)) == (
         report_study.EXIT_GATE_NOT_PASSED), (
@@ -3012,22 +3012,22 @@ def test_a_record_whose_block_is_a_scalar_does_not_kill_the_report():
     33 hours is the failure this guard exists for.
     """
     records = _rendering_study()
-    _cell(records, "cnn", 1)["position"] = None
-    _cell(records, "cnn", 2)["filtering"] = 7
+    _cell(records, "pixel_ae", 1)["position"] = None
+    _cell(records, "pixel_ae", 2)["filtering"] = 7
     _cell(records, "frozen_ssl", 0)["reward"] = "no reward"
     # The whole report renders, and every table is asserted on its own: a
-    # per-cell row prefix like "cnn/s2" appears in four of them, so a search
+    # per-cell row prefix like "pixel_ae/s2" appears in four of them, so a search
     # over the whole text would be answered by whichever table came first.
     report_study.report(records, evaluate_gate(records), "runs/x")
     verdict = evaluate_gate(records)
     assert _row(report_study.metric_table(records, verdict["per_arm"]),
-                "cnn         position") == (
-        "cnn         position    +1000.0000         n/a  +1003.0000"
+                "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000         n/a  +1003.0000"
         "  +1001.5000     2/3      False         n/a          n/a")
-    assert _row(report_study.criterion_4_table(records), "cnn/s2") == (
-        "cnn/s2                    n/a          n/a                      n/a")
-    assert _row(report_study.gain_table(records), "cnn/s2") == (
-        "cnn/s2                   n/a         n/a         n/a"
+    assert _row(report_study.criterion_4_table(records), "pixel_ae/s2") == (
+        "pixel_ae/s2               n/a          n/a                      n/a")
+    assert _row(report_study.gain_table(records), "pixel_ae/s2") == (
+        "pixel_ae/s2              n/a         n/a         n/a"
         "                 [n/a, n/a]        n/a          n/a          n/a"
         "       n/a      n/a")
     assert _row(report_study.reward_table(records), "frozen_ssl/s0") == (
@@ -3039,23 +3039,23 @@ def test_a_record_one_field_short_does_not_kill_the_report():
     """The `key not in node` half, alone: the block is a real dict and only the
     field is gone."""
     records = _rendering_study()
-    del _cell(records, "cnn", 1)["position"]["gap_final"]
+    del _cell(records, "pixel_ae", 1)["position"]["gap_final"]
     verdict = evaluate_gate(records)
     assert _row(report_study.metric_table(records, verdict["per_arm"]),
-                "cnn         position") == (
-        "cnn         position    +1000.0000         n/a  +1003.0000"
+                "pixel_ae    position") == (
+        "pixel_ae    position    +1000.0000         n/a  +1003.0000"
         "  +1001.5000     2/3      False           0         3403")
 
 
 def test_main_refuses_a_mislabelled_record_and_prints_the_remedy(
         tmp_path, capsys):
     _write(tmp_path, _study())
-    (tmp_path / "result_cnn_seed0.json").write_text(
+    (tmp_path / "result_pixel_ae_seed0.json").write_text(
         json.dumps({**_record("random_vit", 2), "nonfinite": {}}))
     status = report_study.main(["--out", str(tmp_path)])
     out = capsys.readouterr().out
     assert status == report_study.EXIT_MISLABELLED
-    assert "result_cnn_seed0.json" in out
+    assert "result_pixel_ae_seed0.json" in out
     assert "arm='random_vit'" in out
     assert "GATE:" not in out
 
@@ -3092,7 +3092,7 @@ def test_the_figure_skips_a_record_that_names_no_cell(tmp_path):
     # never reached and the guard it is supposed to exercise is never run --
     # mutation R21 survived on exactly that. One at each end evaluates it
     # before any match and after every match.
-    stray = _record("cnn", 0) | {"seed": "0"}
+    stray = _record("pixel_ae", 0) | {"seed": "0"}
     records = [stray] + _study() + [stray]
     assert report_study.write_figure(records, figure) == f"figure={figure}"
     assert figure.exists()
@@ -3154,7 +3154,7 @@ def test_a_figure_that_cannot_be_drawn_does_not_cost_the_verdict(
     """The gate verdict is already printed above the figure line. A ragged
     curve set must cost the picture, not the number."""
     records = _study()
-    _cell(records, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
+    _cell(records, "pixel_ae", 1)["curves"]["rssm_position"] = [1.0, 2.0]
     status = report_study.main([
         "--out", str(_write(tmp_path, records)),
         "--figure", str(tmp_path / "curves.png")])
@@ -3198,7 +3198,7 @@ def test_a_record_with_no_curve_to_draw_costs_the_picture_not_the_status(
     `curves_produced` was already telling them about.
     """
     records = _study()
-    mangle(_cell(records, "cnn", 1))
+    mangle(_cell(records, "pixel_ae", 1))
     status = report_study.main([
         "--out", str(_write(tmp_path, records)),
         "--figure", str(tmp_path / "curves.png")])
@@ -3207,10 +3207,10 @@ def test_a_record_with_no_curve_to_draw_costs_the_picture_not_the_status(
         "not 1: a traceback and a gate that did not pass are the two things "
         "an unattended wrapper most needs to tell apart")
     assert _row(out, "figure NOT written") == (
-        f"figure NOT written: no {first_missing!r} curve for [('cnn', 1)]")
+        f"figure NOT written: no {first_missing!r} curve for [('pixel_ae', 1)]")
     assert _row(out, "GATE:") == "GATE: NOT PASSED"
     assert _row(out, "  CURVES INCOMPLETE") == (
-        f"  CURVES INCOMPLETE (1 of 9): cnn/s1 ({', '.join(gaps)})")
+        f"  CURVES INCOMPLETE (1 of 9): pixel_ae/s1 ({', '.join(gaps)})")
     assert not (tmp_path / "curves.png").exists()
 
 
@@ -3256,8 +3256,8 @@ def _assert_the_figure_alone_was_lost(done, figure, message):
     assert _row(done.stdout, "GATE:") == "GATE: NOT PASSED"
     assert _row(done.stdout, "figure NOT written") == (
         f"figure NOT written: {message}")
-    assert _row(done.stdout, "cnn         position").startswith(
-        "cnn         position    +1000.0000"), (
+    assert _row(done.stdout, "pixel_ae    position").startswith(
+        "pixel_ae    position    +1000.0000"), (
         "and the whole report is still printed")
     assert not figure.exists()
 
@@ -3266,7 +3266,7 @@ def _failing_study():
     """Nine cells, criterion 4 failing -- a study whose correct exit status is
     EXIT_GATE_NOT_PASSED, so a status of 1 cannot come from the verdict."""
     records = _study()
-    _cell(records, "cnn", 0)["filtering"]["criterion_4"][
+    _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
         "latent_beats_embedding"] = False
     return records
 
@@ -3410,7 +3410,7 @@ def test_the_figure_is_drawn_AFTER_the_verdict_is_printed(tmp_path, capsys):
     look right in.
     """
     ragged = _study()
-    _cell(ragged, "cnn", 1)["curves"]["rssm_position"] = [1.0, 2.0]
+    _cell(ragged, "pixel_ae", 1)["curves"]["rssm_position"] = [1.0, 2.0]
     report_study.main(["--out", str(_write(tmp_path / "ragged", ragged)),
                        "--figure", str(tmp_path / "ragged.png")])
     lines = capsys.readouterr().out.splitlines()
@@ -3451,7 +3451,7 @@ def test_every_line_main_prints_is_FLUSHED(tmp_path, capsys, monkeypatch):
                        "--figure", str(tmp_path / "curves.png")])
     report_study.main(["--out", str(tmp_path / "empty_directory")])
     mislabelled = _write(tmp_path / "mislabelled", _study())
-    (mislabelled / "result_cnn_seed0.json").write_text(
+    (mislabelled / "result_pixel_ae_seed0.json").write_text(
         json.dumps({**_record("random_vit", 2), "nonfinite": {}}))
     report_study.main(["--out", str(mislabelled)])
     unreadable = _write(tmp_path / "unreadable", _study())

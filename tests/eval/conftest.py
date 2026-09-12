@@ -42,7 +42,12 @@ def small_buffer(tmp_path):
         ))
     rng = np.random.default_rng(0)
     for path in buf.episode_paths():
-        for suffix in (".features.npy", ".features_random_vit.npy"):
+        # One cache per study backbone, each at ITS OWN row width: the ViT
+        # arms read (64, 384), pixel_ae reads (64, 32). A pixel_ae cache
+        # written 384 wide would be refused by the loader's geometry check.
+        for suffix, width in ((".features.npy", 384),
+                              (".features_random_vit.npy", 384),
+                              (".features_pixel_ae.npy", 32)):
             np.save(path.with_suffix(suffix),
-                    rng.random((41, 64, 384)).astype(np.float16))
+                    rng.random((41, 64, width)).astype(np.float16))
     return buf

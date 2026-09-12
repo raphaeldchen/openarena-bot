@@ -42,15 +42,16 @@ from mbfps.eval.study import (
 # test loudly instead of silently hollowing out everything downstream.
 # ---------------------------------------------------------------------------
 JOB_ARM = "random_vit"      # the arm the shared `record` fixture runs at
-OTHER_ARM = "cnn"           # a second arm run below, so `"arm": job.arm` is
+OTHER_ARM = "pixel_ae"      # a second arm run below, so `"arm": job.arm` is
                             # not satisfied by hardcoding the first one
 THIRD_ARM = "frozen_ssl"    # THE ONLY ARM WHOSE NAME IS NOT ITS BACKBONE'S.
                             # `random_vit` reads the `random_vit` cache and
-                            # `cnn` reads pixels, so on those two arms alone
-                            # `backbone = encoder_backbone(cfg.encoder) ->
-                            # backbone = job.arm` is a numerical no-op. This
-                            # arm reads `dinov2`, and running it here is what
-                            # makes that mutation visible at all.
+                            # `pixel_ae` reads the `pixel_ae` cache, so on
+                            # those two arms alone `backbone =
+                            # encoder_backbone(cfg.encoder) -> backbone =
+                            # job.arm` is a numerical no-op. This arm reads
+                            # `dinov2`, and running it here is what makes
+                            # that mutation visible at all.
 THIRD_ARM_BACKBONE = "dinov2"
 JOB_SEED = 1                # NOT SPLIT_SEED (0): `"split_seed": job.seed`
                             # is indistinguishable from the truth at seed 0
@@ -158,10 +159,10 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
     # `mbfps/models/encoders.py` says why: "the arm name and the backbone name
     # are deliberately not assumed equal". But on the two arms this file used
     # to run, they ARE equal or irrelevant -- `random_vit`'s cache is called
-    # `random_vit` and `cnn` reads pixels -- so `backbone = job.arm` was a
-    # numerical no-op and survived the whole suite. In the study it sends
-    # `frozen_ssl` to a cache that does not exist and kills all three of that
-    # arm's seeds at `FileNotFoundError` hours in.
+    # `random_vit` and `pixel_ae`'s is called `pixel_ae` -- so `backbone =
+    # job.arm` was a numerical no-op and survived the whole suite. In the study
+    # it sends `frozen_ssl` to a cache that does not exist and kills all three
+    # of that arm's seeds at `FileNotFoundError` hours in.
     #
     # So all three arms are run below, and the coincidence that hid the
     # mutation is asserted here by name rather than left to be rediscovered.
@@ -183,9 +184,9 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
     assert backbones[JOB_ARM] == JOB_ARM, (
         "this coincidence is the whole reason the third arm is needed: on "
         f"{JOB_ARM!r} the arm name and the backbone name are the same string")
-    assert backbones[OTHER_ARM] is None, (
-        f"{OTHER_ARM!r} reads pixels, so the backbone it is handed is unused "
-        "and cannot discriminate either")
+    assert backbones[OTHER_ARM] == OTHER_ARM, (
+        f"{OTHER_ARM!r}'s arm name and backbone name are the same string too, "
+        "so it cannot discriminate either")
 
 
 # --------------------------------------------------------------------------
@@ -193,8 +194,8 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
 # --------------------------------------------------------------------------
 
 def test_job_record_path_is_unique_per_arm_and_seed(tmp_path):
-    a = job_record_path(tmp_path, StudyJob("cnn", 0))
-    b = job_record_path(tmp_path, StudyJob("cnn", 1))
+    a = job_record_path(tmp_path, StudyJob("pixel_ae", 0))
+    b = job_record_path(tmp_path, StudyJob("pixel_ae", 1))
     c = job_record_path(tmp_path, StudyJob("frozen_ssl", 0))
     assert len({a, b, c}) == 3
     assert a.suffix == ".json"
@@ -714,7 +715,7 @@ def test_a_checkpoint_wrong_in_the_arm_alone_is_refused(
     """Half of the compound guard, exercised ALONE.
 
     `checkpoint["arm"] != job.arm or checkpoint["seed"] != job.seed` was only
-    ever tested with a checkpoint wrong in both fields (`cnn`/99 against this
+    ever tested with a checkpoint wrong in both fields (`pixel_ae`/99 against this
     job's `random_vit`/1), so both disjuncts were true at once and one
     `pytest.raises` could not say which had fired. Deleting either half left
     the suite green.
@@ -1603,7 +1604,7 @@ def test_reward_accuracy_pairs_each_action_with_the_frame_it_led_to(
     convention, and the only one with no test. `[:, 1:] -> [:, :-1]` survived:
     both slices have length T so the shape guard cannot see it, and a value
     pin cannot either -- measured, the two differ in the 6th significant digit
-    of the MSE on this fixture and are bit-identical for the `cnn` arm. So
+    of the MSE on this fixture and were bit-identical for M3b's pixel arm. So
     compare the embeddings actually handed to `observe` against `model.embed`,
     which is where the convention is defined."""
     import torch
@@ -1714,7 +1715,7 @@ def test_every_evaluation_reads_the_cache_the_arms_encoder_actually_uses(
       * `backbone = job.arm` -- the exact hazard `mbfps/models/encoders.py`
         documents ("the arm name and the backbone name are deliberately not
         assumed equal"). It was invisible by pure fixture coincidence:
-        `random_vit`'s arm name IS its backbone name and `cnn` reads pixels,
+        `random_vit`'s arm name IS its backbone name and so is `pixel_ae`'s,
         and those were the only two arms this file ever ran. `frozen_ssl`, the
         one arm where they differ, is the treatment arm of the study, and all
         three of its seeds would die at
@@ -1731,34 +1732,36 @@ def test_every_evaluation_reads_the_cache_the_arms_encoder_actually_uses(
     from mbfps.utils.config import get_config
 
     expected = encoder_backbone(get_config(arm, device="cpu", seed=JOB_SEED).encoder)
-    assert expected == {JOB_ARM: JOB_ARM, OTHER_ARM: None,
+    assert expected == {JOB_ARM: JOB_ARM, OTHER_ARM: OTHER_ARM,
                         THIRD_ARM: THIRD_ARM_BACKBONE}[arm], (
         f"{arm!r} no longer reads the cache this test was written against")
 
     # Check-it-can-fail, part one: a hardcoded "dinov2" is the WRONG answer
-    # for two of the three arms, and `job.arm` is the wrong answer for two of
-    # the three as well -- so between them the parametrisation moves.
+    # for two of the three arms, and `job.arm` is the wrong answer for the
+    # third -- so between them the parametrisation moves.
     if arm != THIRD_ARM:
         assert expected != THIRD_ARM_BACKBONE, (
             "a hardcoded dinov2 backbone is indistinguishable from the truth "
             f"on {arm!r}")
-    if arm != JOB_ARM:
+    else:
         assert expected != arm, (
             f"the arm name and the backbone name coincide on {arm!r}, so "
             "`backbone = job.arm` is invisible here")
 
-    # Check-it-can-fail, part two: for a feature arm, reading the OTHER cache
-    # is a real numerical change, not a relabelling.
-    if expected is not None:
-        other_backbone = JOB_ARM if expected == THIRD_ARM_BACKBONE \
-            else THIRD_ARM_BACKBONE
-        episode = small_buffer.episode_paths()[0]
-        mine = np.load(episode.with_suffix(feature_suffix(expected)))
-        theirs = np.load(episode.with_suffix(feature_suffix(other_backbone)))
-        assert mine.shape == theirs.shape and not np.array_equal(mine, theirs), (
-            "the two feature caches hold identical data in this fixture, so "
-            "reading the wrong one is a numerical no-op and nothing below "
-            "guards anything")
+    # Check-it-can-fail, part two: every arm is a feature arm now, and
+    # reading the OTHER cache must be a real change, not a relabelling. For
+    # the ViT arms that is different numbers of the same shape; for
+    # `pixel_ae` it is a different SHAPE -- (64, 32) rows against (64, 384)
+    # -- which the loader's geometry check refuses outright.
+    other_backbone = JOB_ARM if expected == THIRD_ARM_BACKBONE \
+        else THIRD_ARM_BACKBONE
+    episode = small_buffer.episode_paths()[0]
+    mine = np.load(episode.with_suffix(feature_suffix(expected)))
+    theirs = np.load(episode.with_suffix(feature_suffix(other_backbone)))
+    assert mine.shape != theirs.shape or not np.array_equal(mine, theirs), (
+        "the two feature caches hold identical data in this fixture, so "
+        "reading the wrong one is a numerical no-op and nothing below "
+        "guards anything")
 
     seen: dict = {}
     backbone_argument = {

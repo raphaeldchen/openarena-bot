@@ -266,7 +266,7 @@ def _stub(
     monkeypatch,
     tmp_path,
     *,
-    cells=(("cnn", 0),),
+    cells=(("pixel_ae", 0),),
     checkpoint_labels=None,
     record_curve=None,
     record_names=None,
@@ -614,7 +614,7 @@ def test_the_script_splits_at_the_shared_val_fraction_and_at_split_seed_zero(
     assert script.VAL_FRACTION is split.VAL_FRACTION
     assert script.SPLIT_SEED is study.SPLIT_SEED
 
-    state = _stub(monkeypatch, tmp_path, cells=(("cnn", 2),))
+    state = _stub(monkeypatch, tmp_path, cells=(("pixel_ae", 2),))
     monkeypatch.setattr(script, "VAL_FRACTION", 0.375)
     script.main(_argv(tmp_path) + ["--seeds", "2"])
 
@@ -635,7 +635,7 @@ def test_the_probe_and_both_diagnostics_run_at_the_parsed_context_and_horizon(
     mismatch worth ~25 map units, so the probe and both diagnostics must be
     given the same three numbers rather than being allowed to default apart.
     """
-    state = _stub(monkeypatch, tmp_path, cells=(("cnn", 7),))
+    state = _stub(monkeypatch, tmp_path, cells=(("pixel_ae", 7),))
     script.main(
         ["--out", str(tmp_path), "--data", str(tmp_path), "--device", "cpu",
          "--context", "2", "--horizon", "3", "--ks", "1", "3", "--seeds", "7"]
@@ -710,21 +710,21 @@ def test_a_checkpoint_wrong_in_the_arm_alone_is_refused(monkeypatch, tmp_path, c
     only whichever half is checked first."""
     _stub(
         monkeypatch, tmp_path, cells=(("frozen_ssl", 0),),
-        checkpoint_labels={"arm": "cnn", "seed": 0},
+        checkpoint_labels={"arm": "pixel_ae", "seed": 0},
     )
     assert script.main(_argv(tmp_path) + ["--arms", "frozen_ssl"]) == (
         script.EXIT_MISLABELLED_CHECKPOINT
     )
     out = capsys.readouterr().out
-    assert "arm='cnn'" in out, "the checkpoint's OWN labels were not reported"
+    assert "arm='pixel_ae'" in out, "the checkpoint's OWN labels were not reported"
 
 
 def test_a_checkpoint_wrong_in_the_seed_alone_is_refused(monkeypatch, tmp_path, capsys):
     """The architecture is shared across seeds, so a seed-wrong checkpoint loads
     perfectly cleanly and nothing else in the run would raise."""
     _stub(
-        monkeypatch, tmp_path, cells=(("cnn", 1),),
-        checkpoint_labels={"arm": "cnn", "seed": 0},
+        monkeypatch, tmp_path, cells=(("pixel_ae", 1),),
+        checkpoint_labels={"arm": "pixel_ae", "seed": 0},
     )
     assert script.main(_argv(tmp_path) + ["--seeds", "1"]) == (
         script.EXIT_MISLABELLED_CHECKPOINT
@@ -759,7 +759,7 @@ def test_the_checkpoint_path_carries_both_the_arm_and_the_seed(tmp_path):
     )
     names = {
         script.checkpoint_path(tmp_path, arm, seed).name
-        for arm in ("cnn", "random_vit")
+        for arm in ("pixel_ae", "random_vit")
         for seed in (0, 1, 2)
     }
     assert len(names) == 6
@@ -860,7 +860,7 @@ def _ladder_cell(
     if "constant" in rungs and "contrast" not in rungs["constant"]:
         rungs["constant"] = rungs["constant"] | {"contrast": (3, 0), "held": {}}
     return {
-        "arm": "cnn", "seed": 0, "split_names": list(VAL_NAMES), "curves": {},
+        "arm": "pixel_ae", "seed": 0, "split_names": list(VAL_NAMES), "curves": {},
         "action_marginal": None,
         "open_loop": open_loop, "record": record, "stream": stream,
         "smallest_k_is_floor": smallest_k_is_floor,
@@ -914,7 +914,7 @@ def _null_ladder(**overrides):
     return _ladder_cell(rungs, **overrides)
 
 
-def _verdict(cell, family=FAMILY, arm="cnn", seed=0):
+def _verdict(cell, family=FAMILY, arm="pixel_ae", seed=0):
     return script.verdict_block(arm, seed, cell, family=family)
 
 
@@ -923,10 +923,10 @@ def _line(text: str, name: str) -> str:
 
 
 ROW_SHAPED = {
-    "selfcheck_table": lambda cells: script.selfcheck_table(cells, ["cnn"], [0, 1, 2], 1),
-    "sweep_table": lambda cells: script.sweep_table(cells, ["cnn"], [0, 1, 2], (1, 3)),
+    "selfcheck_table": lambda cells: script.selfcheck_table(cells, ["pixel_ae"], [0, 1, 2], 1),
+    "sweep_table": lambda cells: script.sweep_table(cells, ["pixel_ae"], [0, 1, 2], (1, 3)),
     "sweep_ruler_table": lambda cells: script.sweep_ruler_table(
-        cells, ["cnn"], [0, 1, 2], (1, 3)
+        cells, ["pixel_ae"], [0, 1, 2], (1, 3)
     ),
 }
 
@@ -936,8 +936,8 @@ def test_the_row_shaped_tables_print_a_row_per_cell_and_MISSING_for_a_gap(table)
     """A cell with no checkpoint gets its own row saying so, rather than being
     omitted -- an omitted row makes an incomplete study look complete."""
     cells = {
-        ("cnn", 0): _cell([1.0], [0.5]),
-        ("cnn", 2): _cell([2.0], [0.5]) | {"floor": 42.0, "k": {1: 42.0, 3: 42.0}},
+        ("pixel_ae", 0): _cell([1.0], [0.5]),
+        ("pixel_ae", 2): _cell([2.0], [0.5]) | {"floor": 42.0, "k": {1: 42.0, 3: 42.0}},
     }
     rows = {line.split()[1]: line for line in ROW_SHAPED[table](cells).splitlines()[1:]}
     assert set(rows) == {"0", "1", "2"}, rows
@@ -981,10 +981,10 @@ def test_the_ladder_table_puts_every_seeds_number_in_its_own_column():
         # factor of four, and with one fixture value for both, a row that
         # printed the mean under "final step" -- or the reverse -- is satisfied
         # by the fixture rather than by the code.
-        ("cnn", 0): _cell([1.0, 5.0], [0.5, 0.5], mean=1.0),
-        ("cnn", 2): _cell([2.0, 6.0], [0.5, 0.5], mean=2.0, changed=3, total=5),
+        ("pixel_ae", 0): _cell([1.0, 5.0], [0.5, 0.5], mean=1.0),
+        ("pixel_ae", 2): _cell([2.0, 6.0], [0.5, 0.5], mean=2.0, changed=3, total=5),
     }
-    table = script.ladder_table(cells, ["cnn"], [0, 1, 2], ("shuffled",))
+    table = script.ladder_table(cells, ["pixel_ae"], [0, 1, 2], ("shuffled",))
     header = table.splitlines()[0]
     rows = _rung_rows(table, 0)
     columns_of = lambda row: [c.strip() for c in _seed_columns(row)]  # noqa: E731
@@ -1028,8 +1028,8 @@ def test_the_ladder_table_prints_the_rungs_in_increasing_perturbation_order():
                           steps_changed_mean=1.0, steps_changed_min=0, multiset=0.0,
                           angle=_channel([0.1, 0.1], [0.05, 0.05], mean=0.1, se=0.025)),
     }
-    cells = {("cnn", 0): _ladder_cell(rungs)}
-    table = script.ladder_table(cells, ["cnn"], [0], LADDER)
+    cells = {("pixel_ae", 0): _ladder_cell(rungs)}
+    table = script.ladder_table(cells, ["pixel_ae"], [0], LADDER)
     lines = table.splitlines()
     assert len(lines) == 1 + ROWS_PER_RUNG * len(LADDER), lines
     labelled = [line for line in lines[1:] if line[12:23].strip()]
@@ -1053,9 +1053,9 @@ def test_the_ladder_table_prints_MISSING_for_a_rung_a_cell_did_not_run():
     re-run under `--rungs` beside full cells -- must say so per rung rather
     than being padded with another rung's numbers or dropped."""
     cells = {
-        ("cnn", 0): _ladder_cell({"shuffled": _rung([1.0], [0.5], mean=1.0)}),
+        ("pixel_ae", 0): _ladder_cell({"shuffled": _rung([1.0], [0.5], mean=1.0)}),
     }
-    lines = script.ladder_table(cells, ["cnn"], [0], LADDER).splitlines()
+    lines = script.ladder_table(cells, ["pixel_ae"], [0], LADDER).splitlines()
     body = lines[1:]
     assert "+1.000" in body[0] and "MISSING" not in body[0]
     for line in body[ROWS_PER_RUNG:]:
@@ -1077,10 +1077,10 @@ def test_the_held_table_prints_every_held_action_against_the_real_sequence():
         0: _rung([-11.6] * 2, [7.9] * 2, mean=-11.6, se=3.95, steps_changed_mean=38.0,
                  steps_changed_min=7),
     }
-    cells = {("cnn", 0): _ladder_cell({
+    cells = {("pixel_ae", 0): _ladder_cell({
         "constant": _rung([42.6] * 2, [14.0] * 2, mean=42.6, se=7.0, contrast=(3, 0), held=held),
     })}
-    table = script.held_table(cells, ["cnn"], [0], LADDER)
+    table = script.held_table(cells, ["pixel_ae"], [0], LADDER)
     lines = table.splitlines()
     assert len(lines) == 1 + 4 * len(held), lines
     noop, forward = lines[1:5], lines[5:9]
@@ -1088,7 +1088,7 @@ def test_the_held_table_prints_every_held_action_against_the_real_sequence():
     assert "-11.600 +-7.90" in noop[0] and "+31.000 +-12.00" in forward[0], lines
     assert "38.0(min 7)/2" in noop[1] and "41.0(min 22)/2" in forward[1], lines
     assert "42.6" not in table, "the contrast's own number was printed as a held row"
-    assert script.held_table(cells, ["cnn"], [0], ("shuffled", "resampled")) == ""
+    assert script.held_table(cells, ["pixel_ae"], [0], ("shuffled", "resampled")) == ""
 
 
 def test_the_verdict_names_m4_only_when_the_aggregate_delta_is_inside_two_se():
@@ -1520,8 +1520,8 @@ def test_each_self_check_lands_in_its_own_column():
     protocol divergence sends the reader to the wrong code. The probe's
     selection R^2 is the last column, and it is the study record's own number.
     """
-    cells = {("cnn", 0): _cell([1.0], [0.5], open_loop=1e-1, record=2e-2, stream=3e-3)}
-    header, row = script.selfcheck_table(cells, ["cnn"], [0], 1).splitlines()
+    cells = {("pixel_ae", 0): _cell([1.0], [0.5], open_loop=1e-1, record=2e-2, stream=3e-3)}
+    header, row = script.selfcheck_table(cells, ["pixel_ae"], [0], 1).splitlines()
     assert header.split() == [
         "arm", "seed", "open_loop_k", "record_repro", "stream_drift", "k1_is_floor", "probe_r2",
         "noise_restored", "noise_same",
@@ -1546,8 +1546,8 @@ def test_the_self_check_column_names_the_k_the_alarm_was_computed_at():
     weaker claim. The header therefore carries the k rather than a hardcoded
     "k1", and it agrees with the record's `smallest_k_is_bitwise_the_floor`.
     """
-    cells = {("cnn", 0): _cell([1.0], [0.5])}
-    header = script.selfcheck_table(cells, ["cnn"], [0], 5).splitlines()[0]
+    cells = {("pixel_ae", 0): _cell([1.0], [0.5])}
+    header = script.selfcheck_table(cells, ["pixel_ae"], [0], 5).splitlines()[0]
     assert "k5_is_floor" in header, header
     assert "k1_is_floor" not in header, header
 
@@ -1608,7 +1608,7 @@ def test_the_verdict_scales_the_effect_against_the_actionable_band():
 def test_a_null_through_a_probe_that_cannot_register_an_effect_is_unmeasurable(
     floor, persistence, reason
 ):
-    """On every `cnn` cell the floor EXCEEDS persistence at the final horizon
+    """On every `pixel_ae` cell the floor EXCEEDS persistence at the final horizon
     step: the position probe is a constant predictor (selection R^2 -0.036)
     and no action effect of any size can register through it -- the FWD/NOOP
     contrast reads +0.6 there with the right sign and nothing to scale it. A
@@ -1744,14 +1744,14 @@ def test_the_cross_cell_table_counts_excursions_and_prints_every_cells_sign():
     fixture's EXACT-zero angle null, which prints as `0` -- the sign an
     action-blind prior produces bitwise, and neither + nor -."""
     cells = {
-        ("cnn", 0): _ladder_cell({"shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10)}),
-        ("cnn", 1): _ladder_cell({"shuffled": _rung(
+        ("pixel_ae", 0): _ladder_cell({"shuffled": _rung([0.0] * 4, [0.2] * 4, mean=0.01, se=0.10)}),
+        ("pixel_ae", 1): _ladder_cell({"shuffled": _rung(
             [2.5] * 4, [0.2] * 4, mean=2.5, se=1.0,
             angle=_channel([-0.5] * 4, [0.2] * 4, mean=-0.5, se=0.1),
         )}),
-        ("cnn", 2): _ladder_cell({"shuffled": _rung([-9.0] * 4, [0.2] * 4, mean=-9.0, se=0.3)}),
+        ("pixel_ae", 2): _ladder_cell({"shuffled": _rung([-9.0] * 4, [0.2] * 4, mean=-9.0, se=0.3)}),
     }
-    text = script.cross_cell_table(cells, ["cnn"], [0, 1, 2], ("shuffled",), family=54)
+    text = script.cross_cell_table(cells, ["pixel_ae"], [0, 1, 2], ("shuffled",), family=54)
     header, columns, position, angle = text.splitlines()
     assert "family: 54 comparisons (1 rungs x 3 cells x 2 channels)" in header
     assert "z=3.31" in header and "0.15 excursions" in header, header
@@ -1774,10 +1774,10 @@ def test_the_cross_cell_sign_test_is_the_exact_binomial_over_the_signed_cells():
     assert script.sign_test_p(8, 9) == pytest.approx(2 * (1 + 9) * 0.5**9)
     assert script.sign_test_p(0, 0) == pytest.approx(1.0)
     cells = {
-        ("cnn", seed): _ladder_cell({"constant": _rung([1.0] * 4, [0.2] * 4, mean=1.0, se=1.0)})
+        ("pixel_ae", seed): _ladder_cell({"constant": _rung([1.0] * 4, [0.2] * 4, mean=1.0, se=1.0)})
         for seed in (0, 1, 2)
     }
-    text = script.cross_cell_table(cells, ["cnn"], [0, 1, 2], ("constant",), family=6)
+    text = script.cross_cell_table(cells, ["pixel_ae"], [0, 1, 2], ("constant",), family=6)
     header, columns, position, angle = text.splitlines()
     assert "share windows" in header, header
     assert position.split() == ["constant", "position", "3", "0", "0", "+++", "0.250"], position
@@ -1794,8 +1794,8 @@ def test_the_sweep_ruler_table_prints_the_paired_bar_for_each_adjacent_pair():
     smallest k's margin over the floor, which is self-check 2's quantitative
     half.
     """
-    cells = {("cnn", 0): _cell([1.0], [0.5])}
-    header, row = script.sweep_ruler_table(cells, ["cnn"], [0], (1, 3)).splitlines()
+    cells = {("pixel_ae", 0): _cell([1.0], [0.5])}
+    header, row = script.sweep_ruler_table(cells, ["pixel_ae"], [0], (1, 3)).splitlines()
     assert "1v3" in header, header
     assert "k1-floor" in header, header
     assert "0.125" in row, row
@@ -1806,8 +1806,8 @@ def test_the_sweep_table_labels_its_spread_column_as_one_curves_own():
     """The column is the open-loop curve's between-window spread and nothing
     else; it was documented as the bar for a k-to-k difference, which it is
     not. The heading and the docstring have to agree with the arithmetic."""
-    cells = {("cnn", 0): _cell([1.0], [0.5])}
-    header = script.sweep_table(cells, ["cnn"], [0], (1, 3)).splitlines()[0]
+    cells = {("pixel_ae", 0): _cell([1.0], [0.5])}
+    header = script.sweep_table(cells, ["pixel_ae"], [0], (1, 3)).splitlines()[0]
     assert "spread" in header, header
     assert "se" not in header.split(), header
     assert "paired" in script.sweep_table.__doc__, (
@@ -1861,7 +1861,7 @@ def test_the_floor_alarm_is_computed_at_the_smallest_k_and_reaches_the_record(
     out = capsys.readouterr().out
     row = out[out.index("self-checks") :].splitlines()[2]
     assert row.split()[-2] == "True", row
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     assert written["self_checks"]["smallest_k_is_bitwise_the_floor"] is True
     assert written["self_checks"]["smallest_k"] == 1
 
@@ -1876,7 +1876,7 @@ def test_the_written_record_carries_its_self_checks_and_a_curve_for_every_k(
     """
     _stub(monkeypatch, tmp_path)
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
 
     assert written["self_checks"] == {
         "open_loop_divergence": 0.0,
@@ -1935,7 +1935,7 @@ def test_the_written_record_carries_every_rung_with_its_own_counts_and_the_choic
         rung_steps={"shuffled": (2, 1, 0), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
     )
     assert script.main(_argv(tmp_path) + ["--intervention-seed", "5"]) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
 
     assert written["ladder"]["rungs"] == list(LADDER)
     assert written["ladder"]["intervention_seed"] == 5
@@ -1980,14 +1980,14 @@ def test_the_family_the_verdict_is_corrected_over_is_the_whole_planned_run(
     printed. Two cells, two rungs, two channels: 8. A family of one -- the
     uncorrected verdict -- would print z=1.96; a family counted per cell would
     print 4."""
-    _stub(monkeypatch, tmp_path, cells=(("cnn", 0), ("cnn", 1)))
+    _stub(monkeypatch, tmp_path, cells=(("pixel_ae", 0), ("pixel_ae", 1)))
     assert script.main(_argv(tmp_path) + ["--rungs", "shuffled", "constant"]) == script.EXIT_OK
     out = capsys.readouterr().out
     assert "family: 8 comparisons (2 rungs x 2 cells x 2 channels)" in out, out
     assert f"z={script.family_threshold(8):.2f}" in out
     assert "z=1.96" not in out and "for 4 comparisons" not in out
     for seed in (0, 1):
-        written = load_record(script.diagnostic_record_path(tmp_path, "cnn", seed))
+        written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", seed))
         assert written["ladder"]["family"] == 8
 
 
@@ -2150,10 +2150,10 @@ def test_the_diagnostic_record_names_both_arm_and_seed_and_carries_its_device(
     _stub(monkeypatch, tmp_path, changed=(False, False))
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
 
-    path = script.diagnostic_record_path(tmp_path, "cnn", 0)
-    assert path.name == "diagnostic_cnn_seed0.json"
+    path = script.diagnostic_record_path(tmp_path, "pixel_ae", 0)
+    assert path.name == "diagnostic_pixel_ae_seed0.json"
     written = load_record(path)
-    assert written["arm"] == "cnn" and written["seed"] == 0
+    assert written["arm"] == "pixel_ae" and written["seed"] == 0
     assert written["device"] == "cpu"
     assert written["torch_version"] == torch.__version__
     assert written["episodes"]["val"] == VAL_NAMES
@@ -2223,7 +2223,7 @@ def test_the_record_persists_every_rungs_per_window_deltas_in_traversal_order_an
         episodes=[0, 0, 1],
     )
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
 
     assert written["windows"] == {"total": 3, "episode": [0, 0, 1]}
     for i, name in enumerate(LADDER):
@@ -2268,7 +2268,7 @@ def test_the_record_writes_a_null_episode_index_when_the_ladder_reports_none(
     cluster on as if every window were its own episode."""
     _stub(monkeypatch, tmp_path)
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     assert written["windows"] == {"total": 2, "episode": None}
 
 
@@ -2346,7 +2346,7 @@ def test_the_record_carries_the_embedding_reading_per_rung_and_the_noise_referen
         noise_distance=[4.0, 4.0, 4.0],
     )
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
 
     shuffled = written["interventions"]["shuffled"]["embedding"]
     assert shuffled["window_distance"] == [1.0, 2.0, 9.0]
@@ -2380,10 +2380,10 @@ def test_an_undefined_embedding_ratio_round_trips_as_nan_and_never_as_zero(
     "action-blind" for a rung whose ruler measured nothing."""
     _stub(monkeypatch, tmp_path, noise_distance=[0.0, 0.0], noise_collapsed=0)
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     ratio = written["interventions"]["shuffled"]["embedding"]["ratio_of_medians"]
     assert np.isnan(ratio)
-    raw = json.loads(script.diagnostic_record_path(tmp_path, "cnn", 0).read_text())
+    raw = json.loads(script.diagnostic_record_path(tmp_path, "pixel_ae", 0).read_text())
     assert raw["interventions"]["shuffled"]["embedding"]["ratio_of_medians"] is None
     assert "interventions.shuffled.embedding.ratio_of_medians" in raw["nonfinite"]
 
@@ -2398,7 +2398,7 @@ def test_the_new_record_fields_are_derived_from_the_loaded_checkpoint(
     assert _TinyModel().signature() != TRAINED_SIGNATURE
     _stub(monkeypatch, tmp_path)
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     assert written["interventions"]["shuffled"]["embedding"]["window_distance"] == [
         TRAINED_SIGNATURE + 4.0 + w for w in range(2)
     ]
@@ -2434,8 +2434,8 @@ def test_the_noise_self_checks_land_in_their_own_columns():
     """Beside the three exact equalities: whether the stream came back after
     every noise draw, and how many windows' reference was the canonical
     latent. Given values that differ from every other column."""
-    cells = {("cnn", 0): _cell([1.0], [0.5]) | {"noise_restored": False, "noise_collapsed": 7}}
-    header, row = script.selfcheck_table(cells, ["cnn"], [0], 1).splitlines()
+    cells = {("pixel_ae", 0): _cell([1.0], [0.5]) | {"noise_restored": False, "noise_collapsed": 7}}
+    header, row = script.selfcheck_table(cells, ["pixel_ae"], [0], 1).splitlines()
     assert header.split()[-2:] == ["noise_restored", "noise_same"]
     assert row.split()[-2:] == ["False", "7"], row
 
@@ -2461,7 +2461,7 @@ def test_the_ladder_table_prints_the_embedding_ratio_in_its_own_row_and_MISSING_
         "resampled": _rung([2.0, 2.0], [0.5, 0.5], mean=2.0, embedding=block(0.75)),
         "constant": _rung([3.0, 3.0], [0.5, 0.5], mean=3.0, embedding=None),
     }
-    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    table = script.ladder_table({("pixel_ae", 0): _ladder_cell(rungs)}, ["pixel_ae"], [0], LADDER)
     row = lambda index: _seed_columns(_rung_rows(table, index)["embed ratio num/noise"])[0].strip()  # noqa: E731
     assert row(0) == "0.500"
     assert row(1) == "0.750"
@@ -2472,7 +2472,7 @@ def test_the_ladder_table_prints_the_embedding_ratio_in_its_own_row_and_MISSING_
     assert "MISSING" not in _rung_rows(table, 2)["horizon-mean"]
 
     rungs["shuffled"] = _rung([1.0, 1.0], [0.5, 0.5], mean=1.0, embedding=block(float("nan"), 0.0))
-    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    table = script.ladder_table({("pixel_ae", 0): _ladder_cell(rungs)}, ["pixel_ae"], [0], LADDER)
     assert row(0) == "nan (noise 0)"
     assert "0.000" not in _rung_rows(table, 0)["embed ratio num/noise"]
     # Undefined over a POSITIVE ruler is the other way to have no ratio: no
@@ -2482,7 +2482,7 @@ def test_the_ladder_table_prints_the_embedding_ratio_in_its_own_row_and_MISSING_
 
 
 def test_the_verdict_quotes_the_embedding_ratio_where_the_probe_cannot_register():
-    """On every `cnn` cell the position probe is a constant predictor and the
+    """On every `pixel_ae` cell the position probe is a constant predictor and the
     verdict reads UNMEASURABLE THROUGH THIS PROBE. The embedding-space reading
     is the one thing that CAN be read there, so that branch quotes the held
     contrast's ratio -- and only when the rung carries one. The decision
@@ -2545,7 +2545,7 @@ def test_the_ladder_table_reads_the_constant_rung_on_the_same_axis_as_the_rungs_
             embedding=_embedding(1.02, curve_ratio=[0.67, 0.9, 1.14]),
         ),
     }
-    table = script.ladder_table({("cnn", 0): _ladder_cell(rungs)}, ["cnn"], [0], LADDER)
+    table = script.ladder_table({("pixel_ae", 0): _ladder_cell(rungs)}, ["pixel_ae"], [0], LADDER)
     cell = lambda index, row: _seed_columns(_rung_rows(table, index)[row])[0].strip()  # noqa: E731
     assert cell(0, "embed ratio num/noise") == "0.210"
     assert cell(1, "embed ratio num/noise") == "0.400"
@@ -2560,7 +2560,7 @@ def test_the_ladder_table_reads_the_constant_rung_on_the_same_axis_as_the_rungs_
     bare = {"constant": _rung([3.0] * H, [0.5] * H, mean=3.0, contrast=(3, 0), held={
         3: _rung([31.0] * H, [12.0] * H, mean=31.0), 0: _rung([-11.6] * H, [7.9] * H, mean=-11.6),
     })}
-    table = script.ladder_table({("cnn", 0): _ladder_cell(bare)}, ["cnn"], [0], ("constant",))
+    table = script.ladder_table({("pixel_ae", 0): _ladder_cell(bare)}, ["pixel_ae"], [0], ("constant",))
     assert cell(0, "embed ratio num/noise") == "MISSING|MISSING"
     assert cell(0, "embed contrast/noise") == "MISSING"
     assert cell(0, "embed step 1|H ratio") == "MISSING"
@@ -2577,10 +2577,10 @@ def test_the_held_table_prints_each_held_actions_embedding_ratio_and_its_step_1_
                  embedding=_embedding(0.74, curve_ratio=[0.5, 0.9])),
         0: _rung([-11.6] * 2, [7.9] * 2, mean=-11.6, se=3.95),
     }
-    cells = {("cnn", 0): _ladder_cell({
+    cells = {("pixel_ae", 0): _ladder_cell({
         "constant": _rung([42.6] * 2, [14.0] * 2, mean=42.6, se=7.0, contrast=(3, 0), held=held),
     })}
-    lines = script.held_table(cells, ["cnn"], [0], LADDER).splitlines()
+    lines = script.held_table(cells, ["pixel_ae"], [0], LADDER).splitlines()
     assert len(lines) == 1 + 4 * len(held), lines
     noop, forward = lines[1:5], lines[5:9]
     assert forward[0][12:25].strip() == "MOVE_FORWARD"
@@ -2610,7 +2610,7 @@ def test_the_record_persists_both_ratio_summaries_and_the_per_step_ratio_curve(
         rung_steps={"shuffled": (2, 1, 3), "resampled": (1, 2, 3), "constant": (3, 3, 3)},
     )
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     shuffled = written["interventions"]["shuffled"]["embedding"]
     numerator = np.array([TRAINED_SIGNATURE + 4.0 + w for w in range(3)])
     assert shuffled["ratio_of_medians"] == np.median(numerator) / 2.0
@@ -2622,7 +2622,7 @@ def test_the_record_persists_both_ratio_summaries_and_the_per_step_ratio_curve(
 
     _stub(monkeypatch, tmp_path, noise_distance=[0.0, 0.0])
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    written = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    written = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     shuffled = written["interventions"]["shuffled"]["embedding"]
     assert np.isnan(shuffled["median_of_ratios"])
     assert all(np.isnan(v) for v in shuffled["curve_ratio"])
@@ -2633,7 +2633,7 @@ def test_the_verdicts_embedding_note_separates_the_held_pair_from_the_contrast_a
     actions' own held-vs-real ratios (the same axis as the rungs below),
     the between-held contrast SEPARATELY and named as a between-counterfactual
     distance, the contrast's per-step ratio at step 1 and step H, and how
-    much the noise ruler itself grows over the horizon -- cnn's is flat and
+    much the noise ruler itself grows over the horizon -- pixel_ae's is flat and
     frozen_ssl's grows 6x, and the horizon-mean hides both."""
     cell = _null_ladder(floor=9.0, persistence=1.0)
     cell["rungs"]["constant"]["embedding"] = _embedding(1.02, curve_ratio=np.linspace(0.67, 1.14, H))
@@ -2659,16 +2659,16 @@ def test_the_noise_growth_table_prints_each_cells_ruler_at_step_1_and_step_H():
     space) and a growing one are told apart at a glance -- the shape the
     horizon-mean ratio cannot show. MISSING for a cell that did not run."""
     cells = {
-        ("cnn", 0): _cell([1.0], [0.5]) | {
+        ("pixel_ae", 0): _cell([1.0], [0.5]) | {
             "noise_reference": {"window_distance": np.ones(4), "curve": np.array([0.12, 0.13]), "median": 1.0},
         },
-        ("cnn", 2): _cell([1.0], [0.5]) | {
+        ("pixel_ae", 2): _cell([1.0], [0.5]) | {
             "noise_reference": {"window_distance": np.ones(4), "curve": np.array([2.1, 12.5]), "median": 1.0},
         },
     }
-    header, ruler, growth = script.noise_table(cells, ["cnn"], [0, 1, 2]).splitlines()
+    header, ruler, growth = script.noise_table(cells, ["pixel_ae"], [0, 1, 2]).splitlines()
     assert header.split() == ["arm", "row", "seed", "0", "seed", "1", "seed", "2"]
-    assert ruler.split() == ["cnn", "noise", "ruler", "step", "1->H", "0.120->0.130", "MISSING", "2.100->12.500"], ruler
+    assert ruler.split() == ["pixel_ae", "noise", "ruler", "step", "1->H", "0.120->0.130", "MISSING", "2.100->12.500"], ruler
     assert growth.split() == ["ruler", "growth", "H/1", "x1.08", "MISSING", "x5.95"], growth
 
 
@@ -2702,10 +2702,10 @@ def test_a_record_this_script_writes_is_readable_by_the_pooling_reader(monkeypat
         rung_changed={"shuffled": (True, True, False)},
     )
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
-    record = load_record(script.diagnostic_record_path(tmp_path, "cnn", 0))
+    record = load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0))
     for rung in LADDER:
         cell = pooling.read_series(record, rung, "angle")
-        assert (cell.arm, cell.seed, cell.rung, cell.channel) == ("cnn", 0, rung, "angle")
+        assert (cell.arm, cell.seed, cell.rung, cell.channel) == ("pixel_ae", 0, rung, "angle")
         np.testing.assert_array_equal(cell.episode, [0, 0, 1])
         assert cell.delta.shape == cell.changed.shape == cell.embedding.shape == cell.noise.shape == (3,)
         assert (cell.device, cell.torch_version, cell.horizon, cell.context) == ("cpu", torch.__version__, H, 5)
@@ -2716,4 +2716,4 @@ def test_a_record_this_script_writes_is_readable_by_the_pooling_reader(monkeypat
     _stub(monkeypatch, tmp_path)
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
     with pytest.raises(pooling.StaleRecord, match="episode"):
-        pooling.read_series(load_record(script.diagnostic_record_path(tmp_path, "cnn", 0)), "shuffled")
+        pooling.read_series(load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0)), "shuffled")

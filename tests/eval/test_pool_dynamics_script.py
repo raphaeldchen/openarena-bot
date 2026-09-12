@@ -95,12 +95,12 @@ def test_the_pool_prints_every_arm_rung_and_statistic_and_the_between_arm_block(
     for row in ARM_ROWS + CONTRAST_ROWS:
         assert any(line.startswith(row) for line in lines), row
 
-    # cnn x constant x position: rows 100*0 + 10*seed + 2 + w, seed-averaged
+    # pixel_ae x constant x position: rows 100*0 + 10*seed + 2 + w, seed-averaged
     # per window -> [12, 13, 14, 15], mean 13.5, clustered over [0, 0, 1, 1].
     series = np.array([np.mean([10.0 * seed + 2 + w for seed in SEEDS]) for w in range(4)])
     se = cluster_standard_error(series, EPISODES)
     naive = series.std(ddof=1) / 2.0
-    line = next(l for l in lines if l.startswith(f"{'cnn':<12}{'constant':<11}{'position delta':<16}"))
+    line = next(l for l in lines if l.startswith(f"{'pixel_ae':<12}{'constant':<11}{'position delta':<16}"))
     assert f"{series.mean():+.3f}" in line and f"{se:.3f}" in line and f"{series.mean() / se:+.2f}" in line
     assert f"{naive:.3f}" in line
     assert "windows=4" in line and "clusters=2" in line and "seeds=3" in line
@@ -143,16 +143,16 @@ def test_a_missing_cell_is_refused_by_name_and_never_pooled_as_two_of_three(tmp_
 def test_a_stale_incompatible_mislabelled_or_degenerate_record_is_a_named_status(
     tmp_path, capsys, break_one, status, named
 ):
-    """Four refusals, four statuses, each exercised alone on cnn seed 1, each
+    """Four refusals, four statuses, each exercised alone on pixel_ae seed 1, each
     naming the cell -- and none of them a traceback (exit 1), which is what a
     KeyError on a pre-change record would otherwise be."""
     _write_nine(tmp_path)
-    record = synthetic_record("cnn", 1)
+    record = synthetic_record("pixel_ae", 1)
     break_one(record)
-    write_record(diagnose.diagnostic_record_path(tmp_path, "cnn", 1), record)
+    write_record(diagnose.diagnostic_record_path(tmp_path, "pixel_ae", 1), record)
     assert script.main(_argv(tmp_path)) == getattr(script, status)
     out = capsys.readouterr().out
-    assert "cnn seed 1" in out and named in out
+    assert "pixel_ae seed 1" in out and named in out
     assert not any(line.startswith(ARM_ROWS[0]) for line in out.splitlines())
 
 
@@ -170,16 +170,16 @@ def test_a_mismatched_window_count_between_cells_is_refused_not_truncated(tmp_pa
 def test_the_treatment_and_control_flags_reach_the_contrast_and_the_bootstrap_seed_is_recorded(
     tmp_path, capsys
 ):
-    """random_vit minus cnn is +200 on the fixture; the default pair reads
-    -100, and so would cnn minus frozen_ssl -- the L1 coincidence a first
+    """random_vit minus pixel_ae is +200 on the fixture; the default pair reads
+    -100, and so would pixel_ae minus frozen_ssl -- the L1 coincidence a first
     draft of this test fell into, so the pair here is the one whose value
     differs from the default's."""
     _write_nine(tmp_path)
     assert script.main(
-        _argv(tmp_path, treatment="random_vit", control="cnn", bootstrap_seed=7)
+        _argv(tmp_path, treatment="random_vit", control="pixel_ae", bootstrap_seed=7)
     ) == script.EXIT_OK
     out = capsys.readouterr().out
-    assert "random_vit - cnn" in out and "frozen_ssl - random_vit" not in out
+    assert "random_vit - pixel_ae" in out and "frozen_ssl - random_vit" not in out
     assert "bootstrap_seed=7" in out and "bootstrap=50" in out
     for rung in RUNGS:
         line = next(l for l in out.splitlines() if l.startswith(f"{rung:<11}{'position delta':<16}"))
