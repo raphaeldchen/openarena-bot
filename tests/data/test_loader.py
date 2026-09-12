@@ -3,7 +3,7 @@ import pytest
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import Episode, load_episode
-from mbfps.data.loader import SequenceLoader
+from mbfps.data.loader import SequenceLoader, feature_suffix
 from mbfps.envs.protocol import OBS_SHAPE
 
 KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
@@ -220,14 +220,16 @@ def test_features_window_matches_manual_slice(tmp_path):
         buf.add(make_episode(t=80, fill=fill))
     rng = np.random.default_rng(0)
     for path in buf.episode_paths():
-        feats = rng.random((81, 4, 8)).astype(np.float16)
+        # (64, 384) is dinov2's registered geometry; the loader now refuses
+        # anything else under this suffix (see the geometry tests below).
+        feats = rng.random((81, 64, 384)).astype(np.float16)
         np.save(path.with_suffix(".features.npy"), feats)
 
     loader = SequenceLoader(
         buf, batch_size=4, seq_len=16, seed=0, load_obs=False, load_features=True
     )
     batch = loader.sample()
-    assert batch["features"].shape == (4, 17, 4, 8)
+    assert batch["features"].shape == (4, 17, 64, 384)
     assert batch["features"].dtype == np.float16
     for i in range(4):
         idx, start = int(batch["episode_index"][i]), int(batch["window_start"][i])
@@ -239,7 +241,7 @@ def test_features_and_obs_windows_are_aligned(tmp_path):
     """Both must come from the same episode and the same offset."""
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
     buf.add(make_episode(t=80, fill=3))
-    feats = np.arange(81 * 4 * 8, dtype=np.float16).reshape(81, 4, 8)
+    feats = np.arange(81 * 64 * 384, dtype=np.float32).reshape(81, 64, 384)
     np.save(buf.episode_paths()[0].with_suffix(".features.npy"), feats)
 
     loader = SequenceLoader(
@@ -257,6 +259,7 @@ def test_feature_suffix_namespaces_non_default_backbones():
 
     assert feature_suffix("dinov2") == ".features.npy"
     assert feature_suffix("random_vit") == ".features_random_vit.npy"
+    assert feature_suffix("pixel_ae") == ".features_pixel_ae.npy"
 
 
 def test_loader_reads_the_requested_backbones_cache(tmp_path):
@@ -265,8 +268,8 @@ def test_loader_reads_the_requested_backbones_cache(tmp_path):
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
     buf.add(make_episode(t=80, fill=1))
     path = buf.episode_paths()[0]
-    np.save(path.with_suffix(".features.npy"), np.zeros((81, 4, 8), np.float16))
-    np.save(path.with_suffix(".features_random_vit.npy"), np.ones((81, 4, 8), np.float16))
+    np.save(path.with_suffix(".features.npy"), np.zeros((81, 64, 384), np.float16))
+    np.save(path.with_suffix(".features_random_vit.npy"), np.ones((81, 64, 384), np.float16))
 
     for backbone, expected in (("dinov2", 0.0), ("random_vit", 1.0)):
         loader = SequenceLoader(
@@ -324,6 +327,144 @@ def test_obs_loading_loader_does_read_pixels(tmp_path, monkeypatch):
     monkeypatch.setattr(NpzFile, "__getitem__", spy)
     SequenceLoader(buf, batch_size=2, seq_len=16, seed=0, load_obs=True)
     assert "obs" in seen, "load_obs=True should read obs; the spy is not wired up"
+
+
+# --- Feature geometry ---------------------------------------------------------
+# A cache is a bare `.npy`; nothing in it records which backbone wrote it. The
+# suffix says which backbone the loader THINKS it is reading, and the row
+# geometry is the only property of the bytes that can contradict it. With
+# three backbones and two geometries -- (64, 384) for the ViTs, (64, 32) for
+# the M2 pixel autoencoder -- a cache written under the wrong suffix used to
+# surface as a matmul shape error inside `BottleneckEncoder` at step 0, after
+# the episode loading and model construction time was paid. It is refused at
+# construction now, naming what was found and what the suffix promised.
+
+# Literal, deliberately NOT `BACKBONE_GEOMETRY.items()`: parametrising over
+# the registry would make these tests shrink silently if an entry were
+# dropped, and would agree with whatever the registry said even if a width
+# were edited to the wrong number.
+_GEOMETRY_CASES = [
+    ("dinov2", (64, 384)),
+    ("random_vit", (64, 384)),
+    ("pixel_ae", (64, 32)),
+]
+
+
+def _buffer_with_cache(tmp_path, backbone, rows, n_episodes=1, t=80):
+    """`n_episodes` episodes, each with a `(t + 1, *rows)` cache for `backbone`."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    for i in range(n_episodes):
+        buf.add(make_episode(t=t, fill=i + 1))
+    for path in buf.episode_paths():
+        np.save(path.with_suffix(feature_suffix(backbone)),
+                np.zeros((t + 1, *rows), dtype=np.float16))
+    return buf
+
+
+def _feature_loader(buf, backbone):
+    return SequenceLoader(
+        buf, batch_size=2, seq_len=16, seed=0, load_obs=False,
+        load_features=True, feature_backbone=backbone,
+    )
+
+
+def test_a_vit_geometry_cache_under_the_pixel_ae_suffix_is_refused(tmp_path):
+    """The rows are 64 in both, so this is the width mismatch alone."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 384))
+    with pytest.raises(ValueError, match="does not match backbone"):
+        _feature_loader(buf, "pixel_ae")
+
+
+def test_a_pixel_ae_geometry_cache_under_the_dinov2_suffix_is_refused(tmp_path):
+    """The reverse direction: same row count, narrower rows than promised."""
+    buf = _buffer_with_cache(tmp_path, "dinov2", (64, 32))
+    with pytest.raises(ValueError, match="does not match backbone"):
+        _feature_loader(buf, "dinov2")
+
+
+def test_a_cache_with_the_right_width_but_wrong_row_count_is_refused(tmp_path):
+    """The two tests above both carry 64 rows, so a guard comparing only the
+    width passes them. This one has the right width and 16 rows, so a guard
+    comparing only the row count is the one it catches -- together they pin
+    the comparison to the whole `(n_patches, patch_dim)` pair."""
+    buf = _buffer_with_cache(tmp_path, "dinov2", (16, 384))
+    with pytest.raises(ValueError, match="does not match backbone"):
+        _feature_loader(buf, "dinov2")
+
+
+def test_an_unpartitioned_pixel_ae_cache_is_refused(tmp_path):
+    """The M2 encoder emits a flat 2048-vector; the cache must hold it as
+    64 rows of 32. A `(T, 2048)` file is exactly the mistake a future writer
+    makes by forgetting the reshape, and its `shape[1:]` is `(2048,)`."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (2048,))
+    with pytest.raises(ValueError, match=r"got \(2048,\)"):
+        _feature_loader(buf, "pixel_ae")
+
+
+def test_the_refusal_names_backbone_expected_got_and_path(tmp_path):
+    """Each of the four is asserted on its own, in labelled form: a message
+    that carried both shapes but swapped `expected` and `got` would still
+    contain both substrings, and would send the user to re-cache the wrong
+    backbone."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 384))
+    feature_path = buf.episode_paths()[0].with_suffix(".features_pixel_ae.npy")
+    with pytest.raises(ValueError) as excinfo:
+        _feature_loader(buf, "pixel_ae")
+    message = str(excinfo.value)
+    assert "'pixel_ae'" in message
+    assert "expected rows of shape (64, 32)" in message
+    assert "got (64, 384)" in message
+    assert str(feature_path) in message
+
+
+@pytest.mark.parametrize("backbone,rows", _GEOMETRY_CASES)
+def test_every_registered_backbone_loads_a_cache_of_its_own_geometry(
+    tmp_path, backbone, rows
+):
+    """The complement of the refusals: the guard must admit the shape the
+    backbone actually writes, for EVERY backbone, or `pixel_ae` -- the one
+    with the unusual width -- is the one a hardcoded `(64, 384)` rejects."""
+    buf = _buffer_with_cache(tmp_path, backbone, rows)
+    batch = _feature_loader(buf, backbone).sample()
+    assert batch["features"].shape == (2, 17, *rows)
+
+
+def test_the_guard_fires_on_the_first_cache_it_reads(tmp_path):
+    """Every fixture above holds one episode, so "first", "last" and "any"
+    are indistinguishable there. Two episodes, of which only the first is
+    malformed, pin the guard to the first file it opens."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 32), n_episodes=2)
+    first = buf.episode_paths()[0].with_suffix(".features_pixel_ae.npy")
+    np.save(first, np.zeros((81, 64, 384), dtype=np.float16))
+    with pytest.raises(ValueError, match="does not match backbone"):
+        _feature_loader(buf, "pixel_ae")
+
+
+def test_the_geometry_check_reads_the_header_not_the_frames(tmp_path):
+    """The module docstring promises memmapped caches (0.04 GB to map all
+    122 against 2.93 GB to read them), and nothing pinned it before the
+    guard existed. A guard written as `np.asarray(np.load(...)).shape`, or a
+    `np.load` that lost `mmap_mode`, would turn every construction into a
+    full read of the cache. `.shape` on a memmap comes from the header."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 32))
+    loader = _feature_loader(buf, "pixel_ae")
+    assert isinstance(loader._features[0], np.memmap)
+
+
+def test_an_unregistered_backbone_is_a_keyerror_listing_the_registry(tmp_path):
+    """No cache exists for a name that is not a backbone, so this also pins
+    the ORDER of the checks: the name is validated before the file lookup.
+    Otherwise a typo raises FileNotFoundError and tells the user to run
+    `cache_features.py --backbone <typo>`, which rejects the same name one
+    step later."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    with pytest.raises(KeyError) as excinfo:
+        _feature_loader(buf, "vit_huge")
+    message = str(excinfo.value)
+    assert "'vit_huge'" in message
+    for registered in ("dinov2", "random_vit", "pixel_ae"):
+        assert registered in message
 
 
 # --- Value-level window alignment -------------------------------------------

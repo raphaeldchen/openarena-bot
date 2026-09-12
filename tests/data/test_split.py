@@ -94,7 +94,9 @@ def test_loader_paths_subset_keeps_features_index_aligned_with_episodes(tmp_path
         # Encode each episode's identity into its own feature cache so a
         # misalignment between _paths and _features is visible by value.
         marker = float(path.stem.split("_len")[0].split("_")[1])
-        feats = np.full((81, 4, 8), marker, dtype=np.float16)
+        # (64, 384) is dinov2's registered geometry; the loader refuses any
+        # other row shape under the bare `.features.npy` suffix.
+        feats = np.full((81, 64, 384), marker, dtype=np.float16)
         np.save(path.with_suffix(".features.npy"), feats)
 
     train, _ = episode_split(all_paths, val_fraction=0.5, seed=0)
