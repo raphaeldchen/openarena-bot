@@ -2863,7 +2863,7 @@ Then each row, applied with `sed -i ''` (or by hand), run, and restored from its
 | `run_study.py`: `--arms ... choices=KINDS` (import `KINDS` too) | `test_run_study::test_main_refuses_the_retired_pixel_arm_by_name` — and ONLY that test; measured, the other 141 stay green, which is why it exists |
 | `train_autoencoder.py`: `choices=ARMS` | `test_m2_scripts_take_kinds::test_single_arm_m2_scripts_offer_every_kind[train_autoencoder]` |
 | `eval_reconstruction.py`: `--arms` default `list(KINDS)` | `test_m2_scripts_take_kinds::test_eval_reconstruction_offers_every_kind_and_defaults_to_the_m2_arms` |
-| `conftest.py`: `pixel_ae` cache written `(41, 64, 384)` | `test_run_study::test_a_real_record_from_run_job_is_recognised_as_complete[pixel_ae]`, `test_study::test_every_evaluation_reads_the_cache_...[pixel_ae]` and `test_a_records_arm_label_follows_the_job` — `ValueError: expected (64, 32), got (64, 384)` from the geometry check |
+| `conftest.py`: `pixel_ae` cache written `(41, 64, 384)` | `test_run_study::test_a_real_record_from_run_job_is_recognised_as_complete[pixel_ae]`, `test_study::test_every_evaluation_reads_the_cache_...[pixel_ae]` and `test_the_record_is_labelled_with_the_arm_the_job_asked_for` — `ValueError: expected (64, 32), got (64, 384)` from the geometry check |
 | `test_world_model.py`: `_ARM_CACHE["pixel_ae"]` width `384` (fixture self-check) | `test_all_three_arms_train[pixel_ae]` |
 
 Any mutation that survives is a missing test. Add it before committing. After the last row: `find src scripts tests -name __pycache__ -type d -exec rm -rf {} +` and `git diff --stat` must show only the files in the Files block.
