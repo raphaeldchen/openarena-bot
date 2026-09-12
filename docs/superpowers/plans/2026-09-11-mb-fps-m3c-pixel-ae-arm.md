@@ -5565,7 +5565,7 @@ If the verdict was `RUN_STUDY`, proceed to Task 8. Otherwise this plan stops her
 
 Everything before this task changed code. This task spends ~14 laptop-hours producing the nine records the spec's §4 asks for, and then reads them in the order the spec fixes: `report_study.py`, `diagnose_dynamics.py`, `pool_dynamics.py`. No module under `src/` or `scripts/` changes here. What this task adds to the repository is one section of this plan, filled from the run's own artefacts — which live under `runs/` and are gitignored, so the numbers in the plan are the only copy that survives a clone.
 
-**The M3b records in `runs/m3_study` are NOT compared against, anywhere in this task** (spec §5). They were produced by a different `encoders.py` — the `_N_PATCHES` constant and `cfg.patch_dim` are gone, the geometry now comes from `BACKBONE_GEOMETRY` — under a different code state, with one arm (`cnn`) that no longer exists as a study arm and a new one (`pixel_ae`) that did not. `encoders.py` is on every arm's path (§2.4), so even the six `frozen_ssl`/`random_vit` cells are not the same experiment. The tools refuse the comparison mechanically too: with `ARMS = ("pixel_ae", "frozen_ssl", "random_vit")`, `report_study.py --out runs/m3_study` now fails `every_record_is_a_study_cell` on the three `cnn` records and `all_nine_cells_present` on the three missing `pixel_ae` cells. The M3b write-up stands as the record of what M3b measured; nothing here revises it. **Every script in this task defaults `--out` to `runs/m3_study`, the M3b directory** — pass `--out runs/m3_study_v2` to every one of them, every time. Omitting it does not error; it silently reports the wrong study.
+**The M3b records in `runs/m3_study` are NOT compared against, anywhere in this task** (spec §5). They were produced by a different `encoders.py` — the `_N_PATCHES` constant and `cfg.patch_dim` are gone, the geometry now comes from `BACKBONE_GEOMETRY` — under a different code state, with one arm (`cnn`) that no longer exists as a study arm and a new one (`pixel_ae`) that did not. `encoders.py` is on every arm's path (§2.4), so even the six `frozen_ssl`/`random_vit` cells are not the same experiment. The tools refuse the comparison mechanically too: with `ARMS = ("pixel_ae", "frozen_ssl", "random_vit")`, `report_study.py --out runs/m3_study` now fails `every_record_is_a_study_cell` on the three `cnn` records and `all_nine_cells_present` on the three missing `pixel_ae` cells. The M3b write-up stands as the record of what M3b measured; nothing here revises it. **Every script in this task defaults `--out` to `runs/m3_study_v2`** (changed from `runs/m3_study` in the final-review fix wave, and pinned by a parser-default test in each of the four tools' test files) — still pass `--out runs/m3_study_v2` to every one of them, every time. Pointing any of them at `runs/m3_study` does not error, and the consequence is worse than a wrong report: the driver finds all nine M3b cells pending (they lack the four provenance keys, so `stale_records` sees nothing to refuse) and OVERWRITES `runs/m3_study`'s six unrecoverable `frozen_ssl`/`random_vit` checkpoints and records, and `diagnose_dynamics.py` OVERWRITES its `diagnostic_*.json` there; `report_study.py` and `pool_dynamics.py` merely read the wrong study.
 
 **Files:**
 - Create: nothing under version control. `runs/m3_study_v2/` (records, checkpoints, diagnostics, figure, `study.log`) and `runs/m3c_check_records.py` (the acceptance check below) are both under `runs/`, which `.gitignore` excludes.
@@ -5758,9 +5758,32 @@ print(a.shape, a.dtype)"
 #    (cache_features.py needed it; the study itself does not). Expected: the path.
 ls runs/m2_fixed/autoencoder_cnn.pt
 
-# 7. The study directory does not exist yet, so nothing can be "already done".
-#    Expected: "No such file or directory".
+# 7. Nothing in the study directory can be "already done". Task 5 wrote
+#    cache_pixel_ae.log there (the "## Task 5 results" section cites it), so
+#    do NOT rm -rf the directory. Expected: cache_pixel_ae.log only -- no
+#    result_*.json, no study.lock, no world_model_*.pt.
 ls runs/m3_study_v2
+
+# 8. The evaluation half of run_job has never run for pixel_ae on MPS at
+#    scale: the spike exercised train_world_model and a numpy ridge probe, not
+#    fit_probes / reward_accuracy / evaluate_rollout / filtering_report on a
+#    pixel_ae model. A failure there at cell 4 costs 4.5 h plus a fix commit,
+#    i.e. a new git_sha that forces re-running the six good cells. Smoke all
+#    three arms on MPS at 5 steps into a THROWAWAY directory. Expected: exit 0,
+#    three result_*_seed0.json, each with device == "mps",
+#    len(history["loss"]) == 5, and encoder_params 12320 / 1056 / 12320 for
+#    frozen_ssl / pixel_ae / random_vit.
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -u scripts/run_study.py --out runs/m3c_smoke --device mps --seeds 0 --steps 5 --allow-short
+echo "smoke exit: $?"
+.venv/bin/python -c "
+import json, glob
+for path in sorted(glob.glob('runs/m3c_smoke/result_*_seed0.json')):
+    r = json.load(open(path))
+    print(path, r['device'], r['encoder_params'], len(r['history']['loss']))"
+# Then delete the smoke directory -- runs/m3c_smoke ONLY, never
+# runs/m3_study_v2. Left in place it is harmless to the real run (a different
+# --out), but pointed at as --out it would trip EXIT_CONFIG_MISMATCH (3).
+rm -rf runs/m3c_smoke
 ```
 
 A missing `pixel_ae` cache does not stop the driver — the failure policy in `run_study.py` catches the `FileNotFoundError`, prints a traceback, and moves on. You would find out at hour 4.5, when the first `pixel_ae` cell fails in its first second and the driver proceeds to `random_vit`. Check 5 is what makes that a ten-second finding instead.
@@ -5782,6 +5805,8 @@ echo "driver exit: $?"
 
 `caffeinate -dimsu`, not `-i`: the Global Constraints record that `-i` was insufficient on this host. `-u` tells the driver to log into `runs/m3_study_v2/` rather than the repo root — the M3b run's `tee study.log` left an untracked file at the root that still shows in `git status`; under `runs/` it is gitignored and beside the records it describes. `set -o pipefail` makes `$?` the driver's status rather than `tee`'s (works in zsh and bash).
 
+**Operating rule for the whole run: no HEAD movement of any kind (commit, checkout, switch, reset, rebase, stash, pull) on this checkout until the ninth record is written; `src/` and `scripts/` clean at launch (Step 4 item 2).** `git_sha` is `git rev-parse HEAD` sampled ~1.5 h into each cell, at record-build time, not at launch — so any HEAD move mid-run splits the nine records across two shas and the acceptance check's `shas == {head}` assertion fails, with the cells from the older sha to be re-run. Uncommitted edits, by contrast, change nothing about the running process (every module is imported at process start) — which is exactly why they must not exist at launch: a sha only names the code that ran if the tree at that sha is the tree that ran.
+
 Expected first line:
 ```
 2026-09-1xTHH:MM:SS 9 job(s) pending: frozen_ssl/s0, frozen_ssl/s1, frozen_ssl/s2, pixel_ae/s0, pixel_ae/s1, pixel_ae/s2, random_vit/s0, random_vit/s1, random_vit/s2
@@ -5796,7 +5821,9 @@ driver exit: 0
 ```bash
 PYTHONDONTWRITEBYTECODE=1 caffeinate -dimsu .venv/bin/python -u scripts/run_study.py \
   --out runs/m3_study_v2 --device mps --seeds 0 2>&1 | tee -a runs/m3_study_v2/study.log
-# then --seeds 1, then --seeds 2 (or a bare invocation, which runs whatever is left)
+# then the same command with --seeds 1, then with --seeds 2; or, for whatever is left:
+PYTHONDONTWRITEBYTECODE=1 caffeinate -dimsu .venv/bin/python -u scripts/run_study.py \
+  --out runs/m3_study_v2 --device mps 2>&1 | tee -a runs/m3_study_v2/study.log
 ```
 `tee -a` on the later invocations, or each one truncates the log of the last. `--seeds 0` orders `frozen_ssl/s0, pixel_ae/s0, random_vit/s0` — the pixel arm's first cell finishes at ~3 h instead of ~6 h, which is the argument for this form.
 
@@ -5925,7 +5952,7 @@ Every row below is a way the study could be wrong while `run_study.py` exits 0 a
 | an M3b `result_cnn_seed*.json` copied in | `records in runs/m3_study_v2 that are not study cells: [('cnn', 0)]`; `report_study.py`'s `every_record_is_a_study_cell` FAIL |
 | a `pixel_ae` record with the wrong bottleneck width (a `random_vit` cache mislabelled) | `encoder_params=12320, expected 1056` — and before that, the loader's `BACKBONE_GEOMETRY` shape check refuses the cache at step 0 |
 | a record from a `--steps 2000` spike directory reused as `--out` | the driver exits 3 (`EXIT_CONFIG_MISMATCH`); the check's `steps=2000` assertion |
-| `--out` omitted from any of the four scripts | `report_study.py --out runs/m3_study`: `every_record_is_a_study_cell` FAIL and `all_nine_cells_present` FAIL; `diagnose_dynamics.py`: exit 11 (no `pixel_ae` checkpoints) ; `pool_dynamics.py`: exit 18 |
+| `--out runs/m3_study` (M3b's directory, the default before the fix wave) passed to any of the four scripts | the driver: no symptom at all -- it OVERWRITES M3b's cells (which is why the default is now `runs/m3_study_v2`, pinned by a test per tool); `report_study.py --out runs/m3_study`: `every_record_is_a_study_cell` FAIL and `all_nine_cells_present` FAIL; `diagnose_dynamics.py`: exit 11 (no `pixel_ae` checkpoints) ; `pool_dynamics.py`: exit 18 |
 | diagnostics run on cpu | exit 14, `RECORD MISMATCH ... This run used device=cpu` |
 | `ARMS` silently shrunk to two arms by a preceding task | `ARMS is (...), not ('pixel_ae', 'frozen_ssl', 'random_vit')` — the literal, not the tuple, defines "nine" |
 
