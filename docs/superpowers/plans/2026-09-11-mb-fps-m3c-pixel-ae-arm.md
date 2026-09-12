@@ -5493,6 +5493,56 @@ Create `## Task 7 results` at the end of this plan and fill it. **A FAIL is a re
 
 ```markdown
 
+## Task 7 results
+
+**Run:** `runs/m3c_spike/spike_pixel_ae_seed0.json`, log `runs/m3c_spike/spike.log`.
+git SHA ______ · device ______ · 2,000 steps · seq_len 64 · batch 16 · ____ steps/s · ____ s wall.
+Probe protocol: `fit_probe` ridge selection on the flattened `(T+1, 2048)` cache; fit 16 / select 4 training
+episodes, scored on 20 validation episodes of `episode_split(seed=0)`, ____ rows; selected ridge ____;
+selection R² ____.
+
+| check | value | must read | verdict |
+|---|---|---|---|
+| 1 `embedding_loss` at step 0 (`history["parts"][0]["embedding"]`) | ______ | in [0.1, 1.0] | PASS / FAIL |
+| 2 `kl_rate_above_free_bits` over 2,000 steps (`kl_dyn_max` ______) | ______ | > 0.5 | PASS / FAIL |
+| 3 held-out probe R² on the cached `pixel_ae` features | ______ | > 0 | PASS / FAIL |
+
+**Side-by-side, embedding loss at step 0** (one forward pass each, seed 0, same split and loader draw):
+
+| arm | this run | M3c design §1 |
+|---|---|---|
+| `pixel_ae` | ______ (side-by-side) / ______ (history) | — (new) |
+| `frozen_ssl` | ______ | 0.3165 |
+| `random_vit` | ______ | 0.4104 |
+| `cnn` (retired) | not run | 0.0008 |
+
+**Decision:** `______` (the script's own verdict; exit status ____).
+
+Decision rule, spec §3:
+- all three PASS → **Task 8**: run the nine cells into `runs/m3_study_v2`.
+- check 2 FAILS alone → **STOP**. Do not run the study. Re-plan `KL_FREE_BITS` as a genuine
+  three-arm calibration with the KL trajectory recorded per step; `history["parts"][i]["kl_dyn"]`
+  from this record is the `pixel_ae` trajectory for it.
+- check 1 or 3 FAILS (with or without 2) → **STOP**. The frozen `pixel_ae` backbone is not
+  informative under this objective; §1's argument says no floor can fix that. Do not run the study;
+  the next step is a different backbone (the `pixel_ae_conv` alternative in §2.1 is the named
+  candidate), not a different floor.
+```
+
+If check 2 alone failed, also paste the first 20 and last 20 entries of `[p["kl_dyn"] for p in r["history"]["parts"]]` under the table — the trajectory is the thing the recalibration will be planned from, and it is the first time this project has had it.
+
+- [ ] **Step 10: Commit the result**
+
+```bash
+git status --short          # must show ONLY the plan; runs/ is gitignored
+git add docs/superpowers/plans/2026-09-11-mb-fps-m3c-pixel-ae-arm.md
+git commit -m "docs: M3c spike -- pixel_ae at 2,000 steps, three checks, and the decision
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+If the verdict was `RUN_STUDY`, proceed to Task 8. Otherwise this plan stops here, and the commit message's second line should say which check failed.
+
 ---
 
 ### Task 8: The nine-cell run, the report, the diagnostics, the pooled statistic
@@ -5871,74 +5921,6 @@ Append the section below to this plan as `## Task 8 results`, after the exit cri
 
 ````markdown
 
----
-
-## Exit criteria for this plan
-
-- [ ] `pytest` fully green, with the counts each task states.
-- [ ] `patch_dim` exists nowhere outside `BACKBONE_GEOMETRY` and `BottleneckEncoder`'s attributes (`grep -rn "patch_dim" src scripts`).
-- [ ] `encoder_input_kind` is `"features"` for every arm in `ARMS`; `cnn` still builds via `KINDS` and M2's three scripts accept it.
-- [ ] Every mutation table row is caught, using a harness self-checked all three ways.
-- [ ] `data/my_way_home/*.features_pixel_ae.npy`: 122 files, `(T+1, 64, 32)` float16, per-dim std > 0.
-- [ ] The spike's three checks PASS (Task 7 results filled in). **If any fails, the study does not run.**
-- [ ] Nine records in `runs/m3_study_v2`, one per (arm, seed), every one carrying `git_sha`, `device`, `encoder_params`, `history`; all nine share one `git_sha` and one `device`.
-- [ ] `kl_rate_above_free_bits > 0.5` for all three `pixel_ae` cells — the first thing read from the new study.
-- [ ] The gate verdict is recorded per criterion, whatever it is.
-- [ ] `encoders.py` still the only arm-varying module (`grep -rn "cfg.arm\|\.kind" src/ --include='*.py' | grep -v encoders.py` hits only log prefixes, filenames and record labels).
-- [ ] The M3b records in `runs/m3_study` are untouched and uncompared.
-
----
-
-## Task 7 results
-
-**Run:** `runs/m3c_spike/spike_pixel_ae_seed0.json`, log `runs/m3c_spike/spike.log`.
-git SHA ______ · device ______ · 2,000 steps · seq_len 64 · batch 16 · ____ steps/s · ____ s wall.
-Probe protocol: `fit_probe` ridge selection on the flattened `(T+1, 2048)` cache; fit 16 / select 4 training
-episodes, scored on 20 validation episodes of `episode_split(seed=0)`, ____ rows; selected ridge ____;
-selection R² ____.
-
-| check | value | must read | verdict |
-|---|---|---|---|
-| 1 `embedding_loss` at step 0 (`history["parts"][0]["embedding"]`) | ______ | in [0.1, 1.0] | PASS / FAIL |
-| 2 `kl_rate_above_free_bits` over 2,000 steps (`kl_dyn_max` ______) | ______ | > 0.5 | PASS / FAIL |
-| 3 held-out probe R² on the cached `pixel_ae` features | ______ | > 0 | PASS / FAIL |
-
-**Side-by-side, embedding loss at step 0** (one forward pass each, seed 0, same split and loader draw):
-
-| arm | this run | M3c design §1 |
-|---|---|---|
-| `pixel_ae` | ______ (side-by-side) / ______ (history) | — (new) |
-| `frozen_ssl` | ______ | 0.3165 |
-| `random_vit` | ______ | 0.4104 |
-| `cnn` (retired) | not run | 0.0008 |
-
-**Decision:** `______` (the script's own verdict; exit status ____).
-
-Decision rule, spec §3:
-- all three PASS → **Task 8**: run the nine cells into `runs/m3_study_v2`.
-- check 2 FAILS alone → **STOP**. Do not run the study. Re-plan `KL_FREE_BITS` as a genuine
-  three-arm calibration with the KL trajectory recorded per step; `history["parts"][i]["kl_dyn"]`
-  from this record is the `pixel_ae` trajectory for it.
-- check 1 or 3 FAILS (with or without 2) → **STOP**. The frozen `pixel_ae` backbone is not
-  informative under this objective; §1's argument says no floor can fix that. Do not run the study;
-  the next step is a different backbone (the `pixel_ae_conv` alternative in §2.1 is the named
-  candidate), not a different floor.
-```
-
-If check 2 alone failed, also paste the first 20 and last 20 entries of `[p["kl_dyn"] for p in r["history"]["parts"]]` under the table — the trajectory is the thing the recalibration will be planned from, and it is the first time this project has had it.
-
-- [ ] **Step 10: Commit the result**
-
-```bash
-git status --short          # must show ONLY the plan; runs/ is gitignored
-git add docs/superpowers/plans/2026-09-11-mb-fps-m3c-pixel-ae-arm.md
-git commit -m "docs: M3c spike -- pixel_ae at 2,000 steps, three checks, and the decision
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
-```
-
-If the verdict was `RUN_STUDY`, proceed to Task 8. Otherwise this plan stops here, and the commit message's second line should say which check failed.
-
 ## Task 8 results
 
 **Provenance.** All nine cells of `runs/m3_study_v2` were produced by **one code state** and
@@ -6077,3 +6059,19 @@ git commit -m "docs: M3c nine-cell run under one code state -- gate verdict, dia
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
+
+---
+
+## Exit criteria for this plan
+
+- [ ] `pytest` fully green, with the counts each task states.
+- [ ] `patch_dim` exists nowhere outside `BACKBONE_GEOMETRY` and `BottleneckEncoder`'s attributes (`grep -rn "patch_dim" src scripts`).
+- [ ] `encoder_input_kind` is `"features"` for every arm in `ARMS`; `cnn` still builds via `KINDS` and M2's three scripts accept it.
+- [ ] Every mutation table row is caught, using a harness self-checked all three ways.
+- [ ] `data/my_way_home/*.features_pixel_ae.npy`: 122 files, `(T+1, 64, 32)` float16, per-dim std > 0.
+- [ ] The spike's three checks PASS (Task 7 results filled in). **If any fails, the study does not run.**
+- [ ] Nine records in `runs/m3_study_v2`, one per (arm, seed), every one carrying `git_sha`, `device`, `encoder_params`, `history`; all nine share one `git_sha` and one `device`.
+- [ ] `kl_rate_above_free_bits > 0.5` for all three `pixel_ae` cells — the first thing read from the new study.
+- [ ] The gate verdict is recorded per criterion, whatever it is.
+- [ ] `encoders.py` still the only arm-varying module (`grep -rn "cfg.arm\|\.kind" src/ --include='*.py' | grep -v encoders.py` hits only log prefixes, filenames and record labels).
+- [ ] The M3b records in `runs/m3_study` are untouched and uncompared.
