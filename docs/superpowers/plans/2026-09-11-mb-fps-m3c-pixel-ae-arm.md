@@ -75,6 +75,8 @@ Test sweep size (grepped 2026-09-11): 322 references to `"cnn"` across 14 test f
 ---
 
 > **Line numbers** in every Files block are as of commit `087e04a`. Each task shifts them for the next; every edit is also named by the symbol or test it touches — locate by that, treat the ranges as hints. Tasks are strictly sequential: Task N assumes Tasks 1..N-1 have landed and been committed.
+>
+> **Test counts** stated as `Expected: N passed` were computed against the same commit and are stale by every earlier task's additions. The binding expectation is the *delta* the step names (`17 more than…`) on top of what the previous task's last step measured; write the measured absolute number in the task report. Pre-flight (2026-09-11) corrected the absolute numbers where the cross-task check could compute them.
 
 ---
 
@@ -821,6 +823,7 @@ import pytest
 import torch
 
 from mbfps.data.episode import Episode, save_episode
+import mbfps.data.features as features  # Task 1's `test_the_old_module_constants_are_gone` reads it
 from mbfps.data.features import (
     BACKBONE_GEOMETRY,
     BACKBONES,
@@ -832,14 +835,6 @@ from mbfps.data.features import (
 from mbfps.envs.protocol import OBS_SHAPE
 
 pytestmark = pytest.mark.slow  # downloads ~88MB on first run
-
-N_PATCHES, FEATURE_DIM = 64, 384
-"""The ViT backbones' geometry, as LITERALS on purpose.
-
-The tests below pin what the dinov2 and random_vit paths emit. Reading the
-numbers from `BACKBONE_GEOMETRY` -- the registry those same tests are meant to
-check -- would let a wrong registry entry agree with a wrong output.
-"""
 
 
 @pytest.fixture(scope="module")
@@ -862,7 +857,7 @@ def test_every_backbone_has_a_geometry_and_nothing_else_does():
     assert set(BACKBONE_GEOMETRY) == set(BACKBONES)
 ```
 
-Every later use of `N_PATCHES` / `FEATURE_DIM` in the file (the dinov2 and random_vit shape tests, the stub extractors, the batching test) now reads the test-local literals and needs no edit.
+Task 1 already rewrote every shape assertion in the file (the dinov2 and random_vit shape tests, the stub extractors, the batching test) to read `BACKBONE_GEOMETRY[...]`, and `test_backbone_geometry_is_the_literal_registry` above pins that dict to literals — so the emitted shapes are checked against literals transitively. Do **not** add test-local `N_PATCHES`/`FEATURE_DIM` constants; nothing would read them.
 
 Second, replace lines 180–190 (`test_backbones_registered` and `test_unknown_backbone_rejected`, which did function-local imports) with:
 
@@ -983,8 +978,6 @@ def test_build_backbone_pixel_ae_reads_the_default_path_when_none_is_given(
     fake_m2, monkeypatch
 ):
     """`checkpoint=None` means the module default, not "no checkpoint"."""
-    import mbfps.data.features as features
-
     path, _ = fake_m2
     monkeypatch.setattr(features, "PIXEL_AE_CHECKPOINT", path)
     assert build_backbone("pixel_ae").training is False
@@ -1100,7 +1093,8 @@ def test_vit_encode_refuses_the_wrong_patch_count(extractor, monkeypatch):
         last_hidden_state = torch.zeros(2, 1 + 63, 384)
 
     monkeypatch.setattr(extractor, "model", lambda pixel_values: _Out())
-    with pytest.raises(ValueError, match=r"dinov2.*\(63, 384\).*\(64, 384\)"):
+    # registered (64, 384) first, emitted (63, 384) second -- Task 1's field order
+    with pytest.raises(ValueError, match=r"dinov2.*\(64, 384\).*\(63, 384\)"):
         extractor.encode(_frames(5))
 
 
@@ -1141,7 +1135,7 @@ Why these particular tests, by the species they defend against:
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/data/test_features.py -q`
-Expected: FAIL at collection — `ImportError: cannot import name 'BACKBONE_GEOMETRY' from 'mbfps.data.features'` (1 error).
+Expected: FAIL at collection — `ImportError: cannot import name 'PIXEL_AE_CHECKPOINT' from 'mbfps.data.features'` (1 error; `BACKBONE_GEOMETRY` and `BACKBONES` already exist from Task 1, so the first name Python cannot resolve is the one this task adds).
 
 - [ ] **Step 3: Implement**
 
@@ -1341,10 +1335,10 @@ class FeatureExtractor:
             patches = out[:, 1:, :]  # drop the CLS token
         if tuple(patches.shape[1:]) != (n_patches, patch_dim):
             raise ValueError(
-                f"{self.backbone} emitted patches of shape "
-                f"{tuple(patches.shape[1:])}, expected {(n_patches, patch_dim)}; "
-                "check that the input is 112x112 and the patch size is 14"
-            )
+                f"backbone {self.backbone!r} is registered as {(n_patches, patch_dim)} per frame "
+                f"but emitted {tuple(patches.shape[1:])}; check that the input is "
+                f"112x112 and the patch size is 14"
+            )  # Task 1's wording, which its `test_encode_checks_its_output_against_the_registry` pins (registered first, emitted second)
         return patches.to(torch.float16).cpu().numpy()
 
 
@@ -1392,13 +1386,13 @@ Three things in there that are deliberate and easy to "tidy" away:
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/data/test_features.py -q`
-Expected: PASS — `37 passed` (20 existing + 17 new; on a box without MPS, `36 passed, 1 skipped`). Measured ~6 s.
+Expected: PASS — 17 more than Task 1's Step 16 measured for this file (22 → **39**; on a box without MPS one of the new tests skips). Measured ~6 s.
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/cache_features.py --help`
 Expected: the usage line, with `--backbone {dinov2,random_vit,pixel_ae}`. This is the only check on the script edit — `scripts/` is not a package and the size estimate runs after a real buffer load — so the import must be seen to succeed here rather than discovered on the first cache run.
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`
-Expected: `1137 passed` (1120 + 17). Measured: the full suite takes ~16 min on this Mac; the slow real-data tests read `data/my_way_home` relative to the cwd, so run it from the repo root.
+Expected: 17 more than Task 1's Step 16 measured for the whole suite (1137 → **1154**). Measured: the full suite takes ~16 min on this Mac; the slow real-data tests read `data/my_way_home` relative to the cwd, so run it from the repo root.
 
 - [ ] **Step 5: Mutation-test**
 
@@ -2112,13 +2106,14 @@ def get_config(arm: str, **overrides) -> Config:
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/utils/test_config.py -q`
-Expected: PASS (18 tests; the file had 13).
+Expected: PASS — 5 more than Task 1 left in the file (16 → **21**).
 
 - [ ] **Step 5: Write the failing encoder tests**
 
 In `tests/models/test_encoders.py`, replace the imports at lines 6–15 with:
 
 ```python
+import mbfps.models.encoders as encoders  # Task 1's `test_no_second_source_of_truth_for_the_patch_count` reads it
 from mbfps.data.features import BACKBONE_GEOMETRY
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.utils.config import get_config
@@ -2256,7 +2251,7 @@ comparison has stopped being controlled.
 """
 ```
 
-Replace lines 86–125 (`encoder_input_kind` through the end of the file):
+Two replacements, not one span — Task 1 moved the routing helpers ABOVE `BottleneckEncoder`, so "`encoder_input_kind` through the end of the file" would now swallow the class. (i) Replace the contiguous block `encoder_input_kind`, `_ARM_BACKBONE`, `encoder_backbone` (it sits between `CNNEncoder` and `class BottleneckEncoder`) with the first three definitions below. (ii) Replace `build_encoder` (the last definition in the file, after the class) with the last definition below. `BottleneckEncoder` stays exactly as Task 1 left it:
 
 ```python
 def encoder_input_kind(cfg: EncoderConfig) -> str:
@@ -2318,7 +2313,7 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
 - [ ] **Step 8: Run to verify it passes**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/models/test_encoders.py -q`
-Expected: PASS (31 tests; the file had 27). If `test_pixel_ae_builds_the_same_bottleneck_class_over_32_wide_rows` fails with `in_features == 384`, Task 2's `BottleneckEncoder` is not reading `BACKBONE_GEOMETRY` — that is the dependency, not a bug in this step.
+Expected: PASS — 4 more than Task 1 left in the file (36 → **40**). If `test_pixel_ae_builds_the_same_bottleneck_class_over_32_wide_rows` fails with `in_features == 384`, Task 2's `BottleneckEncoder` is not reading `BACKBONE_GEOMETRY` — that is the dependency, not a bug in this step.
 
 - [ ] **Step 9: Write the failing driver and M2-script tests**
 
@@ -2389,7 +2384,7 @@ Replace lines 1513–1514 (inside `test_a_failing_cell_does_not_abort_the_other_
         "the cell after the failing one was never reached")
 ```
 
-Append after line 1733 (after `test_main_refuses_an_arm_the_study_does_not_have`):
+The test below goes after `test_main_refuses_an_arm_the_study_does_not_have` — **but write it in Step 14, after Step 13's sweep has run, not now.** Its body holds `"cnn"` as the retired name (`assert "cnn" in KINDS`, `--arms cnn`, `result_cnn_seed0.json`), and the sweep's `ANY` regex would rewrite every one of those to `"pixel_ae"` and turn it into a test that `pixel_ae` is refused. In Steps 10 and 12, count it as not yet present (4 driver tests, not 5); Step 14 adds it and runs it.
 
 ```python
 def test_main_refuses_the_retired_pixel_arm_by_name(tmp_path, episode_dir,
@@ -2654,16 +2649,18 @@ Expected output, exactly:
 tests/eval/test_aggregate.py: 270 references; 32 padded table cells, 238 plain; remaining: 0
 tests/eval/test_diagnose_dynamics_script.py: 78 references; 0 padded table cells, 78 plain; remaining: 0
 tests/eval/test_pooling.py: 31 references; 0 padded table cells, 31 plain; remaining: 0
-tests/eval/test_run_study.py: 38 references; 0 padded table cells, 38 plain; remaining: 0
+tests/eval/test_run_study.py: N references; 0 padded table cells, N plain; remaining: 0   # N = 38 minus the six Step 9 removed; record the measured N
 tests/eval/test_pool_dynamics_script.py: 10 references; 0 padded table cells, 10 plain; remaining: 0
 ```
 
 (The task brief's counts — 164, 68, 24, 21, 3 — were of the quoted form `"cnn"` only; the totals above also cover filenames, rendered rows and prose.) Then confirm what is left:
 
 Run: `grep -n "cnn" tests/eval/test_aggregate.py tests/eval/test_diagnose_dynamics_script.py tests/eval/test_pooling.py tests/eval/test_run_study.py tests/eval/test_pool_dynamics_script.py`
-Expected: exactly two lines, both in `test_run_study.py` (1729 and 1732), both the invalid name `cnn2`.
+Expected: exactly two lines, both in `test_run_study.py`, both the invalid name `cnn2` (their line numbers moved with Step 9's edits).
 
 - [ ] **Step 14: The hand edits the sweep cannot make**
+
+**First**, now that the sweep has run: append `test_main_refuses_the_retired_pixel_arm_by_name` from Step 9, verbatim, after `test_main_refuses_an_arm_the_study_does_not_have` in `tests/eval/test_run_study.py`, and run it — `-k retired_pixel_arm`, expected PASS (1 test; its guard is Step 16's `choices=KINDS` mutation). Then:
 
 Four things do not survive a rename: `evaluate_gate` sorts cell listings alphabetically and `pixel_ae` sorts after `frozen_ssl` where `cnn` sorted before it; `test_study.py` reasons about which arm's name coincides with its backbone's, and `pixel_ae` reads a cache where `cnn` read pixels; the shared fixture has no `pixel_ae` cache; and `test_world_model.py`'s arm sweep is a literal list that never grows.
 
@@ -2834,7 +2831,7 @@ SHIPPED_ARM, SHIPPED_SEED = "cnn", 0
 - [ ] **Step 15: Run the full suite**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests -q`
-Expected: PASS — 1120 + 15 = **1135** (plus whatever Tasks 1–3 added): +5 `test_config.py` (13 → 18), +4 `test_encoders.py` (27 → 31), +1 `test_world_model.py` (32 → 33), +1 `test_run_study.py` (141 → 142), +4 `test_m2_scripts_take_kinds.py`; `test_study.py` (62), `test_aggregate.py` (170) and the other swept files keep their counts. The shipped-checkpoint tests in `test_diagnostics.py` run on this box (they need `runs/m3_study`, `data/my_way_home` and MPS) and still pass: they build their config with `get_config("cnn")`, which `KINDS` permits, and load `world_model_cnn_seed0.pt` through `CNNEncoder`, which still exists.
+Expected: PASS — 15 more than Task 3 left the suite at: +5 `test_config.py` (16 → 21), +4 `test_encoders.py` (36 → 40), +1 `test_world_model.py` (32 → 33), +1 `test_run_study.py` (141 → 142), +4 `test_m2_scripts_take_kinds.py`; `test_study.py` (62), `test_aggregate.py` (170) and the other swept files keep their counts. The shipped-checkpoint tests in `test_diagnostics.py` run on this box (they need `runs/m3_study`, `data/my_way_home` and MPS) and still pass: they build their config with `get_config("cnn")`, which `KINDS` permits, and load `world_model_cnn_seed0.pt` through `CNNEncoder`, which still exists.
 
 If `tests/data/test_features.py::test_backbones_registered` fails, that is Task 1's tuple, not this task.
 
@@ -2894,7 +2891,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 The script is the only thing that writes a feature cache, and a cache is then read by every training step of two-thirds of the study with nothing checking how it was made. `--backbone` already takes `choices=BACKBONES`, so `pixel_ae` is *accepted* the moment Task 1 registers it — but three things in the script still assume every backbone is a ViT: the disk guard asks for `frames × 64 × 384 × 2` bytes (2.93 GB for a cache that is 0.24 GB), `FeatureExtractor` is built without the checkpoint the `pixel_ae` backbone is loaded from, and nothing exercises the write path for `(64, 32)` rows. Then the cache is actually produced, and checked for the one property spec §1 says the pixel arm lacked: a target that is not born collapsed.
 
 **Files:**
-- Modify: `scripts/cache_features.py` — the file as Task 1 left it (registry import, `cache_bytes(frames, backbone)`, disk estimate already ported). This task factors the inline parser into `_parser()` / `main(argv)` and adds `--checkpoint`. `cache_bytes` is kept byte-identical.
+- Modify: `scripts/cache_features.py` — the file as Task 1 left it (registry import, `cache_bytes(frames, backbone)`, disk estimate already ported). This task factors the inline parser into `_parser()` / `main(argv)` and adds `--checkpoint`. `cache_bytes`'s body is kept identical (its docstring is reworded).
 - Test: `tests/data/test_cache_features_script.py` (modify — Task 1 created it with three `cache_bytes` tests and the `importlib` loader; keep all three verbatim and append)
 - Modify: this plan (record the measured cache size and per-dim std under "## Task 5 results")
 
@@ -2920,9 +2917,12 @@ The script is the only thing that writes a feature cache, and a cache is then re
 
 ```python
 # tests/data/test_cache_features_script.py
-# EXTENDS the file Task 1 created. Keep Task 1's importlib header and its three
-# cache_bytes tests exactly as they are; the docstring below replaces Task 1's and
-# everything after it is appended.
+# EXTENDS the file Task 1 created. The docstring below REPLACES Task 1's. Task 1's
+# import block, its `_SPEC` / `script` / `exec_module` trio and its three cache_bytes
+# tests stay exactly as they are. The header repeated below is context, not text to
+# paste again: MERGE the import lines (add only the ones Task 1's file lacks -- numpy,
+# torch, ReplayBuffer, ...), keep ONE `_SPEC`/`script` trio, and append everything
+# from the first new fixture onward after Task 1's third test.
 """`scripts/cache_features.py` with a third backbone whose rows are not (64, 384).
 
 The script is the only thing that writes a feature cache, and a cache is read
@@ -3237,7 +3237,7 @@ task already trimmed that import, collection succeeds and every test fails with
 
 - [ ] **Step 3: Implement**
 
-Replace `scripts/cache_features.py` in full. `cache_bytes` below is byte-identical to
+Replace `scripts/cache_features.py` in full. `cache_bytes` below has the same two-line body as (its docstring is reworded)
 Task 1's (Task 1's three tests must stay green through this replacement); the docstring
 now says which cache is the exception and why; `_parser` and `main(argv)` exist so the tests can drive it; and
 `--checkpoint` is forwarded for every backbone — `build_backbone` is the one place
@@ -4258,7 +4258,7 @@ The rest of the dict (`episodes`, `probe`, `position`, `angle`, `filtering`, `re
 - [ ] **Step 6: Run to verify the record tests pass**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/eval/test_study.py -q`
-Expected: PASS — every test in the file, 14 more than Step 2 collected (13 newly green plus the one that was green by design). On the tree as Task 5 left it that is 84 passed; `-rs` must list NO skip from `test_the_record_carries_the_sha_git_reports_for_the_code_that_ran` (a skip there means the test could not run git and pinned nothing).
+Expected: PASS — every test in the file, 14 more than Step 2 collected (13 newly green plus the one that was green by design). On the tree as Task 5 left it that is 62 + 14 = **76** passed; `-rs` must list NO skip from `test_the_record_carries_the_sha_git_reports_for_the_code_that_ran` (a skip there means the test could not run git and pinned nothing).
 
 - [ ] **Step 7: Implement the driver (`scripts/run_study.py`)**
 
@@ -4293,10 +4293,10 @@ The remaining paragraphs of the docstring ("DRIFT IN EITHER DIRECTION ..." and "
 - [ ] **Step 8: Run to verify everything passes**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/eval/test_study.py tests/eval/test_run_study.py -q`
-Expected: PASS, **23 more** than the two files collected before this task (14 in `test_study.py`; in `test_run_study.py` the four new `missing_any_field` cases, `test_the_m3c_keys_are_in_both_literals`, and the four `provenance_field` cases). On the tree as Task 5 left it: **226 passed** (was 203). The drift guard `test_a_real_record_from_run_job_is_recognised_as_complete[<arm>]` runs the real `run_job` for every arm and asserts `REQUIRED_RECORD_KEYS == written - OPTIONAL_RECORD_KEYS`, so this step is also where "the driver demands exactly what `run_job` writes" is proved for `pixel_ae`.
+Expected: PASS, **23 more** than the two files collected before this task (14 in `test_study.py`; in `test_run_study.py` the four new `missing_any_field` cases, `test_the_m3c_keys_are_in_both_literals`, and the four `provenance_field` cases). On the tree as Task 5 left it: **227 passed** (was 62 + 142 = 204). The drift guard `test_a_real_record_from_run_job_is_recognised_as_complete[<arm>]` runs the real `run_job` for every arm and asserts `REQUIRED_RECORD_KEYS == written - OPTIONAL_RECORD_KEYS`, so this step is also where "the driver demands exactly what `run_job` writes" is proved for `pixel_ae`.
 
 Then the whole suite: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests -q`
-Expected: PASS, 23 more than the count Task 5 left (1120 → **1143** if nothing else has changed the total), 3 pre-existing skips in `tests/eval/test_diagnostics.py` (they need the shipped M3b artefacts and MPS), exit 0.
+Expected: PASS, 23 more than the count Task 5 left (23 more than Task 5's full-suite count), 3 pre-existing skips in `tests/eval/test_diagnostics.py` (they need the shipped M3b artefacts and MPS), exit 0.
 
 - [ ] **Step 9: Mutation-test**
 
@@ -5410,7 +5410,7 @@ Then, one row at a time (mutate, `run`, confirm the named test is in the failure
 | `load_cached_features` drops the geometry guard | `test_cached_feature_probe_refuses_a_cache_of_the_wrong_geometry` |
 | `_rows` drops the row-count guard | `test_cached_feature_probe_refuses_a_cache_that_is_not_one_row_per_frame` |
 | `cached_feature_probe` reports `n_fit_episodes = limit - select_episodes` (16) instead of what it used | `test_cached_feature_probe_reports_the_split_it_used` |
-| `main` writes `history["loss"][-20:]` instead of the full list | `test_main_writes_the_full_history_the_checks_and_the_verdict` (length 3 ≠ 3 only if steps > 20 — **change the test to assert `len == record["steps"]` AND run the check once with `--steps 25`** if you want this row caught cheaply; otherwise record it as caught by inspection) |
+| `main` writes `history["loss"][-20:]` instead of the full list | `test_main_writes_the_full_history_the_checks_and_the_verdict` (length 3 ≠ 3 only if steps > 20 — **change the test to assert `len == record["steps"]` AND run it once with `--steps 25`** — a 3-step run cannot tell `[-20:]` from the full list, so "caught by inspection" is not an option for this row) |
 | `main` judges the checks from `side_by_side["pixel_ae"]` instead of `history` | NOT caught on CPU — the two are equal by construction there; this is why `report` prints both and Step 9 asks you to compare them on MPS |
 | `_parser` gains `--seed` | `test_the_spike_is_pinned_to_pixel_ae_seed_0_and_2000_steps` |
 
@@ -5461,7 +5461,7 @@ embedding_loss_step0  pixel_ae=0.____  frozen_ssl=0.3165  random_vit=0.4104   (M
 training              steps_per_second=3.__ kl_dyn_max=0.____
 check 1  embedding_loss_step0       0.____  in [0.1, 1.0]  PASS|FAIL
 check 2  kl_rate_above_free_bits    0.____  > 0.5  PASS|FAIL   (floor KL_FREE_BITS=0.2)
-check 3  probe_r2_cached_features   +0.____  > 0.0  PASS|FAIL   (ridge 1e+03, fit 16 / select 4 / scored 20 val episodes, 10520 rows x 2048 columns)
+check 3  probe_r2_cached_features   +0.____  > 0.0  PASS|FAIL   (ridge 1000, fit 16 / select 4 / scored 20 val episodes, 10520 rows x 2048 columns)
 decision: RUN_STUDY|STOP_RECALIBRATE_FREE_BITS|STOP_BACKBONE_UNINFORMATIVE -- ...
 record: runs/m3c_spike/spike_pixel_ae_seed0.json
 exit=0|10
