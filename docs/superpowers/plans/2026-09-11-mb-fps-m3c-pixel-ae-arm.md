@@ -6091,3 +6091,28 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - [ ] The gate verdict is recorded per criterion, whatever it is.
 - [ ] `encoders.py` still the only arm-varying module (`grep -rn "cfg.arm\|\.kind" src/ --include='*.py' | grep -v encoders.py` hits only log prefixes, filenames and record labels).
 - [ ] The M3b records in `runs/m3_study` are untouched and uncompared.
+
+---
+
+## Task 5 results
+
+Written 2026-09-12 by `scripts/cache_features.py --backbone pixel_ae --checkpoint
+runs/m2_fixed/autoencoder_cnn.pt --device mps` under `caffeinate -dimsu`; log
+`runs/m3_study_v2/cache_pixel_ae.log`. Disk guard printed `needs=0.24 GB`, not the ViTs'
+2.93 GB. The check is Step 8's script, run over all 122 files: every file `(T+1, 64, 32)`
+float16, finite, and its `T+1` equal to the episode's own `obs` count.
+
+| quantity | value |
+|---|---|
+| cache size on disk (`du -ch data/my_way_home/*.features_pixel_ae.npy \| tail -1`) | 233M (`size_gb=0.244` from `nbytes`; 244,256,768 B = 59,633 × 64 × 32 × 2) |
+| files / frames / rows | 122 / 59,633 / (64, 32) |
+| per-dim std min / p05 / median / max, dims below 0.01 | 0.4534 / 0.8496 / 1.2044 / 4.4148, 0 |
+| global std (DINOv2 cache 2.3559, random_vit 1.0000, for the LayerNorm rationale) | 1.4840 |
+| encode wall time and frames/s from the script's last two lines | `elapsed_s=14`, `frames_per_second=4309` (MPS, batch 32) |
+| `git rev-parse HEAD` the cache was written at | `306d2c4a961eab02f55cda9583d0d5182090cc0f` |
+
+The target is not born collapsed: the smallest per-dim std over the whole buffer is 0.4534,
+three decades above the ~0.0007 a random-init `CNNEncoder` emits (§1), and the median 1.2044
+sits beside the 1.06 measured on the first three episodes before the cache existed. Both
+floors of the Step 8 check (`min > 0.01`, `median > 0.1`) clear with two decades to spare.
+This is the direct measurement that licenses the Task 7 spike.
