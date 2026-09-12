@@ -1,13 +1,18 @@
+import re
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
 from mbfps.data.episode import Episode, save_episode
-import mbfps.data.features as features
+import mbfps.data.features as features  # Task 1's `test_the_old_module_constants_are_gone` reads it
 from mbfps.data.features import (
     BACKBONE_GEOMETRY,
     BACKBONES,
+    PIXEL_AE_CHECKPOINT,
     FeatureExtractor,
+    build_backbone,
     cache_episode_features,
 )
 from mbfps.envs.protocol import OBS_SHAPE
@@ -29,16 +34,19 @@ def extractor():
 # with no error until the first matmul. There is now one registry.
 
 
-def test_backbone_geometry_registry():
-    """Pins the literal geometry AND that every backbone has exactly one entry.
+def test_backbone_geometry_is_the_literal_registry():
+    """Literal, not derived: geometry is what the loader and the bottleneck
+    size themselves by, so a typo here is a matmul error at step 0 (or, worse,
+    a cache that loads and trains on the wrong width)."""
+    assert BACKBONE_GEOMETRY == {
+        "dinov2": (64, 384),
+        "random_vit": (64, 384),
+        "pixel_ae": (64, 32),
+    }
 
-    The literal is deliberate: a registry that silently grows or loses a key
-    is the failure mode, so a new backbone must edit this assertion by hand.
-    """
-    assert BACKBONE_GEOMETRY == {"dinov2": (64, 384), "random_vit": (64, 384)}
-    assert set(BACKBONE_GEOMETRY) == set(BACKBONES), (
-        "every registered backbone needs a geometry and vice versa"
-    )
+
+def test_every_backbone_has_a_geometry_and_nothing_else_does():
+    assert set(BACKBONE_GEOMETRY) == set(BACKBONES)
 
 
 def test_the_old_module_constants_are_gone():
@@ -219,12 +227,10 @@ def test_cache_writes_to_the_backbones_own_suffix(tmp_path):
 
 
 def test_backbones_registered():
-    assert BACKBONES == ("dinov2", "random_vit")
+    assert BACKBONES == ("dinov2", "random_vit", "pixel_ae")
 
 
 def test_unknown_backbone_rejected():
-    from mbfps.data.features import build_backbone
-
     with pytest.raises(KeyError, match="unknown backbone 'nope'"):
         build_backbone("nope")
 
@@ -347,3 +353,251 @@ def test_cache_episode_features_batches_and_preserves_frame_order(tmp_path):
     np.testing.assert_array_equal(
         written[:, 0, 0].astype(np.int64), np.arange(n)
     )
+
+
+# --- pixel_ae: the M2 autoencoder's encoder as a frozen backbone --------------
+# None of these tests touch `runs/m2_fixed/autoencoder_cnn.pt`: it is gitignored
+# and absent on a fresh checkout. The checkpoint under test is built here from a
+# real `CNNEncoder` in the exact `{"arm", "state_dict"}` layout that
+# `mbfps.training.autoencoder.train_autoencoder` writes, with `encoder.*` keys
+# next to `decoder.*` keys so the loader has to select the subset. It is a full
+# 26.4M-parameter encoder (the contract fixes the architecture to
+# `CNNEncoder(EncoderConfig(kind="cnn"))`, whose `project` layer is 12544 x
+# 2048), so it is written ONCE per module rather than per test.
+
+
+def _frames(seed: int, n: int = 2) -> np.ndarray:
+    return np.random.default_rng(seed).integers(0, 256, (n, *OBS_SHAPE), dtype=np.uint8)
+
+
+@pytest.fixture(scope="module")
+def fake_m2(tmp_path_factory):
+    """A fake M2 `cnn` checkpoint and the state_dict it was written from."""
+    from mbfps.models.encoders import CNNEncoder
+    from mbfps.utils.config import EncoderConfig
+
+    torch.manual_seed(1234)
+    encoder = CNNEncoder(EncoderConfig(kind="cnn"))
+    state = {f"encoder.{k}": v.clone() for k, v in encoder.state_dict().items()}
+    # Decoder keys, as in the real file. The loader must ignore them rather
+    # than fail a strict load or, worse, try to fit them into the encoder.
+    state["decoder.project.weight"] = torch.zeros(3, 2048)
+    state["decoder.project.bias"] = torch.zeros(3)
+    path = tmp_path_factory.mktemp("m2") / "autoencoder_cnn.pt"
+    torch.save({"arm": "cnn", "state_dict": state}, path)
+    return path, state
+
+
+@pytest.fixture(scope="module")
+def pixel_ae(fake_m2):
+    path, _ = fake_m2
+    return FeatureExtractor(backbone="pixel_ae", device="cpu", checkpoint=path)
+
+
+def test_pixel_ae_checkpoint_default_is_the_m2_cnn_autoencoder():
+    assert PIXEL_AE_CHECKPOINT == Path("runs/m2_fixed/autoencoder_cnn.pt")
+
+
+def test_build_backbone_pixel_ae_loads_the_checkpoint_weights_not_a_fresh_init(fake_m2):
+    """Every encoder tensor must equal the checkpoint's, so the features are
+    the TRAINED autoencoder's and not a random CNN's -- which is the exact
+    collapsed target the design retires."""
+    from mbfps.models.encoders import CNNEncoder
+    from mbfps.utils.config import EncoderConfig
+
+    path, state = fake_m2
+    loaded = build_backbone("pixel_ae", checkpoint=path).state_dict()
+    expected = {k[len("encoder."):]: v for k, v in state.items() if k.startswith("encoder.")}
+    assert set(loaded) == set(expected)
+    for key, tensor in expected.items():
+        assert torch.equal(loaded[key], tensor), key
+    # Self-check: a fresh init must NOT match, or the equality above is vacuous.
+    fresh = CNNEncoder(EncoderConfig(kind="cnn")).state_dict()
+    assert not torch.equal(fresh["project.weight"], expected["project.weight"])
+
+
+def test_build_backbone_pixel_ae_is_frozen(fake_m2):
+    path, _ = fake_m2
+    model = build_backbone("pixel_ae", checkpoint=path)
+    params = list(model.parameters())
+    assert len(params) == 10  # 4 convs + project, weight and bias each
+    assert all(not p.requires_grad for p in params)
+
+
+def test_build_backbone_pixel_ae_is_in_eval_mode(fake_m2):
+    path, _ = fake_m2
+    assert build_backbone("pixel_ae", checkpoint=path).training is False
+
+
+def test_build_backbone_pixel_ae_missing_checkpoint_names_the_path(tmp_path):
+    """Matched on the guard's own wording, not just the exception type:
+    `torch.load` raises its own FileNotFoundError with the path in it, so a
+    type-only assertion passes with the guard deleted. The guard exists to
+    say WHICH backbone wanted the file and how M2 produces it."""
+    missing = tmp_path / "nowhere" / "autoencoder_cnn.pt"
+    with pytest.raises(
+        FileNotFoundError,
+        match="pixel_ae checkpoint not found at " + re.escape(str(missing)),
+    ):
+        build_backbone("pixel_ae", checkpoint=missing)
+
+
+def test_build_backbone_pixel_ae_rejects_a_non_cnn_checkpoint(fake_m2, tmp_path):
+    """Only the arm tag differs from a loadable checkpoint. A loader that
+    skipped the tag and relied on `load_state_dict` failing would pass a
+    mismatched-weights test and still accept this file."""
+    _, state = fake_m2
+    wrong = tmp_path / "autoencoder_frozen_ssl.pt"
+    torch.save({"arm": "frozen_ssl", "state_dict": state}, wrong)
+    with pytest.raises(ValueError, match="frozen_ssl"):
+        build_backbone("pixel_ae", checkpoint=wrong)
+
+
+def test_build_backbone_pixel_ae_reads_the_default_path_when_none_is_given(
+    fake_m2, monkeypatch
+):
+    """`checkpoint=None` means the module default, not "no checkpoint"."""
+    path, _ = fake_m2
+    monkeypatch.setattr(features, "PIXEL_AE_CHECKPOINT", path)
+    assert build_backbone("pixel_ae").training is False
+    monkeypatch.setattr(features, "PIXEL_AE_CHECKPOINT", path.with_name("absent.pt"))
+    with pytest.raises(FileNotFoundError, match="absent.pt"):
+        build_backbone("pixel_ae")
+
+
+def test_pixel_ae_encode_output_shape_and_dtype(pixel_ae):
+    out = pixel_ae.encode(_frames(0, n=3))
+    assert out.shape == (3, 64, 32)
+    assert out.dtype == np.float16
+
+
+def test_pixel_ae_encode_is_byte_identical_on_repeat(pixel_ae):
+    frames = _frames(1)
+    assert np.array_equal(pixel_ae.encode(frames), pixel_ae.encode(frames))
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+def test_pixel_ae_encode_is_byte_identical_on_repeat_on_mps(fake_m2):
+    """`cache_features.py` runs on MPS by default; CPU repeatability alone
+    would not license the cache the study trains on."""
+    path, _ = fake_m2
+    ext = FeatureExtractor(backbone="pixel_ae", device="mps", checkpoint=path)
+    frames = _frames(6)
+    assert np.array_equal(ext.encode(frames), ext.encode(frames))
+
+
+def test_pixel_ae_encode_is_the_2048_vector_partitioned_row_major(pixel_ae, fake_m2):
+    """Row r of the (64, 32) grid is dims [32r, 32r+32) of the encoder's
+    output. Any other partition -- transposed, or a (32, 64) grid swapped
+    into place -- is a permutation of the same numbers, so shape cannot catch
+    it; flattening back must reproduce the encoder's output bit-for-bit."""
+    from mbfps.models.encoders import CNNEncoder
+    from mbfps.utils.config import EncoderConfig
+
+    _, state = fake_m2
+    reference = CNNEncoder(EncoderConfig(kind="cnn")).eval()
+    reference.load_state_dict(
+        {k[len("encoder."):]: v for k, v in state.items() if k.startswith("encoder.")}
+    )
+    frames = _frames(2)
+    with torch.no_grad():
+        expected = reference(torch.from_numpy(frames)).to(torch.float16).numpy()
+    assert expected.shape == (2, 2048)
+    # Self-check: the values must be distinct enough that a permutation is
+    # detectable, or this test could not tell row-major from any other order.
+    assert np.unique(expected[0]).size > 1500
+
+    flat = pixel_ae.encode(frames).reshape(2, 2048)
+    assert np.array_equal(flat, expected)
+
+
+def test_pixel_ae_encode_feeds_raw_uint8_with_no_imagenet_normalisation(pixel_ae, fake_m2):
+    """M2 trained the CNN on `uint8 / 255 - 0.5`, which `CNNEncoder.forward`
+    applies itself. ImageNet mean/std on top would shift every input off the
+    distribution the weights were fit on. Asserts closeness to the raw path
+    AND clear separation from the normalised one, so the check is not vacuous."""
+    from mbfps.models.encoders import CNNEncoder
+    from mbfps.utils.config import EncoderConfig
+
+    _, state = fake_m2
+    reference = CNNEncoder(EncoderConfig(kind="cnn")).eval()
+    reference.load_state_dict(
+        {k[len("encoder."):]: v for k, v in state.items() if k.startswith("encoder.")}
+    )
+    frames = _frames(3)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    # What a copy-pasted ViT preprocessing branch would hand the CNN: floats
+    # already scaled, which the CNN then divides by 255 again.
+    normalised_input = (frames.astype(np.float32) / 255.0 - mean) / std
+    with torch.no_grad():
+        raw = reference(torch.from_numpy(frames)).numpy()
+        normalised = reference(torch.from_numpy(normalised_input)).numpy()
+
+    actual = pixel_ae.encode(frames).reshape(2, 2048).astype(np.float32)
+    # Tolerances are RELATIVE to the output scale. A random-init CNN emits
+    # values of order 5e-3 (the near-constant embedding of design §1), so an
+    # absolute atol=1e-2 would accept the normalised path too and the test
+    # would pass against either implementation. float16 keeps ~3 significant
+    # digits; 5e-3 covers its round-trip and nothing more.
+    scale = float(np.abs(raw).max())
+    tol = dict(rtol=5e-3, atol=5e-3 * scale)
+    assert np.allclose(actual, raw, **tol)
+    assert not np.allclose(normalised, raw, **tol), (
+        "raw and normalised encodings agree within tolerance; this test "
+        "cannot detect whether normalisation is applied"
+    )
+
+
+def test_pixel_ae_encode_rejects_wrong_frame_shape(pixel_ae):
+    with pytest.raises(ValueError, match="expected frames of shape"):
+        pixel_ae.encode(np.zeros((2, 64, 64, 3), dtype=np.uint8))
+
+
+def test_pixel_ae_encode_refuses_an_encoder_of_the_wrong_width(pixel_ae, monkeypatch):
+    """A checkpoint with a different `embed_dim` would otherwise die inside
+    `reshape` with a message about tensor sizes, not about the backbone."""
+    monkeypatch.setattr(pixel_ae, "model", lambda x: torch.zeros(len(x), 2047))
+    with pytest.raises(ValueError, match=r"pixel_ae.*2047.*64 x 32"):
+        pixel_ae.encode(_frames(4))
+
+
+def test_vit_encode_refuses_the_wrong_patch_count(extractor, monkeypatch):
+    """The shared post-branch guard, exercised on the ViT path: 1 + 63 tokens
+    (a wrong patch size) must be named, not silently cached as 63 rows."""
+
+    class _Out:
+        last_hidden_state = torch.zeros(2, 1 + 63, 384)
+
+    monkeypatch.setattr(extractor, "model", lambda pixel_values: _Out())
+    # registered (64, 384) first, emitted (63, 384) second -- Task 1's field order
+    with pytest.raises(ValueError, match=r"dinov2.*\(64, 384\).*\(63, 384\)"):
+        extractor.encode(_frames(5))
+
+
+def test_pixel_ae_cache_writes_64_by_32_rows_to_its_own_suffix(tmp_path, pixel_ae):
+    """End to end through `cache_episode_features`: the pixel_ae cache must
+    land in `.features_pixel_ae.npy` with the registry's geometry, so the
+    loader's shape validation and `feature_suffix` agree with what is on disk."""
+    keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
+    episode = Episode(
+        obs=np.zeros((4, *OBS_SHAPE), dtype=np.uint8),
+        actions=np.zeros(3, dtype=np.int32),
+        rewards=np.zeros(3, dtype=np.float32),
+        terminated=np.zeros(3, dtype=bool),
+        truncated=np.zeros(3, dtype=bool),
+        privileged=np.zeros((4, len(keys)), dtype=np.float32),
+        privileged_keys=keys,
+        policy_name="random",
+        seed=0,
+        scenario="my_way_home",
+    )
+    path = tmp_path / "ep_000000_len00003.npz"
+    save_episode(episode, path)
+    out = cache_episode_features(path, pixel_ae)
+    assert out.name == "ep_000000_len00003.features_pixel_ae.npy"
+    saved = np.load(out)
+    assert saved.shape == (4, 64, 32)  # literal: this is the on-disk contract
+    assert saved.dtype == np.float16
