@@ -2,8 +2,8 @@
 
 A job trains one arm at one seed, evaluates it, and emits a JSON-serialisable
 record. The driver in `scripts/run_study.py` is resumable off these records, so
-a job that has already produced one is never re-run -- which matters when the
-pixel arm costs 8.3 h per seed against the feature arms' 1.4 h.
+a job that has already produced one is never re-run -- which matters when a
+cell costs ~1.5 h and nine of them run unattended.
 
 WHAT THIS MODULE DOES NOT DO: recompute anything. The band statistics and the
 degeneracy threshold come from `mbfps.eval.summary`, which
@@ -249,10 +249,10 @@ def write_record(path: Path, record: dict) -> dict:
     `allow_nan=False` is the belt to `to_json_record`'s braces: if any
     non-finite value ever escapes the sanitiser, this raises instead of writing
     a bare `NaN` token that the aggregation step would only discover nine runs
-    and thirty GPU-hours later.
+    and 13.5 GPU-hours later.
 
     THE WRITE IS ATOMIC, and that is a requirement of the driver rather than a
-    nicety. `scripts/run_study.py` decides whether an 8.3-hour cell has already
+    nicety. `scripts/run_study.py` decides whether a ~1.5-hour cell has already
     been paid for by reading this file, so the file must only ever exist in two
     states: absent, or a complete record. A plain `write_text` truncates the
     destination first and then streams; a process killed in between -- the
@@ -316,10 +316,10 @@ def load_record(path: Path) -> dict:
 
 
 UNKNOWN_GIT_SHA = "unknown"
-"""What `_git_sha` reports when git cannot answer. Never an exception."""
+"""What `git_sha` reports when git cannot answer. Never an exception."""
 
 
-def _git_sha() -> str:
+def git_sha() -> str:
     """The commit the code that is running was checked out from, or "unknown".
 
     Asked of the directory THIS FILE lives in, not of the process's working
@@ -327,7 +327,16 @@ def _git_sha() -> str:
     cells", and the code state is wherever `mbfps` was imported from -- the
     editable install on the laptop, or a checkout on the rented box. A run
     launched from somewhere else (`cd /scratch && python .../run_study.py`)
-    must not report the sha of /scratch.
+    must not report the sha of /scratch. The package is installed editable,
+    so `mbfps.__file__` resolves into this repository's own checkout and the
+    sha is that checkout's HEAD -- which is what makes "no HEAD movement
+    during the run" a sufficient operating rule for a single-sha study.
+
+    PUBLIC, and the only sha the study writes: `scripts/spike_pixel_ae.py`
+    records the same field and used to carry its own copy, asked of the
+    process's cwd with `check=True` -- so a spike launched from outside the
+    repo wrote "unknown" while study records from the same checkout carried
+    the real sha. One function, one set of semantics, one set of tests.
 
     NEVER RAISES. A rented box without git installed, a checkout unpacked from
     a tarball with no `.git`, a `git` that hangs on a stale lock: every one of
@@ -356,6 +365,30 @@ def _git_sha() -> str:
     # as a second guard rather than folded into the one above so each half
     # can be mutation-tested alone.
     return completed.stdout.strip() or UNKNOWN_GIT_SHA
+
+
+def history_record(history: dict) -> dict:
+    """The record's `history` block: the FULL per-step `loss` and `parts`.
+
+    The whole curve, every step, both the total and its five terms, so that
+    the next "the pixel arm's KL never cleared the floor" is a measurement
+    read off nine files instead of a reconstruction (M3b write-up open item
+    6). Coerced element by element so the block holds plain floats whatever
+    `train_world_model` appended -- a numpy scalar becomes a float, and a
+    non-finite one SURVIVES the coercion and is written through the
+    `nonfinite` map by `write_record`, never dropped and never zeroed.
+
+    One home for that policy: `run_job` and `scripts/spike_pixel_ae.py` both
+    write this block, and two copies of the comprehension would be two places
+    for a `[-20:]` to creep into.
+    """
+    return {
+        "loss": [float(v) for v in history["loss"]],
+        "parts": [
+            {str(k): float(v) for k, v in part.items()}
+            for part in history["parts"]
+        ],
+    }
 
 
 def _trainable_parameters(module: torch.nn.Module) -> int:
@@ -444,11 +477,12 @@ def run_job(
       * `history`        -- the FULL per-step `loss` and `parts`, so the next
                             "the pixel arm's KL never cleared the floor" is a
                             measurement read off nine files instead of a
-                            reconstruction. ~3 MB per record at 20,000 steps
-                            with `indent=2`; the aggregation reads the scalar
-                            fields and never touches it, and `_sanitise` maps
-                            a non-finite loss at step k to `history.loss.k`
-                            like any other nested field.
+                            reconstruction. ~4.6 MB per record at 20,000 steps
+                            with `indent=2` (measured: 457,887 bytes for the
+                            2,000-step spike record); the aggregation reads
+                            the scalar fields and never touches it, and
+                            `_sanitise` maps a non-finite loss at step k to
+                            `history.loss.k` like any other nested field.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -518,7 +552,7 @@ def run_job(
         "context": context,
         "horizon": horizon,
         "split_seed": SPLIT_SEED,
-        "git_sha": _git_sha(),
+        "git_sha": git_sha(),
         "device": str(torch_device),
         "encoder_params": int(encoder_params),
         "seconds": float(time.perf_counter() - started),
@@ -526,17 +560,8 @@ def run_job(
         "kl_rate_above_free_bits": float(history["kl_rate_above_free_bits"]),
         "kl_dyn_max": float(history["kl_dyn_max"]),
         "loss_last20": float(np.mean(history["loss"][-20:])),
-        # The whole curve, every step, both the total and its five terms.
-        # Coerced element by element so the record holds plain floats whatever
-        # `train_world_model` appended (a non-finite one survives the coercion
-        # and is written through the `nonfinite` map, never dropped).
-        "history": {
-            "loss": [float(v) for v in history["loss"]],
-            "parts": [
-                {str(k): float(v) for k, v in part.items()}
-                for part in history["parts"]
-            ],
-        },
+        # The whole curve, every step; see `history_record` for the policy.
+        "history": history_record(history),
         # The held-out episodes by name, so "all nine cells were scored on the
         # same episodes" is checkable after the fact rather than assumed.
         "episodes": {

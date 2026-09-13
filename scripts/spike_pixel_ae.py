@@ -56,7 +56,6 @@ attended, unlike the study driver, and a traceback is the right report.
 import argparse
 import contextlib
 import io
-import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -65,11 +64,11 @@ import numpy as np
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import load_episode
-from mbfps.data.features import BACKBONE_GEOMETRY
+from mbfps.data.geometry import BACKBONE_GEOMETRY, geometry_mismatch
 from mbfps.data.loader import feature_suffix
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.probe import fit_probe, probe_r2, probe_targets
-from mbfps.eval.study import SPLIT_SEED, write_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, history_record, write_record
 from mbfps.models.encoders import encoder_backbone
 from mbfps.models.rssm import KL_FREE_BITS
 from mbfps.training.world_model import train_world_model
@@ -207,6 +206,11 @@ def step0_embedding_loss(cfg, buffer: ReplayBuffer) -> float:
     Adam step per arm, which is seconds. The one-step run's own "kl_dyn
     exceeded the floor on only x% of steps" warning is meaningless at a single
     step and is swallowed; the 2,000-step run's warning is not.
+
+    The swallowing is `redirect_stdout`, so it holds only while that WARNING
+    is a `print` in `train_world_model`. Moved to `logging` or to stderr it
+    would reappear here, three times per spike, and this docstring is the
+    note to read when it does.
     """
     one_step = replace(cfg, train=replace(cfg.train, steps=1))
     with contextlib.redirect_stdout(io.StringIO()):
@@ -221,18 +225,19 @@ def step0_embedding_loss(cfg, buffer: ReplayBuffer) -> float:
 def load_cached_features(path: Path, backbone: str) -> np.ndarray:
     """`(T+1, n_patches * patch_dim)` float64 rows of `backbone`'s cache for one episode.
 
-    Validated against `BACKBONE_GEOMETRY` by name, like the loader: a cache
-    at another geometry is refused here rather than flattened into a probe of
-    the wrong width that scores something.
+    Validated against `BACKBONE_GEOMETRY` by name, like the loader and with
+    the loader's own message: a cache at another geometry is refused here
+    rather than flattened into a probe of the wrong width that scores
+    something.
     """
     n_patches, patch_dim = BACKBONE_GEOMETRY[backbone]
     feature_path = path.with_suffix(feature_suffix(backbone))
     features = np.load(feature_path)
     if tuple(features.shape[1:]) != (n_patches, patch_dim):
-        raise ValueError(
-            f"{feature_path.name} holds rows of shape {tuple(features.shape[1:])}, "
-            f"but backbone {backbone!r} caches {(n_patches, patch_dim)}"
-        )
+        raise ValueError(geometry_mismatch(
+            backbone, (n_patches, patch_dim), tuple(features.shape[1:]),
+            path=feature_path,
+        ))
     return features.reshape(features.shape[0], n_patches * patch_dim).astype(np.float64)
 
 
@@ -288,7 +293,7 @@ def cached_feature_probe(
         "ridge": float(probe["ridge"]),
         "selection_r2": float(probe["r2"]),
         "n_fit_episodes": spare,
-        "n_select_episodes": len(used) - spare,
+        "n_select_episodes": select_episodes,
         "n_scored_episodes": len(scored),
         "n_scored_rows": int(y_val.shape[0]),
         "n_columns": int(x_fit.shape[1]),
@@ -299,21 +304,51 @@ def cached_feature_probe(
 # record, report, main
 # --------------------------------------------------------------------------
 
-def git_sha() -> str:
-    """`git rev-parse HEAD`, or "unknown". Never raises: a missing `git` on the
-    box must not be the thing that loses a 10-minute run's record."""
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-            check=True, timeout=10,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-    return out or "unknown"
-
-
 def spike_record_path(out_dir) -> Path:
     return Path(out_dir) / f"spike_{SPIKE_ARM}_seed{SPIKE_SEED}.json"
+
+
+def build_record(
+    history: dict, probe: dict, side_by_side: dict, *,
+    train_paths, val_paths, steps: int, seq_len: int, batch_size: int,
+    device: str,
+) -> dict:
+    """The spike's record, from the three measurements and the run's settings.
+
+    Pure: no training, no file. `main` used to assemble this inline after the
+    8-minute run, so the write/exit path -- the checks judged from the history,
+    the decision from the checks, the provenance fields -- could only be
+    exercised by training. `git_sha` and `history_record` are the study's own
+    (`mbfps.eval.study`), so the spike's provenance and history carry exactly
+    the semantics the nine study records do: the sha of the code's checkout,
+    never the cwd's; the history in full, coerced element-wise, NaN surviving.
+    """
+    checks = evaluate_checks(history, probe["r2"])
+    return {
+        "arm": SPIKE_ARM,
+        "seed": SPIKE_SEED,
+        "steps": steps,
+        "seq_len": seq_len,
+        "batch_size": batch_size,
+        "split_seed": SPLIT_SEED,
+        "git_sha": git_sha(),
+        "device": str(get_device(prefer=device)),
+        "seconds": float(history["seconds"]),
+        "steps_per_second": float(history["steps"] / history["seconds"]),
+        "kl_rate_above_free_bits": float(history["kl_rate_above_free_bits"]),
+        "kl_dyn_max": float(history["kl_dyn_max"]),
+        # IN FULL. Open item 6 of the M3b write-up: section 1 of the M3c design
+        # had to be reconstructed because no run kept this.
+        "history": history_record(history),
+        "embedding_loss_step0": side_by_side,
+        "probe": probe,
+        "checks": checks,
+        "decision": decision(checks),
+        "episodes": {
+            "train": [p.name for p in train_paths],
+            "val": [p.name for p in val_paths],
+        },
+    }
 
 
 def _verdict(check: dict) -> str:
@@ -373,7 +408,10 @@ def main(argv=None) -> int:
     cfg = get_config(SPIKE_ARM, seed=SPIKE_SEED, **overrides)
     backbone = encoder_backbone(cfg.encoder)
 
-    history = train_world_model(cfg, buffer, out_dir=out_dir)
+    # The cheap measurements FIRST, before the 8-minute run: the probe reads
+    # every cache file the study will train on and the side-by-side builds
+    # all three arms' loaders, so a dead or mis-cached backbone fails at
+    # second ten rather than after the training it would have wasted.
     probe = cached_feature_probe(train_paths, val_paths, backbone)
     # Every arm, the spike's included: the pixel_ae value here is tested equal
     # to history["parts"][0]["embedding"] on CPU, and printing both on MPS is
@@ -382,42 +420,20 @@ def main(argv=None) -> int:
         arm: step0_embedding_loss(get_config(arm, seed=SPIKE_SEED, **overrides), buffer)
         for arm in ARMS
     }
-    checks = evaluate_checks(history, probe["r2"])
+    history = train_world_model(cfg, buffer, out_dir=out_dir)
 
-    record = {
-        "arm": SPIKE_ARM,
-        "seed": SPIKE_SEED,
-        "steps": args.steps,
-        "seq_len": args.seq_len,
-        "batch_size": args.batch_size,
-        "split_seed": SPLIT_SEED,
-        "git_sha": git_sha(),
-        "device": str(get_device(prefer=args.device)),
-        "seconds": float(history["seconds"]),
-        "steps_per_second": float(history["steps"] / history["seconds"]),
-        "kl_rate_above_free_bits": float(history["kl_rate_above_free_bits"]),
-        "kl_dyn_max": float(history["kl_dyn_max"]),
-        # IN FULL. Open item 6 of the M3b write-up: section 1 of the M3c design
-        # had to be reconstructed because no run kept this.
-        "history": {
-            "loss": [float(v) for v in history["loss"]],
-            "parts": [{k: float(v) for k, v in p.items()} for p in history["parts"]],
-        },
-        "embedding_loss_step0": side_by_side,
-        "probe": probe,
-        "checks": checks,
-        "decision": decision(checks),
-        "episodes": {
-            "train": [p.name for p in train_paths],
-            "val": [p.name for p in val_paths],
-        },
-    }
+    record = build_record(
+        history, probe, side_by_side,
+        train_paths=train_paths, val_paths=val_paths,
+        steps=args.steps, seq_len=args.seq_len, batch_size=args.batch_size,
+        device=args.device,
+    )
     # `write_record`, not `json.dump`: a `kl_rep` of NaN in one of 2,000 parts
     # is a bare `NaN` token no strict parser reads, and the write is atomic.
     write_record(spike_record_path(out_dir), record)
     print(report(record), flush=True)
     print(f"record: {spike_record_path(out_dir)}", flush=True)
-    return exit_status(checks)
+    return exit_status(record["checks"])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ The script is loaded by path, like `scripts/run_study.py` in its own tests:
 import importlib.util
 import math
 import re
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,7 +28,8 @@ import pytest
 from mbfps.data.episode import load_episode
 from mbfps.data.loader import feature_suffix
 from mbfps.data.split import VAL_FRACTION, episode_split
-from mbfps.eval.probe import probe_targets
+from mbfps.eval import study
+from mbfps.eval.probe import RIDGES, probe_targets
 from mbfps.eval.study import SPLIT_SEED, load_record
 from mbfps.training.world_model import train_world_model
 from mbfps.utils.config import ARMS, get_config
@@ -82,11 +84,16 @@ def _passed(checks: dict) -> dict:
 
 @pytest.fixture
 def spike_buffer(small_buffer):
-    """`small_buffer` plus a `pixel_ae` cache at the registry's (64, 32) rows.
+    """`small_buffer` with its `pixel_ae` cache OVERWRITTEN at the registry's
+    (64, 32) rows, from this file's own RNG (seed 1).
 
-    `tests/eval/conftest.py` writes the two ViT caches at (41, 64, 384). The
-    loader validates rows against `BACKBONE_GEOMETRY`, so `pixel_ae` needs its
-    own file at its own geometry or the arm cannot even build a batch.
+    `tests/eval/conftest.py` already writes all three caches, the pixel one at
+    (41, 64, 32) from its seed-0 stream. The overwrite is kept so that this
+    file's fixture is its own: the step-0 side-by-side test below asserts the
+    three arms' losses pairwise distinct, and that property is a fact about
+    THESE bytes, not about whatever conftest's shared stream happens to hand
+    the third cache. The values are noise either way; only
+    `_plant_position` writes something a probe can read.
     """
     rng = np.random.default_rng(1)
     for path in small_buffer.episode_paths():
@@ -466,7 +473,7 @@ def test_cached_feature_probe_reports_the_split_it_used(spike_buffer):
     assert result["n_select_episodes"] == 4
     assert result["n_scored_episodes"] == 1
     assert result["n_scored_rows"] == 41
-    assert result["ridge"] in (1e-1, 1e1, 1e3, 1e5, 1e7)
+    assert result["ridge"] in RIDGES, "the ridge is one of fit_probe's own grid"
     assert math.isfinite(result["selection_r2"])
 
 
@@ -478,6 +485,195 @@ def test_cached_feature_probe_needs_an_episode_to_fit_on_beyond_the_selection_se
         script.cached_feature_probe(train[:4], val, "pixel_ae")
     with pytest.raises(ValueError, match="validation"):
         script.cached_feature_probe(train, [], "pixel_ae")
+
+
+# --------------------------------------------------------------------------
+# the record, without training
+# --------------------------------------------------------------------------
+
+def _git_head(cwd: Path) -> str | None:
+    """`git rev-parse HEAD` at `cwd`, run by the TEST, or None if git cannot."""
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=cwd,
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _full_history(n: int = 23) -> dict:
+    """A `train_world_model`-shaped history with `n` distinct steps and one NaN."""
+    return {
+        "loss": [100.0 + i for i in range(n)],
+        "parts": [
+            {"embedding": 0.3 + i / 100, "reward": 2.0 + i, "continue": 3.0 + i,
+             "kl_dyn": float("nan") if i == 7 else 4.0 + i, "kl_rep": np.float32(5.0 + i)}
+            for i in range(n)
+        ],
+        "kl_rate_above_free_bits": 0.9,
+        "kl_dyn_max": 0.7,
+        "steps": n,
+        "seconds": 4.0,
+    }
+
+
+def _probe(r2: float = 0.3) -> dict:
+    return {"backbone": "pixel_ae", "r2": r2, "ridge": 1e3, "selection_r2": 0.31,
+            "n_fit_episodes": 1, "n_select_episodes": 4, "n_scored_episodes": 1,
+            "n_scored_rows": 41, "n_columns": 2048}
+
+
+def test_build_record_is_the_study_record_without_the_training(monkeypatch):
+    """The write/exit path, exercised on a fabricated history in milliseconds.
+
+    Every field that is not a straight copy of an argument is pinned to where
+    it must come from: the checks from the history and the probe, the decision
+    from the checks, `git_sha` and `history` from `mbfps.eval.study`'s own
+    helpers (spied on, so a private copy of either reappearing here is
+    visible), and `device` as the RESOLVED device, not the request string.
+    """
+    calls = {"git_sha": 0, "history_record": 0}
+    real_history_record = study.history_record
+
+    def spy_sha():
+        calls["git_sha"] += 1
+        return "sha-from-the-study-helper"
+
+    def spy_history(history):
+        calls["history_record"] += 1
+        return real_history_record(history)
+
+    monkeypatch.setattr(script, "git_sha", spy_sha)
+    monkeypatch.setattr(script, "history_record", spy_history)
+
+    history = _full_history()
+    side = {"pixel_ae": 0.35, "frozen_ssl": 0.3211, "random_vit": 0.4088}
+    train = [Path("ep_000001.npz"), Path("ep_000002.npz")]
+    val = [Path("ep_000003.npz")]
+    record = script.build_record(
+        history, _probe(0.3), side, train_paths=train, val_paths=val,
+        steps=23, seq_len=6, batch_size=2, device="cpu",
+    )
+
+    assert record["arm"] == "pixel_ae" and record["seed"] == 0
+    assert record["steps"] == 23 and record["seq_len"] == 6
+    assert record["batch_size"] == 2 and record["split_seed"] == SPLIT_SEED
+    assert record["git_sha"] == "sha-from-the-study-helper"
+    assert calls == {"git_sha": 1, "history_record": 1}
+    assert record["device"] == "cpu"
+    assert record["seconds"] == 4.0
+    assert record["steps_per_second"] == pytest.approx(23 / 4.0)
+    assert record["kl_rate_above_free_bits"] == 0.9
+    assert record["kl_dyn_max"] == 0.7
+    # NaN is not equal to itself, so the block is compared through the
+    # study's own sanitised projection rather than by `==`.
+    from mbfps.eval.study import to_json_record
+    assert to_json_record({"h": record["history"]}) == to_json_record(
+        {"h": real_history_record(history)})
+    assert record["history"]["loss"] == history["loss"]
+    assert len(record["history"]["parts"]) == 23
+    assert record["embedding_loss_step0"] is side
+    assert record["probe"] == _probe(0.3)
+    assert record["checks"] == script.evaluate_checks(history, 0.3)
+    assert record["checks"]["embedding_loss_step0"]["value"] == 0.3
+    assert record["decision"] == script.RUN_STUDY
+    assert record["episodes"] == {
+        "train": ["ep_000001.npz", "ep_000002.npz"], "val": ["ep_000003.npz"]}
+
+
+def test_build_record_decides_from_its_own_checks():
+    """Each verdict, from the inputs alone: a record whose `decision` was a
+    constant, or read from another record's checks, would agree with the
+    passing case above and nothing else."""
+    history = _full_history()
+    side = {arm: 0.35 for arm in SPIKE_ARMS}
+    kw = dict(train_paths=[], val_paths=[], steps=23, seq_len=6, batch_size=2,
+              device="cpu")
+    dead_prior = dict(history, kl_rate_above_free_bits=M3B_CNN_KL_RATE)
+    assert script.build_record(dead_prior, _probe(0.3), side, **kw)["decision"] == \
+        script.STOP_RECALIBRATE_FREE_BITS
+    assert script.build_record(history, _probe(M3B_CNN_PROBE_R2), side, **kw)["decision"] == \
+        script.STOP_BACKBONE_UNINFORMATIVE
+    collapsed = dict(history, parts=[dict(history["parts"][0],
+                                          embedding=M3B_CNN_EMBEDDING_LOSS_STEP0)]
+                     + history["parts"][1:])
+    assert script.build_record(collapsed, _probe(0.3), side, **kw)["decision"] == \
+        script.STOP_BACKBONE_UNINFORMATIVE
+
+
+def test_build_record_writes_the_history_through_the_studys_policy(tmp_path):
+    """In full, coerced element-wise, NaN surviving to the `nonfinite` map:
+    the one policy, from the one helper. A `[-20:]`, a `[:steps]` or a
+    dropped term is visible on a 23-step history with a NaN at step 7."""
+    from mbfps.eval.study import NONFINITE_KEY, write_record
+
+    history = _full_history()
+    record = script.build_record(
+        history, _probe(), {arm: 0.35 for arm in SPIKE_ARMS},
+        train_paths=[], val_paths=[], steps=5, seq_len=6, batch_size=2,
+        device="cpu",
+    )
+    assert len(record["history"]["loss"]) == 23 != record["steps"]
+    assert all(isinstance(v, float) for v in record["history"]["loss"])
+    assert all(isinstance(v, float) and not isinstance(v, np.floating)
+               for part in record["history"]["parts"] for v in part.values())
+    assert math.isnan(record["history"]["parts"][7]["kl_dyn"])
+    assert record["history"]["parts"][7]["kl_rep"] == 12.0
+    written = write_record(tmp_path / "spike.json", record)
+    assert written[NONFINITE_KEY]["history.parts.7.kl_dyn"] == "nan"
+    back = load_record(tmp_path / "spike.json")
+    assert math.isnan(back["history"]["parts"][7]["kl_dyn"])
+    assert back["history"]["loss"] == history["loss"]
+
+
+def test_the_spike_has_no_git_sha_of_its_own():
+    """`git_sha` is imported from `mbfps.eval.study`, not defined here: the
+    private copy asked the process's cwd with `check=True`, so a spike run
+    from outside the repo wrote "unknown" beside study records carrying the
+    real sha. One function, one set of semantics, one set of tests."""
+    assert script.git_sha is study.git_sha
+    assert script.history_record is study.history_record
+    assert not hasattr(script, "subprocess"), (
+        "the spike no longer shells out itself; a `subprocess` import means "
+        "a second sha (or a second anything) is being computed here")
+
+
+def test_main_runs_the_cheap_probe_and_side_by_side_before_training(
+        spike_buffer, tmp_path, monkeypatch):
+    """A dead cache must fail at second ten, not after the 8-minute run. The
+    probe raising is the dead-cache case; `train_world_model` must not have
+    been reached. The side-by-side is pinned to the same side of the run by
+    a spy that records the call order."""
+    order = []
+
+    def dead_probe(*args, **kwargs):
+        order.append("probe")
+        raise FileNotFoundError("no cached features for this backbone")
+
+    def training(*args, **kwargs):
+        order.append("train")
+        raise AssertionError("train_world_model ran before the cheap checks")
+
+    monkeypatch.setattr(script, "cached_feature_probe", dead_probe)
+    monkeypatch.setattr(script, "train_world_model", training)
+    with pytest.raises(FileNotFoundError):
+        script.main(["--data", str(spike_buffer.root), "--out", str(tmp_path / "s"),
+                     "--steps", "3", "--seq-len", "6", "--batch-size", "2",
+                     "--device", "cpu"])
+    assert order == ["probe"]
+
+    order.clear()
+    monkeypatch.setattr(script, "cached_feature_probe",
+                        lambda *a, **k: order.append("probe") or _probe())
+    monkeypatch.setattr(script, "step0_embedding_loss",
+                        lambda cfg, buffer: order.append("side") or 0.35)
+    with pytest.raises(AssertionError, match="before the cheap checks"):
+        script.main(["--data", str(spike_buffer.root), "--out", str(tmp_path / "s"),
+                     "--steps", "3", "--seq-len", "6", "--batch-size", "2",
+                     "--device", "cpu"])
+    assert order == ["probe", "side", "side", "side", "train"], order
 
 
 # --------------------------------------------------------------------------
@@ -505,7 +701,16 @@ def test_main_writes_the_full_history_the_checks_and_the_verdict(
     assert record["steps"] == 25 and record["seq_len"] == 6
     assert record["split_seed"] == SPLIT_SEED
     assert record["device"] == "cpu"
-    assert isinstance(record["git_sha"], str) and record["git_sha"]
+    # The study's own sha, pinned to a test-side `git rev-parse HEAD` exactly
+    # as `tests/eval/test_study.py` pins `run_job`'s: "is a non-empty string"
+    # was satisfied by the "unknown" a cwd-relative copy wrote from outside
+    # the repo, and by any literal.
+    head = _git_head(Path(__file__).resolve().parents[2])
+    if head is None:
+        pytest.skip("git cannot report HEAD for this checkout, so the sha "
+                    "cannot be pinned here")
+    assert record["git_sha"] == head
+    assert record["git_sha"] != study.UNKNOWN_GIT_SHA
 
     assert len(record["history"]["loss"]) == record["steps"]
     assert len(record["history"]["parts"]) == record["steps"]
@@ -524,13 +729,21 @@ def test_main_writes_the_full_history_the_checks_and_the_verdict(
     assert set(record["embedding_loss_step0"]) == set(ARMS)
     assert record["embedding_loss_step0"]["pixel_ae"] == pytest.approx(
         record["history"]["parts"][0]["embedding"], rel=1e-6)
-    assert record["decision"] == script.decision(record["checks"])
     assert (out / "world_model_pixel_ae_seed0.pt").is_file()
 
     # Fixture sanity, so the exit-10 path is genuinely exercised: 25 steps at
-    # lr 1e-4 lift a 0.03-nat dyn KL to a 0.18 peak, never past the 0.20 floor.
+    # lr 1e-4 lift a 0.03-nat dyn KL to a 0.18 peak, never past the 0.20 floor,
+    # while the noise cache's step-0 embedding loss sits inside the band and
+    # its planted-free probe still scores above zero on these six episodes.
     assert record["checks"]["kl_rate_above_free_bits"]["passed"] is False, (
         "the fixture now passes every check, so a `return 0` in main is invisible")
+    assert record["checks"]["embedding_loss_step0"]["passed"] is True
+    assert record["checks"]["probe_r2_cached_features"]["passed"] is True
+    # Checks 1 and 3 pass and 2 fails DETERMINISTICALLY on this fixture, so
+    # the decision is pinned to the literal rather than to the function that
+    # produced it: `decision(record["checks"])` on both sides would agree with
+    # any decision rule at all.
+    assert record["decision"] == script.STOP_RECALIBRATE_FREE_BITS
     assert status == script.EXIT_SPIKE_FAILED
 
     text = capsys.readouterr().out
