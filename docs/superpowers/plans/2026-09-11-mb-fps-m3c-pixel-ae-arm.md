@@ -6194,3 +6194,196 @@ Decision rule, spec §3:
   candidate), not a different floor.
 
 All three passed: Task 8 runs.
+
+## Task 8 results
+
+**Provenance.** All nine cells of `runs/m3_study_v2` were produced by **one code state** and
+**one device**, as fields rather than as a reconstruction from mtimes: `git_sha` = `ca3e140772d6bc741d4d04312763afe3dd754166`
+(= `git rev-parse HEAD`, tree clean under `src/` and `scripts/`) and `device` = `mps` in
+all nine records (`runs/m3c_check_records.py`: `OK: nine cells, one git_sha == HEAD, one
+device == mps`). torch `2.13.0`. Driver: `1` invocation(s), `study.log` from
+`2026-09-12T14:55:20` to `2026-09-13T04:23:01` (calendar span `13.461` h); total compute `13.461` h summed over the nine `seconds`
+fields. `report_study.py` exited `10` (`0` = PASSED / `10` = `EXIT_GATE_NOT_PASSED`).
+Figure: `runs/m3_study_v2/curves.png`. The spike that licensed the run (spec §3): step-0
+`embedding_loss` `0.3602`, `kl_rate_above_free_bits` `0.5865`, cached-feature probe R² `+0.3052`.
+
+Run 2026-09-12/13 under `caffeinate -dimsu`, `PYTHONDONTWRITEBYTECODE=1`, `__pycache__` cleared;
+`driver.exit` = 0. The acceptance check gained two assertions in Step 9 (every record at
+`seq_len=64, context=5, horizon=45, split_seed=0`; one shared `episodes` split of train=98 / val=24),
+after a copy of the records with one cell at `seq_len=32` and one scored on another split had
+passed the Step 1 check; the amended check passes on the real study.
+
+**The M3b records in `runs/m3_study` are not compared against** (spec §5): different
+`encoders.py`, different code state, the `cnn` arm retired and `pixel_ae` new. The M3b
+write-up stands as the record of what M3b measured.
+
+**The first number.** `kl_rate_above_free_bits` per cell, `pixel_ae` first because it is
+the reason for the re-run — M3b's pixel arm read 0.0008 here:
+
+| cell | steps/s | kl_rate | kl_dyn_max | loss_last20 | wall_h | embed_loss step 0 | probe_r2 |
+|---|---|---|---|---|---|---|---|
+| `pixel_ae`/s0 | 3.84 | **0.913** | 2.951 | 0.4261 | 1.47 | 0.3602 | +0.3661 |
+| `pixel_ae`/s1 | 3.96 | **0.832** | 11.413 | 0.2605 | 1.43 | 0.3364 | +0.0180 |
+| `pixel_ae`/s2 | 4.06 | **0.842** | 14.221 | 0.2995 | 1.39 | 0.3463 | +0.2717 |
+| `frozen_ssl`/s0 | 3.85 | 0.900 | 36.222 | 0.6415 | 1.47 | 0.3165 | +0.3597 |
+| `frozen_ssl`/s1 | 3.74 | 0.781 | 15.707 | 0.4639 | 1.51 | 0.3582 | +0.3336 |
+| `frozen_ssl`/s2 | 3.57 | 0.746 | 1.868 | 0.5645 | 1.58 | 0.3472 | +0.3829 |
+| `random_vit`/s0 | 3.77 | 0.971 | 27.575 | 0.4622 | 1.51 | 0.4104 | +0.2974 |
+| `random_vit`/s1 | 3.55 | 0.976 | 6.186 | 0.4589 | 1.59 | 0.3976 | +0.3300 |
+| `random_vit`/s2 | 3.74 | 0.956 | 10.828 | 0.4886 | 1.51 | 0.3600 | +0.2486 |
+
+`kl_rate` > 0.5 in `9` of 9 cells; `grep -c "WARNING: kl_dyn" study.log` = `0`. Read: the
+pixel arm's prior `trained` (trained on `83.2–91.3`% of steps, against the M3b arm's 0.08%), so the
+three arms `are` comparable on `_kl_rate`'s own criterion (the nine rates span 0.746–0.976, the
+`pixel_ae` cells inside the ViT arms' range). Its step-0 embedding loss (0.3364–0.3602) sits inside
+the feature-arm band the spike required, and its embedding probe is positive on all three cells,
+though `pixel_ae`/s1 at +0.0180 is the weakest probe of the nine.
+
+**`gap_closed` at h=45, position (`GATE_METRIC`),** with the three provenance columns that
+say one code state and one device produced every row. `+nan` is the contract for a
+non-positive persistence-to-floor band. Means are `np.nanmean` over the `finite` cells.
+
+| arm | encoder_params | git_sha | device | steps/s | seed 0 | seed 1 | seed 2 | mean (finite n/3) | unanimous > 0 |
+|---|---|---|---|---|---|---|---|---|---|
+| `pixel_ae` | 1056 | `ca3e14077` | mps | 3.840 / 3.957 / 4.063 | -1.1630 | -0.5878 | -0.6739 | -0.8082 (3/3) | False |
+| `frozen_ssl` | 12320 | `ca3e14077` | mps | 3.852 / 3.743 / 3.573 | -0.8523 | -0.6470 | -0.6491 | -0.7161 (3/3) | False |
+| `random_vit` | 12320 | `ca3e14077` | mps | 3.773 / 3.546 / 3.735 | -0.4419 | -0.3875 | -0.5452 | -0.4582 (3/3) | False |
+
+Every one of the nine cells is below persistence at h=45 on position, and the `pixel_ae` arm's
+mean is the most negative of the three — it loses to both ViT arms on the gate metric. The
+`encoder_params` asymmetry (1,056 against 12,320, spec §2.2) is recorded, not hidden:
+against the 9.73M-parameter RSSM and heads every arm shares byte-for-byte it is noise.
+
+**The gate**, every criterion `evaluate_gate` reports, in its order:
+
+| criterion | verdict | kind |
+|---|---|---|
+| `all_nine_cells_present` | PASS | accounting (harness) |
+| `no_duplicate_cells` | PASS | accounting (harness) |
+| `every_record_is_a_study_cell` | PASS | accounting (harness) |
+| `beats_persistence` | FAIL | spec §4.1 |
+| `band_is_usable` | FAIL | harness guard (`MAX_DEGENERATE_STEPS = 0`, both metrics) |
+| `filtering_beats_embedding` | FAIL | spec §4.4 |
+| `reward_reported` | PASS | spec §4.3 (reported, deliberately not gated) |
+| `curves_produced` | PASS | spec §4.2 |
+| `invariant_tests_green` | NOT EVALUATED by the gate; externally: `1249 passed`, exit 0 (Task 8 Step 4 pre-flight, at this HEAD) | spec §4.5 |
+| **GATE** | **NOT PASSED** (exit `10`) | |
+
+Per-cell detail for the failing criteria (`band_is_usable`: degenerate steps per cell and
+metric; `filtering_beats_embedding`: which cells read True, with margin):
+`beats_persistence` — no cell has `gap_final` > 0 on position (the nine values are the table above);
+no arm is unanimous.
+`band_is_usable` — position: `steps_degenerate` = 0 in all nine cells; angle: `pixel_ae`/s0 1,
+`pixel_ae`/s1 1, `frozen_ssl`/s0 1, the other six 0 — so `max_degenerate_steps` is 1 for `pixel_ae`
+and `frozen_ssl` against the allowed 0, and 0 for `random_vit`. The angle band is also inverted
+(floor ≥ persistence) on some steps: `pixel_ae` 4 / 14 / 0, `frozen_ssl` 2 / 3 / 4, `random_vit`
+0 / 0 / 1 steps per seed, and `frozen_ssl`/s1's angle `gap_final` is `+nan` (non-positive band at
+h=45; 2/3 finite). Position has one such step in `pixel_ae`/s1, none elsewhere.
+`filtering_beats_embedding` — True in 1 of 9 cells: `frozen_ssl`/s2 (latent 0.3376 vs embedding
+0.3353, margin +0.0023). False with margin latent − embedding: `pixel_ae` −0.0961 / −0.2924 /
+−0.1626; `frozen_ssl` −0.0429 / −0.0671; `random_vit` −0.0905 / −0.0498 / −0.1681. The
+bottleneck-free companion (joint − embedding gain) is positive with CI excluding 0 in all three
+`frozen_ssl` cells (+0.0316, +0.0407, +0.0763) and `random_vit`/s0 (+0.0239), negative with CI
+excluding 0 in `pixel_ae`/s2, `random_vit`/s1 and s2, and the report warns that the nine cells
+did not all select the same ridge decade, so its mean is not read.
+
+**Throughput and cost** (`steps_per_second` is training only; `seconds` is the whole cell):
+
+| arm | steps/s per seed | mean steps/s | hours (3 seeds) | share |
+|---|---|---|---|---|
+| `pixel_ae` | 3.840 / 3.957 / 4.063 | 3.954 | 4.295 | 31.9% |
+| `frozen_ssl` | 3.852 / 3.743 / 3.573 | 3.723 | 4.556 | 33.8% |
+| `random_vit` | 3.773 / 3.546 / 3.735 | 3.685 | 4.609 | 34.2% |
+| **total** | — | — | **13.461** | vs the spec's ~13.5 h |
+
+**Diagnostics** (`diagnose_dynamics.py`, exit `0`). Self-checks: `open_loop_k`,
+`record_repro`, `stream_drift` all exactly `0.0` on 9/9 cells; `noise_restored` True and
+`noise_same` 0 on 9/9: `yes` (yes/no — if no, which cell and which column). The ladder, position,
+horizon-mean delta (intervened − real) ± 2 SE, episode-clustered; family-wise threshold
+z = `3.31` over `54` comparisons (3 rungs × 9 cells × 2 channels). The `z` column is the held
+contrast's (constant rung, position); the shuffled and resampled rungs' z are in
+`runs/m3_study_v2/diagnostics.txt`:
+
+| cell | shuffled (order) | resampled (counts) | held FWD − held NOOP | z | verdict |
+|---|---|---|---|---|---|
+| `pixel_ae`/s0 | −0.340 ± 2.44 | −1.311 ± 4.32 | +26.763 ± 12.14 | 4.41 | RESPONDS at constant; M4 NOT blocked |
+| `pixel_ae`/s1 | +0.509 ± 0.51 | +0.505 ± 0.95 | +2.654 ± 3.40 | 1.56 | INCONCLUSIVE (shuffled z=2.01, inside family threshold) |
+| `pixel_ae`/s2 | +0.024 ± 2.07 | +0.015 ± 3.35 | +10.724 ± 18.40 | 1.17 | DOES NOT MEASURABLY USE THE ACTION; M4 BLOCKED (widest null band 28.7% of the 64.098 range) |
+| `frozen_ssl`/s0 | +0.995 ± 3.95 | +5.211 ± 7.90 | +42.592 ± 11.47 | 7.42 | RESPONDS at constant; M4 NOT blocked |
+| `frozen_ssl`/s1 | +0.033 ± 2.23 | −3.329 ± 4.81 | +26.703 ± 12.53 | 4.26 | RESPONDS at constant; M4 NOT blocked |
+| `frozen_ssl`/s2 | +1.926 ± 2.73 | −5.718 ± 6.34 | +17.655 ± 8.40 | 4.20 | RESPONDS at constant; M4 NOT blocked |
+| `random_vit`/s0 | −0.080 ± 0.54 | +2.296 ± 2.75 | +10.124 ± 7.78 | 2.60 | INCONCLUSIVE (shuffled angle z=2.04, constant z=2.60) |
+| `random_vit`/s1 | +2.032 ± 2.87 | −0.483 ± 2.05 | +12.888 ± 8.90 | 2.90 | INCONCLUSIVE (constant z=2.90) |
+| `random_vit`/s2 | −0.110 ± 1.67 | +1.089 ± 4.46 | +10.428 ± 15.16 | 1.38 | DOES NOT MEASURABLY USE THE ACTION; M4 BLOCKED (widest null band 28.2% of the 53.756 range) |
+
+Across cells (the diagnostic's own block): the constant rung on position is outside ±2 SE in
+6/9 cells and clears the family threshold in 4 (`pixel_ae`/s0 and all three `frozen_ssl`), with
+sign + in 9/9 (sign p 0.004); shuffled and resampled clear it in 0/9 on either channel.
+
+The pixel arm's verdict is `split — RESPONDS (s0) / INCONCLUSIVE (s1) / DOES NOT MEASURABLY USE (s2)` — M3b's read `UNMEASURABLE THROUGH THIS PROBE` on all three
+cells because its probe was a constant (`probe_r2` −0.036); with `probe_r2` = `+0.366 / +0.018 / +0.272` here it
+`is read through its own position probe in every cell, and no cell says UNMEASURABLE`. The k-step re-grounding sweep, position error at h=45:
+
+| cell | floor | k=1 | k=3 | k=5 | k=15 | k=45 | persistence |
+|---|---|---|---|---|---|---|---|
+| `pixel_ae`/s0 | 121.280 | 125.920 | 127.892 | 132.621 | 167.541 | 263.351 | 186.962 |
+| `pixel_ae`/s1 | 249.778 | 250.047 | 252.085 | 254.799 | 258.525 | 281.013 | 269.450 |
+| `pixel_ae`/s2 | 154.553 | 160.398 | 163.939 | 167.279 | 188.238 | 261.847 | 218.651 |
+| `frozen_ssl`/s0 | 124.487 | 126.675 | 128.547 | 128.813 | 153.152 | 214.923 | 173.311 |
+| `frozen_ssl`/s1 | 117.725 | 124.244 | 128.719 | 139.042 | 152.574 | 231.967 | 187.086 |
+| `frozen_ssl`/s2 | 122.623 | 121.909 | 128.593 | 127.221 | 141.215 | 190.467 | 163.764 |
+| `random_vit`/s0 | 157.118 | 159.204 | 163.231 | 166.966 | 180.673 | 221.455 | 201.737 |
+| `random_vit`/s1 | 138.184 | 140.259 | 139.288 | 140.409 | 163.514 | 215.680 | 194.036 |
+| `random_vit`/s2 | 155.336 | 159.288 | 163.731 | 160.053 | 184.043 | 238.398 | 209.092 |
+
+In every cell k=45 (the open-loop rollout) is above persistence and k=15 is below it; `k1_is_floor`
+is False in all nine (k=1 − floor is +0.269 to +6.519, except `frozen_ssl`/s2 at −0.714).
+
+**The pooled statistic** (`pool_dynamics.py`; `n_windows=229`, `n_episodes=24`, seeds
+averaged per window, episode-clustered; z read against t(23); family threshold z = `3.47` over 24
+comparisons). Per arm × rung, position delta ± 2 SE (z) — 2 SE is twice the printed cluster se —
+and the embedding ratio [95% cluster bootstrap] (the per-arm block is identical in both runs):
+
+| arm | shuffled | resampled | held FWD − NOOP | embedding ratio: shuffled / resampled / contrast |
+|---|---|---|---|---|
+| `pixel_ae` | +0.065 ± 0.784 (z +0.16) | −0.263 ± 1.292 (z −0.41) | +13.381 ± 5.768 (z +4.64) | 0.081 / 0.142 / 0.560 [0.512, 0.593] |
+| `frozen_ssl` | +0.985 ± 1.648 (z +1.19) | −1.279 ± 4.380 (z −0.58) | +28.983 ± 5.472 (z +10.59) | 0.245 / 0.433 / 1.040 [0.897, 1.211] |
+| `random_vit` | +0.614 ± 0.916 (z +1.34) | +0.967 ± 2.382 (z +0.81) | +11.147 ± 6.702 (z +3.33) | 0.081 / 0.124 / 0.477 [0.430, 0.531] |
+
+Pooled, `pixel_ae` and `frozen_ssl` clear the family threshold on the held contrast
+(z 4.64 and 10.59); `random_vit` at z 3.33 does not clear 3.47 and is read as `null` by the
+pathway table. No arm responds at shuffled or resampled on position or angle.
+
+The two between-arm contrasts, paired per window, held contrast row; the position line is
+the pathway as read through each arm's own probe, the embedding line is probe-free:
+
+| contrast | position delta ± 2 SE (z) | embedding ratio contrast [95% CI] | pathway reading (own-probe / probe-free) |
+|---|---|---|---|
+| `frozen_ssl` − `random_vit` | +17.837 ± 7.890 (z +4.52) | +0.553 [+0.454, +0.636] (ratios 1.071 − 0.517) | exceeds (treatment responds, control null) / exceeds |
+| `frozen_ssl` − `pixel_ae` | +15.603 ± 7.012 (z +4.45) | +0.561 [+0.468, +0.660] (ratios 1.071 − 0.510) | exceeds (both respond, contrast +) / exceeds |
+
+At the shuffled and resampled rungs both contrasts read `neither` on position and angle, and
+`exceeds` on the probe-free embedding ratio (`frozen_ssl` − `random_vit` +0.196 [+0.171, +0.222]
+and +0.365 [+0.319, +0.419]; `frozen_ssl` − `pixel_ae` +0.199 [+0.181, +0.222] and +0.350
+[+0.310, +0.409]). No `pixel_ae` − `random_vit` contrast was run: the two arms' per-arm intervals
+are uncorrected and are stated here, not compared.
+
+**What this run establishes, and what it does not.** `Three things, and one verdict. (1) The
+pixel arm is now a fair baseline under this objective: its dynamics prior trained on 83–91% of
+steps (M3b: 0.08%), its embedding target read 0.34–0.36 at step 0 (M3b: 0.0008), and every one
+of its three cells was measured through its own position probe rather than reported UNMEASURABLE.
+(2) The gate is NOT PASSED, on the same three criteria M3b failed: no arm beats persistence at
+h=45 on position (all nine gap_closed negative, pixel_ae the most negative at −0.8082 mean),
+the angle band is degenerate on one step in three cells, and the posterior latent beats the
+raw embedding in one cell of nine. (3) On the probe-free ladder the pixel arm sits between the
+two ViT arms (constant-rung embedding ratio 0.560 against random_vit's 0.477 and frozen_ssl's
+1.040), and frozen_ssl exceeds both controls on the held contrast, own-probe (z 4.52 / 4.45)
+and probe-free (CIs excluding 0 at every rung) — now against a second control that is not
+action-blind by construction, which is what this milestone set out to buy. The per-cell
+ladder is not unanimous inside any arm except frozen_ssl (pixel_ae: one RESPONDS, one
+INCONCLUSIVE, one BLOCKED; random_vit: two INCONCLUSIVE, one BLOCKED), so what the pooled
+statistic adds is the sign and size of the constant-rung response, not a per-cell M4 verdict.`
+— stated against spec §5's three
+non-claims: it does not show `pixel_ae` is the right pixel baseline in the abstract, only a
+fair one under this objective; it does not claim the feature arms' M3b failures are fixed;
+it does not compare against M3b's records.
