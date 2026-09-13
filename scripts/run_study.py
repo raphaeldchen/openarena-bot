@@ -1,18 +1,19 @@
 """Run the 3 arms x 3 seeds study, resumably.
 
 Every arm reads cached frozen-backbone features and trains at the same speed:
-measured 3.98 steps/s at seq_len=64 on the development Mac, ~1.4 h per
-20k-step cell, ~13.5 h for the nine. Under M3b the end-to-end pixel arm ran
-at 0.67 steps/s (8.3 h per cell) and was scheduled last so an interruption
-still left the treatment/control contrast complete; M3c retired that arm, so
-`_SLOW_ARMS` is empty and cells run in plain `(arm, seed)` order.
+measured 3.55-4.06 steps/s at seq_len=64 on the development Mac (MPS), ~1.5 h
+per 20k-step cell (1.39-1.59 h across the nine M3c records), ~13.5 h for the
+nine. Under M3b the end-to-end pixel arm ran at 0.67 steps/s (8.3 h per cell)
+and was scheduled last so an interruption still left the treatment/control
+contrast complete; M3c retired that arm, so `_SLOW_ARMS` is empty and cells
+run in plain `(arm, seed)` order.
 
 Resumable off the per-job JSON records, so an interrupted run costs at most one
 job rather than the whole study.
 
 WHAT "ALREADY DONE" MEANS HERE, AND WHY IT IS NOT "THE FILE EXISTS". The record
 is the study's only artifact and this script is the only thing that decides
-whether an 8.3-hour cell gets paid for twice. Three states have to be told
+whether a ~1.5-hour cell gets paid for twice. Three states have to be told
 apart:
 
   * no file                -> pending, obviously;
@@ -36,9 +37,9 @@ instead of one cell being reported twice under two names.
 
 AND "DONE" IS ALSO NOT "DONE AT SOME OTHER CONFIGURATION". A complete record
 says what it was trained with, and a record from a three-step smoke run is a
-complete record: without the check below, nine of them turn the real 33-hour
-study into a no-op that exits 0, and the gate is then computed from three-step
-models. The driver REFUSES and stops -- see `stale_records`.
+complete record: without the check below, nine of them turn the real
+~13.5-hour study into a no-op that exits 0, and the gate is then computed
+from three-step models. The driver REFUSES and stops -- see `stale_records`.
 
 FAILURE POLICY: ONE BAD CELL DOES NOT ABORT THE RUN. A job that raises is
 reported with its full traceback, counted, and the driver moves on to the next
@@ -64,6 +65,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -110,7 +112,7 @@ REQUIRED_RECORD_KEYS = frozenset({
 This is the completeness test that "the file parses" is not. `NONFINITE_KEY` is
 in the set on purpose: only `write_record` adds it, so a hand-made or
 half-converted JSON blob at a record path is treated as pending rather than
-mistaken for a finished 8.3-hour cell.
+mistaken for a finished ~1.5-hour cell.
 
 THE FOUR M3c PROVENANCE KEYS ARE REQUIRED, NOT OPTIONAL. `git_sha`, `device`,
 `encoder_params` and `history` were added so that "one code state produced
@@ -133,6 +135,17 @@ would have shrunk with it: deleting a key deleted its own test case, and every
 one of `position`, `curves`, `filtering`, `reward` and `probe` could be removed
 with a green suite.
 """
+
+PROVENANCE_KEYS = frozenset({"git_sha", "device", "encoder_params", "history"})
+"""The four keys M3c added: what a record carries that an M3b record does not.
+
+A subset of `REQUIRED_RECORD_KEYS`, named on its own because `foreign_records`
+asks a question the completeness test cannot: not "is this cell finished" but
+"was this directory written by a code state that recorded provenance at all".
+"""
+
+PRE_M3C_RECORD_KEYS = REQUIRED_RECORD_KEYS - PROVENANCE_KEYS
+"""What an M3b record holds: every required key except the four above."""
 
 CONFIG_KEYS: tuple[str, ...] = ("steps", "seq_len", "context", "horizon")
 """The fields that say what a record was trained with, not just which cell.
@@ -189,7 +202,8 @@ EXIT_CONFIG_MISMATCH = 3
 EXIT_LOCKED = 4
 EXIT_NO_DATA = 5
 EXIT_OUT_UNUSABLE = 6
-"""The six statuses an unattended run can end on. All distinct, and NONE OF
+EXIT_FOREIGN_RECORDS = 23
+"""The seven statuses an unattended run can end on. All distinct, and NONE OF
 THEM IS 2.
 
 2 is argparse's own usage status: `--data` misspelt, `--arms cnn2`, `--seeds`
@@ -208,6 +222,14 @@ FILE, a read-only mount, a full disk: every one of those used to come out of
 `EXIT_JOB_FAILED`. A wrapper reading the overnight run's status was then told
 "some cells failed, re-run to retry exactly those" when nothing ran at all and
 the command line was wrong. See `acquire_lock` and `OutDirUnusable`.
+
+`EXIT_FOREIGN_RECORDS` is 23 rather than 7 because the four M3 tools run in
+one shell into one wrapper and share one numbering: 7-10 are
+`scripts/report_study.py`'s, 11-17 `scripts/diagnose_dynamics.py`'s, 18-22
+`scripts/pool_dynamics.py`'s. It means "this --out is another study's
+directory" -- see `foreign_records` -- and it is the one status here whose
+remedy is never "delete a file": the files it refuses over are the only copy
+of somebody's cells.
 """
 
 
@@ -225,7 +247,7 @@ def _get(record, *keys):
     """`record[k1][k2]...`, or None if any step is missing or not a mapping.
 
     Used by the printing path, which must never be the thing that kills a
-    33-hour run: a record that is one field short should print `n/a` in that
+    ~13.5-hour run: a record that is one field short should print `n/a` in that
     column, not raise a KeyError between cell three and cell four.
 
     BOTH HALVES OF THE GUARD CARRY WEIGHT AND ARE TESTED ALONE. `key not in
@@ -260,6 +282,26 @@ def complete_record(path, job: StudyJob) -> dict | None:
     decides "already done" and the caller that decides "done at the requested
     configuration" must read the same bytes and agree.
     """
+    record = _parse_record_file(path)
+    if record is None:
+        return None
+    if not REQUIRED_RECORD_KEYS <= set(record):
+        return None
+    if not record_names_the_job(record, job):
+        return None
+    return record
+
+
+def _parse_record_file(path) -> dict | None:
+    """The JSON object at `path`, or None for anything that is not one.
+
+    None for: no file, a directory, an unreadable file, a file that is not
+    valid UTF-8, an empty file, JSON that does not parse, JSON that is not an
+    object, and one carrying a non-standard NaN token. Shared by
+    `complete_record` and `foreign_records`, which must agree on what "parses"
+    means -- a file that the first calls unparseable and the second calls a
+    record would be refused over or re-run over depending on which looked.
+    """
     try:
         text = Path(path).read_text()
     except (OSError, ValueError):
@@ -273,11 +315,83 @@ def complete_record(path, job: StudyJob) -> dict | None:
         return None
     if not isinstance(record, dict):
         return None
-    if not REQUIRED_RECORD_KEYS <= set(record):
-        return None
-    if not record_names_the_job(record, job):
-        return None
     return record
+
+
+_CELL_FILES = (
+    ("record", re.compile(r"result_(?P<arm>.+)_seed(?P<seed>\d+)\.json")),
+    ("checkpoint", re.compile(r"world_model_(?P<arm>.+)_seed(?P<seed>\d+)\.pt")),
+)
+"""What a cell leaves in `--out`, by name: `job_record_path` and the checkpoint
+`run_job` writes beside it. Anchored by `fullmatch`, so a quarantined
+`*.json.mislabelled` is not a record here any more than it is to the
+aggregation's glob."""
+
+
+def foreign_records(out_dir, arms=ARMS) -> list[str]:
+    """Files in `--out` that another code state wrote, one line each; empty if none.
+
+    THE QUESTION THIS ASKS IS NOT "IS THIS CELL DONE". `REQUIRED_RECORD_KEYS`
+    grew by `PROVENANCE_KEYS` in M3c, and that made every M3b record in
+    `runs/m3_study` "pending": the six feature-arm cells there parse, name
+    their cell, carry every key the gate reads and none of the four, so a
+    driver pointed at that directory sees nine pending cells and RE-RUNS OVER
+    the only copy of six ~1.5-hour cells with no warning -- the `--out`
+    default fix that landed before the run stops the bare invocation, and this
+    stops the next rename. Two shapes are refused:
+
+      * a record or checkpoint named for an arm not in `arms` -- M3b's `cnn`
+        cells, or any arm a later plan retires. The aggregation would list it
+        under RECORDS THAT ARE NOT STUDY CELLS; the driver must not write
+        beside it.
+      * a record that parses, names the cell its filename does, carries every
+        key in `PRE_M3C_RECORD_KEYS` and NONE of `PROVENANCE_KEYS` -- exactly
+        what the M3b code state wrote. A record missing only SOME of the four
+        is not this: that is a truncated or hand-edited file of our own and
+        `complete_record` already calls it pending.
+
+    Nothing here reads the file for the first shape (a name is enough) and
+    nothing raises for the second: `_parse_record_file` answers None for every
+    unreadable thing, and an unreadable file is pending, not foreign.
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return []
+    found: list[str] = []
+    for path in sorted(out_dir.iterdir()):
+        for kind, pattern in _CELL_FILES:
+            match = pattern.fullmatch(path.name)
+            if match is None:
+                continue
+            arm, seed = match["arm"], int(match["seed"])
+            if arm not in arms:
+                found.append(f"  {path.name}: a {kind} for arm {arm!r}, which "
+                             f"is not one of {list(arms)}")
+            elif kind == "record":
+                record = _parse_record_file(path)
+                if (record is not None
+                        and record_names_the_job(record, StudyJob(arm, seed))
+                        and PRE_M3C_RECORD_KEYS <= set(record)
+                        and not (PROVENANCE_KEYS & set(record))):
+                    found.append(
+                        f"  {path.name}: a complete record for {arm}/s{seed} "
+                        f"with none of {sorted(PROVENANCE_KEYS)}")
+    return found
+
+
+def foreign_report(foreign: list[str], out_dir) -> str:
+    """What the operator sees instead of a study run over another study's cells."""
+    lines = [
+        f"FOREIGN RECORDS: the --out directory {out_dir} holds cells from a "
+        "code state that recorded no provenance, or for an arm this study "
+        "does not have:",
+        *foreign,
+        "Those cells are not this study's and cannot be resumed from; running "
+        "here would train over the only copy of them. Refusing instead.",
+        "Remedy: choose a fresh --out. Do NOT delete these files -- they may "
+        "be the only record of the cells they describe.",
+    ]
+    return "\n".join(lines)
 
 
 def record_is_complete(path, job: StudyJob) -> bool:
@@ -343,7 +457,7 @@ def pending_jobs(out_dir, arms=ARMS, seeds=SEEDS) -> list[StudyJob]:
         for seed in seeds:
             job = StudyJob(arm, seed)
             if job in jobs:
-                continue  # `--arms pixel_ae pixel_ae` must not buy the same 1.4 h twice
+                continue  # `--arms pixel_ae pixel_ae` must not buy the same ~1.5 h twice
             if record_is_complete(job_record_path(out_dir, job), job):
                 continue
             jobs.append(job)
@@ -366,7 +480,7 @@ def acquire_lock(out_dir):
     """Claim `--out` for this process, or return None if someone already has.
 
     Two drivers pointed at one `--out` both see all nine cells pending and both
-    run all nine: 66 GPU-hours instead of 33, racing on the same record and
+    run all nine: 27 GPU-hours instead of 13.5, racing on the same record and
     checkpoint paths, with no warning in either log. `O_CREAT | O_EXCL` is the
     cheapest thing that makes the second one say so.
 
@@ -473,6 +587,19 @@ def _fmt(value, spec: str = ".4f") -> str:
         return str(value)
 
 
+def _short_sha(value) -> str:
+    """The first eight characters of a commit sha, or whatever is there.
+
+    Eight is what `git log --abbrev` shows and enough to tell two commits of
+    this repository apart; the full forty are in the record. "unknown" (what
+    `study.git_sha` writes when git cannot answer) is shorter than eight and
+    prints whole, which is the point: it must not look like a sha.
+    """
+    if value is None:
+        return "n/a"
+    return value[:8] if isinstance(value, str) else str(value)
+
+
 def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
     """The block printed after a cell finishes, for the morning's `study.log`.
 
@@ -480,6 +607,15 @@ def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
     script's own flags. A log that prints what we asked for cannot show that
     something else was used; printing what was recorded is what would make a
     steps/seq_len swap visible on the first cell rather than in the write-up.
+
+    THE PROVENANCE LINE IS THE LIVE DETECTOR for the two failures the record's
+    `git_sha`/`device` fields exist to expose: a HEAD that moved mid-run and a
+    device that silently fell back to CPU. Both used to be invisible until the
+    hand-typed check ran after the ninth cell; printed per cell, a second sha
+    or a `device=cpu` is in the log at hour 1.5, while the other eight cells
+    can still be spared. `encoder_params` is there because it is the one
+    number that says which bottleneck was built: 1,056 for `pixel_ae`, 12,320
+    for the two ViT arms.
     """
     lines = [
         f"  cell      arm={_get(record, 'arm')} seed={_get(record, 'seed')} "
@@ -488,6 +624,9 @@ def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
         f"seq_len={_get(record, 'seq_len')} context={_get(record, 'context')} "
         f"horizon={_get(record, 'horizon')} "
         f"split_seed={_get(record, 'split_seed')}",
+        f"  code      git_sha={_short_sha(_get(record, 'git_sha'))} "
+        f"device={_get(record, 'device')} "
+        f"encoder_params={_get(record, 'encoder_params')}",
         f"  timing    wall={_fmt(wall_seconds, '.1f')}s "
         f"recorded={_fmt(_get(record, 'seconds'), '.1f')}s "
         f"steps_per_second={_fmt(_get(record, 'steps_per_second'), '.2f')}",
@@ -525,7 +664,7 @@ def job_summary(job: StudyJob, record: dict, wall_seconds: float) -> str:
 
 
 def stale_report(stale: list, out_dir) -> str:
-    """What the operator sees instead of a 33-hour run that does nothing.
+    """What the operator sees instead of a ~13.5-hour run that does nothing.
 
     `out_dir` IS THE `--out` DIRECTORY AND THE MESSAGE SAYS SO TWICE. The
     remedy this report prints tells the operator to delete files, and it used
@@ -640,6 +779,14 @@ def main(argv=None) -> int:
     if complaint is not None:
         parser.error(complaint)
 
+    # Before anything reads --out as a study: a directory another code state
+    # wrote is not one, and every cell in it would otherwise be "pending".
+    # Before the lock too, so the refusal leaves no claim file behind.
+    foreign = foreign_records(args.out)
+    if foreign:
+        print(foreign_report(foreign, args.out), flush=True)
+        return EXIT_FOREIGN_RECORDS
+
     jobs = pending_jobs(args.out, tuple(args.arms), tuple(args.seeds))
     listing = ", ".join(f"{j.arm}/s{j.seed}" for j in jobs) or "none"
     print(f"{datetime.now().isoformat(timespec='seconds')} "
@@ -647,7 +794,7 @@ def main(argv=None) -> int:
 
     # Before the "nothing to do" return, or nine smoke records still exit 0;
     # and before `ReplayBuffer`, so this fails in the first second rather than
-    # the thirty-third hour.
+    # the fourteenth hour.
     config = requested_config(args.steps, args.seq_len)
     stale = stale_records(args.out, tuple(args.arms), tuple(args.seeds), config)
     if stale:
@@ -697,8 +844,8 @@ def main(argv=None) -> int:
             holder = "<empty: written by a driver that died before it could "
             holder += "name itself>"
         print(f"another driver already holds {held}: {holder}\n"
-              "Two drivers on one --out run all nine cells twice -- 66 "
-              "GPU-hours instead of 33, racing on the same paths. If no run "
+              "Two drivers on one --out run all nine cells twice -- 27 "
+              "GPU-hours instead of 13.5, racing on the same paths. If no run "
               f"is alive, delete {held} and start again.", flush=True)
         return EXIT_LOCKED
     try:
@@ -711,7 +858,7 @@ def _run(args, jobs: list[StudyJob]) -> int:
     """The loop itself, with `--out` already claimed by `acquire_lock`."""
     buffer = ReplayBuffer(args.data, capacity_transitions=BUFFER_CAPACITY)
     if not buffer.episode_paths():
-        # Fail on the first second rather than the thirty-third hour: with no
+        # Fail on the first second rather than the fourteenth hour: with no
         # episodes every one of the nine cells fails identically inside
         # `episode_split`, and the log would be nine copies of one mistake.
         print(f"no episodes in {args.data}; nothing can be trained", flush=True)

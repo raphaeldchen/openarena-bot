@@ -1,7 +1,7 @@
 """The driver over the nine cells: which ones are pending, in what order.
 
-This script decides whether an 8.3-hour cell gets paid for a second time, and
-it is the only thing standing between a 33-hour unattended run and a morning
+This script decides whether a ~1.5-hour cell gets paid for a second time, and
+it is the only thing standing between a ~13.5-hour unattended run and a morning
 with nothing to show. Two failure modes are worth more than everything else
 here and every test below serves one of them:
 
@@ -166,6 +166,7 @@ SUMMARY_VALUES = {
     "filtering.gain": 5127.0, "filtering.ci_low": 5128.0,
     "filtering.ci_high": 5129.0,
     "reward.mse": 5130.0, "reward.baseline_mse": 5131.0, "reward.r2": 5132.0,
+    "encoder_params": 5133,
     "wall_seconds": SUMMARY_WALL_SECONDS,
 }
 """One distinct value per rendered field. Booleans are deliberately absent.
@@ -208,6 +209,17 @@ SUMMARY_BOOLEANS = {
     "filtering.latent_beats_embedding": False,
     "reward.is_degenerate": True,
 }
+
+#: The two STRINGS `job_summary` prints on its provenance line.
+#
+# Out of the distinctness table for the same reason the booleans are: they are
+# not numbers. The sha's first eight characters differ from its remaining
+# thirty-two on purpose, so the block can tell `git_sha[:8]` from the whole
+# sha, from `[:7]` and from `[:9]`; and both differ from `_record_body`'s own
+# "0123456789abcdef..." / "device-from-the-record" and from `CLI_DEVICE`, so a
+# line that read either field from anywhere but this record would show it.
+SUMMARY_GIT_SHA = "f00d5134" + "e" * 32
+SUMMARY_DEVICE = "device-from-the-summary-record"
 
 #: Every number above that a mutation could exchange for another. All distinct.
 PAIRWISE_DISTINCT_PARAMETERS = {
@@ -261,7 +273,7 @@ UNEVEN_SEEDS = (0, 1, 2, CLI_SEED)
 # smaller set satisfies just as well. Every one of "position", "curves",
 # "filtering", "reward" and "probe" could be removed with a green suite, and a
 # pixel_ae record with no position block would then have been marked done: the
-# 8.3-hour cell never re-runs and the gate is evaluated on a record carrying no
+# ~1.5-hour cell never re-runs and the gate is evaluated on a record carrying no
 # position metric.
 #
 # So this literal is typed out by hand and compared for EQUALITY. Equality is
@@ -303,7 +315,7 @@ below be an EQUALITY against a real record instead of a subset test.
 # ---------------------------------------------------------------------------
 # THE EXIT STATUSES, ALSO WRITTEN OUT INDEPENDENTLY.
 #
-# Nobody is watching the 33-hour run, so the process status is what a wrapper,
+# Nobody is watching the ~13.5-hour run, so the process status is what a wrapper,
 # an `&&` or a CI step actually reads. `EXIT_NO_DATA` used to be 2 -- which is
 # argparse's own usage status, and not ours to reuse -- so `--data` misspelt
 # and a box that mounted no episodes were indistinguishable to everything
@@ -325,15 +337,24 @@ EXPECTED_EXIT_STATUS = {
     "EXIT_LOCKED": 4,
     "EXIT_NO_DATA": 5,
     "EXIT_OUT_UNUSABLE": 6,
+    "EXIT_FOREIGN_RECORDS": 23,
 }
 """Every status `main` can return, spelled out. 2 is deliberately absent.
 
-`EXIT_OUT_UNUSABLE` is the newest and was added for the same reason
-`EXIT_NO_DATA` stopped being 2: `--out` naming an existing file, a read-only
-mount or a full disk came out of `main` as an uncaught traceback, and an
-uncaught traceback exits 1 -- which IS `EXIT_JOB_FAILED`. The wrapper reading
-the overnight run's status was told "some cells failed, re-run to retry exactly
-those" when nothing had run.
+`EXIT_OUT_UNUSABLE` was added for the same reason `EXIT_NO_DATA` stopped
+being 2: `--out` naming an existing file, a read-only mount or a full disk
+came out of `main` as an uncaught traceback, and an uncaught traceback exits 1
+-- which IS `EXIT_JOB_FAILED`. The wrapper reading the overnight run's status
+was told "some cells failed, re-run to retry exactly those" when nothing had
+run.
+
+`EXIT_FOREIGN_RECORDS` is the newest, and 23 rather than 7 because the four M3
+tools share one numbering (7-22 are the report's, the diagnostics' and the
+pooling script's; `tests/eval/test_pool_dynamics_script.py` holds the
+cross-script literal). It is the status for a `--out` that another code state
+wrote -- M3b's `runs/m3_study`, whose nine records became "pending" the day
+the four provenance keys were required, so that a driver pointed there would
+have re-run over the only copy of six cells.
 """
 
 
@@ -496,6 +517,8 @@ def _summary_record() -> dict:
         steps_per_second=value["steps_per_second"],
         kl_rate_above_free_bits=value["kl_rate_above_free_bits"],
         kl_dyn_max=value["kl_dyn_max"], loss_last20=value["loss_last20"],
+        git_sha=SUMMARY_GIT_SHA, device=SUMMARY_DEVICE,
+        encoder_params=value["encoder_params"],
         # Two train episodes and one val: the counts differ, so the mutation
         # that reports each under the other's label changes the text.
         episodes={"train": ["ep_a.npz", "ep_b.npz"], "val": ["ep_c.npz"]},
@@ -542,6 +565,8 @@ EXPECTED_SUMMARY = "\n".join([
     "  cell      arm=pixel_ae seed=2 (requested frozen_ssl/s1)",
     "  recorded  steps=5101 seq_len=5102 context=5103 horizon=5104 "
     "split_seed=5105",
+    "  code      git_sha=f00d5134 device=device-from-the-summary-record "
+    "encoder_params=5133",
     "  timing    wall=42.5s recorded=5106.0s steps_per_second=5107.00",
     "  training  kl_rate_above_free_bits=5108.000 kl_dyn_max=5109.000 "
     "loss_last20=5110.0000",
@@ -664,11 +689,11 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
         "these fixture parameters collide, so every assertion that tells one "
         "from the other is now a tautology and a mutation exchanging them "
         f"survives the suite: {collisions}")
-    assert len(set(values)) == len(PAIRWISE_DISTINCT_PARAMETERS) == 53, (
+    assert len(set(values)) == len(PAIRWISE_DISTINCT_PARAMETERS) == 54, (
         "an entry was dropped from the table rather than made distinct; the "
         "count is spelled out so that deleting a colliding parameter cannot "
         "be mistaken for fixing it")
-    assert len(SUMMARY_VALUES) == 33, (
+    assert len(SUMMARY_VALUES) == 34, (
         "every field `job_summary` renders needs a distinct value here, or "
         "the character-for-character assertion on the block cannot tell that "
         "field from the one beside it")
@@ -687,6 +712,16 @@ def test_the_fixture_parameters_are_pairwise_distinct_so_no_assertion_is_vacuous
             is not SUMMARY_BOOLEANS["reward.is_degenerate"]), (
         "the two booleans `job_summary` prints agree in the fixture, so a "
         "mutation printing either under the other's label is invisible")
+
+    # The two provenance strings: the sha's head must differ from its tail
+    # (or `[:8]` cannot be told from the whole sha), and neither string may
+    # be one that any other fixture or the command line already uses.
+    assert len(SUMMARY_GIT_SHA) == 40
+    assert SUMMARY_GIT_SHA[:8] not in SUMMARY_GIT_SHA[8:]
+    assert SUMMARY_GIT_SHA != _record_body(SUMMARY_RECORD_JOB)["git_sha"]
+    assert SUMMARY_DEVICE not in {
+        CLI_DEVICE, DEFAULT_DEVICE, "mps", "cpu",
+        _record_body(SUMMARY_RECORD_JOB)["device"]}
 
     # The parser's defaults are two of those thirteen, and they are only
     # distinct-by-construction if they really are the defaults.
@@ -740,7 +775,7 @@ def test_the_driver_uses_the_studys_own_arms_and_seeds():
     assert NONFINITE_KEY in run_study.REQUIRED_RECORD_KEYS, (
         "only `write_record` adds this key, so requiring it is what stops a "
         "hand-made JSON blob at a record path from being mistaken for a "
-        "finished 8.3-hour cell")
+        "finished ~1.5-hour cell")
 
 
 def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
@@ -762,7 +797,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     assert actual == EXPECTED_EXIT_STATUS, (
         "an exit status was renumbered; every wrapper, `&&` and CI step that "
         "reads this run's status reads these numbers")
-    assert len(set(actual.values())) == len(EXPECTED_EXIT_STATUS) == 6, (
+    assert len(set(actual.values())) == len(EXPECTED_EXIT_STATUS) == 7, (
         "two statuses collide, so the run cannot say which thing went wrong")
     assert ARGPARSE_USAGE_STATUS not in actual.values(), (
         "this status belongs to argparse's own usage errors; a study status "
@@ -782,7 +817,7 @@ def test_the_parser_defaults_name_the_studys_own_directories():
     `test_main_forwards_the_documented_defaults`; these two were not, and they
     are exactly the pair the documented no-flag invocation depends on. A silent
     drift in `--out` writes the nine records where the aggregation does not
-    read: the study looks unstarted, and the next resume pays for all 33 hours
+    read: the study looks unstarted, and the next resume pays for all 13.5 hours
     again. A drift in `--data` points the driver at a directory with no
     episodes, where every cell fails identically.
     """
@@ -844,8 +879,8 @@ def test_all_nine_jobs_are_pending_on_a_fresh_directory(tmp_path):
 @pytest.mark.parametrize("job", [DONE_JOB, CORRUPT_JOB, INCOMPLETE_JOB],
                          ids=lambda j: f"{j.arm}_s{j.seed}")
 def test_a_job_with_a_complete_record_is_skipped(tmp_path, job):
-    """Resumability. The pixel arm is 8.3 h per seed; re-running it is a lost
-    day. Parametrised over all three arms because a skip that only fires for
+    """Resumability. Every cell is ~1.5 h; re-running one is a lost
+    afternoon. Parametrised over all three arms because a skip that only fires for
     one of them would leave the study re-running the other six cells."""
     _write_complete(tmp_path, job)
     jobs = run_study.pending_jobs(tmp_path, ARMS, SEEDS)
@@ -868,7 +903,7 @@ def test_pending_jobs_reads_the_arms_and_seeds_it_is_given(tmp_path):
 
 
 def test_a_repeated_arm_or_seed_does_not_buy_the_same_cell_twice(tmp_path):
-    """`--arms pixel_ae pixel_ae` is a typo, not a request for 16.6 GPU-hours."""
+    """`--arms pixel_ae pixel_ae` is a typo, not a request for 9 GPU-hours."""
     assert run_study.pending_jobs(tmp_path, ("pixel_ae", "pixel_ae"), (0, 0)) == [
         StudyJob("pixel_ae", 0)]
 
@@ -938,7 +973,8 @@ def test_a_record_missing_any_field_is_treated_as_pending(tmp_path, missing):
     A file that fails to parse costs one re-run. A file that parses and is
     short of `position` is read by the aggregation as this cell's result, and
     the study reports a cell nobody measured. Every required key is removed in
-    turn; the control below writes the same record intact.
+    turn; the control in `_assert_missing_key_makes_the_cell_pending` writes
+    the same record intact.
 
     PARAMETRISED OVER `EXPECTED_RECORD_KEYS`, NOT OVER THE DRIVER'S OWN SET.
     Deriving the cases from the collection under test made this shrink with it:
@@ -998,9 +1034,9 @@ def test_a_record_holding_exactly_the_required_keys_is_complete(tmp_path):
     `kl_dyn_max` and `loss_last20`, which `OPTIONAL_RECORD_KEYS` above declares
     a record is allowed to lack.
 
-    Under `<` such a cell is permanently pending: every resume re-runs it, an
-    8.3-hour `pixel_ae` cell is paid for again on every attempt, and the study never
-    converges. That is the disaster `REQUIRED_RECORD_KEYS`' own docstring calls
+    Under `<` such a cell is permanently pending: every resume re-runs it, a
+    ~1.5-hour `pixel_ae` cell is paid for again on every attempt, and the
+    study never converges. That is the disaster `REQUIRED_RECORD_KEYS`' own docstring calls
     one with no symptom, and the driver and its own tests would flatly disagree
     about what a finished cell is.
     """
@@ -1109,7 +1145,7 @@ def test_a_real_record_from_run_job_is_recognised_as_complete(
         "the driver's completeness set and `run_job`'s actual output have "
         "drifted apart: a key demanded but not written makes every cell "
         "pending forever, and a key written but not demanded lets a record "
-        "short of it count as a finished 8.3-hour cell")
+        "short of it count as a finished ~1.5-hour cell")
     assert OPTIONAL_RECORD_KEYS <= written, (
         "these are subtracted above to make that an equality; if `run_job` "
         "has stopped writing them the subtraction quietly stops testing "
@@ -1118,6 +1154,238 @@ def test_a_real_record_from_run_job_is_recognised_as_complete(
     assert job not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
     # The live record is what `main` prints from, and it is not the file.
     assert run_study.record_names_the_job(record, job)
+
+
+# ---------------------------------------------------------------------------
+# foreign records: another code state's --out
+# ---------------------------------------------------------------------------
+#
+# The day the four provenance keys became required, every M3b record in
+# `runs/m3_study` turned "pending": each parses, names its cell, carries every
+# key the gate reads and none of the four. A driver pointed there saw nine
+# pending cells and would have RE-RUN OVER the only copy of six ~1.5-hour
+# cells. The `--out` default fix stops the bare invocation; `foreign_records`
+# is the guard that survives the next rename.
+
+PRE_M3C_RECORD_KEYS = EXPECTED_RECORD_KEYS - M3C_RECORD_KEYS
+"""What an M3b record holds, as this file's own literal difference."""
+
+M3B_STUDY_DIR = Path(__file__).resolve().parents[2] / "runs" / "m3_study"
+"""The real M3b directory, READ ONLY and never required: the test that copies
+two of its records into `tmp_path` skips when it is absent (a fresh clone has
+no `runs/`), and every other test here builds its foreign files by hand."""
+
+
+def _write_m3b_shaped(out_dir, job: StudyJob) -> Path:
+    """A record exactly as the M3b code state wrote one: complete for the
+    gate, without any of the four provenance keys. Through `write_record`, so
+    `nonfinite` is present as it is in the real files."""
+    body = _record_body(job)
+    for key in M3C_RECORD_KEYS:
+        del body[key]
+    assert set(body) | {NONFINITE_KEY} == PRE_M3C_RECORD_KEYS | OPTIONAL_RECORD_KEYS
+    path = job_record_path(out_dir, job)
+    write_record(path, body)
+    return path
+
+
+def test_the_pre_m3c_keys_are_the_drivers_own_difference():
+    """Pinned against the driver's split of its set, so that a key moved from
+    one side to the other -- `history` demoted to optional, say -- shows up
+    here rather than as a directory that is neither pending nor foreign."""
+    assert run_study.PROVENANCE_KEYS == M3C_RECORD_KEYS
+    assert run_study.PRE_M3C_RECORD_KEYS == PRE_M3C_RECORD_KEYS
+    assert run_study.PRE_M3C_RECORD_KEYS | run_study.PROVENANCE_KEYS == \
+        run_study.REQUIRED_RECORD_KEYS
+    assert not (run_study.PRE_M3C_RECORD_KEYS & run_study.PROVENANCE_KEYS)
+
+
+def test_an_m3b_shaped_record_is_foreign_and_a_truncated_one_of_ours_is_not(
+        tmp_path):
+    """The second shape, and its two neighbours that must NOT match it.
+
+    ALL FOUR keys absent is the M3b code state. Only SOME of the four absent
+    is a truncated or hand-edited record of our own -- `complete_record`
+    already calls that pending and a re-run is the right answer, so it must
+    not be refused over. And a complete record is a finished cell.
+    """
+    path = _write_m3b_shaped(tmp_path, DONE_JOB)
+    assert not run_study.record_is_complete(path, DONE_JOB), (
+        "fixture: the M3b shape must still read as pending to the resume "
+        "check; foreign is a refusal on TOP of that, not instead of it")
+    found = run_study.foreign_records(tmp_path)
+    assert len(found) == 1, found
+    assert path.name in found[0]
+    assert f"{DONE_JOB.arm}/s{DONE_JOB.seed}" in found[0]
+    for key in sorted(M3C_RECORD_KEYS):
+        assert key in found[0], "the refusal names the four missing keys"
+
+    # Some, not all, of the four missing: ours, pending, not foreign. Each
+    # of the four is put back ALONE, so a guard written as "any of the four
+    # absent" fails on every one of these rather than on none.
+    for kept in sorted(M3C_RECORD_KEYS):
+        body = _record_body(DONE_JOB)
+        for key in M3C_RECORD_KEYS - {kept}:
+            del body[key]
+        write_record(path, body)
+        assert not run_study.record_is_complete(path, DONE_JOB)
+        assert run_study.foreign_records(tmp_path) == [], (
+            f"a record carrying only {kept!r} of the four is a damaged record "
+            "of OURS, and refusing over it would turn one truncated file "
+            "into a study that cannot be resumed")
+
+    # The control: a complete record is a finished cell, not a foreigner.
+    _write_complete(tmp_path, DONE_JOB)
+    assert run_study.record_is_complete(path, DONE_JOB)
+    assert run_study.foreign_records(tmp_path) == []
+
+
+def test_an_m3b_shaped_record_named_for_another_cell_is_not_foreign(tmp_path):
+    """The shape is refused only when the record NAMES the cell its filename
+    does: a mislabelled file is `record_names_the_job`'s problem, and one
+    missing a gate key is merely pending. Each half of the condition alone."""
+    path = _write_m3b_shaped(tmp_path, DONE_JOB)
+    body = json.loads(path.read_text())
+    body["seed"] = CLI_SEED
+    path.write_text(json.dumps(body))
+    assert run_study.foreign_records(tmp_path) == []
+
+    body = json.loads(_write_m3b_shaped(tmp_path, DONE_JOB).read_text())
+    del body["position"]
+    path.write_text(json.dumps(body))
+    assert run_study.foreign_records(tmp_path) == [], (
+        "short of a gate key it is not a complete M3b record either; it is "
+        "pending, and pending is re-run, not refused")
+
+
+def test_a_cell_named_for_a_retired_arm_is_foreign_by_name_alone(tmp_path):
+    """The first shape: `cnn` was the study's arm under M3b and is not in
+    `ARMS`. The record need not even parse -- the name is enough, and so is a
+    checkpoint with no record beside it."""
+    (tmp_path / "result_cnn_seed0.json").write_text("not even json")
+    (tmp_path / "world_model_cnn_seed1.pt").write_bytes(b"")
+    # Neither of these is a cell file: the quarantined suffix is exactly what
+    # keeps a mislabelled record out of the aggregation's glob, and a
+    # checkpoint for a study arm is what every finished cell leaves behind.
+    (tmp_path / "result_cnn_seed2.json.mislabelled").write_text("{}")
+    (tmp_path / f"world_model_{DONE_JOB.arm}_seed{DONE_JOB.seed}.pt").write_bytes(b"")
+    (tmp_path / "study.log").write_text("cnn seed 0\n")
+
+    found = run_study.foreign_records(tmp_path)
+    assert len(found) == 2, found
+    assert "result_cnn_seed0.json" in found[0] and "record" in found[0]
+    assert "world_model_cnn_seed1.pt" in found[1] and "checkpoint" in found[1]
+    assert all("'cnn'" in line for line in found)
+    assert "mislabelled" not in "".join(found)
+
+
+def test_foreign_records_is_empty_for_an_absent_or_empty_out(tmp_path):
+    """The common case, in both forms: `--out` not created yet, and created
+    with nothing in it. Neither may raise -- this runs before the mkdir in
+    `acquire_lock` and before anything else has looked at `--out`."""
+    assert run_study.foreign_records(tmp_path / "not_yet") == []
+    assert run_study.foreign_records(tmp_path) == []
+    assert run_study.foreign_records(str(tmp_path)) == [], (
+        "argparse hands over a str, as everywhere else in the driver")
+
+
+def test_main_refuses_a_foreign_out_with_its_own_status_and_runs_nothing(
+        tmp_path, monkeypatch, capsys):
+    """THE REFUSAL, end to end: a named non-zero status, no cell trained, no
+    claim file left behind, `--data` never touched, and a remedy that says
+    "fresh --out" and never "delete"."""
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "m3b_directory"
+    _write_m3b_shaped(out, CORRUPT_JOB)
+    (out / "result_cnn_seed0.json").write_text("{}")
+    gone = tmp_path / "data_not_mounted_yet"
+
+    status = run_study.main(["--data", str(gone), "--out", str(out),
+                             *MATCHING_ARGV])
+
+    assert status == run_study.EXIT_FOREIGN_RECORDS == 23
+    assert calls == [], "a cell was trained over another study's records"
+    printed = capsys.readouterr().out
+    assert printed.startswith("FOREIGN RECORDS:"), (
+        "the refusal is the first thing in the log: a 'pending' line above "
+        "it would describe cells that are not this study's")
+    assert "recorded no provenance" in printed
+    assert "choose a fresh --out" in printed
+    assert "result_cnn_seed0.json" in printed
+    assert job_record_path(out, CORRUPT_JOB).name in printed
+    assert "delete" not in printed.replace("Do NOT delete", ""), (
+        "the remedy must never be a deletion; these files may be the only "
+        "copy of the cells they describe")
+    assert not (out / run_study.LOCK_NAME).exists(), (
+        "the refusal came after the lock was taken")
+    assert not gone.exists(), (
+        "the refusal came after `ReplayBuffer` was asked for the episodes")
+
+
+def test_main_refuses_before_the_lock_so_a_stale_claim_does_not_hide_it(
+        tmp_path, monkeypatch, capsys):
+    """Order pinned: a foreign directory that also holds a claim file is
+    reported as FOREIGN, not LOCKED. The lock's remedy is "delete the claim
+    and start again", which for this directory is the disaster itself."""
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    out = tmp_path / "m3b_directory"
+    _write_m3b_shaped(out, CORRUPT_JOB)
+    (out / run_study.LOCK_NAME).write_text('{"pid": 1}')
+
+    status = run_study.main(["--data", str(tmp_path / "none"),
+                             "--out", str(out), *MATCHING_ARGV])
+
+    assert status == run_study.EXIT_FOREIGN_RECORDS
+    assert calls == []
+    assert "FOREIGN RECORDS" in capsys.readouterr().out
+    assert (out / run_study.LOCK_NAME).read_text() == '{"pid": 1}', (
+        "the stale claim must be left exactly as found")
+
+
+@pytest.mark.skipif(not M3B_STUDY_DIR.is_dir(),
+                    reason="the M3b directory runs/m3_study is not on this "
+                           "machine (runs/ is gitignored)")
+def test_main_refuses_a_copy_of_the_real_m3b_records(
+        tmp_path, monkeypatch, capsys):
+    """Against the real thing: two of M3b's own records, COPIED into
+    `tmp_path` (the M3b directory is read and never written), one of each
+    shape -- `cnn`, an arm not in `ARMS`, and `frozen_ssl`, a complete
+    pre-M3c record with no provenance. Both fixture facts are asserted before
+    the driver sees them, so this cannot pass by the first shape alone."""
+    out = tmp_path / "copy_of_m3b"
+    out.mkdir()
+    names = ("result_cnn_seed0.json", "result_frozen_ssl_seed0.json")
+    originals = {}
+    for name in names:
+        source = M3B_STUDY_DIR / name
+        if not source.is_file():
+            pytest.skip(f"{source} is not on this machine")
+        originals[name] = source.read_bytes()
+        (out / name).write_bytes(originals[name])
+    assert "cnn" not in ARMS
+    frozen = json.loads(originals["result_frozen_ssl_seed0.json"])
+    assert frozen["arm"] == "frozen_ssl" and frozen["seed"] == 0
+    assert PRE_M3C_RECORD_KEYS <= set(frozen)
+    assert not (M3C_RECORD_KEYS & set(frozen)), (
+        "the M3b record carries a provenance key; the second shape is not "
+        "what this test thinks it is")
+
+    fake, calls = _spy()
+    monkeypatch.setattr(run_study, "run_job", fake)
+    status = run_study.main(["--data", str(tmp_path / "none"),
+                             "--out", str(out), *MATCHING_ARGV])
+
+    assert status == run_study.EXIT_FOREIGN_RECORDS
+    assert calls == []
+    printed = capsys.readouterr().out
+    assert all(name in printed for name in names), printed
+    assert not (out / run_study.LOCK_NAME).exists()
+    for name in names:
+        assert (out / name).read_bytes() == originals[name]
+        assert (M3B_STUDY_DIR / name).read_bytes() == originals[name], (
+            "the M3b directory was written to")
 
 
 # ---------------------------------------------------------------------------
@@ -1291,7 +1559,7 @@ def test_job_summary_survives_a_record_whose_blocks_are_not_mappings():
 
 
 def test_job_summary_never_raises_on_a_record_full_of_holes():
-    """The print must not be the thing that kills a 33-hour run.
+    """The print must not be the thing that kills a ~13.5-hour run.
 
     Every numeric field is simultaneously NaN, None or missing outright -- the
     shape a degenerate cell and a partially-sanitised record can both take.
@@ -1462,7 +1730,7 @@ def test_main_prints_the_per_cell_summary_block(
     with a green suite: `job_summary` has unit tests but nothing connected it
     to the driver's output, and the integration assertions only looked at the
     `===== [i/n] =====` banner, the pending header and the completion line.
-    With the nine records, `study.log` is the entire product of a 33-hour
+    With the nine records, `study.log` is the entire product of a ~13.5-hour
     unattended run, and that deletion empties it of every metric while leaving
     every status line intact.
 
@@ -1583,7 +1851,7 @@ def test_main_skips_the_cells_that_already_have_a_record(
 ], ids=lambda e: type(e).__name__)
 def test_a_failing_cell_does_not_abort_the_other_eight(
         tmp_path, episode_dir, monkeypatch, capsys, error):
-    """THE POLICY, tested. Nobody is watching a 33-hour unattended run, and the
+    """THE POLICY, tested. Nobody is watching a ~13.5-hour unattended run, and the
     realistic failures are per-cell; aborting throws away every remaining cell
     to punish one. The run continues, the exit status is non-zero, and the
     traceback is in the log.
@@ -1620,7 +1888,7 @@ def test_a_failing_cell_does_not_abort_the_other_eight(
     # EXACTLY the cells that failed, and not one more. The morning's first
     # question is which cells to retry, and a line naming all nine -- which is
     # what iterating `jobs` here instead of `failed` prints -- answers it
-    # wrongly and sends the operator back for another 33 hours.
+    # wrongly and sends the operator back for another 13.5 hours.
     listed = printed.split("FAILED:")[-1].split(" -- ")[0].strip()
     assert listed == f"{victim.arm}/s{victim.seed}"
 
@@ -1767,7 +2035,7 @@ def test_quarantining_twice_does_not_overwrite_the_first_file(tmp_path):
     """Two mislabelled records for one cell across two runs are two facts.
 
     Overwriting would leave the operator with the second and no sign of the
-    first, and each is the output of a real 1.4-to-8.3-hour training run.
+    first, and each is the output of a real ~1.5-hour training run.
     """
     path = job_record_path(tmp_path, DONE_JOB)
     path.write_text('{"arm": "first"}')
@@ -2042,7 +2310,7 @@ def test_the_studys_own_configuration_is_above_both_floors():
     """A floor raised past the study itself would refuse the real run.
 
     The defaults are what the plan's Step 3 command uses with no flags at all,
-    so a `MIN_STEPS` above 20000 turns the 33-hour run into a usage error.
+    so a `MIN_STEPS` above 20000 turns the ~13.5-hour run into a usage error.
     """
     defaults = vars(run_study._parser().parse_args([]))
     assert defaults["steps"] >= run_study.MIN_STEPS > 0
@@ -2159,14 +2427,14 @@ def test_nine_smoke_records_refuse_instead_of_reporting_a_finished_study(
     """THE TRAP THIS EXISTS FOR, and the plan's own Task 7 Step 1 walks into it.
 
     `record_is_complete` validated the arm and the seed and nothing about the
-    configuration, so nine records from a short smoke run made the real 33-hour
-    study a no-op: every cell read done, the driver exited 0 having trained
+    configuration, so nine records from a short smoke run made the real
+    ~13.5-hour study a no-op: every cell read done, the driver exited 0 having trained
     nothing, and the gate would have been computed from smoke-run models.
 
     It REFUSES rather than treating them as pending. Re-running would fix the
     smoke trap and create a worse one in the other direction: after the real
     study finishes, a quick 100-step check into the same --out would leave the
-    driver deciding all nine records are stale and OVERWRITING 33 hours of the
+    driver deciding all nine records are stale and OVERWRITING 13.5 hours of the
     study's only artifact, unrecoverably. Refusing costs at most one night of a
     rented box, says so on the first screen with a non-zero status, and is
     undone by one flag or one `rm`.
@@ -2200,7 +2468,7 @@ def test_nine_smoke_records_refuse_instead_of_reporting_a_finished_study(
     assert "Remedy" in printed
     assert not gone.exists(), (
         "the refusal came after `ReplayBuffer` was asked for the episodes; it "
-        "has to fail in the first second, not the thirty-third hour")
+        "has to fail in the first second, not the fourteenth hour")
     assert not (out / run_study.LOCK_NAME).exists()
 
 
@@ -2209,7 +2477,7 @@ def test_a_matching_rerun_still_skips_the_cells_that_are_finished(
     """THE OTHER HALF, and the driver's whole point.
 
     A guard that called every record stale would refuse every resume, which
-    costs the study the 33 hours the resume exists to save.
+    costs the study the 13.5 hours the resume exists to save.
     """
     fake, calls = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)
@@ -2424,7 +2692,7 @@ def test_the_refusal_says_delete_from_out_and_names_which_directory(
 def test_a_second_driver_on_the_same_out_refuses_to_start(
         tmp_path, episode_dir, monkeypatch, capsys):
     """Two drivers pointed at one --out both saw all nine cells pending and
-    both ran all nine: 66 GPU-hours instead of 33, racing on the same record
+    both ran all nine: 27 GPU-hours instead of 13.5, racing on the same record
     and checkpoint paths, with no warning in either log.
 
     THE PATH IS DEMANDED ON BOTH LINES SEPARATELY. The refusal interpolates the
@@ -2818,7 +3086,7 @@ def test_no_claim_is_left_behind_when_there_is_nothing_to_do(
 
 def test_main_lists_what_it_is_about_to_do_before_it_starts(
         tmp_path, episode_dir, monkeypatch, capsys):
-    """33 hours later the log's first line is how you tell what was attempted
+    """13.5 hours later the log's first line is how you tell what was attempted
     from what was skipped."""
     fake, _ = _spy()
     monkeypatch.setattr(run_study, "run_job", fake)

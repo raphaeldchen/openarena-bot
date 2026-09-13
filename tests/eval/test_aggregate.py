@@ -1,6 +1,6 @@
 """The cross-seed aggregation and the M3 gate verdict.
 
-This is the last computation before a human reads a number off a 33-hour study,
+This is the last computation before a human reads a number off a 13.5-hour study,
 so the tests below are written against the ways a WRONG number can look right:
 
   * a column that holds its neighbour's value -- every fixture number is
@@ -1830,8 +1830,8 @@ def test_the_gate_fails_when_one_seed_of_one_arm_is_negative():
 
 def test_the_gate_fails_when_a_whole_arm_is_missing():
     """`all()` over the arms that HAVE records is True for an arm with none.
-    The expensive arm is 25 of the study's 33 hours and is the one that does
-    not finish."""
+    Every arm is a third of the study's 13.5 hours, and the one the study
+    exists for -- `pixel_ae` -- is the one whose absence must not pass."""
     records = [r for r in _study() if r["arm"] != "pixel_ae"]
     verdict = evaluate_gate(records)
     assert verdict["criteria"]["beats_persistence"] is False
@@ -2429,6 +2429,134 @@ def test_the_training_table_reports_throughput_per_cell():
         "frozen_ssl/s1      1606.00  1706.000    1806.000    1906.0000     5.72")
 
 
+# --- provenance -------------------------------------------------------------
+#
+# `_record` carries none of the three provenance fields, because the
+# aggregation never reads them; the report does, so the tests below stamp
+# them on. One sha and one device for a coherent study, and per-cell
+# `encoder_params` that differ between the pixel_ae bottleneck and the ViT
+# arms' BY DESIGN -- which is why that column is printed but never checked.
+
+STUDY_SHA = "ca3e1407" + "a" * 32
+STUDY_DEVICE = "mps"
+ENCODER_PARAMS = {"pixel_ae": 1056, "frozen_ssl": 12320, "random_vit": 12320}
+
+
+def _with_provenance(records, sha=STUDY_SHA, device=STUDY_DEVICE):
+    for record in records:
+        record["git_sha"] = sha
+        record["device"] = device
+        record["encoder_params"] = ENCODER_PARAMS[record["arm"]]
+    return records
+
+
+def test_the_provenance_block_prints_sha_device_and_params_per_cell():
+    """Character for character, one row per cell, the FULL sha: this block
+    replaces the hand-typed check that used to be the only reader of these
+    fields, so it has to show what that check showed."""
+    block = report_study.provenance_block(_with_provenance(_rendering_study()))
+    assert _row(block, "cell") == (
+        "cell                                               git_sha  device"
+        "  encoder_params")
+    assert _row(block, "pixel_ae/s0") == (
+        f"pixel_ae/s0       {STUDY_SHA}     mps            1056")
+    assert _row(block, "frozen_ssl/s2") == (
+        f"frozen_ssl/s2     {STUDY_SHA}     mps           12320")
+    assert _row(block, "git_sha:") == (
+        f"git_sha: 1 distinct across 9 record(s): {STUDY_SHA}")
+    assert _row(block, "device:") == "device: 1 distinct across 9 record(s): mps"
+    assert "WARNING" not in block, (
+        "a coherent study must not be warned about, or the warning is noise "
+        "the reader learns to skip on the study that needs it")
+
+
+def test_the_provenance_block_warns_when_the_shas_are_not_one():
+    """A HEAD that moved after cell four: two shas, and the WARNING names
+    the field and says which cells have to be re-run. The device stays a
+    singleton, so the two warnings are told apart."""
+    records = _with_provenance(_rendering_study())
+    other = "deadbeef" + "b" * 32
+    for record in records[4:]:
+        record["git_sha"] = other
+    block = report_study.provenance_block(records)
+    assert _row(block, "git_sha:") == (
+        f"git_sha: 2 distinct across 9 record(s): {STUDY_SHA}, {other}")
+    warnings = [line for line in block.splitlines() if line.startswith("WARNING")]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith("WARNING: the records do not share one git_sha.")
+    assert "re-run" in warnings[0]
+    assert "device" not in warnings[0]
+    assert _row(block, "device:") == "device: 1 distinct across 9 record(s): mps"
+
+
+def test_the_provenance_block_warns_when_the_devices_are_not_one():
+    """The silent MPS->CPU fallback, on one cell: the device set is not a
+    singleton and the WARNING says so, while the sha line stays clean."""
+    records = _with_provenance(_rendering_study())
+    _cell(records, "random_vit", 1)["device"] = "cpu"
+    block = report_study.provenance_block(records)
+    assert _row(block, "random_vit/s1").endswith("     cpu           12320")
+    assert _row(block, "device:") == "device: 2 distinct across 9 record(s): cpu, mps"
+    warnings = [line for line in block.splitlines() if line.startswith("WARNING")]
+    assert len(warnings) == 1, warnings
+    assert warnings[0].startswith("WARNING: the records do not share one device.")
+    assert "git_sha" not in warnings[0]
+    assert _row(block, "git_sha:") == (
+        f"git_sha: 1 distinct across 9 record(s): {STUDY_SHA}")
+
+
+def test_the_provenance_block_counts_a_missing_field_as_its_own_value():
+    """A record with no `git_sha` at all is the record that cannot be shown
+    to share one: it prints n/a in its column AND breaks the singleton, so
+    the WARNING fires. A cell with no record prints MISSING and is not in
+    the denominator -- the gate block already names it."""
+    records = _with_provenance(_rendering_study())
+    del _cell(records, "frozen_ssl", 1)["git_sha"]
+    records = [r for r in records if (r["arm"], r["seed"]) != ("pixel_ae", 2)]
+    block = report_study.provenance_block(records)
+    assert _row(block, "frozen_ssl/s1") == (
+        "frozen_ssl/s1                                          n/a     mps"
+        "           12320")
+    assert _row(block, "pixel_ae/s2") == f"{'pixel_ae/s2':<16}{'MISSING':>42}"
+    assert _row(block, "git_sha:") == (
+        f"git_sha: 2 distinct across 8 record(s): {STUDY_SHA}, n/a")
+    assert "WARNING: the records do not share one git_sha." in block
+
+
+def test_the_provenance_block_never_raises_on_a_record_full_of_holes():
+    """The printing path, after the study is paid for: a `null` device, a
+    sha that is not a string, an `encoder_params` that is not a number."""
+    records = _with_provenance(_rendering_study())
+    record = _cell(records, "pixel_ae", 0)
+    record["device"] = None
+    record["git_sha"] = 12345
+    record["encoder_params"] = "many"
+    block = report_study.provenance_block(records)
+    assert _row(block, "pixel_ae/s0") == (
+        "pixel_ae/s0                                          12345     n/a"
+        "            many")
+
+
+def test_the_report_carries_the_provenance_block_after_the_training_table():
+    """In the report, under its own heading, between the training table and
+    the filtering tables -- and drawn from the same records, so the rows are
+    the ones the study's cells wrote."""
+    records = _with_provenance(_rendering_study())
+    text = report_study.report(records, evaluate_gate(records), "runs/x")
+    lines = text.splitlines()
+    heading = next(i for i, line in enumerate(lines)
+                   if line.startswith("--- provenance:"))
+    training = next(i for i, line in enumerate(lines)
+                    if line == "--- training ---")
+    filtering = next(i for i, line in enumerate(lines)
+                     if line.startswith("--- filtering, gate criterion 4"))
+    assert training < heading < filtering
+    assert _row(text, "git_sha:") == (
+        f"git_sha: 1 distinct across 9 record(s): {STUDY_SHA}")
+    assert _row(text, f"random_vit/s2     {STUDY_SHA}").endswith(
+        "     mps           12320")
+
+
 def test_the_gate_block_renders_a_failing_verdict():
     records = _study()
     _cell(records, "pixel_ae", 0)["filtering"]["criterion_4"][
@@ -2549,14 +2677,14 @@ _CELL_ROWS = tuple(f"{arm}/s{seed}" for arm in ARMS for seed in SEEDS)
 _METRIC_ROWS = tuple(
     f"{arm:<12}{metric:<10}" for arm in ARMS for metric in METRICS)
 
-#: The seven sections of the report: the section header, the first line of the
+#: The eight sections of the report: the section header, the first line of the
 #: block that must sit DIRECTLY under it, and the label prefix of every row of
 #: that block, in order. `None` for the gate block, whose lines are asserted
 #: against `GATE_CRITERIA` at the foot of the test instead.
 #:
 #: The tables are individually pinned character-for-character above; what this
 #: pins is the JOIN between them and the DOCUMENT, and the SET OF ROWS each one
-#: prints. Five of the seven could be deleted from `report()` -- the training
+#: prints. Five of the original seven could be deleted from `report()` -- the training
 #: table, the criterion-4 table, the gain table, the ridge block and the reward
 #: table, i.e. both artefacts R1 exists to produce and the table carrying the
 #: number the milestone fails on -- leaving their section headers behind, and
@@ -2586,6 +2714,13 @@ REPORT_SECTIONS = [
      _METRIC_ROWS),
     ("--- training ---",
      "cell               steps/s   kl_rate  kl_dyn_max  loss_last20   wall_h",
+     _CELL_ROWS),
+    # The two singleton verdict lines follow the table after a blank line,
+    # so the section body is the table alone: one row per cell.
+    ("--- provenance: one code state and one device produced every cell, "
+     "or the comparison is not controlled ---",
+     "cell                                               git_sha  device"
+     "  encoder_params",
      _CELL_ROWS),
     ("--- filtering, gate criterion 4: does the posterior latent beat the "
      "raw encoder embedding of the same frame? ---",
@@ -2658,7 +2793,7 @@ def _assert_sections(text: str, gate_first_line: str) -> None:
 
 
 def test_every_section_of_the_report_is_actually_in_the_report():
-    """Header, column header and one row per cell, for all seven sections.
+    """Header, column header and one row per cell, for all eight sections.
 
     The join is asserted as the literal `f"{header}\\n{column_header}"` rather
     than as two `in` checks: a header line and a row that both appear
@@ -2676,7 +2811,7 @@ def test_every_section_of_the_report_is_actually_in_the_report():
     _assert_sections(text, "  [PASS] all_nine_cells_present")
     assert [line for line in text.splitlines() if line.startswith("---")] == [
         header for header, _, _ in REPORT_SECTIONS], (
-        "seven sections, in this order, and no eighth: a header with no table "
+        "eight sections, in this order, and no ninth: a header with no table "
         "under it is what every one of these deletions left behind")
     gate = _section_body(text, REPORT_SECTIONS[-1][0])
     assert [line[len("  [PASS] "):] for line in gate
@@ -2854,8 +2989,9 @@ def test_main_gates_over_the_STUDYS_arms_not_over_the_ones_that_ran(
     returns EXIT_OK, reports "6 of 9" as "6 of 6", lists no missing cells and
     marks every criterion PASS.
 
-    The pixel_ae arm is 25 of the study's 33 hours and is the one that does not
-    finish on a rented box. The only main-level incomplete-study test removes
+    The pixel_ae arm is the treatment the study exists for, and the one whose
+    three cells are lost if a rented box is reclaimed mid-run. The only
+    main-level incomplete-study test removes
     a single SEED, which leaves all three arm names present and therefore
     cannot tell the two calls apart.
 
@@ -3011,7 +3147,7 @@ def test_a_record_whose_block_is_a_scalar_does_not_kill_the_report():
     `key not in node` RAISES `TypeError` on a scalar rather than answering, and
     a record whose whole `position` block came back as a `null` is exactly what
     a half-converted or hand-edited file holds. Losing the report to that after
-    33 hours is the failure this guard exists for.
+    13.5 hours is the failure this guard exists for.
     """
     records = _rendering_study()
     _cell(records, "pixel_ae", 1)["position"] = None
@@ -3342,7 +3478,7 @@ def test_an_unwritable_matplotlib_cache_costs_the_FIGURE_and_not_the_status(
     at a read-only volume. That is not an exotic failure on the box this guard
     exists for: it is the DEFAULT state of a freshly provisioned rented GPU
     instance with no cache directory, and it is the failure most likely to hit
-    a 33-hour study on its very first report.
+    a 13.5-hour study on its very first report.
 
     `OSError` is neither an `ImportError` nor a `ValueError`, so before this
     term the report printed in full and the process died with an uncaught

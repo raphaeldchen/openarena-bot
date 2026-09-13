@@ -201,7 +201,7 @@ def test_pool_exit_statuses_are_disjoint_from_the_other_three_scripts_and_none_i
     mine = {key: value for key, value in vars(script).items() if key.startswith("EXIT_")}
     assert len(set(mine.values())) == len(mine), mine
     assert 1 not in mine.values() and 2 not in mine.values()
-    others = {0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+    others = {0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 23}
     clash = (set(mine.values()) & others) - {0}
     assert not clash, clash
     for name in ("run_study", "report_study", "diagnose_dynamics"):

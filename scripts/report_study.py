@@ -1,6 +1,6 @@
 """Print the nine-cell table, the M3 gate verdict, and the filtering gain.
 
-THIS IS THE LAST THING BETWEEN A 33-HOUR STUDY AND THE NUMBER A HUMAN READS,
+THIS IS THE LAST THING BETWEEN A 13.5-HOUR STUDY AND THE NUMBER A HUMAN READS,
 so it is arranged around what a reader can be misled by rather than around what
 is convenient to print.
 
@@ -17,6 +17,12 @@ is convenient to print.
     as NOT EVALUATED. Criterion 4 fails on the real trained model; the correct
     output for that study is a legible NOT PASSED, not a softer arrangement of
     the same numbers.
+  * THE PROVENANCE IS PRINTED PER CELL AND CHECKED. `git_sha` and `device`
+    are in every record so that "one code state, one device" is a fact read
+    off nine files; the report prints both per cell and WARNS when either is
+    not a singleton across the records, because a HEAD moved mid-run or a
+    cell that fell back to CPU is otherwise a finding nobody makes until the
+    write-up.
   * THE FILTERING GAIN IS PRINTED WITH ITS INTERVAL AND ITS RIDGE. The gain's
     SIGN moves with the selected ridge decade -- measured -0.0706, -0.0208 and
     +0.0325 for one model under three defensible selection designs -- so nine
@@ -231,6 +237,80 @@ def training_table(records, arms=ARMS, seeds=SEEDS) -> str:
                 f"{_fmt(_get(record, 'kl_dyn_max'), '.3f'):>12}"
                 f"{_fmt(_get(record, 'loss_last20'), '.4f'):>13}"
                 f"{_fmt(hours, '.2f'):>9}"
+            )
+    return "\n".join(lines)
+
+
+PROVENANCE_FIELDS = ("git_sha", "device")
+"""The two per-record fields that must be a SINGLETON across the study.
+
+One code state and one device produced all nine cells, or the study is not a
+controlled comparison: a HEAD moved mid-run means two code states, and a cell
+that fell back from MPS to CPU is a different run at a different speed. Each
+is a field in every record precisely so this can be checked from the records
+rather than reconstructed from mtimes, and `provenance_block` is where the
+check is printed. `encoder_params` is shown beside them and deliberately NOT
+in this tuple: it differs BY DESIGN between the pixel_ae bottleneck (1,056)
+and the ViT arms' (12,320), so a singleton test on it would fail every study.
+"""
+
+
+def _provenance_text(record, field: str) -> str:
+    """What the provenance table prints for `field`: the value, or n/a.
+
+    Rendered text is also what the singleton check compares, so a record with
+    the field missing counts as a distinct value ("n/a") and trips the
+    WARNING: a study where one cell recorded no sha is exactly a study whose
+    cells cannot be shown to share one.
+    """
+    value = _get(record, field)
+    return "n/a" if value is None else str(value)
+
+
+def provenance_block(records, arms=ARMS, seeds=SEEDS) -> str:
+    """One row per cell -- sha, device, encoder_params -- then, after a blank
+    line, the two singleton checks, each a WARNING when it fails.
+
+    Until this block existed nothing under version control read the four
+    provenance fields back: a silent MPS->CPU fallback or a mid-run HEAD move
+    was visible only to a hand-typed check run after the ninth cell. The
+    warnings are decided from the SAME text the rows print, so a reader can
+    verify either warning against the column above it.
+    """
+    cells = _cells(records)
+    lines = [f"{'cell':<16}{'git_sha':>42}{'device':>8}{'encoder_params':>16}"]
+    for arm in arms:
+        for seed in seeds:
+            record = cells.get((arm, seed))
+            label = f"{arm}/s{seed}"
+            if record is None:
+                lines.append(f"{label:<16}{'MISSING':>42}")
+                continue
+            lines.append(
+                f"{label:<16}{_provenance_text(record, 'git_sha'):>42}"
+                f"{_provenance_text(record, 'device'):>8}"
+                f"{_count(_get(record, 'encoder_params')):>16}"
+            )
+    present = [cells[(arm, seed)] for arm in arms for seed in seeds
+               if (arm, seed) in cells]
+    # A blank line: the table above is one row per cell like every other
+    # table in the report, and the two verdict lines below are about the
+    # study as a whole.
+    lines.append("")
+    for field in PROVENANCE_FIELDS:
+        distinct = sorted({_provenance_text(r, field) for r in present})
+        listing = ", ".join(distinct) or "none"
+        lines.append(
+            f"{field}: {len(distinct)} distinct across {len(present)} "
+            f"record(s): {listing}")
+        if len(distinct) > 1:
+            lines.append(
+                f"WARNING: the records do not share one {field}. "
+                + ("Two code states produced these cells; the cells from the "
+                   "older sha are to be re-run, not explained away."
+                   if field == "git_sha" else
+                   "A cell that ran on another device is a different run at "
+                   "a different speed; re-run it on the study's device.")
             )
     return "\n".join(lines)
 
@@ -505,6 +585,10 @@ def report(records: list[dict], verdict: dict, out_dir, arms=ARMS, seeds=SEEDS) 
         "",
         "--- training ---",
         training_table(records, arms, seeds),
+        "",
+        "--- provenance: one code state and one device produced every cell, "
+        "or the comparison is not controlled ---",
+        provenance_block(records, arms, seeds),
         "",
         "--- filtering, gate criterion 4: does the posterior latent beat the "
         "raw encoder embedding of the same frame? ---",
