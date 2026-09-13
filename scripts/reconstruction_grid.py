@@ -15,13 +15,13 @@ from mbfps.data.buffer import ReplayBuffer  # noqa: E402
 from mbfps.data.loader import SequenceLoader  # noqa: E402
 from mbfps.models.encoders import encoder_backbone  # noqa: E402
 from mbfps.training.autoencoder import AutoencoderModel, to_device  # noqa: E402
-from mbfps.utils.config import ARMS, get_config  # noqa: E402
+from mbfps.utils.config import KINDS, get_config  # noqa: E402
 from mbfps.utils.device import get_device  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arm", choices=ARMS, required=True)
+    parser.add_argument("--arm", choices=KINDS, required=True)  # KINDS: M2 renders cnn
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--run", type=Path, default=Path("runs/m2"))
     parser.add_argument("--samples", type=int, default=6)

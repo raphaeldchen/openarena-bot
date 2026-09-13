@@ -12,9 +12,11 @@ and is not.
 """
 
 import os
+from typing import Any
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+import numpy as np  # noqa: E402  -- must follow the env var above
 import torch  # noqa: E402  -- must follow the env var above
 
 
@@ -31,3 +33,22 @@ def get_device(prefer: str = "mps") -> torch.device:
     if prefer == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+_TRAINING_KEYS = ("obs", "features", "actions", "rewards", "terminated", "truncated")
+"""Keys allowed onto the compute device.
+
+A whitelist, deliberately. `privileged` is absent and must stay absent: it is
+evaluation-only, and keeping it off the device makes that a structural property
+rather than a rule someone has to remember. `episode_index` and `window_start`
+are bookkeeping and stay on the host.
+"""
+
+
+def to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move the whitelisted arrays of a loader batch onto `device`."""
+    return {
+        key: torch.from_numpy(value).to(device)
+        for key, value in batch.items()
+        if isinstance(value, np.ndarray) and key in _TRAINING_KEYS
+    }

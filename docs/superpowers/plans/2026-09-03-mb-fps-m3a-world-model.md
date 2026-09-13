@@ -1646,14 +1646,21 @@ class WorldModel(nn.Module):
     def embed(self, batch: dict[str, Any]) -> torch.Tensor:
         """Encode a `(B, T+1, ...)` window down to `(B, T, 2048)`.
 
-        The window carries one more frame than transitions; the RSSM consumes
-        the first T, which are the states the T actions were taken from.
+        The window carries one more frame than transitions. `RSSM.observe`
+        requires `actions[:, i]` to be the action that PRODUCED
+        `embeddings[:, i]` -- i.e. embedding `i` must be the frame action `i`
+        led to, not the frame it was taken from. `batch["actions"][i]` is
+        taken AT `obs[i]` and leads to `obs[i+1]`, so the RSSM consumes the
+        LAST T of the T+1 encoded frames -- `obs[1:T+1]` -- paired with the T
+        actions `actions[0:T]`. Returning `embeddings[:, :-1]` (the FIRST T)
+        instead would pair each action with the frame it was taken FROM,
+        making the posterior acausal.
         """
         source = batch["obs"] if self.input_kind == "obs" else batch["features"]
         b, t_plus_one = source.shape[0], source.shape[1]
         flat = source.reshape(b * t_plus_one, *source.shape[2:])
         embeddings = self.encoder(flat).view(b, t_plus_one, -1)
-        return embeddings[:, :-1]
+        return embeddings[:, 1:]
 
     def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
         embeddings = self.embed(batch)
@@ -2372,8 +2379,11 @@ def evaluate_rollout(
         source = source_for(model, path, episode, feature_backbone)
         for start in range(0, episode.length - need, need):
             window = slice(start, start + need + 1)
+            # `window` spans need+1 frames; drop the FIRST one so
+            # embeddings[k] is the frame actions[k] led to, matching the
+            # RSSM.observe convention documented on WorldModel.embed.
             embeddings = model.encoder(
-                torch.as_tensor(source[window][:-1]).to(device)
+                torch.as_tensor(source[window][1:]).to(device)
             ).unsqueeze(0)
             actions = torch.as_tensor(
                 episode.actions[start : start + need].astype(np.int64)
@@ -2832,12 +2842,17 @@ def fit_probes(model, paths, backbone, device, limit=20):
     for path in paths[:limit]:
         episode = load_episode(path)
         source = source_for(model, path, episode, backbone)
-        embeddings = model.encoder(torch.as_tensor(source[:-1]).to(device)).unsqueeze(0)
+        # Drop the FIRST frame, not the last: embeddings[i] must be the frame
+        # actions[i] led to, matching the RSSM.observe convention documented
+        # on WorldModel.embed. The target below shifts the same way, or
+        # latents[i] (now describing frame i+1) would be fit against
+        # privileged[i] (frame i) -- a one-step-misaligned regression.
+        embeddings = model.encoder(torch.as_tensor(source[1:]).to(device)).unsqueeze(0)
         actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0).to(device)
         out = model.rssm.observe(embeddings, actions)
         latents.append(out["latent"][0].cpu().numpy())
         embeds.append(embeddings[0].cpu().numpy())
-        targets.append(probe_targets(episode.privileged[:-1], episode.privileged_keys))
+        targets.append(probe_targets(episode.privileged[1:], episode.privileged_keys))
     y = np.concatenate(targets)
     return (
         fit_probe(np.concatenate(latents), y),
@@ -3029,34 +3044,137 @@ git commit -m "feat: end-to-end rollout evaluation, local single-arm validation"
 
 ## Task 1 results
 
-*(fill in during execution)*
-
 | seq_len | ms/step | steps/s | hours for 20k |
 |---|---|---|---|
-| 16 | | | |
-| 32 | | | |
-| 64 | | | |
+| 16 | 30.7 | 32.608 | 0.17 |
+| 32 | 56.6 | 17.659 | 0.31 |
+| 64 | 107.4 | 9.313 | 0.60 |
 
-Decision: *(record whether the >3h gate fired and what was decided)*
+These figures cover the RSSM and heads only; they exclude the encoder, which for the pixel
+arm is a 26.4M-parameter CNN that will dominate a real training step (Task 12 measures a
+real step, encoder included).
+
+Decision: Gate re-evaluated against the corrected head depth. Maximum hours_for_20k_steps
+is 0.60 hours (seq_len=64), still well below the 3-hour threshold. Gate did NOT fire. Study
+parameters remain approved for Plan 4.
 
 ---
 
+## 20,000-step result — the 2,000-step reading was undertraining, not a design fault
+
+Task 12 measured, at 2,000 steps, that position was decodable from the encoder embedding but
+NOT from the RSSM latent, so all three rollout references collapsed to within 2% and
+`gap_closed` measured noise. The final review localised the mechanism and named the decisive
+experiment: re-measure the decomposition at the config default and see whether the residual
+collapses (budget) or holds (objective). Run at 20,000 steps, `random_vit`, seq_len 32,
+7.38 steps/s, 2709 s:
+
+| space | held-out R^2 @2,000 | held-out R^2 @20,000 |
+|---|---|---|
+| encoder embedding `E` | +0.3278 | +0.3219 |
+| head prediction `P` (what the rollout probes) | +0.0011 | **+0.3208** |
+| residual `E - P` | +0.3221 | +0.2711 |
+| **posterior latent `[h.z]`** | **-0.0058** | **+0.2466** |
+
+The head's share of the embedding it is trained on fell from 0.774 to 0.533 while its
+position R^2 rose from 0.001 to 0.321 — it stopped fitting the cheap high-variance
+directions and started carrying the content. **The embedding-MSE objective does put position
+in the latent; it simply needs more than 2,000 steps.** No objective change is required.
+
+The band becomes interpretable at the same time:
+
+| | @2,000 | @20,000 |
+|---|---|---|
+| median band width | 5.65 | **55.25** |
+| band as a fraction of persistence (median) | ~0.02 | **0.241** |
+| horizon steps with floor above persistence | 2/45 | **0/45** |
+| horizon steps with a degenerate positive band | — | **0/45** |
+| `gap_closed` finite | 43/45 | **45/45** |
+
+**This retires the final review's Important #4.** That finding said the exit criterion
+"rollout harness emits all three curves with no NaN and `floor <= persistence`" was false and
+should be rewritten. At 20,000 steps it holds exactly — 0/45 inversions, 45/45 finite. The
+criterion was right; the 2,000-step model was too weak to satisfy it.
+
+`kl_rate_above_free_bits = 0.9725`, so the measured `KL_FREE_BITS = 0.20` behaves as
+intended: the dynamics prior received gradient on 97% of steps, against the governing spec's
+inherited 1.0 which was measured giving 1 step in 9.
+
+Still open, and the M3 gate's actual question: `gap_closed` at horizon 45 is **-0.887**
+(mean -0.383, max +0.0131), so the model does not yet beat persistence at the full horizon,
+though it does at some. Whether the real seq_len=64 config and three seeds clear zero is what
+Plan 4 measures.
+
+---
+
+
 ## Task 12 results
 
-*(fill in during execution)*
+Measured 2026-09-04 on the M1 dataset (122 episodes, 98 train / 24 val), fp32,
+MPS for the CLI and CPU for the untrained control. Errors are Doom map units.
 
 | quantity | value |
 |---|---|
 | arm / seed / steps | random_vit / 0 / 2000 |
-| steps_per_second (measured) | |
-| position error — rssm / persistence / floor | |
-| angle error — rssm / persistence / floor | |
-| position_gap_closed (final) | |
-| band width `persistence - floor` (min/median/max) | |
-| horizon steps with floor above persistence | |
-| gap_closed finite at how many of 45 steps | |
-| ratio stable? (spec §9 Q1) | |
-| `kl_rate_above_free_bits` | |
-| trained beats untrained on raw error? | |
-| two eval runs identical? (determinism) | |
-| test count | |
+| steps_per_second (measured) | **7.58** (2000 steps in 264 s, seq_len 32, batch 16) |
+| position error — rssm / persistence / floor | 306.79 / 265.96 / 249.53 |
+| angle error — rssm / persistence / floor | 94.59° / 86.56° / 86.21° |
+| position_gap_closed (final) | **-2.4851** (mean over horizon -8.96, min -88.61, max -1.87) |
+| band width `persistence - floor` (min/median/max) | -2.491 / 5.648 / 16.430 — i.e. -1.0% / 2.2% / 6.2% of the persistence error |
+| horizon steps with floor above persistence | 2 / 45 (steps 1 and 3) |
+| gap_closed finite at how many of 45 steps | 43 / 45 |
+| ratio stable? (spec §9 Q1) | **No.** See below. |
+| `kl_rate_above_free_bits` | **0.7265** (peak kl_dyn 8.096) — the prior did train |
+| trained beats untrained on raw error? | **Yes overall, no at the single endpoint.** See below. |
+| two eval runs identical? (determinism) | **Yes** — all seven curves bitwise identical, `gap_closed` identical NaN-for-NaN |
+| test count | **423 passed** (416 before, +7 for `fit_probes`) |
+
+**The ratio is not stable, and the reason is not the harness.** The band is only
+~2% of the error it divides, so `gap_closed` ranges over -1.87 to -88.61 across
+adjacent horizon steps of one run. On the untrained control the band collapses
+to ~0.01 units and two runs of the identical script returned mean `gap_closed`
+of +1.0778 and +0.8224 — a swing produced by CPU float-reduction order alone.
+Spec §9 open question 1 is answered: **at this training scale the ratio must
+not be reported without the band width beside it**, and the raw errors are the
+reportable quantity. `scripts/eval_rollout.py` therefore always prints the
+width, the band as a fraction of persistence, and the count of degenerate steps.
+
+**Trained vs its own initialisation** (same seed, so `WorldModel(cfg)` IS the
+checkpoint's initialisation; both evaluated identically on CPU):
+
+| protocol | untrained @45 | trained @45 | trained better at | horizon mean |
+|---|---|---|---|---|
+| ridge SELECTED on held-out episodes | 300.29 | 303.22 | 39/45 steps | 284.89 vs 296.97 (**+4.1%**) |
+| ridge fixed at 1e3 (no selection) | 304.81 | 300.82 | **45/45 steps** | 282.13 vs 304.10 (**+7.2%**) |
+
+Training is a clear improvement on both protocols; they disagree only on the
+last few horizon steps. Under selection the untrained model's probe is pushed
+to ridge 1e7 with held-out R² **-0.0335** — a *constant* predictor sitting at
+the dataset mean, whose error is flat at ~300 at every horizon (299.22 at step
+1, 300.29 at step 45). That is a deceptively strong baseline: the trained
+model's rollout degrades from 264.78 to 303.22 and crosses the flat line at
+horizon 39. So the endpoint comparison is "a drifting predictor vs the mean",
+not "training accomplished nothing" — `kl_rate_above_free_bits` of 0.73 rules
+out the frozen-`prior_net` diagnosis, and the trained model's own floor (257.72)
+and persistence (277.52) sit far below the untrained model's 300.31.
+
+**Where the position information goes — the finding Plan 4 should be scoped
+from.** One probe protocol (ridge selected on 4 held-out episodes), four spaces,
+same 20 training episodes:
+
+| space | dim | selected ridge | held-out R² |
+|---|---|---|---|
+| raw cached `random_vit` features (patch-mean) | 384 | 1e-1 | **0.3498** |
+| encoder embedding (bottleneck output) | 2048 | 1e3 | **0.3278** |
+| RSSM posterior latent | 1536 | 1e5 | **-0.0058** |
+| predicted embedding (what the rollout probes) | 2048 | 1e5 | **0.0011** |
+
+The 0.3498 reproduces spec §3.2's measured 0.369 ceiling for this arm, so the
+episode-level held-out protocol is sound and the encoder preserves position
+almost intact. **The RSSM latent is where it is destroyed.** Every rollout
+number above is therefore measuring a probe with no signal, which is why all
+three references land within 2% of each other and why the band is degenerate.
+Fixing rollout accuracy at this scale means getting position into the latent
+first; tuning the dynamics against a probe with R² 0.001 would be measuring
+noise. Whether 2000 steps is simply too few (the config default is 20,000) is
+untested and is the first thing Plan 4 should settle.

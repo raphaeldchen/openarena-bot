@@ -10,3 +10,4 @@ checkpoints/
 .superpowers/
 *.egg-info/
 _vizdoom.ini
+scratchpad/

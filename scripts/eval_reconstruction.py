@@ -27,7 +27,7 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.loader import SequenceLoader
 from mbfps.models.encoders import encoder_backbone
 from mbfps.training.autoencoder import AutoencoderModel, to_device
-from mbfps.utils.config import ARMS, get_config
+from mbfps.utils.config import KINDS, get_config
 from mbfps.utils.device import get_device
 
 
@@ -65,6 +65,13 @@ def evaluate(arm: str, run: Path, buffer: ReplayBuffer, draws: int,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, default=Path("runs/m2_long"))
+    # KINDS, not ARMS: M3c retired `cnn` from the study, but `cnn` is the
+    # encoder this comparison was built around and its checkpoint is the one
+    # that became the `pixel_ae` backbone. The default is what M2 trained;
+    # `pixel_ae` is constructible (an autoencoder over its own cached rows)
+    # but no `autoencoder_pixel_ae.pt` exists, so it is opt-in.
+    parser.add_argument("--arms", nargs="+", choices=KINDS,
+                        default=["cnn", "frozen_ssl", "random_vit"])
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--draws", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -75,7 +82,7 @@ def main() -> None:
     buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
 
     results: dict[str, np.ndarray] = {}
-    for arm in ARMS:
+    for arm in args.arms:
         draws = evaluate(arm, args.run, buffer, args.draws, args.batch_size, device)
         results[arm] = draws
         sem = draws.std(ddof=1) / np.sqrt(draws.size)
