@@ -123,7 +123,7 @@ end-to-end `CNNEncoder` under the name `cnn` and must keep doing so."""
 ```
 
 Two tuples, not one, because two milestones read them. `cnn` stays buildable: `build_encoder`,
-`encoder_input_kind` (`"obs"`) and `_ARM_BACKBONE` (`None`) keep their `cnn` branches, and M2's
+`encoder_input_kind` (`"obs"`) and `_KIND_BACKBONE` (`None`; named `_ARM_BACKBONE` when this spec was written) keep their `cnn` branches, and M2's
 `train_autoencoder.py`, `reconstruction_grid.py` and `eval_reconstruction.py` take
 `choices=KINDS`. It cannot be *selected* by any M3 tool, because those take `choices=ARMS`. A study
 record, checkpoint or diagnostic that says `arm="cnn"` continues to mean the end-to-end pixel arm

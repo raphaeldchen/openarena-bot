@@ -2918,7 +2918,7 @@ def test_a_non_numeric_leaf_costs_its_own_column_and_not_the_report():
     non-numeric value at a LEAF -- `gap_final` holding the string "1.2.3", or
     `n_scored_windows` holding "many" -- which is what a hand-edited or
     half-converted record has. Raising there loses the WHOLE report to one bad
-    field after the 33 GPU hours are already paid for.
+    field after the ~13.5 study-hours are already paid for.
     """
     assert report_study._fmt("1.2.3", "+.4f") == "1.2.3"
     assert report_study._count("many") == "many"
