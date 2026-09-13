@@ -66,7 +66,7 @@ becomes the third frozen backbone, exactly as DINOv2 and the random ViT are for 
 `<episode>.features_pixel_ae.npy` of shape `(T+1, 64, 32)` — the 2048-d output partitioned into
 64 rows of 32. `feature_suffix` already namespaces any non-default backbone, so this cache cannot
 collide with the two that exist. Cost: 122 episodes × 526 frames through a 26M-param conv on MPS,
-~5 min; ~0.5 GB on disk (float16).
+~5 min; 0.244 GB on disk (float16, measured: 122 x (T+1, 64, 32)).
 
 The partition into `(64, 32)` invents nothing — it is a reshape of a vector whose 2048 dimensions
 have no spatial meaning, into the row count the shared bottleneck expects. The alternative,
@@ -192,7 +192,7 @@ record schema gains `git_sha` and `device` (the M3b write-up's other half of ope
 | file | change |
 |---|---|
 | `src/mbfps/data/features.py` | `BACKBONES` gains `"pixel_ae"`; `build_backbone` loads and freezes the M2 encoder; `FeatureExtractor` emits `(64, 32)` rows for it; `BACKBONE_GEOMETRY` is defined here, next to `BACKBONES` |
-| `src/mbfps/models/encoders.py` | `BottleneckEncoder` reads geometry from the registry; `_N_PATCHES` and `cfg.patch_dim` removed; `_ARM_BACKBONE`, `build_encoder`, `encoder_input_kind` gain `pixel_ae`, lose `cnn` |
+| `src/mbfps/models/encoders.py` | `BottleneckEncoder` reads geometry from the registry; `_N_PATCHES` and `cfg.patch_dim` removed; `_KIND_BACKBONE` (was `_ARM_BACKBONE`), `build_encoder`, `encoder_input_kind` gain `pixel_ae`; keep `cnn` (buildable under `KINDS`, not selectable by any M3 tool -- section 2.3) |
 | `src/mbfps/utils/config.py` | `ARMS`, `KINDS`; `get_config` validates against `KINDS`; `EncoderConfig.patch_dim` removed; `cnn_depth` stays (M2) |
 | `scripts/train_autoencoder.py`, `reconstruction_grid.py`, `eval_reconstruction.py` | `choices=KINDS` (M2 keeps building `cnn`) |
 | `src/mbfps/data/loader.py` | feature-shape validation against the registry |

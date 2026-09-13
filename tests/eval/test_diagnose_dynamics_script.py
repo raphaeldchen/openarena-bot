@@ -1617,9 +1617,10 @@ def test_the_verdict_scales_the_effect_against_the_actionable_band():
 def test_a_null_through_a_probe_that_cannot_register_an_effect_is_unmeasurable(
     floor, persistence, reason
 ):
-    """On every `pixel_ae` cell the floor EXCEEDS persistence at the final horizon
-    step: the position probe is a constant predictor (selection R^2 -0.036)
-    and no action effect of any size can register through it -- the FWD/NOOP
+    """On every M3b `cnn` cell the floor EXCEEDED persistence at the final horizon
+    step: the position probe was a constant predictor (selection R^2 -0.036;
+    the M3c `pixel_ae` arm's probe scores +0.305 and is not this case) and no
+    action effect of any size could register through it -- the FWD/NOOP
     contrast reads +0.6 there with the right sign and nothing to scale it. A
     null through such a probe used to print "NOT USING THE ACTION ... M4 is
     BLOCKED" beside a note that there was no range to scale it against. It
@@ -2491,7 +2492,7 @@ def test_the_ladder_table_prints_the_embedding_ratio_in_its_own_row_and_MISSING_
 
 
 def test_the_verdict_quotes_the_embedding_ratio_where_the_probe_cannot_register():
-    """On every `pixel_ae` cell the position probe is a constant predictor and the
+    """On every M3b `cnn` cell the position probe was a constant predictor and the
     verdict reads UNMEASURABLE THROUGH THIS PROBE. The embedding-space reading
     is the one thing that CAN be read there, so that branch quotes the held
     contrast's ratio -- and only when the rung carries one. The decision

@@ -62,7 +62,7 @@ Test sweep size (grepped 2026-09-11): 322 references to `"cnn"` across 14 test f
 | file | responsibility after this plan |
 |---|---|
 | `src/mbfps/data/features.py` | The backbone registry: `BACKBONES`, `BACKBONE_GEOMETRY`, `PIXEL_AE_CHECKPOINT`, `build_backbone`, `FeatureExtractor`, `cache_episode_features`. Owns "what a frozen backbone emits." |
-| `src/mbfps/models/encoders.py` | The arm registry: `_ARM_BACKBONE`, `encoder_input_kind`, `encoder_backbone`, `build_encoder`; `CNNEncoder` (M2), `BottleneckEncoder` (every study arm). Owns "which encoder an arm builds." |
+| `src/mbfps/models/encoders.py` | The arm registry: `_KIND_BACKBONE` (named `_ARM_BACKBONE` until the post-run wave), `encoder_input_kind`, `encoder_backbone`, `build_encoder`; `CNNEncoder` (M2), `BottleneckEncoder` (every study arm). Owns "which encoder an arm builds." |
 | `src/mbfps/utils/config.py` | `ARMS`, `KINDS`, `EncoderConfig` (no `patch_dim`), `TrainConfig`, `Config`, `get_config`. |
 | `src/mbfps/data/loader.py` | `SequenceLoader` validates a cache's row shape against its backbone's geometry on first read. |
 | `src/mbfps/eval/study.py` | `run_job` writes `git_sha`, `device`, `encoder_params`, `history`. |
@@ -70,7 +70,7 @@ Test sweep size (grepped 2026-09-11): 322 references to `"cnn"` across 14 test f
 | `scripts/run_study.py` | `REQUIRED_RECORD_KEYS` grows by four; `_SLOW_ARMS` is empty. |
 | `scripts/spike_pixel_ae.py` | Task 7's three checks, exit 0 / 10. |
 | `scripts/train_autoencoder.py`, `reconstruction_grid.py`, `eval_reconstruction.py` | `choices=KINDS`. |
-| tests mirroring each | `tests/data/test_features.py`, `tests/data/test_loader.py`, `tests/models/test_encoders.py`, `tests/utils/test_config.py`, `tests/eval/test_study.py`, `tests/eval/test_run_study.py`, the sweep in Task 4, `tests/scripts/test_spike_pixel_ae.py`. |
+| tests mirroring each | `tests/data/test_features.py`, `tests/data/test_loader.py`, `tests/models/test_encoders.py`, `tests/utils/test_config.py`, `tests/eval/test_study.py`, `tests/eval/test_run_study.py`, the sweep in Task 4, `tests/eval/test_spike_pixel_ae_script.py`. |
 
 ---
 
@@ -3401,7 +3401,15 @@ p = Path("scripts/cache_features.py"); s = p.read_text()
 assert s.count(sys.argv[1]) == 1, f"mutation target not unique: {sys.argv[1]!r}"
 p.write_text(s.replace(sys.argv[1], sys.argv[2]))
 EOF
-  echo "mutated lines in the file under test: $(grep -c "$3" scripts/cache_features.py)"
+  # Fixed-string (-F), never a regex: several replacements carry `[`, `(`
+  # and `.`, which `grep -c "$3"` read as metacharacters and miscounted. And
+  # an EMPTY replacement (M4 deletes a line) matches every line of the file,
+  # so a deletion is confirmed by the absence of what it removed instead.
+  if [ -n "$3" ]; then
+    echo "mutated lines in the file under test: $(grep -cF -- "$3" scripts/cache_features.py)   # must be >= 1"
+  else
+    echo "deleted text still present: $(grep -cF -- "$2" scripts/cache_features.py)   # must be 0"
+  fi
   run
 }
 
@@ -3420,8 +3428,13 @@ mut "M9 --clear falls through into caching"  '        print(f"removed={removed} 
         return' '        print(f"removed={removed} {args.backbone} feature files from {args.data}")'
 mut "M10 forwarded under another kwarg name" 'checkpoint=args.checkpoint,' 'ckpt=args.checkpoint,'
 
-cp /tmp/cache_features.py.orig scripts/cache_features.py && rm /tmp/cache_features.py.orig
-git diff --stat scripts/cache_features.py   # must print nothing
+cp /tmp/cache_features.py.orig scripts/cache_features.py
+cmp /tmp/cache_features.py.orig scripts/cache_features.py && echo "restored byte-for-byte"
+rm /tmp/cache_features.py.orig
+# NOT `git diff --stat ... must print nothing`: this task's own edits to the
+# file are uncommitted until Step 6, so the diff against HEAD is never empty
+# here. The `cmp` against the copy taken before the first mutation is the
+# check that means something at this point.
 echo "=== restored"; run                    # must print: 18 passed
 ```
 
@@ -4314,8 +4327,10 @@ export PYTHONPATH=$S/src PYTHONDONTWRITEBYTECODE=1
 .venv/bin/python -c "import mbfps.eval.study as s; print(s.__file__)"   # must print $S/src/...
 # 3. No stale bytecode can survive a same-length mutation.
 find $S -name __pycache__ -exec rm -rf {} +
-# Confirm the sha test RUNS here (0 skipped in the output):
-.venv/bin/python -m pytest $S/tests/eval/test_study.py -q -rs -k sha_git_reports
+# Confirm the sha test RUNS here (0 skipped in the output). The provenance
+# tests were split out of test_study.py into test_study_provenance.py in the
+# post-run wave; the harness names both so it runs on either layout.
+.venv/bin/python -m pytest $S/tests/eval/test_study.py $S/tests/eval/test_study_provenance.py -q -rs -k sha_git_reports
 # 2. Prove the harness with a known-fatal mutation FIRST: delete the line
 #    `"git_sha": _git_sha(),` from $S/src/mbfps/eval/study.py and run
 #    `-k sha_git_reports` -- it must FAIL. Restore with `git -C $S checkout -- .`
@@ -5803,7 +5818,7 @@ PYTHONDONTWRITEBYTECODE=1 caffeinate -dimsu .venv/bin/python -u scripts/run_stud
 echo "driver exit: $?"
 ```
 
-`caffeinate -dimsu`, not `-i`: the Global Constraints record that `-i` was insufficient on this host. `-u` tells the driver to log into `runs/m3_study_v2/` rather than the repo root — the M3b run's `tee study.log` left an untracked file at the root that still shows in `git status`; under `runs/` it is gitignored and beside the records it describes. `set -o pipefail` makes `$?` the driver's status rather than `tee`'s (works in zsh and bash).
+`caffeinate -dimsu`, not `-i`: the Global Constraints record that `-i` was insufficient on this host. `-u` is Python's unbuffered stdout: without it the driver's per-step lines sit in a pipe buffer and `tee` shows them minutes late, so a stalled cell cannot be told from a buffered one. Where the log lands is decided by `tee`'s argument alone — `runs/m3_study_v2/study.log` rather than the repo root, because the M3b run's `tee study.log` left an untracked file at the root that still shows in `git status`; under `runs/` it is gitignored and beside the records it describes. `set -o pipefail` makes `$?` the driver's status rather than `tee`'s (works in zsh and bash).
 
 **Operating rule for the whole run: no HEAD movement of any kind (commit, checkout, switch, reset, rebase, stash, pull) on this checkout until the ninth record is written; `src/` and `scripts/` clean at launch (Step 4 item 2).** `git_sha` is `git rev-parse HEAD` sampled ~1.5 h into each cell, at record-build time, not at launch — so any HEAD move mid-run splits the nine records across two shas and the acceptance check's `shas == {head}` assertion fails, with the cells from the older sha to be re-run. Uncommitted edits, by contrast, change nothing about the running process (every module is imported at process start) — which is exactly why they must not exist at launch: a sha only names the code that ran if the tree at that sha is the tree that ran.
 

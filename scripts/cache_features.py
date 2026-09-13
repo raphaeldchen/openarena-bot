@@ -43,6 +43,9 @@ def cache_bytes(frames: int, backbone: str) -> int:
     demand 2.93 GB of free disk to write 0.24 GB. On the 2.3-GB-free machine
     this script was written for, that refusal would block the one cache that
     fits.
+
+    Raises:
+        KeyError: if `backbone` has no registered geometry.
     """
     n_patches, patch_dim = BACKBONE_GEOMETRY[backbone]
     return frames * n_patches * patch_dim * 2  # float16

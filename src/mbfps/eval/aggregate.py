@@ -1,6 +1,6 @@
 """Aggregate the nine study records and judge M3's exit gate.
 
-This is the last computation between a 33-hour study and the number a human
+This is the last computation between a 13.5-hour study and the number a human
 reads, so everything here is arranged so that a wrong number is louder than a
 missing one.
 
