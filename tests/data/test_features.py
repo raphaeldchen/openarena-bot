@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from mbfps.data.episode import Episode, save_episode
-import mbfps.data.features as features  # Task 1's `test_the_old_module_constants_are_gone` reads it
+import mbfps.data.features as features  # the module object itself: `test_the_old_module_constants_are_gone` inspects it
 from mbfps.data.features import (
     BACKBONE_GEOMETRY,
     BACKBONES,
@@ -17,7 +17,13 @@ from mbfps.data.features import (
 )
 from mbfps.envs.protocol import OBS_SHAPE
 
-pytestmark = pytest.mark.slow  # downloads ~88MB on first run
+# The `slow` mark is PER TEST, not module-wide. It means "downloads model
+# weights": the DINOv2 (~88 MB on first run) and random_vit backbones both go
+# through `AutoConfig.from_pretrained`, so every test that builds one of them
+# carries the mark. The pixel_ae block at the foot of this file builds its
+# backbone from a fake M2 checkpoint in `tmp_path` and downloads nothing, and
+# a module-level mark would have let `-m "not slow"` deselect it too.
+slow = pytest.mark.slow
 
 
 @pytest.fixture(scope="module")
@@ -28,10 +34,13 @@ def extractor():
 # --- Backbone geometry ------------------------------------------------------
 # `(n_patches, patch_dim)` belongs to the backbone, not to the study. The two
 # ViT backbones share 112 / 14 = 8, an 8x8 = 64 patch grid, at DINOv2-small's
-# hidden size of 384. Both numbers used to be module constants that every
-# reader -- the encoder, the cache-size estimate, these tests -- copied; a
-# third backbone with a different width would have been built against 384
-# with no error until the first matmul. There is now one registry.
+# hidden size of 384; the M2 pixel autoencoder's 2048-vector is 64 rows of 32.
+# Both ViT numbers used to be module constants that every reader -- the
+# encoder, the cache-size estimate, these tests -- copied, so `pixel_ae`, the
+# third backbone, would have been built against 384 with no error until the
+# first matmul. There is one registry, in the leaf module
+# `mbfps.data.geometry`, re-exported here; `tests/data/test_geometry.py` pins
+# the re-export as the same object and the leaf as transformers-free.
 
 
 def test_backbone_geometry_is_the_literal_registry():
@@ -56,6 +65,7 @@ def test_the_old_module_constants_are_gone():
     assert not hasattr(features, "FEATURE_DIM")
 
 
+@slow
 def test_encode_checks_its_output_against_the_registry(monkeypatch):
     """`encode`'s patch-count check must read the registry, not a literal 64.
 
@@ -73,16 +83,19 @@ def test_encode_checks_its_output_against_the_registry(monkeypatch):
         extractor.encode(frames)
 
 
+@slow
 def test_encode_output_shape(extractor):
     frames = np.random.randint(0, 256, (3, *OBS_SHAPE), dtype=np.uint8)
     assert extractor.encode(frames).shape == (3, *BACKBONE_GEOMETRY[extractor.backbone])
 
 
+@slow
 def test_encode_output_dtype_is_float16(extractor):
     frames = np.random.randint(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
     assert extractor.encode(frames).dtype == np.float16
 
 
+@slow
 def test_encode_is_byte_identical_on_repeat(extractor):
     """The cache is only sound if the frozen backbone is deterministic."""
     frames = np.random.randint(0, 256, (2, *OBS_SHAPE), dtype=np.uint8)
@@ -91,6 +104,7 @@ def test_encode_is_byte_identical_on_repeat(extractor):
     assert np.array_equal(a, b)
 
 
+@slow
 @pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="requires an MPS device"
 )
@@ -101,6 +115,7 @@ def test_encode_is_byte_identical_on_repeat_on_mps():
     assert np.array_equal(mps_extractor.encode(frames), mps_extractor.encode(frames))
 
 
+@slow
 def test_encode_distinguishes_different_frames(extractor):
     frames = np.stack(
         [
@@ -112,6 +127,7 @@ def test_encode_distinguishes_different_frames(extractor):
     assert not np.allclose(out[0].astype(np.float32), out[1].astype(np.float32))
 
 
+@slow
 def test_encode_rejects_wrong_shape(extractor):
     with pytest.raises(ValueError, match="expected frames of shape"):
         extractor.encode(np.zeros((2, 64, 64, 3), dtype=np.uint8))
@@ -127,6 +143,7 @@ def _encode_preprocessed(extractor, x):
     return out[:, 1:, :].cpu().numpy().astype(np.float32)
 
 
+@slow
 def test_encode_applies_imagenet_normalization(extractor):
     """Normalisation must be applied -- but any equivalent formulation is fine.
 
@@ -156,6 +173,7 @@ def test_encode_applies_imagenet_normalization(extractor):
     )
 
 
+@slow
 def test_cache_episode_features_writes_sibling_file(tmp_path, extractor):
     keys = ("health", "pos_x", "pos_y", "pos_z", "angle")
     ep = Episode(
@@ -235,7 +253,7 @@ def test_unknown_backbone_rejected():
         build_backbone("nope")
 
 
-@pytest.mark.slow
+@slow
 def test_random_vit_has_the_same_output_shape_as_dinov2():
     """Arm 3 must be Arm 2 with different weights, not a different shape."""
     ext = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
@@ -243,7 +261,7 @@ def test_random_vit_has_the_same_output_shape_as_dinov2():
     assert ext.encode(frames).shape == (2, *BACKBONE_GEOMETRY["random_vit"])
 
 
-@pytest.mark.slow
+@slow
 def test_random_vit_is_reproducible_from_its_seed():
     a = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
     b = FeatureExtractor(backbone="random_vit", device="cpu", seed=3)
@@ -251,7 +269,7 @@ def test_random_vit_is_reproducible_from_its_seed():
     assert np.array_equal(a.encode(frames), b.encode(frames))
 
 
-@pytest.mark.slow
+@slow
 def test_random_vit_differs_from_dinov2():
     """If these matched, Arm 3 would not be a control at all."""
     rnd = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
@@ -264,7 +282,7 @@ def test_random_vit_differs_from_dinov2():
     )
 
 
-@pytest.mark.slow
+@slow
 def test_different_seeds_give_different_random_backbones():
     a = FeatureExtractor(backbone="random_vit", device="cpu", seed=0)
     b = FeatureExtractor(backbone="random_vit", device="cpu", seed=1)
@@ -564,6 +582,7 @@ def test_pixel_ae_encode_refuses_an_encoder_of_the_wrong_width(pixel_ae, monkeyp
         pixel_ae.encode(_frames(4))
 
 
+@slow
 def test_vit_encode_refuses_the_wrong_patch_count(extractor, monkeypatch):
     """The shared post-branch guard, exercised on the ViT path: 1 + 63 tokens
     (a wrong patch size) must be named, not silently cached as 63 rows."""

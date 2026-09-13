@@ -3,8 +3,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-import mbfps.models.encoders as encoders  # Task 1's `test_no_second_source_of_truth_for_the_patch_count` reads it
-from mbfps.data.features import BACKBONE_GEOMETRY
+import mbfps.models.encoders as encoders  # the module object itself: `test_no_second_source_of_truth_for_the_patch_count` inspects it
+from mbfps.data.features import BACKBONE_GEOMETRY  # the re-export, on purpose: it must be the leaf's own dict
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.utils.config import get_config
 from mbfps.models.encoders import (
@@ -266,7 +266,9 @@ def test_bottleneck_gradients_flow_to_every_parameter():
 # shared `patch_dim = 384`, both describing the ViT backbones' output. A third
 # backbone with a different row width would have been built against 384 with
 # no error until the first matmul. The geometry now lives in ONE registry,
-# `mbfps.data.features.BACKBONE_GEOMETRY`, and the encoder reads it.
+# `mbfps.data.geometry.BACKBONE_GEOMETRY` (re-exported by `mbfps.data.features`
+# as the same dict, which is why patching it through either name works below),
+# and the encoder reads it.
 
 
 def test_bottleneck_takes_its_geometry_from_the_backbone_registry(monkeypatch):

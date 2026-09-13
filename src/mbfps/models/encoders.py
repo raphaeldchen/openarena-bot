@@ -20,7 +20,7 @@ comparison has stopped being controlled.
 import torch
 import torch.nn as nn
 
-from mbfps.data.features import BACKBONE_GEOMETRY
+from mbfps.data.geometry import BACKBONE_GEOMETRY, geometry_mismatch
 from mbfps.utils.config import EncoderConfig
 
 _SPATIAL = 7
@@ -28,7 +28,7 @@ _SPATIAL = 7
 
 
 class CNNEncoder(nn.Module):
-    """Learned convolutional encoder over raw pixels (Arm 1).
+    """Learned convolutional encoder over raw pixels (M2's encoder; M3b's retired `cnn` arm).
 
     Takes uint8 straight from the loader and owns its own normalisation, so no
     caller has to remember to scale. Four stride-2 convolutions reduce
@@ -62,7 +62,7 @@ def encoder_input_kind(cfg: EncoderConfig) -> str:
     return "obs" if cfg.kind == "cnn" else "features"
 
 
-_ARM_BACKBONE: dict[str, str | None] = {
+_KIND_BACKBONE: dict[str, str | None] = {
     "cnn": None,
     "pixel_ae": "pixel_ae",
     "frozen_ssl": "dinov2",
@@ -84,13 +84,13 @@ def encoder_backbone(cfg: EncoderConfig) -> str | None:
     Raises:
         KeyError: if `cfg.kind` is not a registered kind.
     """
-    if cfg.kind not in _ARM_BACKBONE:
+    if cfg.kind not in _KIND_BACKBONE:
         raise KeyError(f"unknown encoder kind {cfg.kind!r}")
-    return _ARM_BACKBONE[cfg.kind]
+    return _KIND_BACKBONE[cfg.kind]
 
 
 class BottleneckEncoder(nn.Module):
-    """Learned per-patch bottleneck over frozen-backbone features (Arms 2, 3).
+    """Learned per-patch bottleneck over frozen-backbone features (every study arm).
 
     The backbone never updates, so its features are cached once at collection
     time and this module is the only trained part of the encoder path. A
@@ -151,9 +151,8 @@ class BottleneckEncoder(nn.Module):
         expected = (self.n_patches, self.patch_dim)
         if tuple(features.shape[1:]) != expected:
             raise ValueError(
-                f"backbone {self.backbone!r} features must be (N, {self.n_patches}, "
-                f"{self.patch_dim}), i.e. rows of {expected}, got rows of "
-                f"{tuple(features.shape[1:])} from input shape {tuple(features.shape)}"
+                geometry_mismatch(self.backbone, expected, tuple(features.shape[1:]))
+                + f" (input shape {tuple(features.shape)})"
             )
         return self.bottleneck(self.norm(features.to(torch.float32))).flatten(1)
 

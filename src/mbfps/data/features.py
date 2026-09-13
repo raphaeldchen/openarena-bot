@@ -7,6 +7,11 @@ than a bottlenecked vector. The grid's geometry is a property of the backbone,
 recorded in `BACKBONE_GEOMETRY`: the two ViTs emit an 8x8 grid of 384-d patch
 tokens; the M2 pixel autoencoder emits one 2048-d vector, partitioned into 64
 rows of 32 so the same per-row bottleneck downstream can consume it.
+
+The registry itself -- `BACKBONES`, `BACKBONE_GEOMETRY`, `PIXEL_AE_CHECKPOINT`
+and the `geometry_mismatch` message -- lives in the leaf module
+`mbfps.data.geometry` and is re-exported here unchanged, so that the encoder
+and the loader can read it without paying for the `transformers` import below.
 """
 
 import shutil
@@ -16,49 +21,28 @@ import numpy as np
 import torch
 from transformers import AutoConfig, AutoModel
 
+# Re-exported, NOT copied: `mbfps.data.geometry` is the registry's home and
+# these are the same objects, so a test that rebinds an entry through this
+# module rebinds the dict the encoder and the loader read.
+from mbfps.data.geometry import (  # noqa: F401 (re-exports)
+    BACKBONE_GEOMETRY,
+    BACKBONES,
+    PIXEL_AE_CHECKPOINT,
+    geometry_mismatch,
+)
 from mbfps.envs.protocol import OBS_SHAPE
+from mbfps.models.encoders import CNNEncoder
+from mbfps.utils.config import EncoderConfig
 from mbfps.utils.device import get_device
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-BACKBONES: tuple[str, ...] = ("dinov2", "random_vit", "pixel_ae")
-"""Frozen backbones. `dinov2` is the treatment arm's pretrained encoder;
-`random_vit` is the control -- identical architecture, random weights, which is
-what separates "pretraining helps" from "a stationary target helps"; `pixel_ae`
-is the encoder of the M2 pixel autoencoder trained on this very data, which
-makes the pixel arm a frozen-target arm like the other two instead of the
-end-to-end arm that M3b measured never leaving its collapsed initial state."""
-
-BACKBONE_GEOMETRY: dict[str, tuple[int, int]] = {
-    "dinov2": (64, 384),
-    "random_vit": (64, 384),
-    "pixel_ae": (64, 32),
-}
-"""`(n_patches, patch_dim)` of each backbone's cached rows.
-
-112 / 14 = 8, so a patch-14 ViT yields an 8x8 = 64 grid of hidden-size-384
-tokens. The pixel autoencoder's encoder ends in `Linear(12544 -> 2048)`, one
-vector with no spatial meaning; it is reshaped row-major into 64 rows of 32 so
-that `64 * bottleneck_dim(32) == embed_dim(2048)` holds for it exactly as for
-the ViTs. Every consumer of a cache's shape -- the loader's validation, the
-bottleneck's `Linear` width, the cache-size estimate -- reads this dict; there
-is deliberately no module constant for "the" patch count or width any more."""
-
-PIXEL_AE_CHECKPOINT: Path = Path("runs/m2_fixed/autoencoder_cnn.pt")
-"""Where M2 left the pixel autoencoder (`scripts/train_autoencoder.py --arm cnn`).
-Gitignored, so a fresh checkout has to retrain it or copy it in."""
 
 _MODEL_NAME = "facebook/dinov2-small"
 
 
 def _load_pixel_ae(path: Path) -> torch.nn.Module:
     """Load the encoder half of an M2 `cnn` autoencoder checkpoint, frozen."""
-    # Local import: `mbfps.models.encoders` reads `BACKBONE_GEOMETRY` from this
-    # module at import time, so a top-level import here would be circular.
-    from mbfps.models.encoders import CNNEncoder
-    from mbfps.utils.config import EncoderConfig
-
     if not path.is_file():
         raise FileNotFoundError(
             f"pixel_ae checkpoint not found at {path}; M2 writes it with "
@@ -182,6 +166,9 @@ class FeatureExtractor:
                     f"pixel_ae encoder emitted {out.shape[1]} dims per frame, "
                     f"expected {n_patches} x {patch_dim} = {n_patches * patch_dim}"
                 )
+            # The reshape is the whole guarantee: having passed the width
+            # check it can only produce (n_patches, patch_dim) rows, so no
+            # post-branch guard is needed on this side.
             patches = out.reshape(len(frames), n_patches, patch_dim)
         else:
             x = frames.astype(np.float32) / 255.0
@@ -189,12 +176,16 @@ class FeatureExtractor:
             tensor = torch.from_numpy(x).permute(0, 3, 1, 2).to(self.device)
             out = self.model(pixel_values=tensor).last_hidden_state
             patches = out[:, 1:, :]  # drop the CLS token
-        if tuple(patches.shape[1:]) != (n_patches, patch_dim):
-            raise ValueError(
-                f"backbone {self.backbone!r} is registered as {(n_patches, patch_dim)} per frame "
-                f"but emitted {tuple(patches.shape[1:])}; check that the input is "
-                f"112x112 and the patch size is 14"
-            )  # Task 1's wording, which its `test_encode_checks_its_output_against_the_registry` pins (registered first, emitted second)
+            if tuple(patches.shape[1:]) != (n_patches, patch_dim):
+                # The patch-size hint is a ViT fact and lives in the ViT
+                # branch: 112 / 14 = 8 is how the 64 comes about, and it
+                # means nothing for the pixel autoencoder's one flat vector.
+                raise ValueError(
+                    geometry_mismatch(
+                        self.backbone, (n_patches, patch_dim), tuple(patches.shape[1:])
+                    )
+                    + " Check that the input is 112x112 and the patch size is 14."
+                )
         return patches.to(torch.float16).cpu().numpy()
 
 
