@@ -12,12 +12,16 @@ so `load_obs=False` skips it. `.npz` decompresses lazily per key, so not
 reading `obs` genuinely avoids the cost.
 
 Feature files are memmapped rather than loaded: mapping all 122 costs 0.04 s
-and 0.04 GB, versus 2.93 GB to read them. The first file's row geometry is
-checked against the backbone registry at construction, from the header alone:
-a cache is a bare `.npy` that does not record which backbone wrote it, and
-with two geometries in play -- (64, 384) for the ViTs, (64, 32) for the M2
-pixel autoencoder -- a wrong-suffix cache used to surface as a matmul error
-in the encoder at step 0, after the loading time was paid.
+and 0.04 GB, versus 2.93 GB to read them. Every file's row geometry is
+checked against the backbone registry at construction, from the header alone
+and within that same 0.04 s: a cache is a bare `.npy` that does not record
+which backbone wrote it, and with two geometries in play -- (64, 384) for the
+ViTs, (64, 32) for the M2 pixel autoencoder -- a wrong-suffix cache used to
+surface as a matmul error in the encoder at step 0, after the loading time
+was paid. Every file rather than the first, because an interrupted `--clear`
+or a partial re-cache leaves a directory that is uniform at file 0 and wrong
+at file 60, and that used to fail minutes into a cell inside
+`BottleneckEncoder.forward` rather than here.
 """
 
 import logging
@@ -28,6 +32,11 @@ import numpy as np
 
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import load_episode
+# The registry lives in a leaf module, so reading it here costs nothing: it is
+# the one source of truth for a backbone's row geometry -- `BottleneckEncoder`
+# reads the same dict -- so what the loader admits is exactly what the
+# encoder's `Linear` can consume.
+from mbfps.data.geometry import BACKBONE_GEOMETRY, geometry_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +73,18 @@ def _check_feature_geometry(
 
     `features` is the memmap `np.load(..., mmap_mode="r")` returned, so
     `.shape` comes from the `.npy` header and no frame is read. The message
-    names all four things a reader needs -- which backbone the suffix
-    promised, what that backbone writes, what the file holds, and which file
-    -- because the fix is always "re-cache this backbone" and the user must
-    not have to reopen the file to know that.
+    (`geometry_mismatch`, shared with the encoder and the spike) names all
+    four things a reader needs -- which backbone the suffix promised, what
+    that backbone writes, what the file holds, and which file -- because the
+    fix is always "re-cache this backbone" and the user must not have to
+    reopen the file to know that.
 
     Raises:
         ValueError: if `features.shape[1:] != expected`.
     """
     got = tuple(features.shape[1:])
     if got != tuple(expected):
-        raise ValueError(
-            f"feature cache {path} does not match backbone {backbone!r}: "
-            f"expected rows of shape {tuple(expected)}, got {got}. "
-            f"Re-run scripts/cache_features.py --backbone {backbone}."
-        )
+        raise ValueError(geometry_mismatch(backbone, expected, got, path=path))
 
 
 class SequenceLoader:
@@ -112,15 +118,6 @@ class SequenceLoader:
 
         self._features: list[np.ndarray | None] = []
         if load_features:
-            # Imported here rather than at module top: `mbfps.data.features`
-            # pulls in `transformers` (measured 1.53 s against this module's
-            # 0.09 s), and the pixel `cnn` kind and M2's autoencoder tools
-            # construct loaders that never read a cache. The registry is the
-            # one source of truth for a backbone's row geometry --
-            # `BottleneckEncoder` reads the same dict -- so what the loader
-            # admits is exactly what the encoder's `Linear` can consume.
-            from mbfps.data.features import BACKBONE_GEOMETRY
-
             # Before the file loop: an unregistered name has no cache either,
             # and the FileNotFoundError below would send the user to
             # `cache_features.py --backbone <typo>`, which refuses the same
@@ -132,7 +129,7 @@ class SequenceLoader:
                 )
             expected = BACKBONE_GEOMETRY[feature_backbone]
             suffix = feature_suffix(feature_backbone)
-            for index, path in enumerate(self._paths):
+            for path in self._paths:
                 feature_path = path.with_suffix(suffix)
                 if not feature_path.is_file():
                     raise FileNotFoundError(
@@ -141,14 +138,12 @@ class SequenceLoader:
                         f"--backbone {feature_backbone} first."
                     )
                 features = np.load(feature_path, mmap_mode="r")
-                # The first file only. One `cache_features.py` invocation
-                # writes one backbone's cache for every episode, so the
-                # geometry is a property of the cache, not of a file, and
-                # one error at one place is what a reader wants.
-                if index == 0:
-                    _check_feature_geometry(
-                        features, feature_backbone, expected, feature_path
-                    )
+                # Every file, from its header: a mixed directory (an
+                # interrupted `--clear`, a partial re-cache) must fail here,
+                # at construction, and name the first file that disagrees.
+                _check_feature_geometry(
+                    features, feature_backbone, expected, feature_path
+                )
                 self._features.append(features)
 
         if load_obs:

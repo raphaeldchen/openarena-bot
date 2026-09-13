@@ -350,8 +350,14 @@ _GEOMETRY_CASES = [
 ]
 
 
-def _buffer_with_cache(tmp_path, backbone, rows, n_episodes=1, t=80):
-    """`n_episodes` episodes, each with a `(t + 1, *rows)` cache for `backbone`."""
+def _buffer_with_cache(tmp_path, backbone, rows, n_episodes=1, t=16):
+    """`n_episodes` episodes, each with a `(t + 1, *rows)` cache for `backbone`.
+
+    `t = 16` is exactly `_feature_loader`'s `seq_len`, the shortest episode
+    it can sample from, so a ViT-geometry cache is 17 x 64 x 384 x 2 bytes
+    (0.8 MB) rather than the 4 MB an 80-step one costs; these tests write a
+    dozen of them.
+    """
     buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
     for i in range(n_episodes):
         buf.add(make_episode(t=t, fill=i + 1))
@@ -432,20 +438,42 @@ def test_every_registered_backbone_loads_a_cache_of_its_own_geometry(
 def test_the_guard_fires_on_the_first_cache_it_reads(tmp_path):
     """Every fixture above holds one episode, so "first", "last" and "any"
     are indistinguishable there. Two episodes, of which only the first is
-    malformed, pin the guard to the first file it opens."""
+    malformed: the guard must open the first file, not only the last."""
     buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 32), n_episodes=2)
     first = buf.episode_paths()[0].with_suffix(".features_pixel_ae.npy")
-    np.save(first, np.zeros((81, 64, 384), dtype=np.float16))
-    with pytest.raises(ValueError, match="does not match backbone"):
+    np.save(first, np.zeros((17, 64, 384), dtype=np.float16))
+    with pytest.raises(ValueError, match="does not match backbone") as excinfo:
         _feature_loader(buf, "pixel_ae")
+    assert str(first) in str(excinfo.value)
+
+
+def test_the_guard_fires_on_a_later_cache_too(tmp_path):
+    """THE OTHER HALF: every file, not the first. The guard used to check
+    file 0 only, on the reasoning that one `cache_features.py` run writes one
+    geometry for every episode -- true of a completed run, and false of an
+    interrupted `--clear` or a partial re-cache, which leave a directory that
+    is right at file 0 and wrong at file 60. That directory used to fail
+    minutes into a cell inside `BottleneckEncoder.forward`. Two episodes, of
+    which only the SECOND is malformed, and the message names that file."""
+    buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 32), n_episodes=2)
+    first, second = (
+        path.with_suffix(".features_pixel_ae.npy") for path in buf.episode_paths()
+    )
+    np.save(second, np.zeros((17, 64, 384), dtype=np.float16))
+    assert np.load(first, mmap_mode="r").shape == (17, 64, 32), (
+        "fixture: the first cache must be the good one, or this is the test above")
+    with pytest.raises(ValueError, match="does not match backbone") as excinfo:
+        _feature_loader(buf, "pixel_ae")
+    assert str(second) in str(excinfo.value)
+    assert str(first) not in str(excinfo.value)
 
 
 def test_the_geometry_check_reads_the_header_not_the_frames(tmp_path):
-    """The module docstring promises memmapped caches (0.04 GB to map all
-    122 against 2.93 GB to read them), and nothing pinned it before the
-    guard existed. A guard written as `np.asarray(np.load(...)).shape`, or a
-    `np.load` that lost `mmap_mode`, would turn every construction into a
-    full read of the cache. `.shape` on a memmap comes from the header."""
+    """The cache is memmapped, not loaded: the module docstring promises it
+    (0.04 GB to map all 122 against 2.93 GB to read them) and this is what
+    pins `mmap_mode="r"` on the `np.load`. It is all this test can see -- a
+    guard that materialised the array internally and then kept the memmap
+    would still pass it."""
     buf = _buffer_with_cache(tmp_path, "pixel_ae", (64, 32))
     loader = _feature_loader(buf, "pixel_ae")
     assert isinstance(loader._features[0], np.memmap)

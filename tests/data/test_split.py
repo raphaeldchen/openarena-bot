@@ -87,8 +87,10 @@ def test_loader_paths_subset_keeps_features_index_aligned_with_episodes(tmp_path
     import numpy as np
 
     buffer = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    # t = 16 is the loader's seq_len below, the shortest usable episode, so
+    # each (17, 64, 384) cache is 0.8 MB rather than the 4 MB of an 80-step one.
     for fill in (1, 2, 3, 4):
-        buffer.add(make_episode(t=80, fill=fill))
+        buffer.add(make_episode(t=16, fill=fill))
     all_paths = buffer.episode_paths()
     for path in all_paths:
         # Encode each episode's identity into its own feature cache so a
@@ -96,7 +98,7 @@ def test_loader_paths_subset_keeps_features_index_aligned_with_episodes(tmp_path
         marker = float(path.stem.split("_len")[0].split("_")[1])
         # (64, 384) is dinov2's registered geometry; the loader refuses any
         # other row shape under the bare `.features.npy` suffix.
-        feats = np.full((81, 64, 384), marker, dtype=np.float16)
+        feats = np.full((17, 64, 384), marker, dtype=np.float16)
         np.save(path.with_suffix(".features.npy"), feats)
 
     train, _ = episode_split(all_paths, val_fraction=0.5, seed=0)
