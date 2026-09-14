@@ -208,7 +208,7 @@ class ReadingTwo:
     horizons: dict[tuple[str, str, float], int]     # (arm, channel, q) -> H*_q
     h_min: int                                      # min over arms of horizons[(arm, "free", 0.75)]
 def reading_two(survival: dict[tuple[str, str], np.ndarray], qs=Q_REPORTED) -> ReadingTwo
-def format_reading_one(r: ReadingOne, inputs: ReadingOneInputs, z_fam: float) -> str
+def format_reading_one(r: ReadingOne, inputs: ReadingOneInputs, z_fam: float, h: int = 45) -> str   # h is printed in the header and every detail line
 def format_reading_two(r: ReadingTwo) -> str
 ```
 `z_fam` is `pooling.cluster_threshold(FAMILY, clusters)` computed by the caller (Task 6) from the actual cluster count.
