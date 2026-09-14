@@ -427,6 +427,42 @@ def test_probe_attenuation_cancels_in_ratio_probe_but_not_in_ratio_raw():
     np.testing.assert_allclose(dec.cosine, np.ones((N, H)))
 
 
+@pytest.mark.parametrize(
+    "degrees, expected, exact",
+    [(60, 0.5, False), (90, 0.0, True), (120, -0.5, False), (180, -1.0, True)],
+    ids=["60deg", "orthogonal", "120deg", "opposite"],
+)
+def test_cosine_reads_the_angle_between_the_imagined_and_the_true_displacement(degrees, expected, exact):
+    """Every other prior here is collinear with the truth, so the cosine is
+    only ever pinned at 1 or NaN and a constant 1 -- or an `abs`, a `clip(0,
+    1)` or a `sign` -- would pass. `d_hat` is `d` rotated by the angle, at
+    the same length: cos 60 = 0.5 and cos 120 = -0.5 to floating point; the
+    90-degree rotation (`(-d_y, d_x)`, the construction the boundary test
+    uses) is exactly 0.0 and the reversal is exactly -1.0, both by integer
+    arithmetic. The ratios read 1 on every row: the length is untouched."""
+    _, p_true, _, p_true0, _ = _prior(1.0)
+    p_hat0 = p_true0 + BIAS
+    d = p_true - p_true0[:, None]
+    if degrees == 90:
+        d_hat = np.stack([-d[..., 1], d[..., 0]], axis=-1)
+    elif degrees == 180:
+        d_hat = -d
+    else:
+        theta = np.deg2rad(degrees)
+        rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+        d_hat = d @ rotation.T
+    p_hat = p_hat0[:, None] + d_hat
+    p_hat_real = p_true + BIAS
+    dec = displacement_decomposition(p_hat, p_true, p_hat0, p_true0, p_hat_real, ALL_MOVED)
+    if exact:
+        np.testing.assert_array_equal(dec.cosine, np.full((N, H), expected))
+    else:
+        np.testing.assert_allclose(dec.cosine, np.full((N, H), expected))
+    np.testing.assert_allclose(dec.ratio_probe, np.ones((N, H)))
+    np.testing.assert_allclose(dec.ratio_raw, np.ones((N, H)))
+    assert not dec.zero_displacement.any()
+
+
 def test_decomposition_respects_the_moved_mask_and_a_dead_probe_reading():
     # Row 0 is perfect but marked not-moved at h = 1; row 1 is a persistence
     # clone (d_hat = 0) marked not-moved everywhere; row 2's real-frame probe

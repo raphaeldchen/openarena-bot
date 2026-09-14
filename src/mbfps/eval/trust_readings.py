@@ -372,15 +372,19 @@ def reading_one(inputs: ReadingOneInputs, z_fam: float, h: int = 45) -> ReadingO
             f"probe control: the h× contrasts clear z_fam {_fmt(z_fam, '.2f')} with opposite "
             f"signs (probe z {_fmt(zp, '+.2f')}, free z {_fmt(zf, '+.2f')}), whatever (i)-(iii) said"
         )
+    # Each condition's detail already begins with the word that names its
+    # outcome ("unreadable: ...", "undecidable at this precision: ...",
+    # "unresolved through the probe: ..."), so the reason is the condition's
+    # name and its detail, never the word twice.
     elif _alpha_unreadable(inputs):
         status = Status.UNRESOLVED_ALPHA
-        reason = f"(iii) unreadable: {iii.detail}"
+        reason = f"{iii.name} {iii.detail}"
     elif best is None:
         status = Status.NOT_TESTABLE
-        reason = f"(i) undecidable at this precision: {i.detail}"
+        reason = f"{i.name} {i.detail}"
     elif least is None:
         status = Status.UNRESOLVED_PROBE
-        reason = f"(i) unresolved through the probe: {i.detail}"
+        reason = f"{i.name} {i.detail}"
     else:
         pooled_failed = [c.name for c in conditions if c.holds is not True]
         seeds_failed = [name for name, count in agreement.items() if count < _SEEDS_REQUIRED]

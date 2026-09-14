@@ -148,7 +148,8 @@ def test_best_delta_arm_clearing_one_contrast_but_not_the_other_is_none_and_read
     assert result.best_delta_arm is None
     assert result.conditions[0].holds is None
     assert "undecidable at this precision" in result.conditions[0].detail
-    assert result.reason.startswith("(i) undecidable at this precision")
+    assert result.reason.startswith("(i) undecidable at this precision: no arm")
+    assert result.reason.count("undecidable") == 1, "the name and the detail, never the word twice"
     # (ii) and (iii) were still evaluated and reported.
     assert result.conditions[1].holds is True and result.conditions[2].holds is True
 
@@ -223,7 +224,8 @@ def test_least_moving_arm_differing_between_channels_leaves_condition_i_unresolv
     verdict = reading_one(_inputs(pooled={"ratio_free": free}), Z_FAM)
     assert verdict.status is Status.UNRESOLVED_PROBE
     assert verdict.best_delta_arm == "random_vit" and verdict.least_moving_arm is None
-    assert verdict.reason.startswith("(i) unresolved through the probe")
+    assert verdict.reason.startswith("(i) unresolved through the probe: the least-moving arm")
+    assert verdict.reason.count("unresolved") == 1, "the name and the detail, never the word twice"
 
 
 def test_least_moving_arm_is_undefined_on_a_nan_or_a_tied_ratio():
@@ -315,7 +317,8 @@ def test_condition_iii_is_unreadable_on_a_boundary_alpha_of_the_treatment_or_the
         assert arm in result.detail
         verdict = reading_one(_inputs(pooled={"alpha_boundary": flags}), Z_FAM)
         assert verdict.status is Status.UNRESOLVED_ALPHA, arm
-        assert verdict.reason.startswith("(iii) unreadable")
+        assert verdict.reason.startswith("(iii) unreadable: alpha on the grid boundary")
+        assert verdict.reason.count("unreadable") == 1, "the name and the detail, never the word twice"
     pixel_only = {"pixel_ae": True, "frozen_ssl": False, "random_vit": False}
     assert condition_iii(_leaf(alpha_boundary=pixel_only), Z_FAM).holds is True
     assert reading_one(_inputs(pooled={"alpha_boundary": pixel_only}), Z_FAM).status is Status.SUPPORTED

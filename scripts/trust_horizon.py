@@ -1,4 +1,4 @@
-"""The trust horizon over the M3c cells, part 1: load, check, one reference pass, one record per cell.
+"""The trust horizon over the M3c cells: load, check, one reference pass, one record per cell, then pool and print both readings.
 
 M3c's ladder records store per-step MEAN error curves. Whether `random_vit`
 loses least at h=45 because its prior drifts slowly -- stays near persistence,
@@ -10,8 +10,10 @@ one `trust_<arm>_seed<n>.json` per cell holding, per window and per horizon
 step, the crossing step in both channels, the persistence margin, the three
 displacement ratios, the direction cosine, and the held-out scale-corrected
 error with its fold alphas -- the quantities of the M3d design, section 2.2.
-The pooling over the nine records and the two readings are the second part
-of this script and come after the per-cell loop in `main`.
+After the per-cell loop, `main` pools the LIVE records of that run (the dict
+it just built, never a stale file on disk) through `pooling.py`, decides the
+two readings through `trust_readings.py`, prints them and writes `trust.txt`
+-- the pooling glue and the printed tables below `write_trust_record`.
 
 LOADING IS `diagnose_dynamics.py`'S, NOT A SECOND COPY. The checkpoint path
 and its arm/seed validation (`load_checkpoint_model`), the diagnostic's path
@@ -47,8 +49,9 @@ and each has its own status:
     `curves.persistence_position` (`max |delta| == 0.0`, the ladder's own
     `record_reproduction` rule), or its windows are not the diagnostic's.
     Same windows, same rollout, same refit probe, or this is not measuring
-    what the ladder measured -- and the cell's record is NOT written, because
-    the second part pools every record it finds.
+    what the ladder measured -- and the cell's record is NOT written, and the
+    run stops: the pooling after the loop reads only the records this run
+    built, and it needs every requested cell.
 
 11, 12 and 14 carry `diagnose_dynamics.py`'s meanings ON PURPOSE -- a wrapper
 reading the status learns the same thing from either tool -- and 30 is new,
@@ -91,11 +94,13 @@ from mbfps.eval.trust import (
     persistence_margin,
     scale_corrected_error,
     survival,
+    trust_horizon,
 )
 from mbfps.eval.trust_readings import (
     ARMS_ORDER,
     CONTROL,
     FAMILY,
+    Q_REPORTED,
     TREATMENT,
     Contrast,
     Ratio,
@@ -600,9 +605,12 @@ def _inputs(records: dict, *, h: int, per_seed: bool) -> tuple[ReadingOneInputs,
     margin = probe_cells("margin", lambda r: _column(r, "margin", hi))
     cosine = probe_cells("cosine", lambda r: _column(r, "cosine", hi))
     held = lambda r: _column(r["scale"], "held_out", hi)  # noqa: E731
-    # Fold A = even episode labels, fold B = odd (`scale_corrected_error`'s
-    # own assignment); each fold's contrast is over that fold's rows alone,
-    # which is where the held-out alpha is the OTHER fold's.
+    # Fold A = the even-label windows, scored with the alpha fit on fold B
+    # (alpha_B); fold B = the odd-label windows, scored with the alpha fit on
+    # fold A (alpha_A) -- `scale_corrected_error`'s own assignment, where
+    # `held_out` scores every row with the OTHER fold's alpha. So "fold A"
+    # names the ROWS of a contrast here, while `alpha_a` / `score_a` on the
+    # record name the FIT (alpha_A is fit on A's rows and scores B's).
     corrected_a = probe_cells("held_out_a", held, fold=0)
     corrected_b = probe_cells("held_out_b", held, fold=1)
 
@@ -649,9 +657,9 @@ def _inputs(records: dict, *, h: int, per_seed: bool) -> tuple[ReadingOneInputs,
         corrected_contrast_b=_contrast(corrected_b[TREATMENT], corrected_b[CONTROL]),
         alpha_boundary=alpha_boundary,
         # The treatment pair is the probe control's own estimator, one code
-        # path with the informational pixel_ae pair (test-pinned equal).
-        crossing_contrast_probe=_informational_crossing(records, TREATMENT, "probe"),
-        crossing_contrast_free=_informational_crossing(records, TREATMENT, "free"),
+        # path with the informational pixel_ae pair.
+        crossing_contrast_probe=_crossing_contrast(records, TREATMENT, "probe"),
+        crossing_contrast_free=_crossing_contrast(records, TREATMENT, "free"),
         per_seed=(
             {
                 seed: _inputs(
@@ -728,12 +736,15 @@ def arm_summaries(records: dict, inputs: ReadingOneInputs, *, h: int) -> dict:
     return out
 
 
-def _informational_crossing(records: dict, arm: str, channel: str) -> Contrast:
-    """`arm - CONTROL` on h_x per (window, seed) draw, the probe control's
-    own estimator over the seeds both arms carry (both measurable, for the
-    probe channel). Printed for pixel_ae -- spec 3.2: "`pixel_ae`'s pair is
-    printed for information" -- and decided on by nothing: `ReadingOneInputs`
-    has no slot for it."""
+def _crossing_contrast(records: dict, arm: str, channel: str) -> Contrast:
+    """`arm - CONTROL` on h_x per (window, seed) draw, paired per draw with
+    the seeds stacked (spec 2.2: never seed-averaged), over the seeds both
+    arms carry -- both measurable, for the probe channel (spec 3.1). ONE
+    estimator for two uses: with `arm = TREATMENT` it is the probe control's
+    own contrast (`ReadingOneInputs.crossing_contrast_probe` / `_free`, which
+    `probe_control` decides on); with `arm = "pixel_ae"` it is printed for
+    information -- spec 3.2: "`pixel_ae`'s pair is printed for information"
+    -- and decided on by nothing."""
     seeds = sorted({seed for _, seed in records})
     if channel == "probe":
         seeds = [
@@ -748,22 +759,135 @@ def _informational_crossing(records: dict, arm: str, channel: str) -> Contrast:
     )
 
 
-def survival_by_arm(records: dict) -> dict:
-    """`(arm, channel) -> S(h)` for Reading 2: `trust.survival` over every
-    (window, seed) draw of the arm, seeds stacked, never-moved draws (NaN)
-    excluded by `survival` itself. The horizon is the records'."""
-    arms = sorted({arm for arm, _ in records}, key=ARMS_ORDER.index)
+def _reading_two_cells(records: dict, arm: str, channel: str) -> list[dict]:
+    """The cells one arm's Reading 2 curve is built from, in seed order: the
+    probe channel takes the MEASURABLE cells only -- spec 3.1's rule for
+    every probe-based pooling, applied here as `probe_cells` and
+    `_crossing_contrast` apply it -- and the free channel every cell."""
     seeds = sorted({seed for _, seed in records})
-    curves = {}
-    for arm in arms:
-        cells = [records[(arm, seed)] for seed in seeds if (arm, seed) in records]
-        horizon = int(cells[0]["horizon"])
-        for channel in ("probe", "free"):
-            crossings = np.concatenate(
-                [np.asarray(cell["crossing"][channel], dtype=float) for cell in cells]
-            )
-            curves[(arm, channel)] = survival(crossings, horizon)
-    return curves
+    cells = [records[(arm, seed)] for seed in seeds if (arm, seed) in records]
+    if channel == "probe":
+        cells = [cell for cell in cells if _measurable(cell)]
+    return cells
+
+
+def _crossing_draws(records: dict, arm: str, channel: str) -> np.ndarray:
+    """One arm's per-(window, seed) crossing draws in one channel, seeds
+    stacked in seed order, over `_reading_two_cells`; empty when the arm has
+    no cell in the channel (every seed unmeasurable, for the probe)."""
+    cells = _reading_two_cells(records, arm, channel)
+    if not cells:
+        return np.zeros(0)
+    return np.concatenate([np.asarray(cell["crossing"][channel], dtype=float) for cell in cells])
+
+
+def survival_by_arm(records: dict) -> dict:
+    """`(arm, channel) -> S(h)` for Reading 2: `trust.survival` over the
+    (window, seed) draws of `_crossing_draws` -- every cell in the free
+    channel, the measurable cells in the probe channel -- never-moved draws
+    (NaN) excluded by `survival` itself. The horizon is the records'."""
+    arms = sorted({arm for arm, _ in records}, key=ARMS_ORDER.index)
+    horizon = int(next(iter(records.values()))["horizon"])
+    return {
+        (arm, channel): survival(_crossing_draws(records, arm, channel), horizon)
+        for arm in arms
+        for channel in ("probe", "free")
+    }
+
+
+# --- Beside S(h): the unmoved fraction and the conditional survival ------------
+# Spec 3.3's S(h) counts every moved draw with h_x > h, and `crossing_step`
+# starts its search at h0, the window's FIRST moved step: a draw whose window
+# has not yet moved at h has h_x >= h0 > h and survives h with nothing having
+# been measured there. On the shipped split 133 of 229 windows are unmoved at
+# h = 1, so S(1) is at least 0.58 before any model is read. The two series
+# below say how much of S(h) that is. S(h), H*_q and H*_min stay exactly as
+# pre-registered; these are printed beside them and decide nothing.
+
+
+def _first_moved(record: dict) -> np.ndarray:
+    """h0 per window, 1-based -- the first step at which the window has moved,
+    `crossing_step`'s own search start -- NaN where it never moves. Read off
+    the per-step moved mask (`_moved`, column by column), never off
+    `counts.not_moved`, which counts windows per step and cannot say which."""
+    moved = np.stack([_moved(record, hi) for hi in range(int(record["horizon"]))], axis=1)
+    return np.where(moved.any(axis=1), moved.argmax(axis=1) + 1.0, np.nan)
+
+
+def _first_moved_draws(records: dict, arm: str, channel: str) -> np.ndarray:
+    """h0 per (window, seed) draw, stacked exactly as `_crossing_draws` stacks
+    the crossings, so the two align draw by draw."""
+    cells = _reading_two_cells(records, arm, channel)
+    if not cells:
+        return np.zeros(0)
+    return np.concatenate([_first_moved(cell) for cell in cells])
+
+
+def unmoved_fraction(crossings: np.ndarray, first_moved: np.ndarray, horizon: int) -> np.ndarray:
+    """`u(h)` for h = 0..horizon: among the draws `S(h)` counts (the finite
+    crossings), the fraction whose window has not yet moved at h -- `h0 > h`
+    -- and so survives h vacuously. `(horizon + 1,)` float, all NaN when no
+    crossing is finite; `u(0) == 1.0` whenever any is (no window has moved at
+    h = 0). Refuses a finite crossing whose window never moved: `crossing_step`
+    cannot produce one, so the record's `crossing` and its moved mask disagree."""
+    crossings = np.asarray(crossings, dtype=np.float64)
+    first_moved = np.asarray(first_moved, dtype=np.float64)
+    if crossings.shape != first_moved.shape or crossings.ndim != 1:
+        raise ValueError(
+            f"crossings and first_moved must share one (n,) shape, got "
+            f"{crossings.shape} and {first_moved.shape}"
+        )
+    finite = np.isfinite(crossings)
+    h0 = first_moved[finite]
+    if h0.size == 0:
+        return np.full(horizon + 1, np.nan)
+    if not np.isfinite(h0).all():
+        raise ValueError(
+            f"{int((~np.isfinite(h0)).sum())} draw(s) have a finite crossing but a window that "
+            "never moved: the record's crossing and its moved mask disagree"
+        )
+    steps = np.arange(horizon + 1)
+    return (h0[None, :] > steps[:, None]).mean(axis=1)
+
+
+def conditional_survival(surv: np.ndarray, unmoved: np.ndarray) -> np.ndarray:
+    """`S_c(h) = (S(h) - u(h)) / (1 - u(h))` where `u(h) < 1`, NaN otherwise:
+    the survival among the draws whose window HAS moved by h -- the ones on
+    which something was measured -- since every draw counted by `u(h)` is in
+    `S(h)` too. `S_c(0)` is always NaN."""
+    surv = np.asarray(surv, dtype=np.float64)
+    unmoved = np.asarray(unmoved, dtype=np.float64)
+    if surv.shape != unmoved.shape:
+        raise ValueError(f"S(h) {surv.shape} and u(h) {unmoved.shape} must share a shape")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(unmoved < 1.0, (surv - unmoved) / (1.0 - unmoved), np.nan)
+
+
+@dataclasses.dataclass(frozen=True)
+class Conditional:
+    """One (arm, channel)'s series beside its `S(h)`: the finite-crossing draw
+    count (S's denominator), `u(h)` and `S_c(h)`, h = 0..H."""
+
+    draws: int
+    unmoved: np.ndarray
+    survival: np.ndarray
+
+
+def conditional_by_arm(records: dict, curves: dict) -> dict:
+    """`(arm, channel) -> Conditional` for every key of `curves` (the output
+    of `survival_by_arm` on the same records), from the same draws in the
+    same order."""
+    horizon = int(next(iter(records.values()))["horizon"])
+    out = {}
+    for (arm, channel), surv in curves.items():
+        crossings = _crossing_draws(records, arm, channel)
+        unmoved = unmoved_fraction(crossings, _first_moved_draws(records, arm, channel), horizon)
+        out[(arm, channel)] = Conditional(
+            draws=int(np.isfinite(crossings).sum()),
+            unmoved=unmoved,
+            survival=conditional_survival(surv, unmoved),
+        )
+    return out
 
 
 def write_readings(out_dir: Path, text: str) -> Path:
@@ -777,7 +901,8 @@ def write_readings(out_dir: Path, text: str) -> Path:
 # The printed readings, in the ladder's style: the self-check table, the
 # pooling notes, the per-arm block, Reading 1 (summary line, then Task 5's
 # block under its own header) with pixel_ae's h_x pair for information, the
-# sensitivity block, Reading 2 (Task 5's block under its own header).
+# sensitivity block, Reading 2 (Task 5's block under its own header) with
+# the unmoved-fraction / conditional-survival block beside it.
 # `_readings_text` is what `main` prints and what trust.txt holds.
 # ---------------------------------------------------------------------------
 
@@ -858,6 +983,14 @@ def _pooling_notes(records: dict, clusters: int, z_fam: float, h: int) -> list[s
         f"probe-based pooling: {len(records) - len(excluded)} of {len(records)} cells measurable "
         f"(persistence-to-floor band at h={h} > 0); excluded: {', '.join(excluded) or 'none'}"
     )
+    lines.append(
+        "Reading 2's probe channel (S(h), H*_q through the probe) pools the same measurable cells; "
+        f"excluded from it: {', '.join(excluded) or 'none'}; the free channel pools every cell"
+    )
+    lines.append(
+        "folds: fold A = the even-label windows, scored with the alpha fit on fold B (alpha_B); "
+        "fold B = the odd-label windows, scored with the alpha fit on fold A (alpha_A)"
+    )
     not_moved = ", ".join(
         f"{arm}/s{seed}={int(r['counts']['not_moved'][h - 1])}" for (arm, seed), r in sorted(records.items())
     )
@@ -888,16 +1021,48 @@ def _sensitivity_table(inputs: ReadingOneInputs, h: int) -> str:
     return "\n".join(rows)
 
 
+def _conditional_table(conditional: dict, qs=Q_REPORTED) -> str:
+    """The block printed under Reading 2's table: per arm and channel (in
+    Reading 2's order), the draw count, then `u(h)` on one row and `S_c(h)`
+    on the next, each at every h like `S(h)` above them, with the
+    conditional `H*c_q` -- the largest h with `S_c(h) >= q`, `trust_horizon`
+    on `S_c` -- beside `S_c(h)` under labels of its own. NaN prints `n/a`
+    (`S_c(0)`, and every h where no counted window has moved)."""
+    qs = sorted(qs)
+    rows = [
+        "--- Reading 2, beside S(h) (not pre-registered; S(h), H*_q and H*_min above are the spec's): "
+        "u(h) = the fraction of the same moved draws whose window has not yet moved at h (h0 > h: "
+        "h_x >= h0, so they survive h with nothing measured); S_c(h) = (S(h) - u(h)) / (1 - u(h)) = "
+        "the survival among the draws whose window has moved by h, n/a where u(h) = 1; "
+        "H*c_q = largest h with S_c(h) >= q ---",
+        f"{'arm':<12}{'channel':<9}{'draws':>6}  {'series':<7}"
+        + "".join(f"{f'H*c_{q:g}':>9}" for q in qs) + "   value, h = 0..H",
+    ]
+    horizons = "".join(f"{'':>9}" for _ in qs)
+    for arm in ARMS_ORDER:
+        for channel in ("probe", "free"):
+            if (arm, channel) not in conditional:
+                continue
+            c = conditional[(arm, channel)]
+            unmoved = " ".join(_num(v, ".2f") for v in c.unmoved)
+            cond = " ".join(_num(v, ".2f") for v in c.survival)
+            cond_horizons = "".join(f"{trust_horizon(c.survival, q):>9d}" for q in qs)
+            rows.append(f"{arm:<12}{channel:<9}{c.draws:>6}  {'u(h)':<7}{horizons}   {unmoved}")
+            rows.append(f"{arm:<12}{channel:<9}{'':>6}  {'S_c(h)':<7}{cond_horizons}   {cond}")
+    return "\n".join(rows)
+
+
 def _readings_text(records: dict, *, h: int) -> str:
     """The whole readings block, in this order: the run header; the
     self-check table (always); then, when every arm is present, the pooling
     notes, the per-arm block, the `reading 1:` summary line followed by
     Task 5's Reading 1 block under its own header, pixel_ae's h_x pair for
-    information, the sensitivity block, and Task 5's Reading 2 block under
-    its own header. Both readings need all three arms -- Reading 1 pools
-    them and `reading_two` refuses a missing (arm, channel) by name -- so a
-    run over fewer prints `not computed` under BOTH headers and still exits
-    0 with the self-check table on disk."""
+    information, the sensitivity block, Task 5's Reading 2 block under its
+    own header, and the unmoved-fraction / conditional-survival block
+    beside it. Both readings need all three arms -- Reading 1 pools them
+    and `reading_two` refuses a missing (arm, channel) by name -- so a run
+    over fewer prints `not computed` under BOTH headers and still exits 0
+    with the self-check table on disk."""
     arms = sorted({arm for arm, _ in records}, key=ARMS_ORDER.index)
     seeds = sorted({seed for _, seed in records})
     lines = [
@@ -928,7 +1093,7 @@ def _readings_text(records: dict, *, h: int) -> str:
         lines.append(f"reading 1: {reading.status.name} -- {reading.reason}")
         lines.append(format_reading_one(reading, inputs, z_fam, h=h))
         for channel in ("probe", "free"):
-            c = _informational_crossing(records, "pixel_ae", channel)
+            c = _crossing_contrast(records, "pixel_ae", channel)
             lines.append(
                 f"for information: h_x {channel} pixel_ae - {CONTROL} per draw: estimate "
                 f"{_num(c.estimate, '+.3f')}, se {_num(c.se)}, z {_num(c.z, '+.2f')} "
@@ -947,7 +1112,10 @@ def _readings_text(records: dict, *, h: int) -> str:
         )
         lines.append(_sensitivity_table(sensitivity, h))
         lines.append("")
-        lines.append(format_reading_two(reading_two(survival_by_arm(records))))
+        curves = survival_by_arm(records)
+        lines.append(format_reading_two(reading_two(curves)))
+        lines.append("")
+        lines.append(_conditional_table(conditional_by_arm(records, curves)))
     else:
         lines.append(
             f"\n--- Reading 1: does the h={h} gate reward slow drift? ---\n"

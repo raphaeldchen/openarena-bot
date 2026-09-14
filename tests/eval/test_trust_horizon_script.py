@@ -1,5 +1,6 @@
-"""scripts/trust_horizon.py, part 1: load as diagnose_dynamics does, the four
-checks in order, one reference pass, one record per cell.
+"""scripts/trust_horizon.py: load as diagnose_dynamics does, the four checks in
+order, one reference pass, one record per cell; then (from the Task 6 marker
+down) the pooling glue over the records, the two readings and trust.txt.
 
 The script is loaded by path, the way `test_diagnose_dynamics_script.py`
 loads its script. Unlike that file, nothing here stubs the model: the cell
@@ -186,25 +187,44 @@ def test_the_reused_statuses_are_diagnose_dynamics_own_and_thirty_is_new():
 # ---------------------------------------------------------------------------
 
 
+BIAS = np.array([0.0, 9.0])
+"""The probe reads every position 9 map units too far in +y: the prior's
+anchor p_hat(0) is the truth plus this bias. Orthogonal to window 0's walk
+(+x) and along window 1's (+y), so every norm below is a Pythagorean integer
+or a half-integer and every hand-typed number is exact in floating point."""
+
+
 def _fabricated() -> tuple[Trajectories, dict]:
     """Two windows, two steps, two episodes. Window 0 is a PERFECT predictor
-    (imagined position == truth, floor == truth); window 1 is a PERSISTENCE
-    CLONE (imagined position held at p_hat(0)). Every number below is chosen
-    so the two rows have different signatures on every channel.
+    (imagined position == truth); window 1 is a PERSISTENCE CLONE (imagined
+    position held at p_hat(0)). The probe is BIASED by `BIAS` at the anchor,
+    and its reading of the real future frames -- the floor, `positions_real`
+    -- is ATTENUATED: p_hat0 + d / 2. Neither equals the truth, so a record
+    that wires the truth where the probe belongs (the anchor for
+    `positions_at_context`, `true_positions` for `positions_real`) is caught
+    by a value. Every number below is chosen so the two rows have different
+    signatures on every channel.
 
-    Truth: window 0 moves (6, 0) then (12, 0) from (0, 0); window 1 moves
-    (0, 6) then (0, 12) from (10, 10). Both are >= 5 map units at every h,
-    so `moved` is all True.
+    Truth: window 0 moves (12, 0) then (40, 0) from (0, 0); window 1 moves
+    (0, 5) then (0, 30) from (10, 10). |d| row 0 [12, 40], row 1 [5, 30]: every
+    cell is >= 5 map units (row 1 at h=1 EXACTLY 5, the `>=` of the mask),
+    so `moved` is all True -- and the mask is the TRUTH's: measured from the
+    biased anchor, row 1 at h=1 would read |(0, 5) - (0, 9)| = 4 and drop out.
+    Anchor p_hat(0) = truth + (0, 9): row 0 (0, 9), row 1 (10, 19).
 
-      model error      row 0 [0, 0]    row 1 [6, 12]
-      persistence err  row 0 [6, 12]   row 1 [6, 12]
+      persistence err |p_hat(0) - p(h)|   row 0 [15, 41] (|(-12, 9)|, |(-40, 9)|)
+                                          row 1 [4, 21]  (|(0, -4)|, |(0, -21)|)
+      model error      row 0 [0, 0] (perfect)    row 1 [4, 21] (the clone IS persistence)
       -> crossing (probe): row 0 never (3 = H + 1); row 1 ties never cross (3)
-      -> margin: row 0 [6, 12]; row 1 [0, 0]
-      -> ratio_probe / ratio_raw: row 0 [1, 1]; row 1 [0, 0]
-      -> cosine: row 0 [1, 1]; row 1 NaN (|d_hat| = 0), counted as zero_displacement
-      -> displacement: probe_hat row 0 [6, 12], row 1 [0, 0]; probe_real [6, 12] on
-         both rows (the floor is the truth); free_hat / free_true are the two
-         embedding norms below, as they are
+      -> margin: row 0 [15, 41]; row 1 [0, 0]
+      d_hat = p_hat - p_hat(0): row 0 = d - BIAS = (12, -9), (40, -9), |d_hat| [15, 41],
+        NOT collinear with d: cos = 12/15 = 0.8, 40/41; row 1 = 0
+      d_hat_real = (p_hat0 + d/2) - p_hat0 = d / 2: |d_hat_real| row 0 [6, 20], row 1 [2.5, 15]
+      -> ratio_raw  = |d_hat| / |d|:        row 0 [15/12, 41/40] = [1.25, 1.025]; row 1 [0, 0]
+      -> ratio_probe = |d_hat| / |d_hat_real|: row 0 [15/6, 41/20] = [2.5, 2.05] (2x raw); row 1 [0, 0]
+      -> cosine: row 0 [0.8, 40/41]; row 1 NaN (|d_hat| = 0), counted as zero_displacement
+      -> displacement: probe_hat row 0 [15, 41], row 1 [0, 0]; probe_real row 0 [6, 20],
+         row 1 [2.5, 15]; free_hat / free_true are the two embedding norms below, as they are
 
     Embedding channel, chosen to DIFFER from the probe channel's answers:
       D_hat  row 0 [0, 0]   row 1 [5, 5]      (distance of e_hat(h) to e(h))
@@ -215,26 +235,27 @@ def _fabricated() -> tuple[Trajectories, dict]:
       -> ratio_free: row 0 [1, 1]; row 1 [0.5, 0.5]
 
     Scale correction (episode labels 0 and 1 -> fold A = row 0, fold B = row 1):
-      alpha_a fit on row 0: |alpha * d - d| = |alpha - 1| * |d| -> 1.0 at both h
+      alpha_a fit on row 0: |p_hat0 + alpha d_hat - p| = |1 - alpha| |d - BIAS| -> 1.0 at both h
       alpha_b fit on row 1: d_hat = 0, the error is |p_hat0 - p| whatever alpha
         -> a tie over the whole grid -> the smallest alpha, 0.0 -> BOUNDARY
-      score_a (fit A, scored on row 1 with alpha 1): [6, 12]
-      score_b (fit B, scored on row 0 with alpha 0): [6, 12]
-      held_out: row 0 with alpha_b = 0 -> [6, 12]; row 1 with alpha_a = 1 -> [6, 12]
+      score_a (fit A, scored on row 1 with alpha 1): row 1's persistence error [4, 21]
+      score_b (fit B, scored on row 0 with alpha 0): row 0's persistence error [15, 41]
+      held_out: row 0 with alpha_b = 0 -> [15, 41]; row 1 with alpha_a = 1 -> [4, 21]
       boundary [True, True]; folds_available True
 
     The diagnostic's curves are the means of the rows above -- reference
-    [3, 6], persistence [6, 12] -- and its floor [1, 1] gives a positive
-    persistence-to-floor band (12 - 1 = 11) at the final step: measurable.
+    [2, 10.5], persistence [9.5, 31] -- and its floor [1, 1] gives a positive
+    persistence-to-floor band (31 - 1 = 30) at the final step: measurable.
     """
     true_at_context = np.array([[0.0, 0.0], [10.0, 10.0]])
-    true_positions = np.array([[[6.0, 0.0], [12.0, 0.0]], [[10.0, 16.0], [10.0, 22.0]]])
-    positions_at_context = true_at_context.copy()
-    positions = np.array([[[6.0, 0.0], [12.0, 0.0]], [[10.0, 10.0], [10.0, 10.0]]])
+    true_positions = np.array([[[12.0, 0.0], [40.0, 0.0]], [[10.0, 15.0], [10.0, 40.0]]])
+    positions_at_context = true_at_context + BIAS
+    d = true_positions - true_at_context[:, None, :]
+    positions = np.array([[[12.0, 0.0], [40.0, 0.0]], [[10.0, 19.0], [10.0, 19.0]]])
     traj = Trajectories(
         positions=positions,
         positions_at_context=positions_at_context,
-        positions_real=true_positions.copy(),
+        positions_real=positions_at_context[:, None, :] + 0.5 * d,
         true_positions=true_positions,
         true_at_context=true_at_context,
         embedding_distance_to_truth=np.array([[0.0, 0.0], [5.0, 5.0]]),
@@ -243,8 +264,8 @@ def _fabricated() -> tuple[Trajectories, dict]:
         true_embedding_displacement=np.array([[2.0, 4.0], [2.0, 4.0]]),
         window_episode=np.array([0, 1]),
         windows_total=2,
-        reference_position=np.array([3.0, 6.0]),
-        persistence_position=np.array([6.0, 12.0]),
+        reference_position=np.array([2.0, 10.5]),
+        persistence_position=np.array([9.5, 31.0]),
     )
     diagnostic = {
         "context": 2,
@@ -253,8 +274,8 @@ def _fabricated() -> tuple[Trajectories, dict]:
         "probe": {"embedding_selection_r2": 0.31},
         "windows": {"total": 2, "episode": [0, 1]},
         "curves": {
-            "reference_position": [3.0, 6.0],
-            "persistence_position": [6.0, 12.0],
+            "reference_position": [2.0, 10.5],
+            "persistence_position": [9.5, 31.0],
             "floor_position": [1.0, 1.0],
         },
     }
@@ -295,14 +316,14 @@ def test_self_check_reads_zero_when_the_trajectories_reproduce_the_diagnostic():
 
 def test_self_check_names_the_curve_and_the_step_of_the_largest_delta():
     """The rule is `max |delta| == 0.0`, the ladder's `record_reproduction`
-    rule: a delta of 2^-40 (exactly representable beside 6.0, so the
+    rule: a delta of 2^-40 (exactly representable beside 10.5, so the
     difference is exactly 2^-40) fails it. Each curve is judged on its own:
     the persistence curve doctored alone fails too, and the step named is
     the 1-based horizon step of the largest delta."""
     traj, diagnostic = _fabricated()
     tiny = 2.0 ** -40
     reference_only = script.self_check(
-        traj, _with_curve(diagnostic, "reference_position", [3.0, 6.0 + tiny])
+        traj, _with_curve(diagnostic, "reference_position", [2.0, 10.5 + tiny])
     )
     assert reference_only.ok is False
     assert reference_only.reference_position_max_delta == tiny
@@ -313,7 +334,7 @@ def test_self_check_names_the_curve_and_the_step_of_the_largest_delta():
     assert "reference_position" in message and "step 2" in message
 
     persistence_only = script.self_check(
-        traj, _with_curve(diagnostic, "persistence_position", [6.5, 12.0])
+        traj, _with_curve(diagnostic, "persistence_position", [10.0, 31.0])
     )
     assert persistence_only.ok is False
     assert persistence_only.reference_position_max_delta == 0.0
@@ -331,11 +352,11 @@ def test_self_check_judges_the_rows_the_record_is_built_from_not_the_passs_own_c
     clean run (Task 3 pins it), but it is not what is judged: a regression
     that kept the curve right and the rows wrong would otherwise write a
     record. Window 0's imagined position at step 2 is moved by one map unit
-    while the pass's curve stays [3, 6]: the row mean there is (1 + 12) / 2
-    = 6.5, so the check reads 0.5 at step 2 and fails. Then window 1's anchor
-    is moved by (0, 2) while the pass's persistence curve stays [6, 12]: its
-    persistence errors become [4, 10], the means [5, 11], a delta of 1.0 at
-    both steps, the first of which is named."""
+    while the pass's curve stays [2, 10.5]: the row mean there is (1 + 21) / 2
+    = 11, so the check reads 0.5 at step 2 and fails. Then window 1's anchor
+    is moved by (0, 2) while the pass's persistence curve stays [9.5, 31]:
+    its persistence errors become [6, 19], the means [10.5, 30], a delta of
+    1.0 at both steps, the first of which is named."""
     traj, diagnostic = _fabricated()
     positions = traj.positions.copy()
     positions[0, 1, 0] += 1.0
@@ -362,7 +383,7 @@ def test_self_check_refuses_a_curve_of_the_wrong_length_rather_than_raising():
     the status reserved for a defect, not for a record that does not match."""
     traj, diagnostic = _fabricated()
     check = script.self_check(
-        traj, _with_curve(diagnostic, "reference_position", [3.0, 6.0, 9.0])
+        traj, _with_curve(diagnostic, "reference_position", [2.0, 10.5, 18.0])
     )
     assert check.ok is False
     assert check.reference_position_max_delta == math.inf
@@ -420,20 +441,24 @@ def test_trust_record_wires_every_channel_the_way_the_spec_names_it():
     equal = np.testing.assert_array_equal  # NaN == NaN by position
     equal(record["crossing"]["probe"], [3.0, 3.0])
     equal(record["crossing"]["free"], [3.0, 1.0])
-    equal(record["margin"], [[6.0, 12.0], [0.0, 0.0]])
-    equal(record["ratio_probe"], [[1.0, 1.0], [0.0, 0.0]])
-    equal(record["ratio_raw"], [[1.0, 1.0], [0.0, 0.0]])
+    equal(record["margin"], [[15.0, 41.0], [0.0, 0.0]])
+    # ratio_probe is |d_hat| over the ATTENUATED floor's displacement, twice
+    # ratio_raw: the truth in the floor's slot would read 1.0 here.
+    equal(record["ratio_probe"], [[15 / 6, 41 / 20], [0.0, 0.0]])
+    equal(record["ratio_raw"], [[15 / 12, 41 / 40], [0.0, 0.0]])
     equal(record["ratio_free"], [[1.0, 1.0], [0.5, 0.5]])
-    equal(record["cosine"], [[1.0, 1.0], [np.nan, np.nan]])
+    # d_hat = d - BIAS is not collinear with d: a constant-1 cosine, an abs,
+    # a clip or a sign would not read 0.8 and 40/41 here.
+    equal(record["cosine"], [[0.8, 40 / 41], [np.nan, np.nan]])
 
     # The four norms the pooling's ratio of medians is built from: the
-    # probe's imagined and REAL displacements (the floor is the truth here,
-    # so row 1's real displacement is its true one), and the two embedding
-    # norms as the pass reduced them.
+    # probe's imagined displacement and the probe's reading of the REAL one
+    # (half the true displacement, from the biased anchor -- neither |d| nor
+    # |d - BIAS|), and the two embedding norms as the pass reduced them.
     displacement = record["displacement"]
     assert set(displacement) == {"probe_hat", "probe_real", "free_hat", "free_true"}
-    equal(displacement["probe_hat"], [[6.0, 12.0], [0.0, 0.0]])
-    equal(displacement["probe_real"], [[6.0, 12.0], [6.0, 12.0]])
+    equal(displacement["probe_hat"], [[15.0, 41.0], [0.0, 0.0]])
+    equal(displacement["probe_real"], [[6.0, 20.0], [2.5, 15.0]])
     equal(displacement["free_hat"], [[2.0, 4.0], [1.0, 2.0]])
     equal(displacement["free_true"], [[2.0, 4.0], [2.0, 4.0]])
 
@@ -443,14 +468,16 @@ def test_trust_record_wires_every_channel_the_way_the_spec_names_it():
     }
     equal(scale["alpha_a"], [1.0, 1.0])
     equal(scale["alpha_b"], [0.0, 0.0])
-    equal(scale["score_a"], [6.0, 12.0])
-    equal(scale["score_b"], [6.0, 12.0])
-    equal(scale["held_out"], [[6.0, 12.0], [6.0, 12.0]])
+    equal(scale["score_a"], [4.0, 21.0])
+    equal(scale["score_b"], [15.0, 41.0])
+    equal(scale["held_out"], [[15.0, 41.0], [4.0, 21.0]])
     equal(scale["boundary"], [True, True])
     assert scale["folds_available"] is True
 
     counts = record["counts"]
     assert set(counts) == {"not_moved", "zero_displacement", "never_moved"}
+    # Row 1 moved exactly 5 at h=1 from the TRUE anchor (4 from the biased
+    # one): the mask is the truth's, `>=`, and nothing is unmoved.
     equal(counts["not_moved"], [0, 0])
     equal(counts["zero_displacement"], [1, 1])
     assert counts["never_moved"] == 0
@@ -469,11 +496,11 @@ def test_measurability_is_the_persistence_to_floor_band_at_the_final_step():
             context=2, horizon=2, device="cpu",
         )["probe"]["measurable"]
 
-    # persistence [6, 12]: band 12 - 8 = 4 > 0. (Off the reference curve,
-    # [3, 6], it would read 6 - 8 < 0.)
-    assert measurable([1.0, 8.0]) is True
-    assert measurable([1.0, 12.0]) is False   # band exactly 0
-    assert measurable([1.0, 13.0]) is False   # floor above persistence
+    # persistence [9.5, 31]: band 31 - 20 = 11 > 0. (Off the reference
+    # curve, [2, 10.5], it would read 10.5 - 20 < 0.)
+    assert measurable([1.0, 20.0]) is True
+    assert measurable([1.0, 31.0]) is False   # band exactly 0
+    assert measurable([1.0, 32.0]) is False   # floor above persistence
 
 
 def test_write_trust_record_names_both_the_arm_and_the_seed_and_round_trips_nan(tmp_path):
@@ -720,13 +747,20 @@ not two, so that each fold still has two clusters after window 0 is dropped."""
 MOVED = [False, True, True, True, True, True]
 """Window 0 did not move at h = 3 in any cell; every probe-based series is NaN
 there and `margin` -- finite everywhere by construction -- must be masked."""
+SENTINEL = -999.0
+"""What every column but `HI` of a fabricated `[n][H]` series carries: the
+glue reads column `h - 1` only, so a step index that drifted to another
+column would pool this and no hand-worked expectation would survive it. The
+`ratio_raw` mask carries NaN there instead -- no window moved before h = 3 --
+so at h = 1 or 2 every masked pool is empty (`_NO_CONTRAST`, `_NO_RATIO`)."""
 
 
-def _tile(column):
-    """One per-window column at h = 3, repeated to every step: the glue reads
-    column `h - 1` only, and a value that leaked from another column would be
-    the same value, so the tiling hides nothing the tests care about."""
-    return np.tile(np.asarray(column, dtype=float)[:, None], (1, H_FAB)).tolist()
+def _at_hi(column, elsewhere=SENTINEL):
+    """One per-window column, placed in column `HI` (h = 3) ONLY; every other
+    step carries `elsewhere`."""
+    out = np.full((N_FAB, H_FAB), elsewhere)
+    out[:, HI] = np.asarray(column, dtype=float)
+    return out.tolist()
 
 
 def _fab_record(arm, seed, *, margin, cosine, held, boundary, crossing_probe, crossing_free,
@@ -746,21 +780,23 @@ def _fab_record(arm, seed, *, margin, cosine, held, boundary, crossing_probe, cr
             "windows_total_match": True, "windows_episode_match": True, "ok": True,
         },
         "crossing": {"probe": list(crossing_probe), "free": list(crossing_free)},
-        "margin": _tile(margin),
-        "ratio_probe": _tile(np.where(moved, hat / real, NAN)),
-        "ratio_raw": _tile(np.where(moved, 1.0, NAN)),
-        "ratio_free": _tile(np.where(moved, e_hat / e_true, NAN)),
-        "cosine": _tile(cosine),
+        "margin": _at_hi(margin),
+        "ratio_probe": _at_hi(np.where(moved, hat / real, NAN)),
+        "ratio_raw": _at_hi(np.where(moved, 1.0, NAN), elsewhere=NAN),
+        "ratio_free": _at_hi(np.where(moved, e_hat / e_true, NAN)),
+        "cosine": _at_hi(cosine),
         "scale": {
             "alpha_a": [1.0] * H_FAB, "alpha_b": [1.0] * H_FAB,
             "score_a": [0.0] * H_FAB, "score_b": [0.0] * H_FAB,
-            "held_out": _tile(held), "boundary": list(boundary), "folds_available": True,
+            "held_out": _at_hi(held), "boundary": list(boundary), "folds_available": True,
         },
         "displacement": {
-            "probe_hat": _tile(hat), "probe_real": _tile(real),
-            "free_hat": _tile(e_hat), "free_true": _tile(e_true),
+            "probe_hat": _at_hi(hat), "probe_real": _at_hi(real),
+            "free_hat": _at_hi(e_hat), "free_true": _at_hi(e_true),
         },
-        "counts": {"not_moved": [1] * H_FAB, "zero_displacement": [0] * H_FAB, "never_moved": 0},
+        # No window has moved before h = 3 (the NaN `ratio_raw` columns), one
+        # is still unmoved there.
+        "counts": {"not_moved": [N_FAB] * (H_FAB - 1) + [1], "zero_displacement": [0] * H_FAB, "never_moved": 0},
         "nonfinite": {},
     }
 
@@ -1027,6 +1063,42 @@ def test_pooled_inputs_refuses_a_missing_cell_and_a_step_past_the_horizon():
         script.pooled_inputs(_fab_records(), h=4)
 
 
+def test_pooled_inputs_reads_the_step_column_h_minus_one_and_no_other():
+    """Every hand-worked value above sits in column `HI` = h - 1 = 2 alone;
+    the other columns carry the -999 sentinel, and `ratio_raw` -- the moved
+    mask -- is NaN there. So at h = 1 (column 0) every masked pool is empty:
+    each Delta, cos and held-out contrast is `_NO_CONTRAST` (NaN, zero
+    windows), each ratio `_NO_RATIO`, no boundary is flagged (frozen_ssl
+    seed 1's is at step 3 only), and the per-arm block has nothing to pool
+    and no moved window. The crossing contrasts are per draw and not
+    per step, so they read the same eleven and twelve draws at every h.
+    A `_column` that read `[:, 0]` for h = 3 would fail every hand-worked
+    test above; one that read `[:, 2]` for h = 1 fails this one."""
+    inputs, clusters = script.pooled_inputs(_fab_records(), h=1)
+    assert clusters == 4
+    for pair in itertools.combinations(ARMS_ORDER, 2):
+        assert inputs.delta_contrast[pair] is script._NO_CONTRAST
+    assert inputs.cosine_contrast is script._NO_CONTRAST
+    assert inputs.corrected_contrast_a is script._NO_CONTRAST
+    assert inputs.corrected_contrast_b is script._NO_CONTRAST
+    assert math.isnan(script._NO_CONTRAST.z) and script._NO_CONTRAST.n_windows == 0
+    for arm in ARMS_ORDER:
+        assert inputs.ratio_probe[arm] is script._NO_RATIO
+        assert inputs.ratio_free[arm] is script._NO_RATIO
+    assert inputs.alpha_boundary == {arm: False for arm in ARMS_ORDER}
+    assert inputs.crossing_contrast_probe.n_windows == 11
+    assert inputs.crossing_contrast_free.n_windows == 12
+    assert inputs.per_seed[1].alpha_boundary["frozen_ssl"] is False
+    block = script.arm_summaries(_fab_records(), inputs, h=1)
+    for arm in ARMS_ORDER:
+        assert block[arm].delta is None and block[arm].cosine is None
+        assert math.isnan(block[arm].ratio_raw) and block[arm].moved == 0
+    # ... and at h = 3 the same records read the hand-worked answers.
+    at_h, _ = script.pooled_inputs(_fab_records(), h=H_FAB)
+    assert at_h.delta_contrast[("frozen_ssl", "random_vit")].estimate == pytest.approx(3.0)
+    assert at_h.alpha_boundary["frozen_ssl"] is True
+
+
 def test_the_r2_filter_marks_low_r2_cells_unmeasurable_without_touching_the_originals():
     """The sensitivity line of spec 3.1 recomputes every probe-based
     statistic with cells of selection R^2 < 0.1 excluded, and changes no
@@ -1097,17 +1169,24 @@ def test_pixel_aes_crossing_pair_is_computed_for_information_with_the_seeds_stac
     per-draw estimator as the probe control's contrast, `arm - random_vit`:
     pixel_ae's probe crossings are 3 in every draw against random_vit's 1 --
     twelve differences of exactly 2, se 0, and `_z` reads +inf -- and the
-    free channel is 4 against 4, 0 over twelve draws. frozen_ssl's pair
-    through the same function is the contrast `pooled_inputs` decides on, so
-    the two must agree. Nothing reads it: `ReadingOneInputs` has no slot."""
-    probe = script._informational_crossing(_fab_records(), "pixel_ae", "probe")
+    free channel is 4 against 4, 0 over twelve draws. The TREATMENT pair
+    through the same function is the probe control's own contrast: eleven
+    finite draws (frozen_ssl's NaN draw leaves), mean 2, se sqrt(56 / 3) /
+    11 -- the numbers worked by hand in the crossing-contrast test above,
+    typed here again rather than read back from `pooled_inputs`, so an
+    `arm` ignored in favour of TREATMENT (pixel_ae's pair reading a finite
+    z) or a pair that seed-averages first (five windows) is caught. Nothing
+    reads pixel_ae's pair: `ReadingOneInputs` has no slot for it."""
+    probe = script._crossing_contrast(_fab_records(), "pixel_ae", "probe")
     assert isinstance(probe, Contrast)
     assert probe.estimate == pytest.approx(2.0) and probe.se == 0.0
     assert probe.z == math.inf and probe.n_windows == 12
-    free = script._informational_crossing(_fab_records(), "pixel_ae", "free")
+    free = script._crossing_contrast(_fab_records(), "pixel_ae", "free")
     assert free.estimate == 0.0 and free.n_windows == 12
-    inputs, _ = script.pooled_inputs(_fab_records(), h=H_FAB)
-    assert script._informational_crossing(_fab_records(), TREATMENT, "probe") == inputs.crossing_contrast_probe
+    treatment = script._crossing_contrast(_fab_records(), TREATMENT, "probe")
+    assert treatment.estimate == pytest.approx(2.0)
+    assert treatment.se == pytest.approx(math.sqrt(56 / 3) / 11)
+    assert treatment.z == pytest.approx(22 * math.sqrt(3 / 56)) and treatment.n_windows == 11
 
 
 def test_the_self_check_table_has_one_row_per_cell_in_arm_order_with_the_deltas_and_the_probe():
@@ -1145,6 +1224,121 @@ def test_survival_by_arm_stacks_the_seeds_per_channel():
     np.testing.assert_allclose(curves[("random_vit", "probe")], [1.0, 0.0, 0.0, 0.0])
     for arm in ARMS_ORDER:
         np.testing.assert_allclose(curves[(arm, "free")], [1.0, 1.0, 1.0, 1.0])
+
+
+def test_survival_by_arms_probe_channel_pools_the_measurable_cells_only():
+    """Spec 3.1: a cell enters the probe-based pooling iff its persistence-
+    to-floor band is positive -- Reading 2's probe channel included, the
+    same rule `probe_cells` and the probe crossing contrast apply. frozen_ssl
+    seed 1 marked unmeasurable: its probe draws are seed 0's five finite
+    ones, [4, 4, 2, 3, 4] -> S = [1, 1, 4/5, 3/5] (not the eleven-draw
+    [1, 10/11, 7/11, 5/11]), while its free channel keeps all twelve draws.
+    With both frozen_ssl cells unmeasurable the probe channel has no draw:
+    `survival` reads all NaN and `trust_horizon` -1 -- never a curve over a
+    dead probe."""
+    records = _fab_records()
+    records[("frozen_ssl", 1)]["probe"]["measurable"] = False
+    probe = script._crossing_draws(records, "frozen_ssl", "probe")
+    assert probe.shape == (6,) and int(np.isfinite(probe).sum()) == 5
+    assert script._crossing_draws(records, "frozen_ssl", "free").shape == (12,)
+    curves = script.survival_by_arm(records)
+    np.testing.assert_allclose(curves[("frozen_ssl", "probe")], [1.0, 1.0, 4 / 5, 3 / 5])
+    np.testing.assert_allclose(curves[("frozen_ssl", "free")], [1.0, 1.0, 1.0, 1.0])
+    np.testing.assert_allclose(curves[("random_vit", "probe")], [1.0, 0.0, 0.0, 0.0])
+    records[("frozen_ssl", 0)]["probe"]["measurable"] = False
+    dead = script.survival_by_arm(records)
+    assert script._crossing_draws(records, "frozen_ssl", "probe").shape == (0,)
+    assert np.isnan(dead[("frozen_ssl", "probe")]).all()
+    np.testing.assert_allclose(dead[("frozen_ssl", "free")], [1.0, 1.0, 1.0, 1.0])
+
+
+# --- beside S(h): the unmoved fraction and the conditional survival ------------
+
+
+def _h0_record(arm, seed, h0, crossing):
+    """A record whose per-window moved mask (`ratio_raw`'s finiteness, the
+    glue's own `_moved` rule) encodes `h0` -- the 1-based first moved step,
+    NaN for a window that never moves -- with `crossing` in BOTH channels.
+    Every other series is `_fab_record`'s and is not read here."""
+    record = _fab_record(
+        arm, seed, margin=[1] * N_FAB, cosine=[1] * N_FAB, held=[1] * N_FAB,
+        boundary=[False] * H_FAB, crossing_probe=crossing, crossing_free=crossing,
+        probe_hat=[1] * N_FAB, probe_real=[1] * N_FAB, free_hat=[1] * N_FAB, free_true=[1] * N_FAB,
+    )
+    moved = np.array([[np.isfinite(h) and step + 1 >= h for step in range(H_FAB)] for h in h0])
+    record["ratio_raw"] = np.where(moved, 1.0, NAN).tolist()
+    record["counts"]["not_moved"] = (~moved).sum(axis=0).tolist()
+    record["counts"]["never_moved"] = int((~moved.any(axis=1)).sum())
+    return record
+
+
+def test_the_unmoved_fraction_and_the_conditional_survival_differ_from_s_of_h_by_hand():
+    """Two frozen_ssl cells, six windows each. Seed 0's windows first move at
+    h0 = [1, 1, 2, 3, never, 1] and cross at [2, 4, 4, 4, NaN, 1]; seed 1's
+    at h0 = [1, 2, 2, 3, 3, 1] and cross at [4, 2, 3, 3, 4, 4] (every
+    crossing >= its h0, as `crossing_step` guarantees). Eleven finite draws.
+      S(h)  = fraction with h_x > h:  [1, 10/11, 8/11, 6/11]
+      u(h)  = fraction with h0 > h:   [1, 6/11, 3/11, 0]  (six draws unmoved at
+              h = 1: h0 in {2, 3, 3, 2, 2, 3}; three at h = 2)
+      S_c(h) = (S - u) / (1 - u):     [n/a, 4/5, 5/8, 6/11]
+    By hand: at h = 1 the draws already moved are seed 0's windows 0, 1, 5
+    (crossings 2, 4, 1) and seed 1's 0, 5 (4, 4): four of five survive; at
+    h = 2 eight draws (add windows 2 in both seeds and seed 1's window 1:
+    crossings 4, 3, 2), five survive. So S(1) = 0.909 reads as three-in-four
+    reliability at h = 1 while S_c(1) = 0.8 -- and at q = 0.9 the
+    pre-registered H* is 1 but the conditional H*c is 0; at q = 0.5 and
+    0.75 they agree (3 and 1). A draw counted by u at h is counted by S at
+    h, so S >= u wherever u < 1. Both channels carry the same crossings
+    here; the probe channel is the one `_measurable` filters."""
+    records = {
+        ("frozen_ssl", 0): _h0_record("frozen_ssl", 0, [1, 1, 2, 3, NAN, 1], [2, 4, 4, 4, NAN, 1]),
+        ("frozen_ssl", 1): _h0_record("frozen_ssl", 1, [1, 2, 2, 3, 3, 1], [4, 2, 3, 3, 4, 4]),
+    }
+    np.testing.assert_array_equal(
+        script._first_moved(records[("frozen_ssl", 0)]), [1, 1, 2, 3, NAN, 1]
+    )
+    curves = script.survival_by_arm(records)
+    np.testing.assert_allclose(curves[("frozen_ssl", "probe")], [1, 10 / 11, 8 / 11, 6 / 11])
+    conditional = script.conditional_by_arm(records, curves)
+    assert sorted(conditional) == [("frozen_ssl", "free"), ("frozen_ssl", "probe")]
+    c = conditional[("frozen_ssl", "probe")]
+    assert isinstance(c, script.Conditional) and c.draws == 11
+    np.testing.assert_allclose(c.unmoved, [1.0, 6 / 11, 3 / 11, 0.0])
+    assert math.isnan(c.survival[0])
+    np.testing.assert_allclose(c.survival[1:], [4 / 5, 5 / 8, 6 / 11])
+    from mbfps.eval.trust import trust_horizon
+    assert [trust_horizon(curves[("frozen_ssl", "probe")], q) for q in (0.5, 0.75, 0.9)] == [3, 1, 1]
+    assert [trust_horizon(c.survival, q) for q in (0.5, 0.75, 0.9)] == [3, 1, 0]
+    table = script._conditional_table(conditional).splitlines()
+    assert table[0].startswith("--- Reading 2, beside S(h)") and "not pre-registered" in table[0]
+    assert table[1].split()[:4] == ["arm", "channel", "draws", "series"]
+    assert "H*c_0.75" in table[1]
+    unmoved_line, conditional_line = table[2], table[3]
+    assert unmoved_line.split()[:4] == ["frozen_ssl", "probe", "11", "u(h)"]
+    assert unmoved_line.endswith("1.00 0.55 0.27 0.00")
+    assert conditional_line.split()[:2] == ["frozen_ssl", "probe"]
+    assert conditional_line.split()[2:6] == ["S_c(h)", "3", "1", "0"]
+    assert conditional_line.endswith("n/a 0.80 0.62 0.55")
+    assert len(table) == 6, "one u(h) and one S_c(h) row per (arm, channel)"
+
+
+def test_the_unmoved_fraction_refuses_a_finite_crossing_on_a_window_that_never_moved():
+    """`crossing_step` cannot cross a window that never moves, so a record
+    saying both has been corrupted or mis-wired; the conditional block must
+    not quietly compute on it. `S(h)` itself, being pre-registered, is left
+    to `survival`. And `S_c(h)` is NaN wherever u(h) = 1, S_c(0) always."""
+    with pytest.raises(ValueError, match="never moved"):
+        script.unmoved_fraction(np.array([2.0, 4.0]), np.array([1.0, NAN]), H_FAB)
+    np.testing.assert_array_equal(script.unmoved_fraction(np.array([NAN, NAN]), np.array([NAN, 2.0]), 2), [NAN] * 3)
+    with pytest.raises(ValueError, match="shape"):
+        script.unmoved_fraction(np.array([2.0, 4.0]), np.array([1.0]), H_FAB)
+    surv = np.array([1.0, 0.9, 0.5])
+    np.testing.assert_array_equal(
+        script.conditional_survival(surv, np.array([1.0, 1.0, 0.0])), [NAN, NAN, 0.5]
+    )
+    np.testing.assert_allclose(
+        script.conditional_survival(surv, np.array([1.0, 0.5, 0.25])), [NAN, 0.8, 1 / 3]
+    )
 
 
 def test_write_readings_writes_trust_txt_under_out_and_returns_its_path(tmp_path):
@@ -1192,6 +1386,8 @@ def test_the_fixture_run_writes_trust_txt_with_both_readings(trust_run):
     assert "--- self-check per cell" in text
     assert "--- per arm at h = 3" in text
     assert "--- Reading 1: does the h=3 gate reward slow drift?" in text
+    assert "no arm's Δ(3) contrast clears" in text, "the pooled details name THIS run's step"
+    assert "(45)" not in text and "h=45" not in text
     assert "for information: h_x probe pixel_ae - random_vit" in text
     assert "--- Reading 2: the horizon M4 designs around" in text
     assert text.count("--- Reading 1:") == 1 and text.count("--- Reading 2:") == 1
@@ -1199,8 +1395,45 @@ def test_the_fixture_run_writes_trust_txt_with_both_readings(trust_run):
     order = [text.index(s) for s in (
         "--- self-check per cell", "clusters: 1 validation", "--- per arm at h = 3",
         "--- Reading 1:", "for information: h_x probe", "--- sensitivity", "--- Reading 2:",
+        "--- Reading 2, beside S(h)",
     )]
     assert order == sorted(order)
+    # The pooling notes name what Reading 2's probe channel pooled and what
+    # "fold A" means throughout. On this fixture NO cell is measurable (the
+    # tiny cell's persistence-to-floor band at h = 3 is not positive), so
+    # spec 3.1's rule leaves the probe channel of Reading 2 with no draw:
+    # its S(h) is all NaN and its H*_q -1 on every arm, while H*_min, being
+    # probe-free, is still read.
+    excluded = "frozen_ssl/s0, pixel_ae/s0, random_vit/s0"
+    assert f"probe-based pooling: 0 of 3 cells measurable (persistence-to-floor band at h=3 > 0); excluded: {excluded}" in text
+    assert f"Reading 2's probe channel (S(h), H*_q through the probe) pools the same measurable cells; excluded from it: {excluded}; the free channel pools every cell" in text
+    assert "fold A = the even-label windows, scored with the alpha fit on fold B (alpha_B)" in text
+    reading_two = text[text.index("--- Reading 2:"):]
+    survival = {
+        (line.split()[0], line.split()[1]): line.split()
+        for line in reading_two.splitlines()
+        if line.split()[:1] in ([a] for a in ARMS_ORDER) and " u(h) " not in line and " S_c(h) " not in line
+    }
+    assert len(survival) == 6
+    for arm in ARMS_ORDER:
+        assert survival[(arm, "probe")][2:] == ["-1", "-1", "-1", "nan", "nan", "nan", "nan"]
+        assert survival[(arm, "free")][-4:-2] == ["1.00", "1.00"], "no window has moved at h = 1"
+    assert "probe-based H*_0.75 beside it: pixel_ae -1, frozen_ssl -1, random_vit -1" in text
+    # Beside S(h): on this fixture no window has moved at h = 1 (h * sqrt(13)
+    # = 3.61 < 5) and every one has by h = 2, so the free channel's u(h) reads
+    # 1, 1, 0, 0 over its eight draws and S_c(h) is n/a at h = 0 and 1, then
+    # S(h) itself; the probe channel has no draw and reads n/a throughout.
+    rows = [l.split() for l in reading_two.splitlines() if l.split()[:1] in ([a] for a in ARMS_ORDER)]
+    unmoved = {(r[0], r[1]): r for r in rows if "u(h)" in r}
+    conditional = {(r[0], r[1]): r for r in rows if "S_c(h)" in r}
+    assert len(unmoved) == len(conditional) == 6
+    for arm in ARMS_ORDER:
+        assert unmoved[(arm, "free")][2:] == ["8", "u(h)", "1.00", "1.00", "0.00", "0.00"]
+        assert conditional[(arm, "free")][-4:-2] == ["n/a", "n/a"]
+        assert conditional[(arm, "free")][-2:] == survival[(arm, "free")][-2:]
+        assert conditional[(arm, "free")][2] == "S_c(h)" and len(conditional[(arm, "free")]) == 10
+        assert unmoved[(arm, "probe")][2:] == ["0", "u(h)", "n/a", "n/a", "n/a", "n/a"]
+        assert conditional[(arm, "probe")][2:] == ["S_c(h)", "-1", "-1", "-1", "n/a", "n/a", "n/a", "n/a"]
     for arm in ARMS_ORDER:
         assert f"{arm}/s0" in text[:text.index("clusters:")], "the self-check table names every cell"
 
@@ -1213,9 +1446,27 @@ def test_the_fixture_run_says_why_every_contrast_is_n_a(trust_run):
     reading, so it does not depend on how the formatter renders a NaN."""
     text = (trust_run.out_dir / "trust.txt").read_text()
     assert "clusters: 1 validation episode(s)" in text
-    assert "at least two" in text and "n/a" in text
+    assert "at least two" in text
+    # The contrast lines themselves print n/a for the NaN ruler -- not only
+    # the pooling note that says every contrast will: the per-arm block's se
+    # column, the information lines' se and z, and the sensitivity rows.
+    information = next(line for line in text.splitlines() if line.startswith("for information: h_x probe"))
+    assert "se n/a, z n/a" in information and "nan" not in information
+    sensitivity = next(line for line in text.splitlines() if line.startswith("delta(3) pixel_ae - frozen_ssl"))
+    assert sensitivity.split()[-3:-1] == ["n/a", "n/a"], sensitivity
+    assert "nan" not in text[text.index("--- per arm"):text.index("\nreading 1:")]
     assert "reading 1: NOT_TESTABLE" in text
     assert "sensitivity" in text and "changes no verdict" in text
+
+
+def test_num_prints_nan_as_n_a_and_everything_else_as_the_format_says():
+    """`_num` is the tables' one NaN policy: a NaN ruler must never print as
+    something that looks measured, an infinite z prints as itself (the
+    ladder's policy for a zero standard error), a number as its format."""
+    assert script._num(float("nan")) == "n/a"
+    assert script._num(float("nan"), "+.2f") == "n/a"
+    assert script._num(1.5) == "1.500" and script._num(-0.25, "+.2f") == "-0.25"
+    assert script._num(math.inf, "+.2f") == "+inf" and script._num(-math.inf, "+.2f") == "-inf"
 
 
 def test_a_single_arm_run_still_exits_ok_and_says_both_readings_are_not_computed(cell, capsys):
