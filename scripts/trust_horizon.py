@@ -58,7 +58,9 @@ have no status here and surface as the library's own exceptions.
 """
 
 import argparse
+import dataclasses
 import importlib.util
+import itertools
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +68,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import mbfps.eval.pooling as pooling
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
@@ -87,6 +90,20 @@ from mbfps.eval.trust import (
     moved_mask,
     persistence_margin,
     scale_corrected_error,
+    survival,
+)
+from mbfps.eval.trust_readings import (
+    ARMS_ORDER,
+    CONTROL,
+    FAMILY,
+    TREATMENT,
+    Contrast,
+    Ratio,
+    ReadingOneInputs,
+    format_reading_one,
+    format_reading_two,
+    reading_one,
+    reading_two,
 )
 from mbfps.models.encoders import encoder_backbone
 from mbfps.utils.config import ARMS, get_config
@@ -376,6 +393,587 @@ def write_trust_record(out_dir: Path, record: dict) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# Pooling glue: per-cell records -> the inputs the two readings are decided on.
+# ---------------------------------------------------------------------------
+# Every estimator is `pooling.py`'s -- the same clustered ruler the ladder was
+# read against -- and every rule is `trust_readings.py`'s. What is decided here
+# is only WHICH series goes in under WHICH mask: means and contrasts on the
+# per-window seed-mean series over the moved windows; the crossing contrasts
+# on per-(window, seed) draws with the seeds stacked, because spec 2.2 says
+# nothing about a crossing step is ever seed-averaged; ratios as ratios of
+# medians over the moved windows' numerator and denominator series through
+# `pool_ratio`, which puts each cell in units of its own denominator median.
+
+BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
+"""`pool_ratio`'s interval: 2000 episode resamples, seed 0 -- spec 3.1."""
+R2_SENSITIVITY = 0.1
+"""Cells whose probe selection R^2 is below this are dropped from the
+SENSITIVITY line only (spec 3.1) -- chosen knowing pixel_ae/s1 reads 0.018 and
+every other shipped cell >= 0.249. It changes no verdict."""
+STACKED_SEED = -1
+"""The `seed` a CellSeries carries when it holds every seed's draws stacked;
+`CellSeries.seed` is identity for `require_compatible`, and -1 is no seed."""
+
+
+def cell_series(arm, seed, name, values: np.ndarray, changed: np.ndarray, record: dict) -> pooling.CellSeries:
+    """One per-window series of one cell, in the shape the pool reads.
+
+    `changed` is the trust pass's own mask -- the moved windows, less the NaN
+    ones -- never the ladder's `window_steps_changed`. The identity fields
+    (windows.episode, episodes.val, horizon, context, device, torch_version)
+    are the record's, so `require_compatible` refuses a pool over cells that
+    did not score the same windows on the same device, as it does for the
+    ladder. Refuses a `values` or `changed` that is not one entry per window:
+    an `(n, H)` array here would broadcast inside `np.mean` and cluster by
+    the wrong axis.
+    """
+    values = np.asarray(values, dtype=float)
+    changed = np.asarray(changed, dtype=bool)
+    episode = np.asarray(record["windows"]["episode"], dtype=int)
+    if not (values.shape == changed.shape == episode.shape):
+        raise ValueError(
+            f"{arm} seed {seed} {name!r}: values {values.shape}, changed {changed.shape} and "
+            f"windows.episode {episode.shape} must all be (n_windows,)"
+        )
+    return pooling.CellSeries(
+        arm=arm, seed=int(seed), rung=name, channel="position",
+        delta=values, changed=changed, episode=episode, embedding=None, noise=None,
+        windows_total=int(record["windows"]["total"]), val=tuple(record["episodes"]["val"]),
+        horizon=int(record["horizon"]), context=int(record["context"]),
+        device=str(record["device"]), torch_version=str(record["torch_version"]),
+    )
+
+
+def _stacked(cells) -> pooling.CellSeries:
+    """One series holding every cell's draws end to end, the episode labels
+    tiled with them, so `paired_contrast` on one stacked series per arm is
+    the paired PER-DRAW difference clustered by episode. Both arms stack the
+    same seeds in the same order, so their tiled labels are identical and
+    `_require_same_windows` accepts the pair."""
+    return dataclasses.replace(
+        cells[0], seed=STACKED_SEED,
+        delta=np.concatenate([c.delta for c in cells]),
+        changed=np.concatenate([c.changed for c in cells]),
+        episode=np.concatenate([c.episode for c in cells]),
+        windows_total=sum(c.windows_total for c in cells),
+    )
+
+
+def _stacked_crossings(records: dict, arm: str, channel: str, seeds) -> pooling.CellSeries:
+    """One series per arm holding the per-(window, seed) crossing draws of
+    `seeds` end to end -- spec 2.2: nothing about a crossing step is ever
+    seed-averaged -- a never-moved draw (NaN) leaving on its own."""
+    cells = []
+    for seed in seeds:
+        record = records[(arm, seed)]
+        crossing = np.asarray(record["crossing"][channel], dtype=float)
+        cells.append(
+            cell_series(arm, seed, f"crossing_{channel}", crossing, np.isfinite(crossing), record)
+        )
+    return _stacked(cells)
+
+
+def _moved_series(arm: str, seed: int, name: str, record: dict, hi: int) -> pooling.CellSeries:
+    """Column `hi` of the record's `name` series under moved-and-finite: the
+    mask every per-window mean and contrast is pooled over."""
+    values = _column(record, name, hi)
+    return cell_series(arm, seed, name, values, _moved(record, hi) & np.isfinite(values), record)
+
+
+def _pooled_mean(cells) -> pooling.PooledMean | None:
+    """`pool_arm` on the cells, or None when there is nothing to pool -- no
+    cell (every seed of the arm unmeasurable) or no window surviving every
+    cell's mask -- decided BEFORE `pool_arm`, so an empty series never
+    reaches `np.mean`."""
+    if not cells:
+        return None
+    pooling.require_compatible(cells)
+    if not np.logical_and.reduce([c.changed for c in cells]).any():
+        return None
+    return pooling.pool_arm(cells)
+
+
+_NO_CONTRAST = Contrast(estimate=float("nan"), se=float("nan"), z=float("nan"), n_windows=0)
+_NO_RATIO = Ratio(estimate=float("nan"), low=float("nan"), high=float("nan"))
+
+
+def _contrast(treatment, control) -> Contrast:
+    """`paired_contrast` reduced to what the rules read. NaN with zero windows
+    when either side has no cell (every cell of an arm unmeasurable) or no
+    window survives every cell's mask -- decided BEFORE `paired_contrast`, so
+    an empty series never reaches `np.mean`. The compatibility refusals are
+    still `pooling`'s, raised first."""
+    if not treatment or not control:
+        return _NO_CONTRAST
+    pooling.require_compatible(treatment)
+    pooling.require_compatible(control)
+    if not np.logical_and.reduce([c.changed for c in treatment + control]).any():
+        return _NO_CONTRAST
+    result = pooling.paired_contrast(treatment, control)
+    return Contrast(estimate=result.mean, se=result.se, z=result.z, n_windows=result.windows)
+
+
+def _ratio(cells) -> Ratio:
+    """`pool_ratio` reduced to (ratio, low, high); NaN when no cell has a
+    moved window to pool."""
+    if not cells or not any(c.changed.any() for c in cells):
+        return _NO_RATIO
+    result = pooling.pool_ratio(cells, bootstrap=BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    return Ratio(estimate=result.ratio, low=result.ci_low, high=result.ci_high)
+
+
+def _column(block: dict, key: str, hi: int) -> np.ndarray:
+    """Column `hi` (0-based step) of an `[n][H]` series."""
+    return np.asarray(block[key], dtype=float)[:, hi]
+
+
+def _moved(record: dict, hi: int) -> np.ndarray:
+    """The moved mask at a step. `ratio_raw` is NaN exactly where the window
+    did not move (the contract's `Decomposition`) and finite everywhere else
+    -- |d| >= MIN_MOVE there -- so its finiteness IS the mask."""
+    return np.isfinite(_column(record, "ratio_raw", hi))
+
+
+def _measurable(record: dict) -> bool:
+    """Spec 3.1: a cell enters the probe-based pooling iff its persistence-
+    to-floor band at the final step is positive -- decided by Task 4 with the
+    ladder's `probe_is_measurable` rule and carried on the record."""
+    return bool(record["probe"]["measurable"])
+
+
+def pooled_inputs(records: dict, *, h: int = 45) -> tuple[ReadingOneInputs, int]:
+    """Every input Reading 1 is decided on, pooled over the cells handed in,
+    at step `h`, and the cluster count `z_fam` is read against.
+
+    Probe-based series (margin, cosine, held-out error, R_probe, the probe
+    crossing) pool the MEASURABLE cells; probe-free ones (R_free, the free
+    crossing) pool every cell. The same inputs are computed again within
+    each seed -- one cell per arm, no seed averaging, that seed's windows
+    clustered by episode -- under `per_seed`; those carry `per_seed=None`.
+    Refuses a missing (arm, seed) by name and a record with no step `h`.
+    """
+    return _inputs(records, h=h, per_seed=True)
+
+
+def _inputs(records: dict, *, h: int, per_seed: bool) -> tuple[ReadingOneInputs, int]:
+    seeds = sorted({seed for _, seed in records})
+    for arm in ARMS_ORDER:
+        for seed in seeds:
+            if (arm, seed) not in records:
+                raise KeyError(
+                    f"no record for {arm} seed {seed}: Reading 1 pools every arm at every seed "
+                    f"handed in, and the cells here are {sorted(records)}"
+                )
+    for (arm, seed), record in records.items():
+        if int(record["horizon"]) < h:
+            raise ValueError(f"{arm} seed {seed}: horizon {record['horizon']} has no step h={h}")
+    hi = h - 1
+    first = next(iter(records.values()))
+    # The clusters are the validation EPISODES that contribute windows -- 24
+    # on the shipped split -- read off the window index, not off the kept
+    # windows of any one contrast: the family threshold is one number.
+    clusters = int(np.unique(np.asarray(first["windows"]["episode"], dtype=int)).size)
+
+    def series(arm, seed, name, values, changed):
+        return cell_series(arm, seed, name, values, changed, records[(arm, seed)])
+
+    def probe_cells(name, values_of, fold=None):
+        """Per arm, one CellSeries per MEASURABLE seed: the series at `hi`
+        under moved-and-finite, restricted to one fold's rows if asked."""
+        out = {}
+        for arm in ARMS_ORDER:
+            cells = []
+            for seed in seeds:
+                record = records[(arm, seed)]
+                if not _measurable(record):
+                    continue
+                values = values_of(record)
+                changed = _moved(record, hi) & np.isfinite(values)
+                if fold is not None:
+                    changed &= np.asarray(record["windows"]["episode"], dtype=int) % 2 == fold
+                cells.append(series(arm, seed, name, values, changed))
+            out[arm] = cells
+        return out
+
+    margin = probe_cells("margin", lambda r: _column(r, "margin", hi))
+    cosine = probe_cells("cosine", lambda r: _column(r, "cosine", hi))
+    held = lambda r: _column(r["scale"], "held_out", hi)  # noqa: E731
+    # Fold A = even episode labels, fold B = odd (`scale_corrected_error`'s
+    # own assignment); each fold's contrast is over that fold's rows alone,
+    # which is where the held-out alpha is the OTHER fold's.
+    corrected_a = probe_cells("held_out_a", held, fold=0)
+    corrected_b = probe_cells("held_out_b", held, fold=1)
+
+    def ratio_cells(name, numerator_key, denominator_key, probe_based):
+        """Per arm, the moved windows' numerator and denominator series in
+        `pool_ratio`'s slots (`embedding`, `noise`); `delta` carries the
+        record's own per-window ratio for the reader, and is not pooled."""
+        out = {}
+        for arm in ARMS_ORDER:
+            cells = []
+            for seed in seeds:
+                record = records[(arm, seed)]
+                if probe_based and not _measurable(record):
+                    continue
+                numerator = _column(record["displacement"], numerator_key, hi)
+                denominator = _column(record["displacement"], denominator_key, hi)
+                changed = _moved(record, hi) & np.isfinite(numerator) & np.isfinite(denominator)
+                cell = series(arm, seed, name, _column(record, name, hi), changed)
+                cells.append(dataclasses.replace(cell, embedding=numerator, noise=denominator))
+            out[arm] = cells
+        return out
+
+    ratio_probe = ratio_cells("ratio_probe", "probe_hat", "probe_real", probe_based=True)
+    ratio_free = ratio_cells("ratio_free", "free_hat", "free_true", probe_based=False)
+
+    def crossing_contrast(channel, probe_based):
+        """TREATMENT - CONTROL paired per (window, seed) draw: the seeds
+        both arms carry (both measurable, for the probe channel) stacked in
+        one series per arm, a never-moved draw (NaN) leaving on its own."""
+        common = [
+            seed for seed in seeds
+            if not probe_based
+            or (_measurable(records[(TREATMENT, seed)]) and _measurable(records[(CONTROL, seed)]))
+        ]
+        if not common:
+            return _NO_CONTRAST
+        return _contrast(
+            [_stacked_crossings(records, TREATMENT, channel, common)],
+            [_stacked_crossings(records, CONTROL, channel, common)],
+        )
+
+    # A boundary alpha in ANY measurable seed of an arm flags the arm: the
+    # corrected contrast pooled those seeds, and a correction that is
+    # persistence itself in one of them is not a correction (spec 2.2).
+    alpha_boundary = {
+        arm: any(
+            bool(records[(arm, seed)]["scale"]["boundary"][hi])
+            for seed in seeds if _measurable(records[(arm, seed)])
+        )
+        for arm in ARMS_ORDER
+    }
+    inputs = ReadingOneInputs(
+        delta_contrast={
+            (a, b): _contrast(margin[a], margin[b]) for a, b in itertools.combinations(ARMS_ORDER, 2)
+        },
+        ratio_probe={arm: _ratio(ratio_probe[arm]) for arm in ARMS_ORDER},
+        ratio_free={arm: _ratio(ratio_free[arm]) for arm in ARMS_ORDER},
+        cosine_contrast=_contrast(cosine[TREATMENT], cosine[CONTROL]),
+        corrected_contrast_a=_contrast(corrected_a[TREATMENT], corrected_a[CONTROL]),
+        corrected_contrast_b=_contrast(corrected_b[TREATMENT], corrected_b[CONTROL]),
+        alpha_boundary=alpha_boundary,
+        crossing_contrast_probe=crossing_contrast("probe", probe_based=True),
+        crossing_contrast_free=crossing_contrast("free", probe_based=False),
+        per_seed=(
+            {
+                seed: _inputs(
+                    {key: r for key, r in records.items() if key[1] == seed}, h=h, per_seed=False
+                )[0]
+                for seed in seeds
+            }
+            if per_seed else None
+        ),
+    )
+    return inputs, clusters
+
+
+def _r2_filtered(records: dict, min_r2: float) -> dict:
+    """The records again with every cell of probe selection R^2 below
+    `min_r2` marked unmeasurable -- NEW record dicts sharing every series
+    with the originals, only the `probe` block rewritten, so the records the
+    verdict was read from are untouched."""
+    return {
+        key: {
+            **record,
+            "probe": {
+                **record["probe"],
+                "measurable": bool(record["probe"]["measurable"])
+                and float(record["probe"]["selection_r2"]) >= min_r2,
+            },
+        }
+        for key, record in records.items()
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class ArmSummary:
+    """One arm's line of the per-arm block at step h (spec 5: "per-arm block,
+    then contrasts, then the verdict lines"). `delta` and `cosine` are
+    `pool_arm` over the arm's MEASURABLE cells -- seed-mean per window over
+    the moved-and-finite windows, mean +- episode-clustered se -- or None
+    when there is nothing to pool; the two ratios are the ones
+    `pooled_inputs` decided on; `ratio_raw` is the median of the moved
+    draws' own |d_hat| / |d| over every cell (spec 2.2: "stored beside it as
+    a secondary column, not decided on"); the counts are summed over the
+    arm's cells. Nothing here is read by a rule."""
+
+    delta: pooling.PooledMean | None
+    cosine: pooling.PooledMean | None
+    ratio_probe: Ratio
+    ratio_free: Ratio
+    ratio_raw: float
+    moved: int
+    zero_displacement: int
+
+
+def arm_summaries(records: dict, inputs: ReadingOneInputs, *, h: int) -> dict:
+    """`arm -> ArmSummary` in ARMS_ORDER, at step `h`, from the same records
+    and masks `pooled_inputs` pooled the contrasts from."""
+    hi = h - 1
+    out = {}
+    for arm in ARMS_ORDER:
+        cells = [(seed, r) for (a, seed), r in sorted(records.items()) if a == arm]
+        measurable = [(seed, r) for seed, r in cells if _measurable(r)]
+        raw = np.concatenate([_column(r, "ratio_raw", hi) for _, r in cells])
+        raw = raw[np.isfinite(raw)]
+        out[arm] = ArmSummary(
+            delta=_pooled_mean([_moved_series(arm, seed, "margin", r, hi) for seed, r in measurable]),
+            cosine=_pooled_mean([_moved_series(arm, seed, "cosine", r, hi) for seed, r in measurable]),
+            ratio_probe=inputs.ratio_probe[arm],
+            ratio_free=inputs.ratio_free[arm],
+            ratio_raw=float(np.median(raw)) if raw.size else float("nan"),
+            moved=sum(
+                int(r["windows"]["total"]) - int(r["counts"]["not_moved"][hi]) for _, r in cells
+            ),
+            zero_displacement=sum(int(r["counts"]["zero_displacement"][hi]) for _, r in cells),
+        )
+    return out
+
+
+def _informational_crossing(records: dict, arm: str, channel: str) -> Contrast:
+    """`arm - CONTROL` on h_x per (window, seed) draw, the probe control's
+    own estimator over the seeds both arms carry (both measurable, for the
+    probe channel). Printed for pixel_ae -- spec 3.2: "`pixel_ae`'s pair is
+    printed for information" -- and decided on by nothing: `ReadingOneInputs`
+    has no slot for it."""
+    seeds = sorted({seed for _, seed in records})
+    if channel == "probe":
+        seeds = [
+            seed for seed in seeds
+            if _measurable(records[(arm, seed)]) and _measurable(records[(CONTROL, seed)])
+        ]
+    if not seeds:
+        return _NO_CONTRAST
+    return _contrast(
+        [_stacked_crossings(records, arm, channel, seeds)],
+        [_stacked_crossings(records, CONTROL, channel, seeds)],
+    )
+
+
+def survival_by_arm(records: dict) -> dict:
+    """`(arm, channel) -> S(h)` for Reading 2: `trust.survival` over every
+    (window, seed) draw of the arm, seeds stacked, never-moved draws (NaN)
+    excluded by `survival` itself. The horizon is the records'."""
+    arms = sorted({arm for arm, _ in records}, key=ARMS_ORDER.index)
+    seeds = sorted({seed for _, seed in records})
+    curves = {}
+    for arm in arms:
+        cells = [records[(arm, seed)] for seed in seeds if (arm, seed) in records]
+        horizon = int(cells[0]["horizon"])
+        for channel in ("probe", "free"):
+            crossings = np.concatenate(
+                [np.asarray(cell["crossing"][channel], dtype=float) for cell in cells]
+            )
+            curves[(arm, channel)] = survival(crossings, horizon)
+    return curves
+
+
+def write_readings(out_dir: Path, text: str) -> Path:
+    """`runs/<out>/trust.txt`: the readings exactly as printed."""
+    path = Path(out_dir) / "trust.txt"
+    path.write_text(text)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# The printed readings, in the ladder's style: the self-check table, the
+# pooling notes, the per-arm block, Reading 1 (summary line, then Task 5's
+# block under its own header) with pixel_ae's h_x pair for information, the
+# sensitivity block, Reading 2 (Task 5's block under its own header).
+# `_readings_text` is what `main` prints and what trust.txt holds.
+# ---------------------------------------------------------------------------
+
+
+def _num(value: float, spec: str = ".3f") -> str:
+    """NaN prints as `n/a`, never as something that looks measured -- and NaN
+    is what every clustered ruler is below two clusters. An infinite z (a
+    ruler of exactly 0 under a nonzero mean, `pooling._z`'s policy) prints
+    as itself, as the ladder prints it."""
+    return "n/a" if np.isnan(value) else format(value, spec)
+
+
+def _self_check_table(records: dict) -> str:
+    """One row per cell, in ARMS_ORDER then seed: the evidence that the
+    readings below pool what the ladder measured. Both self-check deltas
+    (exactly 0.0 on every cell that reached this point -- a non-zero delta
+    is exit 30 before any reading), the window count and whether the
+    episode labels matched, the probe's selection R^2 and measurability,
+    the never-moved count, and `ok`. Task 7 fills its self-check table
+    from this."""
+    rows = [
+        f"{'cell':<16}{'ref_max|delta|':>15}{'pers_max|delta|':>16}{'windows':>9}"
+        f"{'episodes_match':>16}{'probe_r2':>10}{'measurable':>12}{'never_moved':>13}{'ok':>7}"
+    ]
+    for (arm, seed), r in sorted(records.items(), key=lambda kv: (ARMS_ORDER.index(kv[0][0]), kv[0][1])):
+        sc = r["self_check"]
+        rows.append(
+            f"{f'{arm}/s{seed}':<16}{float(sc['reference_position_max_delta']):>15.1e}"
+            f"{float(sc['persistence_position_max_delta']):>16.1e}{int(r['windows']['total']):>9}"
+            f"{str(bool(sc['windows_episode_match'])):>16}{float(r['probe']['selection_r2']):>10.3f}"
+            f"{str(_measurable(r)):>12}{int(r['counts']['never_moved']):>13}{str(bool(sc['ok'])):>7}"
+        )
+    return "\n".join(rows)
+
+
+def _arm_table(summaries: dict, h: int) -> str:
+    """The per-arm block, one row per arm in ARMS_ORDER."""
+    rows = [
+        f"{'arm':<12}{f'delta({h})':>11}{'se':>9}{'n':>5}{f'R_probe({h})':>13}{'[95% CI]':>18}"
+        f"{f'R_free({h})':>12}{'[95% CI]':>18}{f'R_raw({h})':>11}{f'cos({h})':>9}{'se':>8}{'n':>5}"
+        f"{'moved':>7}{'zero_dhat':>11}"
+    ]
+    for arm, s in summaries.items():
+        delta = (
+            f"{_num(s.delta.mean, '+.3f'):>11}{_num(s.delta.se):>9}{s.delta.windows:>5}"
+            if s.delta is not None else f"{'n/a':>11}{'n/a':>9}{0:>5}"
+        )
+        cosine = (
+            f"{_num(s.cosine.mean, '+.3f'):>9}{_num(s.cosine.se):>8}{s.cosine.windows:>5}"
+            if s.cosine is not None else f"{'n/a':>9}{'n/a':>8}{0:>5}"
+        )
+        rows.append(
+            f"{arm:<12}{delta}"
+            f"{_num(s.ratio_probe.estimate):>13}{f'[{_num(s.ratio_probe.low)}, {_num(s.ratio_probe.high)}]':>18}"
+            f"{_num(s.ratio_free.estimate):>12}{f'[{_num(s.ratio_free.low)}, {_num(s.ratio_free.high)}]':>18}"
+            f"{_num(s.ratio_raw):>11}{cosine}{s.moved:>7}{s.zero_displacement:>11}"
+        )
+    return "\n".join(rows)
+
+
+def _pooling_notes(records: dict, clusters: int, z_fam: float, h: int) -> list[str]:
+    """What the pooled numbers stand on, before any of them is printed: the
+    cluster count and the family threshold, and -- when the clustered ruler
+    cannot exist -- WHY every contrast below reads n/a."""
+    lines = [
+        f"clusters: {clusters} validation episode(s) contribute windows; "
+        f"z_fam = cluster_threshold({FAMILY}, {clusters}) = {_num(z_fam, '.2f')} "
+        f"(Bonferroni over the {FAMILY} clustered contrasts of Reading 1, read against t({clusters - 1}))"
+    ]
+    if clusters < 2:
+        lines.append(
+            "the episode-clustered standard error needs at least two clusters, so on this "
+            "split every pooled se and z is NaN, every contrast reads n/a, and Reading 1 has "
+            "no best-delta arm: NOT_TESTABLE by construction, not by evidence"
+        )
+    excluded = [f"{arm}/s{seed}" for (arm, seed), r in sorted(records.items()) if not _measurable(r)]
+    lines.append(
+        f"probe-based pooling: {len(records) - len(excluded)} of {len(records)} cells measurable "
+        f"(persistence-to-floor band at h={h} > 0); excluded: {', '.join(excluded) or 'none'}"
+    )
+    not_moved = ", ".join(
+        f"{arm}/s{seed}={int(r['counts']['not_moved'][h - 1])}" for (arm, seed), r in sorted(records.items())
+    )
+    lines.append(f"windows not moved at h={h} (excluded from every pooled series): {not_moved}")
+    return lines
+
+
+def _sensitivity_table(inputs: ReadingOneInputs, h: int) -> str:
+    """Every probe-based statistic of Reading 1, one row each, as recomputed
+    with the low-R^2 cells excluded. Estimates and rulers only: this block
+    changes no verdict and prints none."""
+    rows = [f"{'statistic (h_x per draw)':<40}{'estimate':>12}{'se':>10}{'z':>10}{'windows':>10}"]
+    contrast = lambda label, c: rows.append(  # noqa: E731
+        f"{label:<40}{_num(c.estimate, '+.3f'):>12}{_num(c.se):>10}{_num(c.z, '+.2f'):>10}"
+        f"{c.n_windows:>10}"
+    )
+    for (a, b), c in inputs.delta_contrast.items():
+        contrast(f"delta({h}) {a} - {b}", c)
+    contrast(f"cos({h}) {TREATMENT} - {CONTROL}", inputs.cosine_contrast)
+    contrast(f"c({h}) fold A {TREATMENT} - {CONTROL}", inputs.corrected_contrast_a)
+    contrast(f"c({h}) fold B {TREATMENT} - {CONTROL}", inputs.corrected_contrast_b)
+    contrast(f"h_x probe {TREATMENT} - {CONTROL}", inputs.crossing_contrast_probe)
+    for arm, ratio in inputs.ratio_probe.items():
+        rows.append(
+            f"{f'R_probe({h}) {arm}':<40}{_num(ratio.estimate):>12}"
+            f"{f'[{_num(ratio.low)}, {_num(ratio.high)}]':>30}"
+        )
+    return "\n".join(rows)
+
+
+def _readings_text(records: dict, *, h: int) -> str:
+    """The whole readings block, in this order: the run header; the
+    self-check table (always); then, when every arm is present, the pooling
+    notes, the per-arm block, the `reading 1:` summary line followed by
+    Task 5's Reading 1 block under its own header, pixel_ae's h_x pair for
+    information, the sensitivity block, and Task 5's Reading 2 block under
+    its own header. Both readings need all three arms -- Reading 1 pools
+    them and `reading_two` refuses a missing (arm, channel) by name -- so a
+    run over fewer prints `not computed` under BOTH headers and still exits
+    0 with the self-check table on disk."""
+    arms = sorted({arm for arm, _ in records}, key=ARMS_ORDER.index)
+    seeds = sorted({seed for _, seed in records})
+    lines = [
+        f"--- trust readings at h = {h}: {len(records)} cells, arms {arms}, seeds {seeds}; "
+        f"means and contrasts seed-averaged per window and clustered by episode, crossings "
+        f"per (window, seed) draw, ratios as ratios of medians over the moved windows "
+        f"(bootstrap={BOOTSTRAP} bootstrap_seed={BOOTSTRAP_SEED}) ---",
+        "\n--- self-check per cell (spec 2.3): the trust pass's window-mean curves against "
+        "the diagnostic's, max |delta| exactly 0.0 (a non-zero delta is exit 30 before any "
+        "reading), and the windows ---",
+        _self_check_table(records),
+    ]
+    complete = all(arm in arms for arm in ARMS_ORDER)
+    if complete:
+        inputs, clusters = pooled_inputs(records, h=h)
+        z_fam = pooling.cluster_threshold(FAMILY, clusters)
+        lines.append("")
+        lines += _pooling_notes(records, clusters, z_fam, h)
+        lines.append(
+            f"\n--- per arm at h = {h}: delta and cos seed-averaged per window over the "
+            f"measurable cells' moved windows, mean +- episode-clustered se; ratios of medians "
+            f"with the 95% episode-bootstrap interval; R_raw the median of the moved draws' "
+            f"|d_hat| / |d|, for information ---"
+        )
+        lines.append(_arm_table(arm_summaries(records, inputs, h=h), h))
+        reading = reading_one(inputs, z_fam, h=h)
+        lines.append("")
+        lines.append(f"reading 1: {reading.status.name} -- {reading.reason}")
+        lines.append(format_reading_one(reading, inputs, z_fam, h=h))
+        for channel in ("probe", "free"):
+            c = _informational_crossing(records, "pixel_ae", channel)
+            lines.append(
+                f"for information: h_x {channel} pixel_ae - {CONTROL} per draw: estimate "
+                f"{_num(c.estimate, '+.3f')}, se {_num(c.se)}, z {_num(c.z, '+.2f')} "
+                f"(windows {c.n_windows}); decides nothing"
+            )
+        filtered = _r2_filtered(records, R2_SENSITIVITY)
+        dropped = [
+            f"{arm}/s{seed}" for (arm, seed), r in sorted(records.items())
+            if _measurable(r) and not _measurable(filtered[(arm, seed)])
+        ]
+        sensitivity, _ = pooled_inputs(filtered, h=h)
+        lines.append(
+            f"\n--- sensitivity: the probe-based statistics with probe selection R^2 < "
+            f"{R2_SENSITIVITY} excluded ({len(dropped)} of {len(records)} cells: "
+            f"{', '.join(dropped) or 'none'}); this changes no verdict ---"
+        )
+        lines.append(_sensitivity_table(sensitivity, h))
+        lines.append("")
+        lines.append(format_reading_two(reading_two(survival_by_arm(records))))
+    else:
+        lines.append(
+            f"\n--- Reading 1: does the h={h} gate reward slow drift? ---\n"
+            f"not computed: Reading 1 pools all of {list(ARMS_ORDER)} and this run has {arms}"
+        )
+        lines.append(
+            "\n--- Reading 2: the horizon M4 designs around ---\n"
+            f"not computed: Reading 2 needs every arm's survival curve and this run has {arms}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def protocol_mismatch(args, diagnostic: dict) -> str | None:
     """The flag that disagrees with the protocol the diagnostic was written
     at, or None. A flag left at None takes the diagnostic's value."""
@@ -509,6 +1107,14 @@ def main(argv: list[str] | None = None) -> int:
             return status
         records[(cell.arm, cell.seed)] = record
         horizon = int(record["horizon"])
+    # Pooling and the two readings -- only after every cell's checks held
+    # and every record is on disk, so trust.txt never describes cells a
+    # later line disowns. `records` is keyed (arm, seed); `horizon` is the
+    # run's resolved horizon, so the reading is at the final step (45 on
+    # the shipped records).
+    text = _readings_text(records, h=horizon)
+    print(text, end="")
+    write_readings(args.out, text)
     return EXIT_OK
 
 
