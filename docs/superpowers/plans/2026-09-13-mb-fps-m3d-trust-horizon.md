@@ -7615,24 +7615,32 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Provenance.** The trust pass read the nine M3c checkpoints of `runs/m3_study_v2` (all
 trained under `git_sha` `ca3e140772d6bc741d4d04312763afe3dd754166`, device `mps`, torch
 `2.13.0`, per the study records) under one code state, `git_sha` =
-`19ed6a225ab8aaab2389df16cc92d10716f226d8` (= `git rev-parse HEAD` = `trust.head`, tree clean
+`e5feeb9351de4e2090da29c17b110c3c56c6699c` (= `git rev-parse HEAD` = `trust.head`, tree clean
 under `src/` and `scripts/`), on one device, `mps`, torch `2.13.0`, in all nine
-`trust_<arm>_seed<n>.json`. Launched `2026-09-14T03:43:31Z` (`trust.started`) under
-`caffeinate -dimsu`, `PYTHONDONTWRITEBYTECODE=1`, `__pycache__` cleared; finished
-`2026-09-14T03:53:22Z` (mtime of `trust.exit`); wall `9 min 51 s`; `trust.exit` = `0` (0 = both
-readings printed). `trust.txt` is byte-identical to `trust.log` from the `--- trust readings`
+`trust_<arm>_seed<n>.json`. This is the RE-RUN after the whole-branch review's fix wave
+(`.superpowers/sdd/m3d-final-fix-list.md`), launched `2026-09-14T05:23:18Z` (`trust.started`)
+under `caffeinate -dimsu`, `PYTHONDONTWRITEBYTECODE=1`, `__pycache__` cleared; finished
+`2026-09-14T05:31:40Z` (mtime of `trust.exit`); wall `8 min 22 s`; `trust.exit` = `0` (0 = both
+readings printed). The first run, at `19ed6a225ab8aaab2389df16cc92d10716f226d8` (launched
+`2026-09-14T03:43:31Z`, wall 9 min 51 s, exit 0), produced a `trust.txt` whose every number and
+status this re-run reproduced exactly (`diff` of the two: the re-run adds two pooling-note lines
+and the conditional-survival block below, and drops the doubled `unreadable:` from two lines;
+nothing else differs). `trust.txt` is byte-identical to `trust.log` from the `--- trust readings`
 header on (the nine per-cell progress lines above it are in the log only). Geometry: context 5,
 horizon 45, `split_seed` 0, 229 windows over 24 validation episodes, identical to the
-diagnostics field by field (`runs/m3d_check_trust.py`: `OK: nine trust records, one git_sha ==
-HEAD, one device == mps, self-check exactly 0.0 on 9/9`; its 22 doctorings were run and caught
-on `2026-09-14T03:54:56Z`, every one on the named assertion and none surviving, and the
-hand-recomputed Reading 2 in `trust_provenance.txt` agrees with `trust.txt` on every line --
-the same `H*_0.5` / `H*_0.75` / `H*_0.9` = 3 / 1 / 0 on all six (arm, channel) lines, the same
-`H*_min` = 1, and `trust.txt`'s two-decimal `S(h)` the round of the check's three-decimal value
-at h = 1, 5, 15, 45 on every line). Family-wise threshold `z_fam` = `3.01`
-(= `cluster_threshold(8, 24)`, expected 3.01), read against t(23). Full suite on this tree,
-before the launch and again after the results were read: `pytest: 1428 passed`, 0 warnings,
-both times (Task 6 left 1428; this task's delta is 0).
+diagnostics field by field (`runs/m3d_check_trust.py` on the re-run's records: `OK: nine trust
+records, one git_sha == HEAD, one device == mps, self-check exactly 0.0 on 9/9` with HEAD
+`e5feeb9`; its 22 doctorings were run and caught on the first run's records on
+`2026-09-14T03:54:56Z`, every one on the named assertion and none surviving, and the
+hand-recomputed Reading 2 in `trust_provenance.txt` -- the first run's, whose per-cell columns
+are identical to the re-run's -- agrees with `trust.txt` on every line: the same `H*_0.5` /
+`H*_0.75` / `H*_0.9` = 3 / 1 / 0 on all six (arm, channel) lines, the same `H*_min` = 1, and
+`trust.txt`'s two-decimal `S(h)` the round of the check's three-decimal value at h = 1, 5, 15, 45
+on every line). Family-wise threshold `z_fam` = `3.01` (= `cluster_threshold(8, 24)`, expected
+3.01), read against t(23). Full suite on the first run's tree, before its launch and again after
+its results were read: `pytest: 1428 passed`, 0 warnings, both times (Task 6 left 1428; this
+task's delta is 0); on the re-run's tree, before its commit: `pytest: 1437 passed`, 0 warnings
+(the fix wave's nine new tests).
 
 **Self-check** (spec section 2.3), from `trust.txt`'s first table and the records'
 `self_check`: the trust pass's window-mean curves against the diagnostic's, and its windows.
@@ -7662,10 +7670,15 @@ moved at some step within the horizon (`never_moved` = 0 on all nine), so every 
 curve is over the full 3 x 229 = 687 draws.
 
 **Reading 2 -- the horizon M4 designs around** (spec section 3.3; no verdict attached).
-`S(h)` = the fraction of (window, seed) draws with `h× > h`, over draws that moved
-(`687` / `687` / `687` draws per arm of 687, the rest never moved within the horizon -- there are
-none); the full table at every h is in `trust.txt`, these are its columns at h = 1, 2, 3, 5, 10,
-15, 30, 45. `H*_q` = the largest h with `S(h) ≥ q`; q = 0.75 pre-registered.
+`S(h)` = the fraction of (window, seed) draws with `h× > h`, over draws that moved: 687 draws
+per arm on every line (3 seeds x 229 windows; `never_moved` = 0 on every cell, so no draw is
+excluded). The full table at every h is in `trust.txt`, these are its columns at h = 1, 2, 3, 5,
+10, 15, 30, 45. `H*_q` = the largest h with `S(h) ≥ q`; q = 0.75 pre-registered. What `S(h)`
+counts, by spec 2.2 / 3.3: `h×` is searched from the window's FIRST moved step h0 onward, so a
+draw whose window has not yet moved 5 map units at h has `h× ≥ h0 > h` and survives h without
+anything having been measured there -- `S(h)` is the fraction of moved draws not yet lost to
+persistence by h, where a window not yet moved by h cannot yet have lost. The second table
+below says how much of each `S(h)` that is.
 
 | arm | channel | draws | S(1) | S(2) | S(3) | S(5) | S(10) | S(15) | S(30) | S(45) | H*_0.5 | **H*_0.75** | H*_0.9 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -7678,24 +7691,57 @@ none); the full table at every h is in `trust.txt`, these are its columns at h =
 
 **`H*_min` = `1`** (min over arms of the probe-free `H*_0.75`; the probe-based `H*_0.75`
 beside it reads `1` / `1` / `1` for `pixel_ae` / `frozen_ssl` / `random_vit`). The two
-channels order the arms `the same way` (the same way: every `H*_q` is identical on all six
-lines -- 3 / 1 / 0 -- so neither channel orders the arms at all at any reported q; the curves
+channels order the arms the same way -- which is to say not at all: every `H*_q` is identical
+on all six lines, 3 / 1 / 0, so neither channel orders the arms at any reported q; the curves
 part only below q = 0.5, where `random_vit`'s probe channel stays highest, 0.12 against 0.09
-and 0.08 at h = 45, and `frozen_ssl`'s free channel lowest, 0.02 against 0.04 and 0.05).
+and 0.08 at h = 45, and `frozen_ssl`'s free channel lowest, 0.02 against 0.04 and 0.05.
 `H*_0.5` per arm through the probe, `3` / `3` / `3`, is the old median reading; the mean-curve
 crossing of spec section 1 (median step 6, range 1-17) was a statement about curves, this is
-one about draws, and they `disagree` (`H*_0.5` = 3 says more than half the draws are still ahead
+one about draws, and they disagree: `H*_0.5` = 3 says more than half the draws are still ahead
 of persistence at h = 3 and fewer than half at h = 4 -- `S(3)` 0.52-0.56, `S(4)` 0.44-0.49 on
 every line -- so the pooled median draw crosses at step 4 on every arm and channel, and per cell
 at 3.0-5.0, `hx_probe` / `hx_free` in `trust_provenance.txt`; against the mean-curve crossings
 the M3c records reported per cell, 10·5·2 / 9·2·6 / 1·11·17, the median draw through the probe
 sits below the mean curve's crossing on six of the nine cells and above it on three,
 `frozen_ssl`/s2, `pixel_ae`/s1 and `random_vit`/s0 -- the two statistics do not track each other
-cell by cell). Read for M4: `1` (the number of
-open-loop steps over which every arm's imagination beats standing still for three quarters of
-the draws, probe-free: `S(1)` is 0.80-0.82 on every line and `S(2)` is 0.64-0.65, so the
-three-quarters bar is cleared at h = 1 and at no later step on any arm through either channel;
-by h = 45 between 2 % and 12 % of the draws are still ahead of persistence).
+cell by cell.
+
+**Beside `S(h)`: the unmoved fraction and the conditional survival** (`trust.txt`'s second
+Reading 2 table, added after the review; NOT pre-registered -- `S(h)`, `H*_q` and `H*_min` above
+are the spec's and stand as printed). `u(h)` = the fraction of the same 687 draws whose window
+has not yet moved at h (h0 > h), every one of which survives h vacuously; `S_c(h)` = (`S(h)` −
+`u(h)`) / (1 − `u(h)`) = the survival among the draws whose window HAD moved by h, the ones on
+which something was measured (n/a where `u(h)` = 1, so at h = 0); `H*c_q` = the largest h with
+`S_c(h) ≥ q`. The moved mask is the truth's and identical on every cell, so `u(h)` is the same on
+all six lines: 133 / 81 / 49 / 29 / 12 / 8 / 0 / 0 of the 229 windows have h0 > h at h = 1 / 2 /
+3 / 5 / 10 / 15 / 30 / 45. (These are not the per-step `not_moved` counts of the self-check
+table, 133 / 81 / 52 / 36 / 21 / 18 / 9 / 3: a window that moved and came back within 5 units at
+h is unmoved AT h but was measured from its h0 on, and its crossing search started there.)
+
+| arm | channel | draws | u(1) | u(2) | u(3) | u(5) | u(10) | u(15) | u(30) | u(45) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| every line | probe and free | 687 | 0.58 | 0.35 | 0.21 | 0.13 | 0.05 | 0.03 | 0.00 | 0.00 |
+
+| arm | channel | draws | S_c(1) | S_c(2) | S_c(3) | S_c(5) | S_c(10) | S_c(15) | S_c(30) | S_c(45) | H*c_0.5 | H*c_0.75 | H*c_0.9 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `pixel_ae` | probe | 687 | 0.52 | 0.45 | 0.39 | 0.33 | 0.23 | 0.20 | 0.12 | 0.09 | 1 | 0 | 0 |
+| `pixel_ae` | free | 687 | 0.56 | 0.44 | 0.41 | 0.32 | 0.20 | 0.14 | 0.07 | 0.04 | 1 | 0 | 0 |
+| `frozen_ssl` | probe | 687 | 0.55 | 0.45 | 0.39 | 0.34 | 0.25 | 0.19 | 0.12 | 0.08 | 1 | 0 | 0 |
+| `frozen_ssl` | free | 687 | 0.53 | 0.44 | 0.41 | 0.30 | 0.18 | 0.11 | 0.04 | 0.02 | 1 | 0 | 0 |
+| `random_vit` | probe | 687 | 0.55 | 0.46 | 0.44 | 0.37 | 0.29 | 0.25 | 0.17 | 0.12 | 1 | 0 | 0 |
+| `random_vit` | free | 687 | 0.54 | 0.45 | 0.40 | 0.30 | 0.19 | 0.15 | 0.08 | 0.05 | 1 | 0 | 0 |
+
+So of `S(1)` = 0.80-0.82, 0.58 is windows that had not moved 5 units by h = 1; among the draws
+whose window had, 0.52-0.56 were still ahead of persistence at h = 1 -- about half, not three
+quarters -- and 0.44-0.46 at h = 2, 0.30-0.37 at h = 5. From h = 30 on `u(h)` = 0 and `S_c(h)` =
+`S(h)`. The conditional `H*c_0.75` is 0 on every line (no h has `S_c(h) ≥ 0.75`), `H*c_0.5` = 1,
+against the pre-registered `H*_0.75` = 1 and `H*_0.5` = 3. Read for M4: `H*_min` = `1` is, by
+the spec's definition, the largest h at which at least three quarters of the moved draws have
+not yet lost to persistence on every arm probe-free (`S(1)` 0.80-0.82, `S(2)` 0.64-0.65 on every
+line) -- where a draw whose window has not yet moved by h cannot yet have lost, and 58 % of the
+windows are in that state at h = 1; conditional on the window having moved, the per-step
+reliability at h = 1 is about one half on every arm and channel, and by h = 45 between 2 % and
+12 % of the draws are still ahead of persistence.
 
 **Reading 1 -- does the h=45 gate reward slow drift?** (spec section 3.2.) Pooled over
 seeds per window, episode-clustered; the pooling notes read `clusters: 24 validation
@@ -7706,7 +7752,15 @@ every cell.
 
 Per arm at h=45 (`Δ(45)` mean ± cluster SE; ratios as median/median with the 95 %
 episode-bootstrap interval; `cos(45)` mean over moved windows), the per-arm block of
-`trust.txt` verbatim:
+`trust.txt` verbatim. On the ratios: `pool_ratio` normalises each cell by its own denominator
+median before stacking, so `R_probe` / `R_free` are `median(num_c / med(den_c)) /
+median(den_c / med(den_c))` over the stacked draws, not the spec-literal median of the raw
+stacked numerators over that of the raw stacked denominators (spec 3.1, sentence added after
+the run); the spec-literal stacked values from the same records are `R_probe` 0.993 / 0.873 /
+0.827 and `R_free` 0.189 / 0.257 / 0.210 (`pixel_ae` / `frozen_ssl` / `random_vit`) against
+the tool's 1.019 / 0.861 / 0.797 and 0.169 / 0.266 / 0.209 below, and the argmin is the same
+arm under either estimand on both channels (`random_vit` through the probe, `pixel_ae`
+probe-free), so `least-moving arm: none` stands either way.
 
 | arm | `Δ(45)` ± SE | `R_probe(45)` [CI] | `R_free(45)` [CI] | `R_raw(45)` | `cos(45)` ± SE | moved / zero-`d̂` |
 |---|---|---|---|---|---|---|
@@ -7721,7 +7775,14 @@ of the free-channel `h×` contrast are not printed there and were read from the 
 through the script's own `pooled_inputs` (the same `paired_contrast` call that produced the
 printed z; every printed z was reproduced). The `Δ(45)` rows are in the orientation the tool
 prints, `pixel_ae − frozen_ssl` rather than the template's `frozen_ssl − pixel_ae`, so the sign
-is the tool's and not a re-derivation.
+is the tool's and not a re-derivation. "Fold A" in the `c(45)` rows names the ROWS: fold A = the
+even-label windows, scored with the alpha fit on fold B (α_B), fold B = the odd-label windows
+scored with α_A -- while the `α_A` / `α_B` listed below name the FIT (α_A is fit on fold A's
+rows and scores fold B's), as `trust.txt`'s `folds:` note now says. The two `h×` rows are the
+paired per-draw contrast over 687 (window, seed) draws; with `never_moved` = 0 every window
+carries all three seeds, so that contrast is numerically identical to the 229-window
+seed-averaged one (same mean, same clustered SE, checked on the records: -1.968 / 1.154 and
+-1.217 / 0.532 either way) -- the 687 is not a sharper ruler than the 229.
 
 | contrast | statistic | estimate | cluster SE | z | clears `z_fam`? |
 |---|---|---|---|---|---|
@@ -7738,7 +7799,11 @@ is the tool's and not a re-derivation.
 free `-0.157, se 0.659` (z `-0.24`); decides nothing.
 Scale correction at h=45 per cell, `α_A` / `α_B` from the records' `scale` (boundary = on a
 grid end, 0 or 2; the arm is flagged when any of its measurable seeds is on a boundary on
-either fold, which is how `pooled_inputs` builds `alpha_boundary`):
+either fold, which is how `pooled_inputs` builds `alpha_boundary` -- the pooled reading of spec
+3.2 (iii)'s "either arm's α is on the grid boundary" is "in any measurable seed of that arm",
+a sentence added to the spec after the run so a re-run cannot be read either way; it is the rule
+that decided this status, since exactly one seed of each of the treatment and the control hit
+α = 0):
 `pixel_ae` s0 `0.11` / `0.19` (`no`), s1 `0.00` / `0.00` (`boundary`), s2 `0.00` / `0.77`
 (`boundary`) -- arm flagged; `frozen_ssl` s0 `0.11` / `0.25` (`no`), s1 `0.00` / `0.32`
 (`boundary`), s2 `0.96` / `0.51` (`no`) -- arm flagged; `random_vit` s0 `0.49` / `0.00`
@@ -7782,20 +7847,26 @@ of those arms lost a cell. No condition's outcome changes: (i) still has no best
 frozen_ssl − random_vit contrast still does not clear), (ii) still fails, (iii) is still
 unreadable, the probe control still does not fire.`
 
-**Status: `UNRESOLVED_ALPHA`.** Reason, as `trust.txt` printed it: `(iii) unreadable:
+**Status: `UNRESOLVED_ALPHA`.** Reason, as the re-run's `trust.txt` printed it: `(iii)
 unreadable: alpha on the grid boundary at h=45 for frozen_ssl, random_vit (held-out c(45)
 frozen_ssl-random_vit: fold A z -1.86, fold B z -1.29, bar ±3.01)` (the `verdict:` line reads
-`Reading 1 unresolved (alpha on the grid boundary) -- decided by:` and the same text; the
-doubled `unreadable:` is `reading_one` prefixing a detail that already begins with the word,
-a formatting slip in `trust_readings.py` and not two findings). Decided by the rule `(iii)
-unreadable → UNRESOLVED_ALPHA` -- the second rule in the precedence, reached because the first
-(the probe control) did not fire (probe control fires → UNRESOLVED_PROBE; (iii) unreadable →
+`Reading 1 unresolved (alpha on the grid boundary) -- decided by:` and the same text; the first
+run's text read `(iii) unreadable: unreadable: ...`, `reading_one` prefixing a detail that
+already began with the word -- a formatting slip in `trust_readings.py`, not two findings,
+fixed in the wave and gone from the re-run). Decided by the rule `(iii) unreadable →
+UNRESOLVED_ALPHA` -- the second rule in the precedence, reached because the first (the probe
+control) did not fire (probe control fires → UNRESOLVED_PROBE; (iii) unreadable →
 UNRESOLVED_ALPHA; (i) undecidable → NOT_TESTABLE; (i) unresolved through the probe →
 UNRESOLVED_PROBE; all three hold pooled and in ≥ 2 of 3 seeds → SUPPORTED; else
 NOT_SUPPORTED). For the record, what the later rules would have said had (iii) been readable:
 (i) is undecidable (no best-Δ arm) and, separately, unresolved through the probe (the
 least-moving arm differs between channels), so the status would have been `NOT_TESTABLE`; and
-(ii) fails pooled and in every seed.
+(ii) fails pooled and in every seed. Two of spec 3.2's statuses therefore apply to this run --
+`NOT_TESTABLE` via (i) and `UNRESOLVED_ALPHA` via (iii) -- and the spec does not rank them; the
+plan header does (its interface contract for `reading_one` fixes the order quoted above, probe
+control first, then (iii) unreadable, then (i) undecidable, implemented as such in
+`trust_readings.reading_one`), and that ranking is what chose `UNRESOLVED_ALPHA` over
+`NOT_TESTABLE`. Neither is `SUPPORTED`, and the choice is the plan's, not the spec's.
 
 **The probe-free twins** (Step 7): least-moving arm through the probe `random_vit`
 (`R_probe(45)` 0.797 against 0.861 and 1.019), probe-free `pixel_ae` (`R_free(45)` 0.169
@@ -7813,9 +7884,12 @@ on both channels, short of the family bar).
 **What this run establishes, and what it does not.** `Three things. (1) The instrument is the
 ladder's: nine records at max|Δ| exactly 0.0 on both curves, the same windows, the same
 rollout, the same refit probe, one code state, one device. (2) Reading 2, the number M4 designs
-around: H*_min = 1. On every arm, through either channel, imagination beats standing still for
-three quarters of the moved draws at h = 1 and for no later step; by h = 2 the fraction is
-0.64-0.65, by h = 5 0.39-0.45, by h = 45 0.02-0.12 -- the pooled median draw crosses at step 4
+around: H*_min = 1 -- h = 1 is the last step at which at least three quarters of the moved
+draws have not yet lost to persistence on every arm (S(1) 0.80-0.82, S(2) 0.64-0.65, S(5)
+0.39-0.45, S(45) 0.02-0.12), where a draw whose window has not yet moved by h cannot yet have
+lost and 58 % of the windows are in that state at h = 1; conditional on the window having moved,
+about half the draws are still ahead of persistence at h = 1 (S_c(1) 0.52-0.56), 0.44-0.46 at
+h = 2 and 0.30-0.37 at h = 5, on every arm and channel; the pooled median draw crosses at step 4
 on every arm and channel, and the three arms are indistinguishable at every reported q. (3) Reading 1 is unresolved: the
 question whether the h=45 gate rewards slow drift could not be put to these records, because
 the cross-fitted scale correction hit α = 0 on at least one fold in one seed of each of the
