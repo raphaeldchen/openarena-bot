@@ -25,7 +25,7 @@ invisible against it too. Each test below says which rig it needs and why.
 """
 
 import inspect
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import numpy as np
@@ -40,14 +40,19 @@ from mbfps.eval.diagnostics import (
     LADDER_PERTURBS,
     REGROUNDING_KS,
     RegroundingSweep,
+    Trajectories,
     action_intervention_ladder,
     action_shuffled_rollout,
+    reference_trajectories,
     regrounding_sweep,
 )
+from mbfps.eval.probe import apply_probe
 from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
     CONTEXT,
+    DX,
+    DY,
     HORIZON,
     STEP,
     T_SYNTHETIC,
@@ -3049,3 +3054,463 @@ def test_the_ladder_on_a_shipped_checkpoint_leaves_the_shuffled_rung_bitwise_the
     assert all(ratio > 0.0 for ratio in ratios.values()), ratios
     # Not pinned -- printed, so a `-s` run carries the reading in its log.
     print(f"cnn/seed0 embedding ratios: {ratios}")
+
+
+# ---------------------------------------------------------------------------
+# The reference pass's trajectories (M3d): `keep_trajectories` on `_diagnose`
+# and `reference_trajectories`. The ladder stores mean error curves; the trust
+# horizon needs the per-window rows those curves are means of, plus four
+# embedding-space series that read the imagination against the TRUTH --
+# something no ladder channel does. Two things can go wrong without breaking
+# a shape: the flag can move a curve the ladder pins bitwise, and a row can
+# be taken one frame, one pipeline, or one anchor away from where the spec
+# puts it. The oracle rigs give every row a closed form; the real sampling
+# rig pins the bitwise identities the trust pass's self-check depends on.
+# ---------------------------------------------------------------------------
+
+TRAJECTORY_FIELDS = (
+    "positions", "positions_at_context", "positions_real",
+    "true_positions", "true_at_context",
+    "embedding_distance_to_truth", "embedding_persistence_distance",
+    "embedding_displacement", "true_embedding_displacement",
+)
+"""Literal, deliberately NOT `diagnostics_module._TRAJECTORY_FIELDS`: a field
+dropped from the module's tuple must be a missing attribute here, not a
+shorter loop."""
+
+
+def trajectories(model, paths, probe, *, device=None, seed=0):
+    return reference_trajectories(
+        model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=seed,
+        device=device or torch.device("cpu"), feature_backbone=None,
+    )
+
+
+def reference_pass(model, paths, probe, *, keep, device=None, seed=0):
+    """`_diagnose` as `reference_trajectories` calls it, with the flag chosen.
+
+    Under `no_grad` because `_diagnose` is deliberately undecorated (its
+    docstring says why) and a real model's encoder output carries grad."""
+    with torch.no_grad():
+        return diagnostics_module._diagnose(
+            model, paths, probe, arms={}, context=CONTEXT, horizon=HORIZON,
+            seed=seed, device=device or torch.device("cpu"), feature_backbone=None,
+            noise_reference=True, keep_trajectories=keep,
+        )
+
+
+def _three_length_oracle(tmp_path):
+    """Four windows from two contributing episodes, at the lengths the window
+    rule is sensitive to: `need` (no window), `need + 1` (one), `3 * need`
+    (three). `(episodes, paths, probe, expected (episode, start) per window)`."""
+    need = CONTEXT + HORIZON
+    episodes = [synthetic_episode(length=n) for n in (need, need + 1, 3 * need)]
+    paths = [write(tmp_path, episode, index) for index, episode in enumerate(episodes)]
+    cut = [
+        (episode, start)
+        for episode in episodes
+        for start in window_starts(episode.length, CONTEXT, HORIZON)
+    ]
+    assert len(cut) == 4, [len(window_starts(e.length, CONTEXT, HORIZON)) for e in episodes]
+    return episodes, paths, oracle_probe(episodes[-1]), cut
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_without_the_flag_the_pass_carries_no_trajectories_and_is_bitwise_what_it_was(
+    tmp_path, device
+):
+    """The ladder's pin, from the other side: the flag is the ONLY difference
+    between two passes on the real sampling rig, and every field the ladder
+    reads must be bitwise the same across them -- the six curves, the six
+    per-window matrices, the noise reference and its two self-checks, the
+    counts and the labels -- and the generator must end at the same state,
+    so the flag drew nothing from the stream. Without the flag all nine
+    trajectory fields are None; with it none of them is."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+
+    plain = reference_pass(model, paths, probe, keep=False, device=device)
+    left_by_plain = diagnostics_module._rng_snapshot(device)
+    kept = reference_pass(model, paths, probe, keep=True, device=device)
+    left_by_kept = diagnostics_module._rng_snapshot(device)
+
+    for name in TRAJECTORY_FIELDS:
+        assert getattr(plain, name) is None, name
+        assert getattr(kept, name) is not None, name
+    for name in ("horizon", "rssm_position", "persistence_position", "floor_position",
+                 "rssm_angle", "persistence_angle", "floor_angle"):
+        np.testing.assert_array_equal(
+            getattr(kept.reference, name), getattr(plain.reference, name), err_msg=name
+        )
+    assert kept.reference_windows.keys() == plain.reference_windows.keys()
+    for name, rows in plain.reference_windows.items():
+        np.testing.assert_array_equal(kept.reference_windows[name], rows, err_msg=name)
+    np.testing.assert_array_equal(kept.noise_embedding, plain.noise_embedding)
+    np.testing.assert_array_equal(kept.noise_bitwise_real, plain.noise_bitwise_real)
+    np.testing.assert_array_equal(kept.noise_stream_restored, plain.noise_stream_restored)
+    assert kept.windows_total == plain.windows_total == 4
+    np.testing.assert_array_equal(kept.window_episode, plain.window_episode)
+    assert kept.arms == plain.arms == {} and kept.arm_pairs == plain.arm_pairs == {}
+    assert set(left_by_kept) == set(left_by_plain)
+    for key in left_by_plain:
+        assert torch.equal(left_by_kept[key], left_by_plain[key]), key
+
+
+def test_the_flag_is_keyword_only_and_off_by_default():
+    """Off by default so that the ladder and the sweep -- which never pass it
+    -- keep running the pass they pin bitwise against the records."""
+    parameter = inspect.signature(diagnostics_module._diagnose).parameters["keep_trajectories"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_flagged_pass_and_the_trajectories_carry_the_nine_arrays_at_their_shapes(
+    tmp_path, device
+):
+    """Four windows, five horizon steps, two map coordinates: the per-step
+    arrays are `(4, 5, 2)` or `(4, 5)`, the two context anchors `(4, 2)`, all
+    float64 like the curves they reduce to. `Trajectories` carries the same
+    nine under the same names, with the pass's counts and labels, and is
+    frozen -- a consumer cannot quietly overwrite a row it then reads."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    expected = {
+        "positions": (4, HORIZON, 2), "positions_at_context": (4, 2),
+        "positions_real": (4, HORIZON, 2), "true_positions": (4, HORIZON, 2),
+        "true_at_context": (4, 2), "embedding_distance_to_truth": (4, HORIZON),
+        "embedding_persistence_distance": (4, HORIZON),
+        "embedding_displacement": (4, HORIZON),
+        "true_embedding_displacement": (4, HORIZON),
+    }
+    assert set(expected) == set(TRAJECTORY_FIELDS)
+
+    kept = reference_pass(model, paths, probe, keep=True, device=device)
+    result = trajectories(model, paths, probe, device=device)
+
+    assert isinstance(result, Trajectories)
+    for name, shape in expected.items():
+        assert getattr(kept, name).shape == shape, name
+        assert getattr(kept, name).dtype == np.float64, name
+        assert getattr(result, name).shape == shape, name
+        assert getattr(result, name).dtype == np.float64, name
+    assert result.windows_total == 4
+    np.testing.assert_array_equal(result.window_episode, np.array([0, 0, 1, 1]))
+    assert result.reference_position.shape == result.persistence_position.shape == (HORIZON,)
+    with pytest.raises(FrozenInstanceError):
+        result.windows_total = 0
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_trajectories_curves_are_the_passes_own_and_the_rollouts_bitwise(
+    tmp_path, device
+):
+    """The two curves the trust pass checks itself against. Bitwise the
+    flagged pass's `reference.rssm_position` / `reference.persistence_position`
+    AND bitwise `evaluate_rollout`'s on the same rig and seed -- the second
+    is the independent one: it is the function the shipped records were
+    written by, and a pass whose stream had drifted (an arm left in, the
+    noise reference skipped) would still equal itself."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    rollout_result = rollout(model, paths, probe, device=device)
+    kept = reference_pass(model, paths, probe, keep=True, device=device)
+    result = trajectories(model, paths, probe, device=device)
+
+    np.testing.assert_array_equal(result.reference_position, kept.reference.rssm_position)
+    np.testing.assert_array_equal(result.persistence_position, kept.reference.persistence_position)
+    np.testing.assert_array_equal(result.reference_position, rollout_result.rssm_position)
+    np.testing.assert_array_equal(result.persistence_position, rollout_result.persistence_position)
+    assert result.reference_position.min() > 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_per_window_rows_reduce_to_the_curves_bitwise(tmp_path, device):
+    """THE identity the self-check in `scripts/trust_horizon.py` demands with
+    max |delta| == 0.0: the Euclidean distance of `positions` to
+    `true_positions`, meaned over windows, IS `reference_position`; the
+    distance of the held `positions_at_context` to `true_positions`, meaned,
+    IS `persistence_position`. Bitwise, on the real sampling rig, so the
+    anchor must be the very rows the persistence curve was scored on -- a
+    second `apply_probe` over a different shape is not promised the same
+    last bit -- and the reduction must be `np.stack(rows).mean(axis=0)`."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    result = trajectories(model, paths, probe, device=device)
+
+    model_error = np.linalg.norm(result.positions - result.true_positions, axis=-1)
+    persistence_error = np.linalg.norm(
+        result.positions_at_context[:, None, :] - result.true_positions, axis=-1
+    )
+    assert model_error.shape == persistence_error.shape == (4, HORIZON)
+    np.testing.assert_array_equal(model_error.mean(axis=0), result.reference_position)
+    np.testing.assert_array_equal(persistence_error.mean(axis=0), result.persistence_position)
+
+
+def test_true_positions_are_the_privileged_positions_at_the_frames_the_actions_produced(
+    tmp_path
+):
+    """The truth slice, element for element, per window: `true_positions[w, h-1]`
+    is `privileged[start + context + h, (pos_x, pos_y)]` -- the frame the h-th
+    horizon action PRODUCED, one after the last context frame -- and
+    `true_at_context[w]` is `privileged[start + context]`. Indexed by hand
+    from `window_starts` over three episode lengths, and checked bitwise
+    against the closed form `(DX * t, DY * t)` as well, so a slice off by one
+    frame, or an anchor taken at the first horizon frame, reads as a whole
+    step of displacement rather than as noise."""
+    _, paths, probe, cut = _three_length_oracle(tmp_path)
+    result = trajectories(OracleModel(), paths, probe)
+
+    assert result.windows_total == 4
+    np.testing.assert_array_equal(result.window_episode, np.array([0, 1, 1, 1]))
+    for w, (episode, start) in enumerate(cut):
+        for h in range(1, HORIZON + 1):
+            frame = start + CONTEXT + h
+            np.testing.assert_array_equal(
+                result.true_positions[w, h - 1],
+                episode.privileged[frame, 1:3].astype(np.float64),
+                err_msg=f"window {w} step {h}",
+            )
+            np.testing.assert_array_equal(
+                result.true_positions[w, h - 1], np.array([DX * frame, DY * frame])
+            )
+        anchor = start + CONTEXT
+        np.testing.assert_array_equal(
+            result.true_at_context[w], episode.privileged[anchor, 1:3].astype(np.float64)
+        )
+        np.testing.assert_array_equal(
+            result.true_at_context[w], np.array([DX * anchor, DY * anchor])
+        )
+
+
+def test_the_probe_channel_reads_the_imagination_the_floor_and_the_last_context_frame(
+    tmp_path
+):
+    """Three probe readings, three different sources, told apart on a rig
+    whose dynamics DRIFT: `DriftingModel` advances two frames per action
+    while its filter is exact. So p_hat(h) is the position at frame
+    `start + context + 2h`, p_hat_real(h) -- the floor, a posterior over the
+    real frames -- is the position at `start + context + h`, and p_hat(0) is
+    the position at `start + context`. Each is the closed form `(DX * t,
+    DY * t)` through a probe exact to 1e-6, so the imagination taken from
+    the floor, the floor taken from the imagination, or the anchor taken from
+    step 1 is off by whole steps of displacement."""
+    _, paths, probe, cut = _three_length_oracle(tmp_path)
+    result = trajectories(DriftingModel(), paths, probe)
+
+    steps = np.arange(1, HORIZON + 1)
+    for w, (_, start) in enumerate(cut):
+        imagined_frames = start + CONTEXT + 2 * steps
+        real_frames = start + CONTEXT + steps
+        np.testing.assert_allclose(
+            result.positions[w], np.stack([DX * imagined_frames, DY * imagined_frames], axis=1),
+            atol=1e-6, err_msg=f"window {w}: positions",
+        )
+        np.testing.assert_allclose(
+            result.positions_real[w], np.stack([DX * real_frames, DY * real_frames], axis=1),
+            atol=1e-6, err_msg=f"window {w}: positions_real",
+        )
+        np.testing.assert_allclose(
+            result.positions_at_context[w],
+            np.array([DX * (start + CONTEXT), DY * (start + CONTEXT)]),
+            atol=1e-6, err_msg=f"window {w}: positions_at_context",
+        )
+    # The drift is a whole frame per step, so the imagination and the floor
+    # are STEP apart at h = 1 -- the readings cannot be the same source.
+    assert np.abs(result.positions - result.positions_real).max() > STEP / 2
+
+
+@pytest.mark.parametrize(
+    "model, drift",
+    [(OracleModel(), 1), (DriftingModel(), 2)],
+    ids=["exact", "drifting"],
+)
+def test_the_embedding_channel_has_the_closed_form_of_the_frame_tags(tmp_path, model, drift):
+    """The four series against the truth in embedding space, on rigs where
+    every embedding is a frame tag. The encoder tags frame t with `[t]`, the
+    head returns the tag, and `imagine` advances `drift` tags per step, so
+    with e(h) the tag of frame `start + context + h`:
+
+        e_hat(h) - e(h)     = (drift - 1) * h      -> distance_to_truth
+        e_hat(0) - e(h)     = -h                   -> persistence_distance
+        e_hat(h) - e_hat(0) = drift * h            -> displacement
+        e(h) - e(0)         = h                    -> true_displacement
+
+    Integers in float32 are exact, so these are bitwise. The exact rig gives
+    a distance to truth of 0 at every step -- which is what separates e(h)
+    from e(h + 1): one frame late reads 1 there, not 0 -- and the drifting
+    rig separates persistence from distance-to-truth (equal on the exact
+    rig) and the imagined displacement from the true one."""
+    _, paths, probe, cut = _three_length_oracle(tmp_path)
+    result = trajectories(model, paths, probe)
+
+    h = np.arange(1, HORIZON + 1, dtype=np.float64)
+    for w in range(len(cut)):
+        np.testing.assert_array_equal(
+            result.embedding_distance_to_truth[w], (drift - 1) * h, err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            result.embedding_persistence_distance[w], h, err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            result.embedding_displacement[w], drift * h, err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            result.true_embedding_displacement[w], h, err_msg=f"window {w}"
+        )
+
+
+def test_every_row_is_recomputed_by_hand_from_the_encoder_the_head_and_the_probe(
+    tmp_path, monkeypatch
+):
+    """The single-pipeline rule, on the real sampling rig, where nothing has
+    a closed form: every one of the nine arrays is rebuilt in the test from
+    what the model actually emitted, and must match bitwise.
+
+    Spied per window: the encoder's output (the window's `need` rows, from
+    which e(0) is row `context - 1` and e(1..H) the rows after it), the
+    context filter's and the floor's `observe` outputs (call order: filter,
+    floor -- stride 2), and the canonical `imagine` output (call order:
+    canonical, noise reference -- stride 2). The head is then applied BY THE
+    TEST to those latents, the probe by the test to those rows, and the
+    norms taken in float64 -- so a series read off the raw latent instead of
+    the head, the noise draw instead of the canonical one, the imagination's
+    rows for the floor's, or a norm taken in float32, all differ."""
+    paths = [write(tmp_path, synthetic_episode())]
+    model, probe = real_model_and_probe()
+    encoded: list[np.ndarray] = []
+    observed: list[torch.Tensor] = []
+    imagined: list[torch.Tensor] = []
+    real_encoder = model.encoder.forward
+    real_observe = model.rssm.observe
+    real_imagine = model.rssm.imagine
+    monkeypatch.setattr(
+        model.encoder, "forward",
+        lambda obs: _tee(encoded, real_encoder(obs)),
+    )
+
+    def spy_observe(embeddings, actions, state=None):
+        out = real_observe(embeddings, actions, state=state)
+        observed.append(out["latent"].clone())
+        return out
+
+    def spy_imagine(actions, state):
+        out = real_imagine(actions, state)
+        imagined.append(out["latent"].clone())
+        return out
+
+    monkeypatch.setattr(model.rssm, "observe", spy_observe)
+    monkeypatch.setattr(model.rssm, "imagine", spy_imagine)
+    result = trajectories(model, paths, probe)
+
+    assert result.windows_total == 2
+    assert len(encoded) == 2 and len(observed) == 4 and len(imagined) == 4
+    with torch.no_grad():
+        for w in range(2):
+            embeddings = encoded[w].detach().cpu().numpy()          # (need, E), float32
+            assert embeddings.shape == (CONTEXT + HORIZON, 2048)
+            e0, e = embeddings[CONTEXT - 1], embeddings[CONTEXT:]   # e(0), e(1..H)
+            filter_latent, floor_latent = observed[2 * w], observed[2 * w + 1]
+            canonical_latent = imagined[2 * w]
+            e_hat = model.heads(canonical_latent)["embedding"][0].cpu().numpy()
+            e_hat0 = model.heads(filter_latent[:, -1:])["embedding"][0, 0].cpu().numpy()
+            e_real = model.heads(floor_latent)["embedding"][0].cpu().numpy()
+            assert e_hat.shape == e_real.shape == (HORIZON, 2048) and e_hat0.shape == (2048,)
+
+            np.testing.assert_array_equal(result.positions[w], apply_probe(probe, e_hat)[:, :2])
+            np.testing.assert_array_equal(
+                result.positions_real[w], apply_probe(probe, e_real)[:, :2]
+            )
+            np.testing.assert_array_equal(
+                result.positions_at_context[w],
+                apply_probe(probe, np.repeat(e_hat0[None, :], HORIZON, axis=0))[0, :2],
+            )
+            f64 = lambda x: np.asarray(x, dtype=np.float64)  # noqa: E731
+            np.testing.assert_array_equal(
+                result.embedding_distance_to_truth[w],
+                np.linalg.norm(f64(e_hat) - f64(e), axis=-1),
+            )
+            np.testing.assert_array_equal(
+                result.embedding_persistence_distance[w],
+                np.linalg.norm(f64(e_hat0)[None, :] - f64(e), axis=-1),
+            )
+            np.testing.assert_array_equal(
+                result.embedding_displacement[w],
+                np.linalg.norm(f64(e_hat) - f64(e_hat0)[None, :], axis=-1),
+            )
+            np.testing.assert_array_equal(
+                result.true_embedding_displacement[w],
+                np.linalg.norm(f64(e) - f64(e0)[None, :], axis=-1),
+            )
+    # None of the four embedding series is degenerate on a real model: the
+    # imagination is neither the truth nor the anchor, and the frames move.
+    for name in TRAJECTORY_FIELDS[5:]:
+        assert getattr(result, name).min() > 0.0, name
+
+
+def test_reference_trajectories_runs_the_canonical_pass_alone_with_the_noise_reference(
+    tmp_path, monkeypatch
+):
+    """The call `reference_trajectories` makes, pinned by its arguments and by
+    what reaches `imagine`: no intervention arm, the noise reference drawn,
+    the flag on, and every protocol argument forwarded verbatim. Behaviourally,
+    `imagine` is called exactly twice per window -- the canonical pass and
+    the noise draw -- and the second call carries the first's real actions;
+    an arm left in would add a call, a skipped noise reference would remove
+    one, and either moves the stream the curves are pinned on."""
+    paths = [write(tmp_path, varied_action_episode())]
+    model, probe = real_model_and_probe()
+    calls: list[dict] = []
+    real_diagnose = diagnostics_module._diagnose
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real_diagnose(*args, **kwargs)
+
+    monkeypatch.setattr(diagnostics_module, "_diagnose", spy)
+    seen = _imagined_actions(monkeypatch, model)
+    result = reference_trajectories(
+        model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=7,
+        device=torch.device("cpu"), feature_backbone=None,
+    )
+
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["arms"] == {}
+    assert kwargs["noise_reference"] is True
+    assert kwargs["keep_trajectories"] is True
+    assert kwargs["context"] == CONTEXT and kwargs["horizon"] == HORIZON
+    assert kwargs["seed"] == 7 and kwargs["feature_backbone"] is None
+    assert kwargs["device"] == torch.device("cpu")
+    assert result.windows_total == 2
+    _, canonical = _per_rung(seen, arms=(), windows=2)
+    assert len(canonical) == 2
+
+
+def test_reference_trajectories_runs_in_eval_mode_and_takes_no_gradient(
+    tmp_path, monkeypatch
+):
+    """Sampled AT the moment the RSSM is called, as the ladder's own test
+    does it. On the real model this is not decoration: the encoder's output
+    carries grad, and `.numpy()` on it inside the flag's block raises unless
+    the entry point is under `no_grad`."""
+    paths = [write(tmp_path, synthetic_episode())]
+    model, probe = real_model_and_probe()
+    model.train(True)
+    states = []
+    real = model.rssm.imagine
+    monkeypatch.setattr(
+        model.rssm, "imagine",
+        lambda actions, state: states.append((model.training, torch.is_grad_enabled()))
+        or real(actions, state),
+    )
+    result = trajectories(model, paths, probe)
+    assert result.windows_total == 2 and states
+    assert not any(training for training, _ in states)
+    assert not any(grad for _, grad in states)
+
+
+def test_reference_trajectories_raises_when_no_window_is_long_enough(tmp_path):
+    """The same refusal as the ladder's, through the same `_no_window_error`:
+    an empty stack of trajectories would otherwise surface as a numpy error
+    about zero-length stacking, far from the split/horizon problem it is."""
+    episode = synthetic_episode(length=CONTEXT + HORIZON)  # exactly `need`: excluded
+    path = write(tmp_path, episode)
+    with pytest.raises(ValueError, match="no diagnostic window"):
+        trajectories(OracleModel(), [path], oracle_probe(episode))
