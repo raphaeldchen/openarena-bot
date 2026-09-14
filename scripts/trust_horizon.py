@@ -628,22 +628,6 @@ def _inputs(records: dict, *, h: int, per_seed: bool) -> tuple[ReadingOneInputs,
     ratio_probe = ratio_cells("ratio_probe", "probe_hat", "probe_real", probe_based=True)
     ratio_free = ratio_cells("ratio_free", "free_hat", "free_true", probe_based=False)
 
-    def crossing_contrast(channel, probe_based):
-        """TREATMENT - CONTROL paired per (window, seed) draw: the seeds
-        both arms carry (both measurable, for the probe channel) stacked in
-        one series per arm, a never-moved draw (NaN) leaving on its own."""
-        common = [
-            seed for seed in seeds
-            if not probe_based
-            or (_measurable(records[(TREATMENT, seed)]) and _measurable(records[(CONTROL, seed)]))
-        ]
-        if not common:
-            return _NO_CONTRAST
-        return _contrast(
-            [_stacked_crossings(records, TREATMENT, channel, common)],
-            [_stacked_crossings(records, CONTROL, channel, common)],
-        )
-
     # A boundary alpha in ANY measurable seed of an arm flags the arm: the
     # corrected contrast pooled those seeds, and a correction that is
     # persistence itself in one of them is not a correction (spec 2.2).
@@ -664,8 +648,10 @@ def _inputs(records: dict, *, h: int, per_seed: bool) -> tuple[ReadingOneInputs,
         corrected_contrast_a=_contrast(corrected_a[TREATMENT], corrected_a[CONTROL]),
         corrected_contrast_b=_contrast(corrected_b[TREATMENT], corrected_b[CONTROL]),
         alpha_boundary=alpha_boundary,
-        crossing_contrast_probe=crossing_contrast("probe", probe_based=True),
-        crossing_contrast_free=crossing_contrast("free", probe_based=False),
+        # The treatment pair is the probe control's own estimator, one code
+        # path with the informational pixel_ae pair (test-pinned equal).
+        crossing_contrast_probe=_informational_crossing(records, TREATMENT, "probe"),
+        crossing_contrast_free=_informational_crossing(records, TREATMENT, "free"),
         per_seed=(
             {
                 seed: _inputs(
