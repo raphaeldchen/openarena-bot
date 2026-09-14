@@ -7500,7 +7500,7 @@ channels order the arms `…` (the same way / differently: …). `H*_0.5` per ar
 probe, `…` / `…` / `…`, is the old median reading; the mean-curve crossing of spec section 1
 (median step 6, range 1-17) was a statement about curves, this is one about draws, and they
 `…`. Read for M4: `…` (the number of open-loop steps over which every arm's imagination
-beats standing still for three quarters of the draws, probe-free).
+has not yet strictly lost to persistence in at least three quarters of the moved draws, probe-free -- read it beside the unmoved fraction u(h) and the conditional survival S_c(h): a draw that has not moved by h survives vacuously).
 
 **Reading 1 -- does the h=45 gate reward slow drift?** (spec section 3.2.) Pooled over
 seeds per window, episode-clustered; the pooling notes read `clusters: 24 validation
