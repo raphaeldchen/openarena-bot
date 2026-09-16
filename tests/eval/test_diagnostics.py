@@ -3514,3 +3514,28 @@ def test_reference_trajectories_raises_when_no_window_is_long_enough(tmp_path):
     path = write(tmp_path, episode)
     with pytest.raises(ValueError, match="no diagnostic window"):
         trajectories(OracleModel(), [path], oracle_probe(episode))
+
+
+def test_reference_trajectories_carries_the_pass_band(tmp_path):
+    """The pass already computes all six mean curves (`_Pass.reference` is a
+    `RolloutResult`); `Trajectories` used to copy two of them out. `band` is
+    the whole thing, so a consumer can take `gap_closed` on the stratum it
+    just evaluated without a second `evaluate_rollout`. The two named curves
+    stay and are the band's own -- the self-check reads them by name."""
+    paths = [write(tmp_path, varied_action_episode())]
+    model, probe = real_model_and_probe()
+    result = reference_trajectories(
+        model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=7,
+        device=torch.device("cpu"), feature_backbone=None,
+    )
+    band = result.band
+    assert isinstance(band, RolloutResult)
+    for name in ("rssm_position", "persistence_position", "floor_position",
+                 "rssm_angle", "persistence_angle", "floor_angle"):
+        assert getattr(band, name).shape == (HORIZON,), name
+        assert np.isfinite(getattr(band, name)).all(), name
+    np.testing.assert_array_equal(band.rssm_position, result.reference_position)
+    np.testing.assert_array_equal(band.persistence_position, result.persistence_position)
+    assert band.position_gap_closed().shape == (HORIZON,)
+    # Additive: a fabricated Trajectories that reads no band need not build one.
+    assert Trajectories.__dataclass_fields__["band"].default is None

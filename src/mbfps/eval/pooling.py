@@ -581,6 +581,52 @@ def paired_contrast(treatment, control) -> PairedContrast:
     )
 
 
+@dataclass(frozen=True)
+class UnpairedContrast:
+    """`a` minus `b` where the two pools score DIFFERENT windows -- two strata
+    of one arm -- so nothing is paired: the standard error is the root sum of
+    squares of the two clustered ones, and the cluster count the ruler is
+    read against is the SMALLER of the two (conservative for the larger)."""
+
+    a: str          # "<arm>/<rung>" of the first pool
+    b: str          # "<arm>/<rung>" of the second
+    channel: str
+    windows_a: int
+    windows_b: int
+    clusters: int
+    mean: float
+    se: float
+    z: float
+
+
+def unpaired_contrast(a: PooledMean, b: PooledMean) -> UnpairedContrast:
+    """`a.mean - b.mean`, `se = sqrt(a.se^2 + b.se^2)`, `z = mean / se` under
+    `_z`'s zero-ruler policy; a NaN ruler on either side propagates and never
+    becomes the naive one.
+
+    The two pools must be the same READING (`channel`) and must not be the
+    same pool (`arm` and `rung` both equal -- a stratum against itself). They
+    are NOT required to share windows: that is the point. Compare
+    `paired_contrast`, whose two arms must score identical windows so it can
+    difference them window by window.
+    """
+    if a.channel != b.channel:
+        raise IncompatibleCells(
+            f"{a.arm}/{a.rung} ({a.channel}) and {b.arm}/{b.rung} ({b.channel}) are "
+            "not the same reading"
+        )
+    if (a.arm, a.rung) == (b.arm, b.rung):
+        raise IncompatibleCells(f"{a.arm}/{a.rung} would be contrasted against itself")
+    mean = float(a.mean - b.mean)
+    se = float(np.sqrt(a.se ** 2 + b.se ** 2))
+    return UnpairedContrast(
+        a=f"{a.arm}/{a.rung}", b=f"{b.arm}/{b.rung}", channel=a.channel,
+        windows_a=int(a.windows), windows_b=int(b.windows),
+        clusters=int(min(a.clusters, b.clusters)),
+        mean=mean, se=se, z=_z(mean, se),
+    )
+
+
 def _normalised(cells) -> dict:
     """Every cell's numerator and noise rows over ALL its windows, each cell
     divided by ITS OWN noise median over its changed windows -- so a cell's

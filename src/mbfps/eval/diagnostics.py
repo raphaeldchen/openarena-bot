@@ -790,6 +790,16 @@ class Trajectories:
     windows_total: int
     reference_position: np.ndarray
     persistence_position: np.ndarray
+    band: "RolloutResult | None" = None
+    """The pass's `_Pass.reference` -- all six mean curves (`rssm`,
+    `persistence`, `floor` x position, angle) -- so a consumer can take
+    `gap_closed` on the stratum it just evaluated without a second
+    `evaluate_rollout` (M3e). `reference_trajectories` always sets it; the
+    default exists so a fabricated `Trajectories` in a test that reads none
+    of the band need not build one. `reference_position` and
+    `persistence_position` above are `band.rssm_position` and
+    `band.persistence_position`, kept under their own names because the
+    self-check reads them by name."""
 
 
 @torch.no_grad()
@@ -832,6 +842,7 @@ def reference_trajectories(
         windows_total=result.windows_total,
         reference_position=result.reference.rssm_position,
         persistence_position=result.reference.persistence_position,
+        band=result.reference,
     )
 
 
