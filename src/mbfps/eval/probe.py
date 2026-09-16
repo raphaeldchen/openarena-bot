@@ -294,6 +294,33 @@ def gather_probe_data(
     }
 
 
+PROBE_EPISODE_LIMIT: int = 20
+"""How many TRAINING episodes the rollout's probe is fit on: the first
+`PROBE_EPISODE_LIMIT` of the train split in the order `episode_split` returns
+it, `select_episodes` of which are held back to select the ridge.
+
+Named because a second consumer now depends on the SAME rule. The split-gap
+diagnostic (`scripts/split_gap.py`) evaluates the shipped checkpoints on the
+training episodes the probe never saw -- model-seen, probe-unseen -- and
+which those are is exactly `probe_episodes(train)[1]`. A bare `20` here and
+a bare `20` there would be two rules that agree today; `fit_probes` and the
+diagnostic both call `probe_episodes`, and a test pins `fit_probes`'s
+default to this constant, so moving it moves both or fails the suite.
+"""
+
+
+def probe_episodes(paths, limit: int = PROBE_EPISODE_LIMIT) -> tuple[list, list]:
+    """`(used, held)`: the episodes the probe is fit on and every other one,
+    both in the caller's order. `used` is the LEADING block, so a caller that
+    hands the train split in `episode_split`'s order gets a deterministic set.
+    `held` is empty when `paths` has at most `limit` entries -- legal for the
+    probe, and what the split-gap diagnostic refuses as an empty stratum."""
+    if limit < 1:
+        raise ValueError(f"the probe needs at least one episode; limit={limit}")
+    ordered = list(paths)
+    return ordered[:limit], ordered[limit:]
+
+
 @torch.no_grad()
 def fit_probes(
     model,
@@ -302,7 +329,7 @@ def fit_probes(
     device,
     context: int = 5,
     horizon: int = 45,
-    limit: int = 20,
+    limit: int = PROBE_EPISODE_LIMIT,
     seed: int = 0,
     select_episodes: int = 4,
     ridge: float | None = None,
@@ -344,7 +371,7 @@ def fit_probes(
         device: where to run the encoder and RSSM.
         context: real frames filtered from a zero state, per window.
         horizon: steps after the context, per window.
-        limit: how many episodes to fit on.
+        limit: how many episodes to fit on -- `probe_episodes(paths, limit)[0]`, the rule the split-gap strata share.
         seed: fixes the posterior samples, and so the probe.
         select_episodes: how many of the used episodes are held back to SELECT
             the ridge rather than fit it. Selection is not optional -- a fixed
@@ -353,7 +380,7 @@ def fit_probes(
             or too few episodes to spare, falls back to `fit_probe`'s default.
         ridge: pin the penalty and skip selection entirely (tests).
     """
-    used = list(paths)[:limit]
+    used, _ = probe_episodes(paths, limit)
     if not used:
         raise ValueError("no episodes to fit the probe on; `paths` was empty")
 

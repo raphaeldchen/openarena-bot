@@ -1,9 +1,11 @@
 import inspect
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from mbfps.eval.probe import (
+    PROBE_EPISODE_LIMIT,
     PROBE_KEYS,
     RIDGES,
     TARGET_DIM,
@@ -12,7 +14,9 @@ from mbfps.eval.probe import (
     apply_probe,
     filtering_comparison,
     fit_probe,
+    fit_probes,
     position_error,
+    probe_episodes,
     probe_r2,
     probe_targets,
 )
@@ -750,6 +754,66 @@ def test_fit_probes_rejects_an_empty_episode_list():
 
 
 # ---------------------------------------------------------------------------
+# probe_episodes -- the ONE rule for which training episodes the probe saw.
+#
+# `fit_probes` fits on the first `PROBE_EPISODE_LIMIT` training episodes and
+# no others. The split-gap diagnostic evaluates the shipped checkpoints on
+# the training episodes the probe did NOT see, so it needs the same rule;
+# both call `probe_episodes`, and the default is pinned to the constant so
+# re-hardcoding a `20` in either place fails here.
+# ---------------------------------------------------------------------------
+
+import mbfps.eval.probe as probe_module  # noqa: E402
+
+
+def test_the_probe_episode_limit_is_one_constant_that_fit_probes_and_probe_episodes_share():
+    """Equality to 20 alone would pass again the moment someone re-hardcoded
+    the literal in `fit_probes`; the SIGNATURE defaults are what couple the
+    two, the way `VAL_FRACTION` couples the three split callers."""
+    assert PROBE_EPISODE_LIMIT == 20
+    assert inspect.signature(fit_probes).parameters["limit"].default == PROBE_EPISODE_LIMIT
+    assert inspect.signature(probe_episodes).parameters["limit"].default == PROBE_EPISODE_LIMIT
+    paths = [Path(f"ep_{i:06d}_len00526.npz") for i in range(25)]
+    used, held = probe_episodes(paths)
+    assert used == paths[:20] and held == paths[20:]
+    assert probe_episodes(paths, limit=30) == (paths, [])
+    assert probe_episodes(paths[:20]) == (paths[:20], []), "exactly the limit leaves nothing held"
+    assert probe_episodes(paths, limit=3) == (paths[:3], paths[3:])
+    with pytest.raises(ValueError, match="at least one"):
+        probe_episodes(paths, limit=0)
+
+
+def test_fit_probes_takes_its_fit_set_from_probe_episodes(tmp_path, monkeypatch):
+    """The routing, pinned behaviourally: `fit_probes` calls `probe_episodes`
+    with its own `paths` and `limit`, and gathers on EXACTLY the `used` list
+    that comes back -- so a `fit_probes` that sliced for itself would gather
+    the same episodes today and drift from the diagnostic's strata the day
+    either rule changed."""
+    paths = _write_episodes(tmp_path, [20, 20, 20, 20, 20])
+    seen: list[tuple[list, int]] = []
+    real_probe_episodes = probe_module.probe_episodes
+
+    def spy(ps, limit=PROBE_EPISODE_LIMIT):
+        seen.append((list(ps), limit))
+        return real_probe_episodes(ps, limit)
+
+    monkeypatch.setattr(probe_module, "probe_episodes", spy)
+    gathered: list[list] = []
+    real_gather = probe_module.gather_probe_data
+
+    def gather_spy(model, ps, *args, **kwargs):
+        gathered.append(list(ps))
+        return real_gather(model, ps, *args, **kwargs)
+
+    monkeypatch.setattr(probe_module, "gather_probe_data", gather_spy)
+
+    _fit(paths, limit=3, select_episodes=0, ridge=1.0)
+
+    assert seen == [(paths, 3)]
+    assert gathered == [paths[:3]], "the fit set must be probe_episodes' `used`, nothing else"
+
+
+# ---------------------------------------------------------------------------
 # gather_probe_data -- the probe must be fit under the ROLLOUT's own protocol.
 #
 # `evaluate_rollout` gives the RSSM `context` real frames out of a ZERO state
@@ -767,7 +831,6 @@ def test_fit_probes_rejects_an_empty_episode_list():
 # the study's headline ratio divides by.
 # ---------------------------------------------------------------------------
 
-import mbfps.eval.probe as probe_module  # noqa: E402
 import mbfps.eval.rollout as rollout_module  # noqa: E402
 from mbfps.eval.probe import gather_probe_data  # noqa: E402
 from mbfps.eval.rollout import evaluate_rollout  # noqa: E402
