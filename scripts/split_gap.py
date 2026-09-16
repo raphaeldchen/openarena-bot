@@ -521,7 +521,7 @@ def _learning_curve_table(records: dict, window: int) -> str:
     lines = [
         f"--- learning curves (from history.parts; {window}-step moving mean; descriptive, "
         "no verdict): last quarter vs preceding quarter, and the smoothed minimum's step ---",
-        f"  {'arm':<12}{'seed':>5}{'term':<11}{'last_q':>11}{'prev_q':>11}{'change%':>9}"
+        f"  {'arm':<12}{'seed':>5}  {'term':<11}{'last_q':>11}{'prev_q':>11}{'change%':>9}"
         f"{'descending':>11}{'min_step':>9}",
     ]
     for arm, seed in _cells_in_order(records):
@@ -529,7 +529,7 @@ def _learning_curve_table(records: dict, window: int) -> str:
         for term in ("loss", *TERMS):
             t = summary["terms"][term]
             lines.append(
-                f"  {arm:<12}{seed:>5}{term:<11}{_num(t['last_quarter_mean'], '.4f'):>11}"
+                f"  {arm:<12}{seed:>5}  {term:<11}{_num(t['last_quarter_mean'], '.4f'):>11}"
                 f"{_num(t['preceding_quarter_mean'], '.4f'):>11}{_num(t['change_pct'], '+.2f'):>9}"
                 f"{str(t['descending']):>11}{t['smoothed_min_step']:>9}"
             )
