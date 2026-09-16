@@ -193,3 +193,217 @@ def stratum_summary(traj: Trajectories, horizon: int) -> dict:
             "never_moved": int((~moved.any(axis=1)).sum()),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Reading G -- the generalisation gap (spec 3.3), over pooled inputs.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StratumContrast:
+    """`pooling.unpaired_contrast` reduced to what the rules read."""
+
+    estimate: float
+    se: float
+    z: float
+    clusters: int
+
+
+@dataclass(frozen=True)
+class ArmInputs:
+    """One arm's pooled numbers at the decision horizon: the two stratum
+    contrasts (`train_held - val`), spec 4.1's criterion on `train_held` per
+    seed, and the same inputs within each seed alone (leaves carry
+    `per_seed=None`)."""
+
+    gap_free: StratumContrast
+    gap_probe: StratumContrast
+    train_held_gap_final: dict[int, float]
+    per_seed: "dict[int, ArmInputs] | None"
+
+
+@dataclass(frozen=True)
+class GapInputs:
+    arms: dict[str, ArmInputs]
+    z_fam: float
+    h: int
+
+
+class Status(str, Enum):
+    """Spec 3.3's five outcomes, in the table's order of precedence."""
+
+    UNRESOLVED_PROBE = "unresolved through the probe"
+    MEMORISATION = "memorisation"
+    PARTIAL_GAP = "partial gap"
+    INVERTED_GAP = "inverted gap"
+    NO_GAP = "no gap"
+
+
+@dataclass(frozen=True)
+class ArmReading:
+    arm: str
+    status: Status
+    rule: str
+    free_clears_up: bool
+    free_clears_down: bool
+    probe_clears_up: bool
+    probe_clears_down: bool
+    seeds_clearing: int
+    seeds_total: int
+    train_held_unanimous: bool
+
+
+@dataclass(frozen=True)
+class GapReading:
+    arms: dict[str, ArmReading]
+    h: int
+    z_fam: float
+
+
+def clears(z: float, z_fam: float) -> bool:
+    """STRICTLY above the bar. NaN never clears (nothing to read); an infinite
+    z never clears either -- `pooling._z` returns +-inf for a zero standard
+    error, a degenerate ruler. `trust_readings._clears`'s policy, restated."""
+    return bool(np.isfinite(z) and np.isfinite(z_fam) and z > z_fam)
+
+
+def train_held_passes_gate(gap_final: dict[int, float]) -> bool:
+    """Spec 3.3 / governing spec 4.1 on the train side: `gap_closed(45)` on
+    position > 0 in ALL seeds of the arm, where a NaN (a non-positive
+    persistence-to-floor band) is not > 0. No seed at all is not unanimity."""
+    values = list(gap_final.values())
+    return bool(values) and all(np.isfinite(v) and v > 0.0 for v in values)
+
+
+def _fmt(value: float, spec: str = "+.2f") -> str:
+    return format(value, spec) if np.isfinite(value) else str(value)
+
+
+def _gate_detail(gap_final: dict[int, float]) -> str:
+    return "gap_closed(45) per seed " + " / ".join(
+        f"s{seed} {_fmt(gap_final[seed], '+.3f')}" for seed in sorted(gap_final)
+    )
+
+
+def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
+    """The rules of spec 3.3, in the table's precedence, each status carrying
+    the sentence that decided it."""
+    free_up, free_down = clears(a.gap_free.z, z_fam), clears(-a.gap_free.z, z_fam)
+    probe_up, probe_down = clears(a.gap_probe.z, z_fam), clears(-a.gap_probe.z, z_fam)
+    per_seed = a.per_seed or {}
+    seeds_clearing = sum(1 for leaf in per_seed.values() if clears(leaf.gap_free.z, z_fam))
+    unanimous = train_held_passes_gate(a.train_held_gap_final)
+    fz, pz, bar = _fmt(a.gap_free.z), _fmt(a.gap_probe.z), f"{z_fam:.2f}"
+    seeds = f"{seeds_clearing} of {len(per_seed)} seeds"
+    if (free_up and probe_down) or (free_down and probe_up):
+        status = Status.UNRESOLVED_PROBE
+        rule = f"G_free z {fz} and G_probe z {pz} both clear +-{bar} with opposite signs"
+    elif free_up and seeds_clearing >= SEEDS_REQUIRED and unanimous:
+        status = Status.MEMORISATION
+        rule = (f"G_free z {fz} > {bar} pooled and in {seeds}; train_held passes spec 4.1 "
+                f"({_gate_detail(a.train_held_gap_final)})")
+    elif free_up and seeds_clearing >= SEEDS_REQUIRED:
+        status = Status.PARTIAL_GAP
+        rule = (f"G_free z {fz} > {bar} pooled and in {seeds}; train_held FAILS spec 4.1 "
+                f"({_gate_detail(a.train_held_gap_final)})")
+    elif free_down:
+        status = Status.INVERTED_GAP
+        rule = f"G_free z {fz} < -{bar}: train_held is worse than val"
+    elif free_up:
+        status = Status.NO_GAP
+        rule = (f"G_free z {fz} clears {bar} pooled but in only {seeds} "
+                f"(>= {SEEDS_REQUIRED} required)")
+    else:
+        status = Status.NO_GAP
+        rule = f"G_free z {fz} does not clear +-{bar}"
+    return ArmReading(
+        arm=arm, status=status, rule=rule,
+        free_clears_up=free_up, free_clears_down=free_down,
+        probe_clears_up=probe_up, probe_clears_down=probe_down,
+        seeds_clearing=seeds_clearing, seeds_total=len(per_seed),
+        train_held_unanimous=unanimous,
+    )
+
+
+def reading_gap(inputs: GapInputs) -> GapReading:
+    """One `ArmReading` per arm, in the caller's order; arms never read each
+    other (spec 4: no ranking)."""
+    return GapReading(
+        arms={arm: _arm_reading(arm, a, inputs.z_fam) for arm, a in inputs.arms.items()},
+        h=inputs.h, z_fam=inputs.z_fam,
+    )
+
+
+def format_reading_gap(reading: GapReading, inputs: GapInputs) -> str:
+    """The contrast table and the verdict lines, in `trust.txt`'s style."""
+    lines = [
+        f"--- Reading G: the generalisation gap at h={reading.h} (train_held - val); "
+        f"z_fam = {reading.z_fam:.2f} ---",
+        f"  {'arm':<12}{'channel':<9}{'estimate':>10}{'se':>9}{'z':>8}  clears",
+    ]
+    for arm, a in inputs.arms.items():
+        for channel, c in (("free", a.gap_free), ("probe", a.gap_probe)):
+            verdict = "yes" if clears(abs(c.z), reading.z_fam) else "no"
+            lines.append(
+                f"  {arm:<12}{channel:<9}{_fmt(c.estimate, '+.4f'):>10}{_fmt(c.se, '.4f'):>9}"
+                f"{_fmt(c.z):>8}  {verdict}"
+            )
+    lines.append("  train_held, spec 4.1 (gap_closed(45) position > 0 in every seed):")
+    for arm, a in inputs.arms.items():
+        word = "passes" if train_held_passes_gate(a.train_held_gap_final) else "FAILS"
+        lines.append(f"    {arm:<12}{_gate_detail(a.train_held_gap_final)} -> {word}")
+    for arm, r in reading.arms.items():
+        lines.append(
+            f"  verdict: {arm:<12}{r.status.name.replace('_', ' ')} -- decided by: {r.rule}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Learning curves (spec 2.3): descriptive, no verdict.
+# ---------------------------------------------------------------------------
+
+
+def _smoothed(series: np.ndarray, window: int) -> np.ndarray:
+    return np.convolve(series, np.ones(window) / window, mode="valid")
+
+
+def learning_curve_summary(history: dict, window: int = 100) -> dict:
+    """Per term (and the summed loss): the mean over the last quarter of
+    training against the mean over the quarter before it -- the statistic the
+    M3b write-up used on the summed loss -- as sign and percentage, and the
+    1-based step at which the `window`-step moving mean is lowest (the step
+    at the END of the minimising window). `window` shrinks to the history's
+    length when the history is shorter than it."""
+    loss = np.asarray(history["loss"], dtype=float)
+    parts = list(history["parts"])
+    n = int(loss.size)
+    if n < 4:
+        raise ValueError(f"a learning curve needs at least four steps for quarters, got {n}")
+    if len(parts) != n:
+        raise ValueError(
+            f"history.loss ({n}) and history.parts ({len(parts)}) disagree on the step count"
+        )
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    window = min(int(window), n)
+    series = {"loss": loss}
+    for term in TERMS:
+        series[term] = np.asarray([float(p[term]) for p in parts], dtype=float)
+    quarter = n // 4
+    terms = {}
+    for name, s in series.items():
+        last = float(s[n - quarter:].mean())
+        previous = float(s[n - 2 * quarter: n - quarter].mean())
+        smoothed = _smoothed(s, window)
+        terms[name] = {
+            "last_quarter_mean": last,
+            "preceding_quarter_mean": previous,
+            "change_pct": float(100.0 * (last - previous) / previous) if previous != 0.0 else float("nan"),
+            "descending": bool(last < previous),
+            "smoothed_min_step": int(np.argmin(smoothed)) + window,
+            "smoothed_min": float(smoothed.min()),
+            "smoothed_final": float(smoothed[-1]),
+        }
+    return {"steps": n, "window": window, "quarter": int(quarter), "terms": terms}

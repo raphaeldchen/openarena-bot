@@ -16,19 +16,30 @@ import pytest
 from mbfps.eval.diagnostics import Trajectories
 from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.split_gap import (
+    ArmInputs,
+    ArmReading,
     CHANNELS,
     CURVE_NAMES,
     DECISION,
     DECISION_H,
     FAMILY,
+    GapInputs,
+    GapReading,
     REPORTED_H,
     SEEDS_REQUIRED,
     STRATA,
+    Status,
+    StratumContrast,
     TERMS,
     StrataNotAPartition,
+    clears,
+    format_reading_gap,
+    learning_curve_summary,
     q_key,
+    reading_gap,
     strata_partition,
     stratum_summary,
+    train_held_passes_gate,
 )
 from mbfps.eval.trust_readings import Q_REPORTED
 
@@ -219,3 +230,186 @@ def test_stratum_summary_refuses_a_pass_without_a_band_and_a_horizon_that_is_not
         stratum_summary(dataclasses.replace(_fabricated(), band=None), horizon=2)
     with pytest.raises(ValueError, match="horizon"):
         stratum_summary(_fabricated(), horizon=3)
+
+
+# ---------------------------------------------------------------------------
+# Reading G, on fabricated pooled tables. z_fam is 3.0 throughout; every
+# fabricated z is either clearly above (+4), clearly below (+1), clearly
+# inverted (-4), or exactly the bar (3.0, which must NOT clear).
+# ---------------------------------------------------------------------------
+
+Z_FAM = 3.0
+
+
+def _contrast(z: float) -> StratumContrast:
+    return StratumContrast(estimate=0.1 * z, se=0.1, z=z, clusters=24)
+
+
+def _arm(free_z, probe_z, *, seeds=(4.0, 4.0, 4.0), gate=(0.2, 0.3, 0.1)) -> ArmInputs:
+    """Pooled contrasts plus three per-seed leaves (each with its own free z
+    and the SAME probe z) and train_held's gap_closed(45) per seed."""
+    per_seed = {
+        seed: ArmInputs(
+            gap_free=_contrast(z), gap_probe=_contrast(probe_z),
+            train_held_gap_final={seed: gate[seed]}, per_seed=None,
+        )
+        for seed, z in enumerate(seeds)
+    }
+    return ArmInputs(
+        gap_free=_contrast(free_z), gap_probe=_contrast(probe_z),
+        train_held_gap_final={s: gate[s] for s in range(3)}, per_seed=per_seed,
+    )
+
+
+def _inputs(**arms) -> GapInputs:
+    return GapInputs(arms=arms, z_fam=Z_FAM, h=DECISION_H)
+
+
+def test_clears_is_strict_and_never_on_a_nan_or_infinite_z():
+    assert clears(3.01, Z_FAM) and not clears(3.0, Z_FAM) and not clears(2.99, Z_FAM)
+    assert not clears(float("nan"), Z_FAM) and not clears(float("inf"), Z_FAM)
+    assert not clears(4.0, float("nan")), "a NaN bar cannot be cleared"
+
+
+def test_train_held_passes_gate_is_spec_4_1_unanimity_with_nan_not_positive():
+    assert train_held_passes_gate({0: 0.2, 1: 0.01, 2: 0.9})
+    assert not train_held_passes_gate({0: 0.2, 1: 0.0, 2: 0.9}), "zero is not > 0"
+    assert not train_held_passes_gate({0: 0.2, 1: -0.1, 2: 0.9})
+    assert not train_held_passes_gate({0: 0.2, 1: float("nan"), 2: 0.9}), (
+        "a NaN gap_closed is a non-positive band and is not > 0")
+    assert not train_held_passes_gate({}), "no seed is not unanimity"
+
+
+def test_memorisation_needs_the_pooled_gap_two_seeds_and_the_train_side_gate():
+    reading = reading_gap(_inputs(frozen_ssl=_arm(4.0, 1.0)))
+    r = reading.arms["frozen_ssl"]
+    assert r.status is Status.MEMORISATION
+    assert r.free_clears_up and not r.probe_clears_up and not r.probe_clears_down
+    assert (r.seeds_clearing, r.seeds_total, r.train_held_unanimous) == (3, 3, True)
+    assert "passes" in r.rule and "4.1" in r.rule
+    assert (reading.h, reading.z_fam) == (DECISION_H, Z_FAM)
+
+
+def test_partial_gap_when_one_train_held_seed_does_not_beat_persistence_at_45():
+    r = reading_gap(_inputs(frozen_ssl=_arm(4.0, 1.0, gate=(0.2, -0.05, 0.1)))).arms["frozen_ssl"]
+    assert r.status is Status.PARTIAL_GAP and not r.train_held_unanimous
+    assert "FAILS" in r.rule
+    nan = reading_gap(_inputs(a=_arm(4.0, 1.0, gate=(0.2, float("nan"), 0.1)))).arms["a"]
+    assert nan.status is Status.PARTIAL_GAP, "a NaN band on one seed is not unanimity"
+
+
+def test_a_pooled_gap_that_only_one_seed_shows_is_no_gap():
+    r = reading_gap(_inputs(frozen_ssl=_arm(4.0, 1.0, seeds=(4.0, 1.0, 1.0)))).arms["frozen_ssl"]
+    assert r.status is Status.NO_GAP and r.seeds_clearing == 1
+    assert "only 1 of 3" in r.rule
+    two = reading_gap(_inputs(frozen_ssl=_arm(4.0, 1.0, seeds=(4.0, 4.0, 1.0)))).arms["frozen_ssl"]
+    assert two.status is Status.MEMORISATION and two.seeds_clearing == 2, "two of three suffice"
+
+
+def test_no_gap_when_the_free_contrast_does_not_clear_even_if_the_probe_does():
+    r = reading_gap(_inputs(random_vit=_arm(1.0, 4.0))).arms["random_vit"]
+    assert r.status is Status.NO_GAP and r.probe_clears_up and not r.free_clears_up
+    assert "does not clear" in r.rule
+    bar = reading_gap(_inputs(random_vit=_arm(3.0, 1.0))).arms["random_vit"]
+    assert bar.status is Status.NO_GAP, "z equal to the bar does not clear"
+
+
+def test_inverted_gap_when_train_held_is_worse_than_val():
+    r = reading_gap(_inputs(pixel_ae=_arm(-4.0, -1.0))).arms["pixel_ae"]
+    assert r.status is Status.INVERTED_GAP and r.free_clears_down
+    also_probe = reading_gap(_inputs(pixel_ae=_arm(-4.0, -4.0))).arms["pixel_ae"]
+    assert also_probe.status is Status.INVERTED_GAP, "both channels inverted agree; not unresolved"
+
+
+def test_unresolved_probe_when_the_two_channels_clear_with_opposite_signs_and_it_wins_precedence():
+    up_down = reading_gap(_inputs(pixel_ae=_arm(4.0, -4.0))).arms["pixel_ae"]
+    assert up_down.status is Status.UNRESOLVED_PROBE and "opposite signs" in up_down.rule
+    down_up = reading_gap(_inputs(pixel_ae=_arm(-4.0, 4.0))).arms["pixel_ae"]
+    assert down_up.status is Status.UNRESOLVED_PROBE
+    # Precedence: the SAME inputs that would be MEMORISATION become unresolved
+    # when the probe twin clears the other way.
+    assert reading_gap(_inputs(a=_arm(4.0, 1.0))).arms["a"].status is Status.MEMORISATION
+    assert reading_gap(_inputs(a=_arm(4.0, -4.0))).arms["a"].status is Status.UNRESOLVED_PROBE
+
+
+def test_reading_gap_reads_every_arm_independently_in_the_callers_order():
+    reading = reading_gap(_inputs(
+        pixel_ae=_arm(-4.0, -1.0), frozen_ssl=_arm(4.0, 1.0), random_vit=_arm(1.0, 1.0),
+    ))
+    assert list(reading.arms) == ["pixel_ae", "frozen_ssl", "random_vit"]
+    assert [r.status for r in reading.arms.values()] == [
+        Status.INVERTED_GAP, Status.MEMORISATION, Status.NO_GAP,
+    ]
+
+
+def test_reading_gap_with_no_per_seed_leaves_never_reaches_memorisation():
+    """Per-seed inputs absent (None): zero seeds clear, so the pooled gap can
+    at most be NO_GAP with the seed count named -- never MEMORISATION."""
+    arm = ArmInputs(gap_free=_contrast(4.0), gap_probe=_contrast(1.0),
+                    train_held_gap_final={0: 0.2}, per_seed=None)
+    r = reading_gap(_inputs(a=arm)).arms["a"]
+    assert r.status is Status.NO_GAP and (r.seeds_clearing, r.seeds_total) == (0, 0)
+
+
+def test_format_reading_gap_prints_each_arm_with_its_status_and_rule():
+    inputs = _inputs(frozen_ssl=_arm(4.0, 1.0), random_vit=_arm(1.0, 1.0))
+    text = format_reading_gap(reading_gap(inputs), inputs)
+    assert f"h={DECISION_H}" in text and f"z_fam = {Z_FAM:.2f}" in text
+    assert "frozen_ssl" in text and "MEMORISATION" in text
+    assert "random_vit" in text and "NO GAP" in text
+    assert "decided by:" in text
+    assert "train_held - val" in text
+    for column in ("free", "probe"):
+        assert column in text
+
+
+# ---------------------------------------------------------------------------
+# learning_curve_summary, on a synthetic history.
+# ---------------------------------------------------------------------------
+
+
+def _history(n: int = 400) -> dict:
+    """embedding descends 1 -> 0.5 linearly, reward ascends 0 -> 1, the other
+    three terms are flat; loss is their sum."""
+    i = np.arange(n, dtype=float)
+    embedding = 1.0 - 0.5 * i / (n - 1)
+    reward = i / (n - 1)
+    parts = [
+        {"embedding": float(embedding[k]), "reward": float(reward[k]), "continue": 0.7,
+         "kl_dyn": 0.3, "kl_rep": 0.3}
+        for k in range(n)
+    ]
+    loss = [sum(p.values()) for p in parts]
+    return {"loss": loss, "parts": parts}
+
+
+def test_learning_curve_summary_reads_quarters_and_the_smoothed_minimum():
+    s = learning_curve_summary(_history(400), window=100)
+    assert (s["steps"], s["window"], s["quarter"]) == (400, 100, 100)
+    assert set(s["terms"]) == {"loss", *TERMS}
+    emb = s["terms"]["embedding"]
+    assert emb["last_quarter_mean"] == pytest.approx(1.0 - 0.5 * 349.5 / 399)
+    assert emb["preceding_quarter_mean"] == pytest.approx(1.0 - 0.5 * 249.5 / 399)
+    assert emb["descending"] and emb["change_pct"] < 0
+    assert emb["smoothed_min_step"] == 400, "still descending: the minimum is the last window"
+    rew = s["terms"]["reward"]
+    assert not rew["descending"] and rew["change_pct"] > 0
+    assert rew["smoothed_min_step"] == 100, "ascending: the minimum is the FIRST full window"
+    flat = s["terms"]["kl_dyn"]
+    assert flat["change_pct"] == pytest.approx(0.0) and not flat["descending"]
+    assert s["terms"]["loss"]["last_quarter_mean"] == pytest.approx(
+        emb["last_quarter_mean"] + rew["last_quarter_mean"] + 1.3
+    )
+
+
+def test_learning_curve_summary_shrinks_the_window_to_the_history_and_refuses_junk():
+    short = learning_curve_summary(_history(8), window=100)
+    assert short["window"] == 8 and short["quarter"] == 2
+    with pytest.raises(ValueError, match="four"):
+        learning_curve_summary(_history(3))
+    with pytest.raises(ValueError, match="window"):
+        learning_curve_summary(_history(8), window=0)
+    broken = _history(8)
+    broken["parts"] = broken["parts"][:-1]
+    with pytest.raises(ValueError, match="disagree"):
+        learning_curve_summary(broken)
