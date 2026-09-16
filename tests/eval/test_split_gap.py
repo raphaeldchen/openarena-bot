@@ -277,6 +277,8 @@ def test_train_held_passes_gate_is_spec_4_1_unanimity_with_nan_not_positive():
     assert not train_held_passes_gate({0: 0.2, 1: -0.1, 2: 0.9})
     assert not train_held_passes_gate({0: 0.2, 1: float("nan"), 2: 0.9}), (
         "a NaN gap_closed is a non-positive band and is not > 0")
+    assert not train_held_passes_gate({0: 0.2, 1: float("inf"), 2: 0.9}), (
+        "an infinite gap_closed is not a measurement; the isfinite guard is what excludes it")
     assert not train_held_passes_gate({}), "no seed is not unanimity"
 
 
