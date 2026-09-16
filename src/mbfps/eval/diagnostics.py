@@ -162,6 +162,17 @@ evidence -- a BITWISE equality against nine cells of shipped numbers, on a
 stochastic model -- into decoration. It would also put the provenance of those
 nine cells at risk for no measurable gain. The window rule is shared because its
 failure mode is the opposite: silent drift with no loud test available.
+
+THE TRUST HORIZON (M3d) READS THE SAME CANONICAL PASS, PER WINDOW. The ladder
+stores mean error curves, and a mean curve cannot tell an imagination that
+drifts slowly from one that moves the wrong way. `keep_trajectories` on
+`_diagnose` keeps, for the canonical pass only, the per-window rows those
+curves are means of, plus four embedding-space series read against the
+ENCODER'S embedding of the real future frames -- the one reading in this
+module that is imagination-vs-truth rather than imagination-vs-imagination --
+and `reference_trajectories` is the entry point that runs the pass with no
+intervention arm and hands them over. The flag draws nothing from the stream
+and, when False, leaves the pass byte-identical to what the ladder pins.
 """
 
 from dataclasses import dataclass
@@ -423,6 +434,55 @@ class _Pass:
     come from 24 episodes at 3 to 10 windows each, so this is what separates
     229 independent draws from 24 clusters."""
 
+    # The trust horizon's per-window trajectories (M3d). None unless the
+    # traversal ran with `keep_trajectories=True`; then every one is set, for
+    # the CANONICAL pass only -- no intervention arm carries them.
+    positions: np.ndarray | None = None
+    """`(n_windows, horizon, 2)`: p_hat(h), the probe of the imagined
+    embedding at step h -- rows `model_pred[:, :2]`, bitwise."""
+    positions_at_context: np.ndarray | None = None
+    """`(n_windows, 2)`: p_hat(0), the probe of the last posterior latent's
+    embedding, taken from the persistence prediction's own first row so
+    that `|p_hat(0) - p(h)|` recomputed from it is bitwise the persistence
+    curve's row."""
+    positions_real: np.ndarray | None = None
+    """`(n_windows, horizon, 2)`: p_hat_real(h), the probe of the floor's
+    embedding at step h -- the same probe reading the posterior over the
+    real future frames."""
+    true_positions: np.ndarray | None = None
+    """`(n_windows, horizon, 2)`: p(h), the privileged `(pos_x, pos_y)` at
+    frame `start + context + h` -- the first two columns of the truth slice
+    the curves are scored against."""
+    true_at_context: np.ndarray | None = None
+    """`(n_windows, 2)`: p(0), the privileged position at frame
+    `start + context`, the last context frame."""
+    embedding_distance_to_truth: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e_hat(h) - e(h)||`, the imagination's
+    embedding against the ENCODER'S embedding of the frame the action
+    produced. See `_diagnose`: this is imagination-vs-truth, which no
+    ladder channel measures."""
+    embedding_persistence_distance: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e_hat(0) - e(h)||`, the embedding-space
+    persistence error -- the last context embedding held for the horizon,
+    against the encoder's embedding of each future frame."""
+    embedding_displacement: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e_hat(h) - e_hat(0)||`, how far the
+    imagination moved in embedding space."""
+    true_embedding_displacement: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e(h) - e(0)||`, how far the encoder's
+    embedding of the real frames moved."""
+
+
+_TRAJECTORY_FIELDS: tuple[str, ...] = (
+    "positions", "positions_at_context", "positions_real",
+    "true_positions", "true_at_context",
+    "embedding_distance_to_truth", "embedding_persistence_distance",
+    "embedding_displacement", "true_embedding_displacement",
+)
+"""The nine `_Pass` fields `keep_trajectories` fills, in `_Pass` order; the
+one list `_diagnose` collects by and `reference_trajectories` repackages
+by, so a field added to one cannot be forgotten by the other."""
+
 
 def _diagnose(
     model,
@@ -437,6 +497,7 @@ def _diagnose(
     feature_backbone,
     arm_pairs: dict | None = None,
     noise_reference: bool = True,
+    keep_trajectories: bool = False,
 ) -> _Pass:
     """`evaluate_rollout`, plus extra imagination arms on a matched stream.
 
@@ -462,6 +523,25 @@ def _diagnose(
     read directly against the real imagination's, per step. `arm_pairs` names
     pairs of arms whose embeddings are read against EACH OTHER, for a contrast
     whose real arm cancels.
+
+    `keep_trajectories` (M3d) additionally carries, on the CANONICAL pass
+    only, the per-window rows the curves are means of -- the probe's
+    imagined, persistence and floor positions, the true positions -- and
+    FOUR EMBEDDING-SPACE SERIES THAT ARE NEW: every embedding channel the
+    ladder reads is imagination-vs-imagination (an intervened draw against
+    the canonical one, or the canonical one against a second draw), so
+    nothing above measures the imagination against the TRUTH. These do. The
+    truth in embedding space is the encoder's own embedding of the frame
+    the action produced, `e(h) = handle.embeddings[0, context + h - 1]` --
+    the embedding head's training target (`world_model.py` fits
+    `predictions["embedding"]` to `embeddings.detach()`) -- with
+    `e(0) = handle.embeddings[0, context - 1]`, the last context frame.
+    Against it: `e_hat(h)`, the head's output on the imagined latent (the
+    rows `real_embedding` already holds), and `e_hat(0)`, the head's output
+    on the last posterior latent (`last_context_embedding`, the persistence
+    anchor). With the flag False the pass is byte-identical to today's:
+    the extra work is numpy on rows already in hand, draws nothing from the
+    stream, and calls `probe_targets` once more only inside the flag.
 
     Deliberately NOT separately decorated with `@torch.no_grad()`: both public
     entry points are, so a second decorator here is a guard no mutation can
@@ -491,6 +571,9 @@ def _diagnose(
     noise_bitwise: list[bool] = []
     noise_restored: list[bool] = []
     window_episode: list[int] = []
+    kept: dict[str, list[np.ndarray]] | None = (
+        {name: [] for name in _TRAJECTORY_FIELDS} if keep_trajectories else None
+    )
 
     for path in val_paths:
         episode = load_episode(path)
@@ -595,6 +678,44 @@ def _diagnose(
                 angle_error_degrees(pers_pred, truth)
             )
 
+            if kept is not None:
+                # `embeddings[0, k]` is the encoder's row for frame
+                # `start + 1 + k`, so row `context + h - 1` is frame
+                # `start + context + h` -- the frame `imagine`'s step h
+                # predicts and `truth[h - 1]` scores -- and row `context - 1`
+                # is the last context frame, `start + context`. One slice
+                # from that row on: `true_embedding[0]` is e(0),
+                # `true_embedding[1:]` is e(1..horizon).
+                true_embedding = embeddings[0, context - 1 :].cpu().numpy()
+                held = np.repeat(last_context_embedding[None, :], horizon, axis=0)
+                held_truth = np.repeat(true_embedding[:1], horizon, axis=0)
+                kept["positions"].append(model_pred[:, :2])
+                # Row 0 of the persistence prediction, not a fresh
+                # `apply_probe` on one row: the curve's persistence error is
+                # scored on these rows, and a separate matmul over a
+                # different shape is not guaranteed the same last bit.
+                kept["positions_at_context"].append(pers_pred[0, :2])
+                kept["positions_real"].append(floor_pred[:, :2])
+                kept["true_positions"].append(truth[:, :2])
+                kept["true_at_context"].append(
+                    probe_targets(
+                        episode.privileged[start + context : start + context + 1],
+                        episode.privileged_keys,
+                    )[0, :2]
+                )
+                kept["embedding_distance_to_truth"].append(
+                    _embedding_distance(real_embedding, true_embedding[1:])
+                )
+                kept["embedding_persistence_distance"].append(
+                    _embedding_distance(held, true_embedding[1:])
+                )
+                kept["embedding_displacement"].append(
+                    _embedding_distance(real_embedding, held)
+                )
+                kept["true_embedding_displacement"].append(
+                    _embedding_distance(true_embedding[1:], held_truth)
+                )
+
             arm_embeddings = {}
             for name, latent in arm_latents.items():
                 arm_embedding = embed(latent)
@@ -632,6 +753,85 @@ def _diagnose(
         noise_stream_restored=np.array(noise_restored, dtype=bool) if noise_reference else None,
         windows_total=stacked["rssm_position"].shape[0],
         window_episode=np.array(window_episode, dtype=int),
+        **({} if kept is None else {name: np.stack(rows) for name, rows in kept.items()}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The reference pass's trajectories, for the trust horizon (M3d).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Trajectories:
+    """The canonical pass, per window and per step, instead of as mean curves.
+
+    What `scripts/trust_horizon.py` reads. The nine arrays are `_Pass`'s
+    `keep_trajectories` fields under the same names and shapes, none of them
+    optional here; `window_episode` and `windows_total` are the pass's own,
+    so a consumer clusters by the same labels the ladder clusters by; and
+    the two curves are the pass's `reference.rssm_position` and
+    `reference.persistence_position` -- `np.stack(rows).mean(axis=0)` over
+    the per-window rows, the same reduction the diagnostic records were
+    written with -- so a consumer that recomputes them from the rows and
+    compares against the stored diagnostic can demand max |delta| == 0.0.
+    """
+
+    positions: np.ndarray
+    positions_at_context: np.ndarray
+    positions_real: np.ndarray
+    true_positions: np.ndarray
+    true_at_context: np.ndarray
+    embedding_distance_to_truth: np.ndarray
+    embedding_persistence_distance: np.ndarray
+    embedding_displacement: np.ndarray
+    true_embedding_displacement: np.ndarray
+    window_episode: np.ndarray
+    windows_total: int
+    reference_position: np.ndarray
+    persistence_position: np.ndarray
+
+
+@torch.no_grad()
+def reference_trajectories(
+    model,
+    val_paths,
+    embedding_probe_weights: dict,
+    *,
+    context: int,
+    horizon: int,
+    seed: int,
+    device,
+    feature_backbone,
+) -> Trajectories:
+    """The canonical pass alone, with its per-window trajectories kept.
+
+    `_diagnose` with NO intervention arm and the noise reference drawn, so
+    the sampling stream is walked exactly as the ladder walks it: the
+    context filter, the per-window snapshot, the canonical `imagine` from
+    it, the floor, then the noise draw and its restore. The curves this
+    returns are therefore bitwise the ladder's reference curves -- and,
+    through the ladder's own pin, bitwise `evaluate_rollout`'s -- which is
+    what lets the trust pass check itself against the stored diagnostic
+    before reading anything off the rows.
+
+    No defaults for `context`, `horizon`, `seed`, `device` or
+    `feature_backbone`: the caller reads every one of them from the cell's
+    diagnostic record, and a default here would let a mismatch pass in
+    silence.
+    """
+    result = _diagnose(
+        model, val_paths, embedding_probe_weights,
+        arms={}, context=context, horizon=horizon, seed=seed, device=device,
+        feature_backbone=feature_backbone, noise_reference=True,
+        keep_trajectories=True,
+    )
+    return Trajectories(
+        **{name: getattr(result, name) for name in _TRAJECTORY_FIELDS},
+        window_episode=result.window_episode,
+        windows_total=result.windows_total,
+        reference_position=result.reference.rssm_position,
+        persistence_position=result.reference.persistence_position,
     )
 
 

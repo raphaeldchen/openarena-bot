@@ -461,10 +461,17 @@ def _argv(tmp_path, **extra):
 
 
 def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
-    """The three study scripts run one after another in the same shell and a
+    """The study scripts run one after another in the same shell and a
     wrapper reads the status, so a collision reports one script's failure under
     another's meaning. 1 is an uncaught traceback and 2 is argparse's usage
-    error, so neither may be reused either."""
+    error, so neither may be reused either.
+
+    `trust_horizon.py` is the one script that shares codes with this one ON
+    PURPOSE: 11, 12 and 14 mean the same thing there (a checkpoint or record
+    missing, the split by name, `evaluate_rollout` no longer reproducing the
+    record) and are exported under the same names. The literal below is what
+    is shared; anything else the two have in common is a collision, and
+    everything else `trust_horizon` exits with must be nobody else's."""
     import importlib.util as util
 
     def statuses(name):
@@ -484,6 +491,21 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         theirs = statuses(other)
         clash = (set(mine.values()) & set(theirs.values())) - {0}
         assert not clash, f"diagnose_dynamics collides with {other} on {clash}"
+
+    trust = statuses("trust_horizon")
+    reused = {"EXIT_NO_CHECKPOINTS": 11, "EXIT_SPLIT_MISMATCH": 12, "EXIT_RECORD_MISMATCH": 14}
+    shared = {name: value for name, value in trust.items() if value in set(mine.values()) - {0}}
+    assert shared == reused, (
+        f"trust_horizon shares {shared} with diagnose_dynamics; only {reused} is shared on purpose"
+    )
+    assert {name: mine[name] for name in reused} == reused
+    assert len(set(trust.values())) == len(trust), trust
+    assert 1 not in trust.values() and 2 not in trust.values()
+    assert trust["EXIT_SELF_CHECK_FAILED"] == 30
+    own = set(trust.values()) - set(reused.values()) - {0}
+    for other in ("run_study", "report_study", "pool_dynamics"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"trust_horizon collides with {other} on {clash}"
 
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
