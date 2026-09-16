@@ -15,7 +15,7 @@
 - Every task begins and ends with `.venv/bin/python -m pytest -q` fully green, **0 warnings**. Record the measured count at the end of each task; the suite is at `1437 passed` on `main` at `0550a82`.
 - `runs/m3_study` and `runs/m3_study_v2` are read-only except for the files this diagnostic writes: `split_gap_<arm>_seed<n>.json`, `split_gap.txt`, `split_gap.log`, `split_gap.exit`, `split_gap.head`, `learning_curves.png`. **Never `rm` anything under `runs/`.** `ls -lt runs/m3_study_v2 | head` after the run must show nothing newer than those files.
 - Exit statuses: `0`, and `11 / 12 / 14 / 30` reused from `trust_horizon.py` WITH ITS MEANINGS; `31` new (`EXIT_STRATA_NOT_A_PARTITION`). Never `1` (an uncaught traceback) or `2` (argparse). `test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own` gains `split_gap` in Task 6.
-- Nothing under `src/mbfps/eval/{aggregate,summary,study,rollout,trust,trust_readings}.py`, `scripts/{report_study,diagnose_dynamics,trust_horizon,run_study,pool_dynamics}.py` changes. `diagnostics.py` gains ONE additive field; `probe.py` a constant and a function whose introduction is behaviour-preserving; `pooling.py` one dataclass and one function.
+- Nothing under `src/mbfps/eval/{aggregate,summary,study,rollout,trust,trust_readings}.py`, `scripts/{report_study,diagnose_dynamics,run_study,pool_dynamics}.py` changes. `scripts/trust_horizon.py` changes ONLY by a behaviour-preserving extraction: its per-cell check-and-refit block becomes `prepare_cell()`, which its own `_run_cell` calls; every one of its existing tests passes unchanged and its printed output is byte-identical. `diagnostics.py` gains ONE additive field; `probe.py` a constant and a function whose introduction is behaviour-preserving; `pooling.py` one dataclass and one function.
 - The M3c plan (`2026-09-11-...`) and the M3d plan (`2026-09-13-...`) are closed records. Results go in THIS plan's `## Task 7 results` only.
 - Device: the run is `--device mps`; every test runs `device="cpu"`. A CPU run of the real cells exits 14 by design (spec 2.4).
 - Commit after every task, message in the repo's voice (`feat:` / `test:` / `docs:`, a sentence, no period), ending with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
@@ -1407,11 +1407,12 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `scripts/split_gap.py`
+- Modify: `scripts/trust_horizon.py` (extract `Prepared` + `prepare_cell()` from `_run_cell`; behaviour-preserving)
 - Modify: `tests/eval/conftest.py` (`small_buffer` -> `_build_buffer(tmp_path, n)` + `wide_buffer`)
-- Test: `tests/eval/test_split_gap_script.py` (new)
+- Test: `tests/eval/test_split_gap_script.py` (new); `tests/eval/test_trust_horizon_script.py` (one pin test)
 
 **Interfaces:**
-- Consumes: `trust_horizon.py`'s `Cell`, `CellMissing`, `load_cell`, `self_check`, `protocol_mismatch`, `_max_delta`, `load_checkpoint_model`, `probe_is_measurable`, and its four exit statuses (by path); `probe_episodes`, `fit_probes`; `evaluate_rollout`, `reference_trajectories`; `strata_partition`, `stratum_summary`; `study.write_record`, `study.git_sha`, `study.SPLIT_SEED`.
+- Consumes: `trust_horizon.py`'s `Cell`, `CellMissing`, `load_cell`, `self_check`, `probe_is_measurable`, the new `prepare_cell`, and its four exit statuses (by path); `probe_episodes`; `reference_trajectories`; `strata_partition`, `stratum_summary`; `study.write_record`, `study.git_sha`, `study.SPLIT_SEED`.
 - Produces: `EXIT_*` (0, 11, 12, 14, 30, 31), `split_gap_record_path(out_dir, arm, seed)`, `split_gap_record(...)`, `_run_cell(...)`, `main(argv) -> int` that -- in THIS task -- stops after the per-cell loop and prints the self-check and strata tables. Task 6 appends the pooling and readings to `main`.
 
 - [ ] **Step 1: The fixture -- `_build_buffer(tmp_path, n)` and `wide_buffer`**
@@ -1599,6 +1600,8 @@ def _doctor(path: Path, edit) -> None:
 
 
 def _never_refit(*args, **kwargs):
+    """Patched onto `script._trust`: the refit lives in trust_horizon's
+    `prepare_cell`, which split_gap calls by path."""
     raise AssertionError("fit_probes ran; this refusal must come before the refit")
 
 
@@ -1755,7 +1758,7 @@ def test_a_missing_diagnostic_is_exit_11(cell, capsys):
 def test_a_six_episode_buffer_is_exit_31_before_any_refit(narrow_cell, capsys, monkeypatch):
     """Five training episodes, all the probe's: no train_held. Judged once,
     up front, before the first probe refit."""
-    monkeypatch.setattr(script, "fit_probes", _never_refit)
+    monkeypatch.setattr(script._trust, "fit_probes", _never_refit)
     assert script.main(_argv(narrow_cell)) == script.EXIT_STRATA_NOT_A_PARTITION
     out = capsys.readouterr().out
     assert "STRATA NOT A PARTITION" in out and "train_held is empty" in out
@@ -1765,7 +1768,7 @@ def test_a_six_episode_buffer_is_exit_31_before_any_refit(narrow_cell, capsys, m
 def test_a_probe_rule_that_disagrees_with_the_split_is_exit_31(cell, capsys, monkeypatch):
     """`probe_episodes` returning a `used` that is not the leading block of
     train -- the drift the partition check exists for."""
-    monkeypatch.setattr(script, "fit_probes", _never_refit)
+    monkeypatch.setattr(script._trust, "fit_probes", _never_refit)
     real = script.probe_episodes
 
     def skewed(paths, limit=PROBE_EPISODE_LIMIT):
@@ -1779,7 +1782,7 @@ def test_a_probe_rule_that_disagrees_with_the_split_is_exit_31(cell, capsys, mon
 
 
 def test_a_split_that_is_not_the_records_is_exit_12_before_the_refit(cell, capsys, monkeypatch):
-    monkeypatch.setattr(script, "fit_probes", _never_refit)
+    monkeypatch.setattr(script._trust, "fit_probes", _never_refit)
     FAULTS["split"](cell)
     assert script.main(_argv(cell)) == script.EXIT_SPLIT_MISMATCH
     assert "SPLIT MISMATCH for random_vit seed 1" in capsys.readouterr().out
@@ -1787,7 +1790,7 @@ def test_a_split_that_is_not_the_records_is_exit_12_before_the_refit(cell, capsy
 
 
 def test_a_protocol_that_disagrees_with_the_diagnostic_is_exit_14_before_the_refit(cell, capsys, monkeypatch):
-    monkeypatch.setattr(script, "fit_probes", _never_refit)
+    monkeypatch.setattr(script._trust, "fit_probes", _never_refit)
     assert script.main(_argv(cell, "--context", "3")) == script.EXIT_RECORD_MISMATCH
     out = capsys.readouterr().out
     assert "RECORD MISMATCH for random_vit seed 1" in out and "--context 3" in out
@@ -1834,6 +1837,139 @@ def test_an_absent_requested_cell_is_exit_11(cell, capsys):
 
 Run: `.venv/bin/python -m pytest tests/eval/test_split_gap_script.py -q 2>&1 | tail -3`
 Expected: collection error -- `FileNotFoundError` / `spec_from_file_location` on `scripts/split_gap.py`.
+
+- [ ] **Step 3b: Extract `prepare_cell` in `trust_horizon.py` (behaviour-preserving)**
+
+The block of `trust_horizon._run_cell` from the split-mismatch check through the `evaluate_rollout` reproduction check is exactly what `split_gap.py` must do before its own passes. Rather than a second copy, lift it into a function both scripts call. Its prints, their order and the statuses are unchanged.
+
+In `scripts/trust_horizon.py`, add `RolloutResult` to the `from mbfps.eval.rollout import evaluate_rollout` line, and insert directly ABOVE `def _run_cell(`:
+
+```python
+@dataclass(frozen=True)
+class Prepared:
+    """One cell past its checks: the loaded model, the refit probe, the
+    protocol kwargs every pass takes, the resolved protocol, and the val
+    rollout that reproduced the record bitwise."""
+
+    model: object
+    embedding_probe: dict
+    common: dict
+    context: int
+    horizon: int
+    reference: RolloutResult
+
+
+def prepare_cell(args, cell: Cell, device, train, val) -> tuple[int, Prepared | None]:
+    """12, the protocol (14), the refit, the reproduction (14): everything a
+    per-cell pass needs before it can start, and every refusal that comes
+    before a pass. `(EXIT_OK, Prepared)` once the record reproduces;
+    `(status, None)` with the refusal printed. Shared by this script's
+    `_run_cell` and by `scripts/split_gap.py` (imported by path), so the two
+    tools refuse a cell for the same reasons in the same words."""
+    arm, seed = cell.arm, cell.seed
+    names = [p.name for p in val]
+    if cell.record["episodes"]["val"] != names:
+        print(
+            f"\nSPLIT MISMATCH for {arm} seed {seed}: the held-out episodes are not "
+            "the ones the record was scored on.\n"
+            f"  split:  {names}\n  record: {cell.record['episodes']['val']}"
+        )
+        return EXIT_SPLIT_MISMATCH, None
+
+    mismatch = protocol_mismatch(args, cell.diagnostic)
+    if mismatch is not None:
+        print(
+            f"\nRECORD MISMATCH for {arm} seed {seed}: {mismatch}. A rollout at "
+            "another protocol cannot reproduce the record's curve, so nothing is refit."
+        )
+        return EXIT_RECORD_MISMATCH, None
+    context = int(cell.diagnostic["context"]) if args.context is None else args.context
+    horizon = int(cell.diagnostic["horizon"]) if args.horizon is None else args.horizon
+
+    cfg = get_config(arm, seed=seed, device=args.device)
+    model = load_checkpoint_model(args.out, arm, seed, cfg, device)
+    backbone = encoder_backbone(cfg.encoder)
+    # The probe is REFIT at the rollout's own context/horizon and at the
+    # cell's seed, exactly as the ladder refit it: it is applied to latents
+    # filtered from a zero state for exactly `context` real frames.
+    _, embedding_probe = fit_probes(
+        model, train, backbone, device, context=context, horizon=horizon, seed=seed,
+    )
+    common = dict(
+        context=context, horizon=horizon, seed=seed, device=device, feature_backbone=backbone,
+    )
+    reference = evaluate_rollout(model, val, embedding_probe, **common)
+    reproduction, step = _max_delta(
+        reference.rssm_position, cell.record["curves"]["rssm_position"]
+    )
+    if reproduction != 0.0:
+        print(
+            f"\nRECORD MISMATCH for {arm} seed {seed}: evaluate_rollout no longer "
+            f"reproduces the study record's curves.rssm_position (max abs "
+            f"{reproduction:.3e} at step {step}). Measured, the records reproduce "
+            f"bitwise on mps and miss on cpu by an arm-dependent 6-12 map units. "
+            f"This run used device={device} torch={torch.__version__}."
+        )
+        return EXIT_RECORD_MISMATCH, None
+    return EXIT_OK, Prepared(
+        model=model, embedding_probe=embedding_probe, common=common,
+        context=context, horizon=horizon, reference=reference,
+    )
+```
+
+Then replace the body of `_run_cell` from its first statement through the `return EXIT_RECORD_MISMATCH, None` that follows the reproduction check with:
+
+```python
+    arm, seed = cell.arm, cell.seed
+    status, prepared = prepare_cell(args, cell, device, train, val)
+    if status != EXIT_OK:
+        return status, None
+    context, horizon = prepared.context, prepared.horizon
+    model, embedding_probe, common = prepared.model, prepared.embedding_probe, prepared.common
+```
+
+so that the remainder of `_run_cell` (`traj = reference_trajectories(model, val, embedding_probe, **common)` onward) is untouched.
+
+Append to `tests/eval/test_trust_horizon_script.py`, after `test_a_study_record_the_rollout_no_longer_reproduces_is_exit_14`:
+
+```python
+def test_prepare_cell_is_the_check_and_refit_block_and_run_cell_uses_it(cell, monkeypatch):
+    """The extraction is behaviour-preserving: `prepare_cell` on the clean
+    fixture returns EXIT_OK and a `Prepared` whose val rollout IS the
+    record's curve, and `_run_cell` reaches its pass through it -- so the
+    two scripts that share it refuse a cell for one set of reasons."""
+    import argparse
+
+    from mbfps.data.buffer import ReplayBuffer
+    from mbfps.data.split import VAL_FRACTION, episode_split
+    from mbfps.utils.device import get_device
+
+    args = argparse.Namespace(out=cell.out, device="cpu", context=None, horizon=None)
+    loaded = script.load_cell(cell.out, JOB.arm, JOB.seed)
+    train, val = episode_split(
+        ReplayBuffer(cell.data, capacity_transitions=10**9).episode_paths(),
+        val_fraction=VAL_FRACTION, seed=0,
+    )
+    status, prepared = script.prepare_cell(args, loaded, get_device(prefer="cpu"), train, val)
+    assert status == script.EXIT_OK and isinstance(prepared, script.Prepared)
+    assert (prepared.context, prepared.horizon) == (CONTEXT, HORIZON)
+    assert prepared.common["context"] == CONTEXT and prepared.common["seed"] == JOB.seed
+    assert list(prepared.reference.rssm_position) == loaded.record["curves"]["rssm_position"]
+
+    calls = []
+    real = script.prepare_cell
+
+    def spy(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(script, "prepare_cell", spy)
+    assert script.main(_argv(cell)) == script.EXIT_OK
+    assert len(calls) == 1 and calls[0][1].arm == JOB.arm
+```
+
+Run: `.venv/bin/python -m pytest tests/eval/test_trust_horizon_script.py -q 2>&1 | tail -3`
+Expected: every existing test passes unchanged plus the new one, `0 warnings`.
 
 - [ ] **Step 4: Create the script**
 
@@ -1910,8 +2046,7 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import Trajectories, reference_trajectories
-from mbfps.eval.probe import fit_probes, probe_episodes
-from mbfps.eval.rollout import evaluate_rollout
+from mbfps.eval.probe import probe_episodes
 from mbfps.eval.split_gap import (
     CHANNELS,
     DECISION,
@@ -1934,9 +2069,8 @@ from mbfps.eval.split_gap import (
 from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
 from mbfps.eval.trust import survival, trust_horizon
 from mbfps.eval.trust_readings import ARMS_ORDER, Q_REPORTED
-from mbfps.models.encoders import encoder_backbone
 from mbfps.models.rssm import KL_FREE_BITS
-from mbfps.utils.config import ARMS, get_config
+from mbfps.utils.config import ARMS
 from mbfps.utils.device import get_device
 
 
@@ -1954,10 +2088,8 @@ Cell = _trust.Cell
 CellMissing = _trust.CellMissing
 load_cell = _trust.load_cell
 self_check = _trust.self_check
-protocol_mismatch = _trust.protocol_mismatch
-load_checkpoint_model = _trust.load_checkpoint_model
+prepare_cell = _trust.prepare_cell
 probe_is_measurable = _trust.probe_is_measurable
-_max_delta = _trust._max_delta
 
 EXIT_OK = _trust.EXIT_OK
 EXIT_NO_CHECKPOINTS = _trust.EXIT_NO_CHECKPOINTS
@@ -2041,53 +2173,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run_cell(args, cell: Cell, device, train, val, strata: dict) -> tuple[int, dict | None]:
-    """One cell: 12, the protocol (14), the refit, the reproduction (14), the
-    val pass and 30, the two train passes, the record."""
+    """One cell: trust_horizon's checks and refit (12, 14, 14) through
+    `prepare_cell`, then the val pass and 30, the two train passes, the record."""
     arm, seed = cell.arm, cell.seed
-    names = [p.name for p in val]
-    if cell.record["episodes"]["val"] != names:
-        print(
-            f"\nSPLIT MISMATCH for {arm} seed {seed}: the held-out episodes are not "
-            "the ones the record was scored on.\n"
-            f"  split:  {names}\n  record: {cell.record['episodes']['val']}"
-        )
-        return EXIT_SPLIT_MISMATCH, None
-
-    mismatch = protocol_mismatch(args, cell.diagnostic)
-    if mismatch is not None:
-        print(
-            f"\nRECORD MISMATCH for {arm} seed {seed}: {mismatch}. A rollout at "
-            "another protocol cannot reproduce the record's curve, so nothing is refit."
-        )
-        return EXIT_RECORD_MISMATCH, None
-    context = int(cell.diagnostic["context"]) if args.context is None else args.context
-    horizon = int(cell.diagnostic["horizon"]) if args.horizon is None else args.horizon
-
-    cfg = get_config(arm, seed=seed, device=args.device)
-    model = load_checkpoint_model(args.out, arm, seed, cfg, device)
-    backbone = encoder_backbone(cfg.encoder)
-    # ONE probe per cell, refit exactly as run_job and the ladder fit it -- on
-    # `train`, whose first PROBE_EPISODE_LIMIT episodes are the train_probe
-    # stratum -- and applied to all three strata.
-    _, embedding_probe = fit_probes(
-        model, train, backbone, device, context=context, horizon=horizon, seed=seed,
-    )
-    common = dict(
-        context=context, horizon=horizon, seed=seed, device=device, feature_backbone=backbone,
-    )
-    reference = evaluate_rollout(model, val, embedding_probe, **common)
-    reproduction, step = _max_delta(
-        reference.rssm_position, cell.record["curves"]["rssm_position"]
-    )
-    if reproduction != 0.0:
-        print(
-            f"\nRECORD MISMATCH for {arm} seed {seed}: evaluate_rollout no longer "
-            f"reproduces the study record's curves.rssm_position (max abs "
-            f"{reproduction:.3e} at step {step}). Measured, the records reproduce "
-            f"bitwise on mps and miss on cpu by an arm-dependent 6-12 map units. "
-            f"This run used device={device} torch={torch.__version__}."
-        )
-        return EXIT_RECORD_MISMATCH, None
+    status, prepared = prepare_cell(args, cell, device, train, val)
+    if status != EXIT_OK:
+        return status, None
+    model, embedding_probe, common = prepared.model, prepared.embedding_probe, prepared.common
 
     # val FIRST: it is the anchor, and a failed self-check costs no train pass.
     traj = {"val": reference_trajectories(model, val, embedding_probe, **common)}
@@ -2103,7 +2195,8 @@ def _run_cell(args, cell: Cell, device, train, val, strata: dict) -> tuple[int, 
         traj[name] = reference_trajectories(model, strata[name], embedding_probe, **common)
 
     record = split_gap_record(
-        cell, traj, strata, check, context=context, horizon=horizon, device=device,
+        cell, traj, strata, check,
+        context=prepared.context, horizon=prepared.horizon, device=device,
     )
     path = write_split_gap_record(args.out, record)
     counts = "; ".join(
@@ -2166,11 +2259,11 @@ Expected: 16 passed (the fixture takes ~5-8 s per test that uses it), `0 warning
 - [ ] **Step 6: Full suite and commit**
 
 Run: `.venv/bin/python -m pytest -q 2>&1 | tail -3`
-Expected: `1480 passed` (1464 + 16), `0 warnings`.
+Expected: `1481 passed` (1464 + 16 + 1 in `test_trust_horizon_script.py`), `0 warnings`; every pre-existing `test_trust_horizon_script.py` test passes unchanged.
 
 ```bash
-git add scripts/split_gap.py tests/eval/conftest.py tests/eval/test_split_gap_script.py
-git commit -m "feat: split_gap.py part 1 -- load as trust_horizon does, five checks in order, three strata per cell, one record per cell
+git add scripts/split_gap.py scripts/trust_horizon.py tests/eval/conftest.py tests/eval/test_split_gap_script.py tests/eval/test_trust_horizon_script.py
+git commit -m "feat: split_gap.py part 1 -- trust_horizon's check-and-refit block becomes prepare_cell, shared; five checks in order, three strata per cell, one record per cell
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -2884,7 +2977,7 @@ Temporarily make each edit, run `.venv/bin/python -m pytest tests/eval/test_spli
 - [ ] **Step 6: Full suite and commit**
 
 Run: `.venv/bin/python -m pytest -q 2>&1 | tail -3`
-Expected: `1489 passed` (1480 + 9), `0 warnings`. Record the number.
+Expected: `1490 passed` (1481 + 9), `0 warnings`. Record the number.
 
 ```bash
 git add scripts/split_gap.py tests/eval/test_split_gap_script.py tests/eval/test_diagnose_dynamics_script.py
@@ -2907,7 +3000,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```bash
 cd /Users/raphaelchen/Desktop/csgo-bot && git status --short           # expect: clean (or only study.log untracked)
 git branch --show-current                                                # expect: feat/m3e-split-gap
-.venv/bin/python -m pytest -q 2>&1 | tail -2                             # expect: 1489 passed, 0 warnings
+.venv/bin/python -m pytest -q 2>&1 | tail -2                             # expect: 1490 passed, 0 warnings
 ls runs/m3_study_v2/world_model_*.pt | wc -l                             # expect: 9
 ls runs/m3_study_v2/diagnostic_*.json | wc -l                            # expect: 9
 ls runs/m3_study_v2/split_gap* 2>/dev/null                               # expect: nothing
