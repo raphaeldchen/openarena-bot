@@ -25,9 +25,10 @@ import numpy as np
 import pytest
 import torch
 
+import mbfps.eval.pooling as pooling
 import mbfps.eval.study as study
 from mbfps.eval.probe import PROBE_EPISODE_LIMIT
-from mbfps.eval.split_gap import CURVE_NAMES, STRATA
+from mbfps.eval.split_gap import CURVE_NAMES, STRATA, TERMS
 from mbfps.eval.study import StudyJob, job_record_path, load_record, run_job
 from mbfps.utils.config import ARMS
 
@@ -341,3 +342,181 @@ def test_an_absent_requested_cell_is_exit_11(cell, capsys):
     base = ["--out", str(cell.out), "--data", str(cell.data), "--device", "cpu"]
     assert script.main(base) == script.EXIT_NO_CHECKPOINTS
     assert "pixel_ae seed 0" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Task 6: the pooling glue, Reading G, the learning curves, split_gap.txt.
+# ---------------------------------------------------------------------------
+
+
+def _fake_record(arm, seed, *, crossing_free, crossing_probe, moved_h, margin_free, episode, stratum="val"):
+    """The slice of a record `survival_series` / `margin_series` read: one
+    stratum with n windows, horizon 3."""
+    n = len(episode)
+    moved = np.zeros((n, 3), dtype=bool)
+    moved[:, moved_h - 1:] = True
+    margin = np.zeros((n, 3))
+    margin[:, moved_h - 1] = margin_free
+    return {
+        "arm": arm, "seed": seed, "horizon": 3, "context": 2, "device": "cpu",
+        "torch_version": torch.__version__,
+        "episodes": {stratum: [f"ep{e}" for e in sorted(set(episode))]},
+        "probe": {"selection_r2": 0.3, "measurable": True},
+        "strata": {stratum: {
+            "windows": {"total": n, "episode": list(episode), "clusters": len(set(episode))},
+            "crossing": {"free": list(crossing_free), "probe": list(crossing_probe)},
+            "margin": {"free": margin, "probe": margin},
+            "moved": moved,
+            "band": {"position": {"gap_final": 0.1}},
+        }},
+    }
+
+
+def test_survival_series_is_the_indicator_over_the_windows_that_ever_moved():
+    """Crossings [4, 2, NaN, 1] at h=2: alive [1, 0, -, 0]; the NaN window
+    never moved and is `changed=False` -- M3d's S(h) denominator -- so the
+    pooled mean over the kept three is S(2) = 1/3."""
+    record = _fake_record("random_vit", 0, crossing_free=[4, 2, np.nan, 1],
+                          crossing_probe=[4, 4, np.nan, 4], moved_h=1,
+                          margin_free=[1, 1, 1, 1], episode=[0, 0, 1, 1])
+    s = script.survival_series(record, "val", "free", h=2)
+    assert isinstance(s, pooling.CellSeries)
+    assert (s.arm, s.seed, s.rung, s.channel) == ("random_vit", 0, "val", "S/free")
+    np.testing.assert_array_equal(s.delta, [1.0, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(s.changed, [True, True, False, True])
+    np.testing.assert_array_equal(s.episode, [0, 0, 1, 1])
+    assert s.val == ("ep0", "ep1") and s.windows_total == 4
+    pooled = pooling.pool_arm([s])
+    assert pooled.mean == pytest.approx(1 / 3) and pooled.windows == 3
+
+
+def test_margin_series_masks_by_moved_at_h_not_ever_moved():
+    """moved from h=2 on: at h=1 every window is unmoved -> nothing kept; at
+    h=2 all kept with the margin values."""
+    record = _fake_record("random_vit", 0, crossing_free=[4, 2, 4, 1], crossing_probe=[4] * 4,
+                          moved_h=2, margin_free=[3, -1, 2, 0], episode=[0, 0, 1, 1])
+    at_one = script.margin_series(record, "val", "free", h=1)
+    assert not at_one.changed.any()
+    at_two = script.margin_series(record, "val", "free", h=2)
+    assert at_two.changed.all() and at_two.channel == "margin/free"
+    np.testing.assert_array_equal(at_two.delta, [3.0, -1.0, 2.0, 0.0])
+
+
+def test_decision_horizon_is_fifteen_unless_the_run_is_shorter():
+    assert script.decision_horizon(45) == (15, False)
+    assert script.decision_horizon(15) == (15, False)
+    assert script.decision_horizon(3) == (3, True), "clamped, and flagged so the text says so"
+
+
+def test_gap_inputs_contrasts_train_held_against_val_per_arm_and_per_seed():
+    """Two seeds, two strata, hand-built crossings. train_held: every window
+    alive at h=2 in both seeds (S = 1); val: none alive (S = 0). The free
+    contrast is +1.0 with a zero clustered SE on both sides (constant within
+    every cluster) -> z = +inf, which the reading refuses to clear. The
+    probe channel is identical here. Per-seed leaves carry one seed each,
+    and the train_held gap_final per seed is what the record says."""
+    def rec(seed, stratum, alive):
+        crossing = [4, 4, 4, 4] if alive else [1, 1, 1, 1]
+        r = _fake_record("random_vit", seed, crossing_free=crossing, crossing_probe=crossing,
+                         moved_h=1, margin_free=[0] * 4, episode=[0, 0, 1, 1], stratum=stratum)
+        r["strata"][stratum]["band"]["position"]["gap_final"] = 0.5 + seed
+        return r
+
+    records = {}
+    for seed in (0, 1):
+        merged = rec(seed, "val", alive=False)
+        held = rec(seed, "train_held", alive=True)
+        merged["strata"]["train_held"] = held["strata"]["train_held"]
+        merged["episodes"]["train_held"] = held["episodes"]["train_held"]
+        records[("random_vit", seed)] = merged
+    inputs = script.gap_inputs(records, arms=["random_vit"], seeds=[0, 1], h=2)
+    assert list(inputs.arms) == ["random_vit"] and inputs.h == 2
+    a = inputs.arms["random_vit"]
+    assert a.gap_free.estimate == pytest.approx(1.0) and a.gap_free.se == 0.0
+    assert a.gap_free.z == float("inf") and a.gap_free.clusters == 2
+    assert a.gap_probe.estimate == pytest.approx(1.0)
+    assert a.train_held_gap_final == {0: 0.5, 1: 1.5}
+    assert set(a.per_seed) == {0, 1}
+    assert a.per_seed[1].train_held_gap_final == {1: 1.5} and a.per_seed[1].per_seed is None
+    assert np.isfinite(inputs.z_fam), "cluster_threshold(6, 2) is finite"
+    assert inputs.z_fam == pytest.approx(pooling.cluster_threshold(6, 2))
+
+
+def test_an_unmeasurable_cell_leaves_the_probe_channel_only():
+    def rec(seed, stratum):
+        r = _fake_record("pixel_ae", seed, crossing_free=[4] * 4, crossing_probe=[4] * 4,
+                         moved_h=1, margin_free=[0] * 4, episode=[0, 0, 1, 1], stratum=stratum)
+        return r
+
+    records = {}
+    for seed in (0, 1):
+        merged = rec(seed, "val")
+        merged["strata"]["train_held"] = rec(seed, "train_held")["strata"]["train_held"]
+        merged["episodes"]["train_held"] = ["ep0", "ep1"]
+        records[("pixel_ae", seed)] = merged
+    records[("pixel_ae", 0)]["probe"]["measurable"] = False
+    records[("pixel_ae", 1)]["probe"]["measurable"] = False
+    inputs = script.gap_inputs(records, arms=["pixel_ae"], seeds=[0, 1], h=2)
+    a = inputs.arms["pixel_ae"]
+    assert np.isfinite(a.gap_free.estimate), "the free channel pools every cell"
+    assert np.isnan(a.gap_probe.estimate) and a.gap_probe.clusters == 0, (
+        "no measurable cell: the probe contrast is NaN with no clusters, never a number")
+
+
+@pytest.fixture
+def gap_run(cell, capsys):
+    assert script.main(_argv(cell)) == script.EXIT_OK
+    out = capsys.readouterr().out
+    return types.SimpleNamespace(cell=cell, stdout=out, text=(cell.out / "split_gap.txt").read_text())
+
+
+def test_the_fixture_run_writes_split_gap_txt_identical_to_stdout_from_the_header_on(gap_run):
+    header = "--- split gap: self-check"
+    assert header in gap_run.stdout and gap_run.text.startswith(header)
+    assert gap_run.stdout[gap_run.stdout.index(header):] == gap_run.text
+
+
+def test_the_fixture_run_prints_every_block(gap_run):
+    text = gap_run.text
+    for block in (
+        "--- split gap: self-check", "--- strata", "--- the band per stratum",
+        "--- survival per stratum", "--- conditional survival per stratum",
+        "--- Reading G", "--- G at the reported horizons",
+        "--- sensitivity", "--- learning curves", "--- per seed",
+    ):
+        assert block in text, block
+    assert "random_vit" in text
+    for stratum in STRATA:
+        assert stratum in text
+    assert "train_probe" in text and "confounded" in text.lower()
+    assert "verdict: random_vit" in text and "decided by:" in text
+    assert "h=3" in text and "clamped" in text, "the fixture's horizon is 3 < 15"
+    for term in TERMS:
+        assert term in text
+    assert "figure=" in text and (gap_run.cell.out / "learning_curves.png").stat().st_size > 0
+
+
+def test_a_single_seed_run_cannot_read_memorisation_and_says_so(gap_run):
+    """One seed: at most one seed can clear, below SEEDS_REQUIRED, so the
+    status is one of the other four and the verdict line names the count."""
+    verdict = [line for line in gap_run.text.splitlines() if "verdict: random_vit" in line]
+    assert len(verdict) == 1
+    assert "MEMORISATION" not in verdict[0]
+
+
+def test_write_learning_curves_handles_a_missing_matplotlib_by_costing_the_figure_only(cell, monkeypatch, tmp_path):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_matplotlib(name, *args, **kwargs):
+        if name.startswith("matplotlib"):
+            raise ImportError("no matplotlib here")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_matplotlib)
+    records = {("random_vit", 1): {"arm": "random_vit", "seed": 1,
+                                   "history": {"loss": [1.0] * 8,
+                                               "parts": [{t: 0.1 for t in TERMS}] * 8}}}
+    line = script.write_learning_curves(records, tmp_path / "x.png", window=4)
+    assert line.startswith("figure NOT written:") and not (tmp_path / "x.png").exists()
