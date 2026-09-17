@@ -2995,7 +2995,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Write: `runs/m3_study_v2/split_gap_<arm>_seed<n>.json` x 9, `split_gap.txt`, `split_gap.log`, `split_gap.exit`, `split_gap.head`, `learning_curves.png`
 - Modify: this plan, `## Task 7 results`
 
-- [ ] **Step 1: Pre-flight**
+- [x] **Step 1: Pre-flight**
 
 ```bash
 cd /Users/raphaelchen/Desktop/csgo-bot && git status --short           # expect: clean (or only study.log untracked)
@@ -3009,7 +3009,7 @@ ls runs/m3_study_v2/split_gap* 2>/dev/null                               # expec
 
 If the worktree is not the main checkout, run from wherever `runs/` and `data/` live -- the shipped artefacts are in the main checkout at `/Users/raphaelchen/Desktop/csgo-bot`. Do NOT copy or move them.
 
-- [ ] **Step 2: MPS smoke on one cell (the 14 device check, ~5 min)**
+- [x] **Step 2: MPS smoke on one cell (the 14 device check, ~5 min)**
 
 ```bash
 cd /Users/raphaelchen/Desktop/csgo-bot && PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/split_gap.py --out runs/m3_study_v2 --device mps --arms random_vit --seeds 0 2>&1 | tail -30; echo "exit $?"
@@ -3023,7 +3023,7 @@ rm runs/m3_study_v2/split_gap_random_vit_seed0.json runs/m3_study_v2/split_gap.t
 
 If the smoke exits 14 with a non-zero reproduction: STOP. The environment is not the one the records were written on; nothing below is valid.
 
-- [ ] **Step 3: Launch**
+- [x] **Step 3: Launch**
 
 ```bash
 cd /Users/raphaelchen/Desktop/csgo-bot && git rev-parse HEAD > runs/m3_study_v2/split_gap.head && date -u +%Y-%m-%dT%H:%M:%SZ > runs/m3_study_v2/split_gap.started && find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; PYTHONDONTWRITEBYTECODE=1 caffeinate -dimsu .venv/bin/python scripts/split_gap.py --out runs/m3_study_v2 --device mps 2>&1 | tee runs/m3_study_v2/split_gap.log; echo ${PIPESTATUS[0]} > runs/m3_study_v2/split_gap.exit; cat runs/m3_study_v2/split_gap.exit
@@ -3031,7 +3031,7 @@ cd /Users/raphaelchen/Desktop/csgo-bot && git rev-parse HEAD > runs/m3_study_v2/
 
 Expected: ~40-50 minutes; `split_gap.exit` = `0`. **Do not commit, checkout, rebase or edit `src/` or `scripts/` while it runs.**
 
-- [ ] **Step 4: Acceptance**
+- [x] **Step 4: Acceptance**
 
 ```bash
 cd /Users/raphaelchen/Desktop/csgo-bot && cat runs/m3_study_v2/split_gap.exit && ls runs/m3_study_v2/split_gap_*.json | wc -l && .venv/bin/python - <<'EOF'
@@ -3053,7 +3053,7 @@ ls -lt runs/m3_study_v2 | head -16   # nothing newer than the run's own outputs
 git status --short                    # clean under src/ and scripts/
 ```
 
-- [ ] **Step 5: Fill `## Task 7 results`**
+- [x] **Step 5: Fill `## Task 7 results`**
 
 Copy numbers from `split_gap.txt`, not rounded. Use the template at the end of this plan. Then:
 
@@ -3068,63 +3068,210 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ## Exit criteria for this plan
 
-- [ ] `pytest` fully green with zero warnings; the delta over 1437 is the sum of the tasks' stated deltas (record the measured number).
-- [ ] `fit_probes`'s fit set is unchanged: exit 14 never fires on the real cells on mps (every record reproduces bitwise).
-- [ ] `split_gap.py` on `runs/m3_study_v2` exits 0 with the self-check table reading `0.0e+00 / 0.0e+00 / True` on all nine rows and strata `24 / 78 / 20`.
-- [ ] Nine `split_gap_<arm>_seed<n>.json` carrying every key of the contract; `split_gap.txt` carrying every block; `learning_curves.png` written.
-- [ ] Reading G's status per arm is one of the five and its rule names the statistic and the bar; the decision horizon is 15, unclamped.
-- [ ] `## Task 7 results` filled from `split_gap.txt`, numbers copied not rounded, closing paragraph stated against spec 4's non-claims. `NO_GAP` on every arm is a result.
-- [ ] Every mutation-table row was run and caught.
-- [ ] `runs/m3_study` and `runs/m3_study_v2`'s existing files untouched.
+- [x] `pytest` fully green with zero warnings; the delta over 1437 is the sum of the tasks' stated deltas (record the measured number).
+- [x] `fit_probes`'s fit set is unchanged: exit 14 never fires on the real cells on mps (every record reproduces bitwise).
+- [x] `split_gap.py` on `runs/m3_study_v2` exits 0 with the self-check table reading `0.0e+00 / 0.0e+00 / True` on all nine rows and strata `24 / 78 / 20`.
+- [x] Nine `split_gap_<arm>_seed<n>.json` carrying every key of the contract; `split_gap.txt` carrying every block; `learning_curves.png` written.
+- [x] Reading G's status per arm is one of the five and its rule names the statistic and the bar; the decision horizon is 15, unclamped.
+- [x] `## Task 7 results` filled from `split_gap.txt`, numbers copied not rounded, closing paragraph stated against spec 4's non-claims. `NO_GAP` on every arm is a result.
+- [x] Every mutation-table row was run and caught.
+- [x] `runs/m3_study` and `runs/m3_study_v2`'s existing files untouched.
 
-## Task 7 results (template -- replace every `…`)
+## Task 7 results
 
-**Provenance.** Nine records under one code state, `git_sha` = `…` (= `split_gap.head` = `git rev-parse HEAD`, tree clean under `src/` and `scripts/`), device `mps`, torch `…`; every record's `checkpoint_git_sha` = `ca3e140772d6bc741d4d04312763afe3dd754166`. Launched `…` (`split_gap.started`) under `caffeinate -dimsu`, `PYTHONDONTWRITEBYTECODE=1`, `__pycache__` cleared; `split_gap.exit` = `…`; wall `…`. `pytest`: `… passed`, 0 warnings, before launch.
+**Provenance.** Nine records under one code state, `git_sha` =
+`47df59a3b5d09d7228548441741af7e52f240b13` (= `split_gap.head` = `git rev-parse HEAD`, tree
+clean under `src/` and `scripts/`), device `mps`, torch `2.13.0`, in all nine
+`split_gap_<arm>_seed<n>.json`; every record's `checkpoint_git_sha` =
+`ca3e140772d6bc741d4d04312763afe3dd754166`, the M3c study's. Launched `2026-09-16T23:52:04Z`
+(`split_gap.started`) under `caffeinate -dimsu`, `PYTHONDONTWRITEBYTECODE=1`, `__pycache__`
+cleared, from the `feat/m3e-split-gap` worktree with `data/` and `runs/` symlinked to the main
+checkout's (so `runs/m3_study_v2` is the one directory the M3c and M3d records live in); finished
+`2026-09-17T00:16:45Z` (`split_gap.finished`), wall `24 min 41 s`, about 2.7 min per cell.
+`split_gap.exit` = `0`, INFERRED, not captured: the process was detached (`nohup … &`) so its
+status could not be waited on; the log ends on the `figure=` line that `main` prints last before
+`return EXIT_OK`, no refusal line (`MISMATCH` / `SELF-CHECK FAILED` / `STRATA NOT A PARTITION` /
+`NO CELL` / `Traceback`) appears in it, and all nine records plus `split_gap.txt` and
+`learning_curves.png` are on disk -- the state only the exit-0 path produces. `split_gap.txt` is
+byte-identical to `split_gap.log` from the `--- split gap: self-check` header on (the nine
+per-cell progress lines above it are in the log only). The MPS smoke on `random_vit`/s0 that
+preceded the launch (exit 0, the same self-check) had its three outputs removed before the run
+so no record predates `split_gap.started`. Acceptance (`runs/m3e_check_split_gap`, run inline):
+`OK: nine records, one git_sha == HEAD 47df59a, one device == mps, self-check exactly 0.0 on
+9/9, strata 24/78/20, windows (229, 729, 172), torch 2.13.0`. `ls -lt runs/m3_study_v2 | head`
+shows nothing newer than the run's own outputs. `pytest` at the launched HEAD: ``1490 passed` in 9 min 14 s, 0 skipped, 0 warnings, exit 0 -- 1437 + the seven tasks' 2 + 5 + 7 + 13 + 17 + 9 = 1490, the count this plan predicted; with `runs/` reachable the four tests that skip without the shipped artefacts (three of them the MPS bitwise-reproduction pins) ran and passed`.
 
-**Self-check** (val stratum against the diagnostic): max|Δ| reference `…` / persistence `…` on 9/9; windows match 9/9; probe R² `…`–`…`; measurable 9/9.
+**Self-check** (val stratum against the diagnostic; `split_gap.txt`'s first table): max|Δ|
+`reference_position` `0.0e+00` and `persistence_position` `0.0e+00` on 9/9 cells; `windows.total`
+and `windows.episode` match on 9/9; probe selection R² `0.018`–`0.383` (`pixel_ae`/s1 the 0.018);
+`measurable` True on 9/9. Read: every train-side number below is read against the ruler M3d
+validated -- same 229 val windows, same rollout (every record reproduced its study record's
+`curves.rssm_position` bitwise, or the run would have exited 14 before the val pass), same refit
+probe.
 
-**Strata.** val 24 episodes / 229 windows / 24 clusters; train_held 78 / `…` / 78; train_probe 20 / `…` / 20. never_moved `…` / `…` / `…`; not_moved@1 `…` / `…` / `…`; not_moved@15 `…` / `…` / `…`.
+**Strata** (identical for every cell: one split, one probe rule):
 
-**The band per stratum, gap_closed(45) position** (spec 4.1's metric):
+| stratum | episodes | windows | clusters | never_moved | not_moved @1 / @15 / @45 | role |
+|---|---|---|---|---|---|---|
+| `val` | 24 | 229 | 24 | 0 | 133 / 18 / 3 | the record's; self-check anchor |
+| `train_held` | 78 | 729 | 77 | 1 | 370 / 57 / 10 | model-seen, probe-unseen; the decision stratum |
+| `train_probe` | 20 | 172 | 19 | 0 | 87 / 12 / 2 | model-seen, probe-seen; CONFOUNDED, information only |
+
+One of the 78 `train_held` episodes and one of the 20 `train_probe` episodes are too short for
+a 50-frame window and yield none (77 and 19 clusters); one `train_held` window never moves 5 map
+units within the horizon and is counted, not pooled. The `train_held` stratum is 3.2× the val
+stratum's windows over 3.2× its clusters.
+
+**The band per stratum, `gap_closed(45)` on position** (spec 4.1's metric; no cell had a
+non-positive band at h=45 on position; `steps_degenerate` 0 on every stratum, every cell):
 
 | arm | stratum | s0 | s1 | s2 | nanmean | unanimous > 0 |
 |---|---|---|---|---|---|---|
-| `pixel_ae` | val | … | … | … | … | … |
-| `pixel_ae` | train_held | … | … | … | … | … |
-| `pixel_ae` | train_probe (confounded) | … | … | … | … | … |
-| `frozen_ssl` | val / train_held / train_probe | … |
-| `random_vit` | val / train_held / train_probe | … |
+| `pixel_ae` | val | -1.1630 | -0.5878 | -0.6739 | -0.8082 | False |
+| `pixel_ae` | train_held | -0.7179 | -0.5903 | -0.5045 | -0.6043 | False |
+| `pixel_ae` | train_probe (confounded) | -0.7504 | -1.5711 | -0.4089 | -0.9102 | False |
+| `frozen_ssl` | val | -0.8523 | -0.6470 | -0.6491 | -0.7161 | False |
+| `frozen_ssl` | train_held | -0.9128 | -0.5743 | -0.5582 | -0.6818 | False |
+| `frozen_ssl` | train_probe (confounded) | -0.8106 | -0.5100 | -0.1015 | -0.4740 | False |
+| `random_vit` | val | -0.4419 | -0.3875 | -0.5452 | -0.4582 | False |
+| `random_vit` | train_held | -0.5348 | -0.4928 | -0.4337 | -0.4871 | False |
+| `random_vit` | train_probe (confounded) | -0.3977 | -0.2056 | -0.0620 | -0.2218 | False |
 
-**Survival per stratum** (S(h) at 1 / 5 / 15 / 45; H*_0.75), free channel:
+Every one of the nine `train_held` cells is below persistence at h=45 on position, as every val
+cell is; spec 4.1 fails on the training episodes exactly as it fails on the held-out ones. The
+val column reproduces the M3c records' `gap_final` to four decimals (the same rollout). On
+`train_probe` -- where the probe saw the episodes -- `frozen_ssl`/s2 and `random_vit`/s2 read
+-0.10 and -0.06, the two least-negative numbers in the table: that is what an in-sample probe
+does to the metric, and it is why that stratum decides nothing.
 
-| arm | val | train_held | train_probe |
+**Survival per stratum, free channel** (`S(h)` over the (window, seed) draws that moved --
+687 on val, 2,184 on `train_held`; `H*_0.75` at every arm × stratum × channel = **1**,
+`H*_0.5` = 3 on every line but `pixel_ae`/`train_probe`/probe = 2, `H*_0.9` = 0 everywhere):
+
+| arm | `S(5)` val / train_held | `S(15)` val / train_held | `S(45)` val / train_held |
 |---|---|---|---|
-| `pixel_ae` | … | … | … |
-| `frozen_ssl` | … | … | … |
-| `random_vit` | … | … | … |
+| `pixel_ae` | 0.405 / 0.392 | 0.169 / 0.171 | 0.042 / 0.036 |
+| `frozen_ssl` | 0.386 / 0.392 | 0.141 / 0.165 | 0.017 / 0.034 |
+| `random_vit` | 0.392 / 0.411 | 0.179 / 0.197 | 0.049 / 0.060 |
 
-(Probe channel: `…`.)
+Probe channel, the same columns: `pixel_ae` 0.412 / 0.412, 0.227 / 0.228, 0.090 / 0.103;
+`frozen_ssl` 0.419 / 0.429, 0.218 / 0.238, 0.080 / 0.090; `random_vit` 0.450 / 0.426,
+0.272 / 0.250, 0.124 / 0.115. The largest train-minus-val difference in any `S(h)` column, any
+arm, either channel, is 0.024 (`frozen_ssl` free at h=15); the conditional survival `S_c(h)`
+(the `u(h)` / `S_c(h)` table in `split_gap.txt`) is 0.52–0.56 at h=1 and 0.11–0.21 at h=15 on
+every stratum and arm, val and train alike.
 
-**Reading G at h = 15** (train_held − val; `z_fam` = `cluster_threshold(6, 24)` = `…`):
+**Reading G at h = 15** (`train_held − val`; `z_fam` = `cluster_threshold(6, 24)` = `2.89`, 24
+being the smaller cluster count of the two decision strata; every contrast pooled over the three
+seeds, seeds averaged per window, episode-clustered):
 
-| arm | G_free estimate ± se (z) | G_probe estimate ± se (z) | train_held §4.1 | seeds clearing | **status** | decided by |
+| arm | `G_free(15)` estimate ± se (z) | `G_probe(15)` estimate ± se (z) | train_held §4.1 | seeds clearing | **status** | decided by |
 |---|---|---|---|---|---|---|
-| `pixel_ae` | … | … | … | …/3 | **…** | … |
-| `frozen_ssl` | … | … | … | …/3 | **…** | … |
-| `random_vit` | … | … | … | …/3 | **…** | … |
+| `pixel_ae` | +0.0019 ± 0.0189 (+0.10) | +0.0014 ± 0.0216 (+0.06) | FAILS (-0.718 / -0.590 / -0.505) | 0/3 | **NO GAP** | `G_free z +0.10 does not clear ±2.89` |
+| `frozen_ssl` | +0.0236 ± 0.0192 (+1.23) | +0.0193 ± 0.0218 (+0.89) | FAILS (-0.913 / -0.574 / -0.558) | 0/3 | **NO GAP** | `G_free z +1.23 does not clear ±2.89` |
+| `random_vit` | +0.0178 ± 0.0211 (+0.85) | -0.0222 ± 0.0289 (-0.77) | FAILS (-0.535 / -0.493 / -0.434) | 0/3 | **NO GAP** | `G_free z +0.85 does not clear ±2.89` |
 
-G at h = 5 / 15 / 45, z, free / probe: `pixel_ae` … ; `frozen_ssl` … ; `random_vit` … . ΔFree(15) stratum difference: … .
+Decided by the last rule in spec 3.3's precedence in every arm: the probe control did not fire
+(no channel clears in any arm, so no opposite-sign pair), `G_free` did not clear pooled (so
+neither `MEMORISATION` nor `PARTIAL_GAP` was reachable, and the §4.1 column is printed for the
+record only), and `G_free` did not clear negative (`INVERTED_GAP`). The three arms agree.
 
-**Sensitivity** (probe channel, R² < 0.1 excluded — dropped `…`): G_probe z per arm `…`; which changed: `…`; no verdict changed: `…`.
+G at the reported horizons, z only (`train_held − val`; not decided on):
 
-**Per seed:** `…`.
+| arm | channel | z@5 | z@15 | z@45 | `Δ_free(15)` stratum difference |
+|---|---|---|---|---|---|
+| `pixel_ae` | free | -0.44 | +0.10 | -0.72 | +0.0278 (z +0.28) |
+| `pixel_ae` | probe | +0.01 | +0.06 | +0.75 | |
+| `frozen_ssl` | free | +0.23 | +1.23 | +2.29 | +0.2222 (z +1.70) |
+| `frozen_ssl` | probe | +0.39 | +0.89 | +0.73 | |
+| `random_vit` | free | +0.64 | +0.85 | +0.85 | -0.1081 (z -0.45) |
+| `random_vit` | probe | -0.78 | -0.77 | -0.39 | |
 
-**Learning curves** (100-step mean; last quarter vs preceding; smoothed-min step), `embedding` and `kl_dyn` per cell:
+No z at any of the three horizons, either channel, any arm, clears 2.89; the largest is
+`frozen_ssl` free at h=45, +2.29 -- `S_free(45)` 0.034 against 0.017, a difference of 0.017 in
+survival on which the verdict would not have turned at h=15 and does not turn at h=45 either. The
+continuous companion `Δ_free(15)` has the same sign as `G_free(15)` in `pixel_ae` and
+`frozen_ssl` and the opposite sign in `random_vit`, every one within 1.7 SE of zero.
 
-| cell | embedding last_q / prev_q / change% / descending / min_step | kl_dyn last_q / prev_q / change% | loss change% |
-|---|---|---|---|
-| … | … | … | … |
+**Sensitivity** (changes no verdict): with cells of probe selection R² < 0.1 excluded from the
+probe channel -- `pixel_ae`/s1 (0.018) and no other -- `G_probe(15)` reads `pixel_ae`
++0.0085 ± 0.0300 (z +0.28), `frozen_ssl` +0.0193 ± 0.0218 (z +0.89), `random_vit`
+-0.0222 ± 0.0289 (z -0.77). Only `pixel_ae`'s statistic moved (from +0.0014 / z +0.06), as it
+must, and it still does not clear; the free channel, which decides, pools every cell and is
+untouched.
 
-Figure: `runs/m3_study_v2/learning_curves.png`.
+**Per seed** (the same contrast within one seed alone, that seed's windows clustered; `NO GAP`
+on all nine): `G_free(15)` z `pixel_ae` -0.53 / +0.58 / +0.11, `frozen_ssl` +0.67 / +1.20 /
++0.87, `random_vit` +0.44 / -0.13 / +1.58; `G_probe(15)` z `pixel_ae` +0.56 / -0.39 / -0.09,
+`frozen_ssl` +0.10 / -0.01 / +1.77, `random_vit` -0.42 / -0.71 / -0.52. No seed of any arm clears
+in either channel; the largest per-seed z in the run is `frozen_ssl`/s2's probe +1.77.
 
-**What this run establishes, and what it does not.** `…` — stated against spec 4: it does not change the M3 gate or any recorded verdict; it does not rank arms (every contrast is within-arm); a MEMORISATION reading says the fix is data, not how much or which policy or scenario; `train_probe` is confounded and decided nothing; probe-based numbers inherit the probe's R² and the decision channel is probe-free; everything is `my_way_home`, one split, the M3c checkpoints.
+**Learning curves** (from each study record's `history.parts`, 100-step moving mean; last
+quarter = steps 15,001–20,000 against the preceding quarter 10,001–15,000; `min_step` = the
+1-based step at the end of the minimising window; descriptive, no verdict attached):
+
+| cell | `embedding` last_q / prev_q / change | descending | `embedding` min_step | `kl_dyn` last_q / prev_q / change | `loss` change |
+|---|---|---|---|---|---|
+| `pixel_ae`/s0 | 0.1521 / 0.1533 / -0.79% | True | 8,359 | 0.3511 / 0.4221 / -16.82% | -10.68% |
+| `pixel_ae`/s1 | 0.0758 / 0.0900 / -15.73% | True | 19,096 | 0.2332 / 0.3765 / -38.06% | -30.05% |
+| `pixel_ae`/s2 | 0.1162 / 0.1252 / -7.19% | True | 16,873 | 0.2731 / 0.3180 / -14.12% | -11.74% |
+| `frozen_ssl`/s0 | 0.2665 / 0.2196 / **+21.35%** | False | 2,045 | 0.4956 / 0.5635 / -12.05% | +1.11% |
+| `frozen_ssl`/s1 | 0.1979 / 0.2002 / -1.14% | True | 3,555 | 0.4224 / 0.5375 / -21.42% | -13.65% |
+| `frozen_ssl`/s2 | 0.3324 / 0.2703 / **+22.99%** | False | 4,510 | 0.3593 / 0.3073 / +16.91% | +20.50% |
+| `random_vit`/s0 | 0.1622 / 0.1389 / **+16.78%** | False | 1,610 | 0.4451 / 0.4841 / -8.06% | -0.01% |
+| `random_vit`/s1 | 0.1741 / 0.1432 / **+21.63%** | False | 4,535 | 0.4612 / 0.4541 / +1.57% | +8.47% |
+| `random_vit`/s2 | 0.1318 / 0.1190 / **+10.76%** | False | 3,275 | 0.5559 / 0.5448 / +2.04% | +4.34% |
+
+`reward` is 1e-5–1e-4 throughout and `continue` is at 1e-4 after the first few hundred steps in
+every cell (the two sparse targets); they are in the figure and in `split_gap.txt` and are not
+tabulated here. Figure: `runs/m3_study_v2/learning_curves.png` (one panel per term plus the summed
+loss, arms coloured, seeds as thin lines, `KL_FREE_BITS` = 0.20 drawn on the two KL panels).
+
+Read, term by term. The `embedding` term is the one-step prediction loss the RSSM is trained
+on -- `mse(heads(latent)["embedding"], embeddings.detach())` on TRAINING batches -- and it is
+per-arm (each arm's own target space), so it compares within a cell over time and never across
+arms. In **five of the six ViT-arm cells** it is HIGHER over the last quarter of training than
+over the quarter before, by +10.76% to +22.99%, and its smoothed minimum sits at step
+1,610–4,535 -- in the first quarter of a 20,000-step run. In the figure, `frozen_ssl`/s0 and s2
+climb almost monotonically from about step 5,000 (0.20 → 0.35 and 0.22 → 0.30), and all three
+`random_vit` seeds reach about 0.08 by step 1,600–4,500 and climb back to 0.13–0.17. The exception
+is `frozen_ssl`/s1 (-1.14%, minimum at 3,555, essentially flat from there). The summed `loss` in
+those five cells is flat or rising (-0.01% to +20.50%), and `kl_dyn` falls in three of them and
+rises in two, so the rising prediction term is not being traded for a falling KL in any
+consistent way. All three **`pixel_ae`** cells descend in every term (embedding -0.79% / -15.73%
+/ -7.19%, minimum at 8,359 / 19,096 / 16,873, `kl_dyn` -14% to -38%, `loss` -11% to -30%) and
+`pixel_ae`/s1's embedding minimum is at step 19,096 -- still descending at the end of the budget.
+`kl_dyn` sits at 0.23–0.56 nats over the last quarter in every cell, above the 0.20 free-bits
+floor, with the spikes to 1–3 nats the figure shows in all nine.
+
+**What this run establishes, and what it does not.** Three things. (1) The instrument is M3d's:
+nine records at max|Δ| exactly 0.0 on both val curves, one code state, one device, and the val
+column of every table reproduces the M3c and M3d numbers. (2) **Reading G is `NO GAP` on all
+three arms, pooled and in every seed.** The world models roll out no better on the episodes they
+trained on ~430 times than on the 24 they never saw: `G_free(15)` z +0.10 / +1.23 / +0.85
+against a bar of 2.89, no per-seed leaf above +1.58, the largest `S(h)` difference in any column
+0.024, and `gap_closed(45)` on position negative in all nine `train_held` cells (-0.43 to -0.91)
+as in all nine val cells. Memorisation is not the cause of the h=45 failure, and more data of the
+same kind is not the indicated fix. (3) The learning curves, read after (2) as spec 2.3 says they
+are to be read: the one-step prediction term is RISING over the second half of training in five
+of the six ViT-arm cells, with its minimum in the first quarter of the run, so the 20,000-step
+checkpoints M3c evaluated -- the only checkpoints saved -- are past those cells' best point on
+their own training objective, and "train longer" would move them further from it; `pixel_ae`,
+by contrast, is still descending at 20,000 steps in every term. What that permits is a
+statement about the next experiment, not a verdict: the h=45 failure on the ViT arms is
+accompanied by a training-time degradation of the prediction term that a longer budget does not
+address, a larger model may not address, and a checkpoint saved at the embedding term's minimum,
+or a change to the balance between the prediction and KL terms of the objective, would put to
+the test -- the latter an arm-parity-preserving change and therefore a nine-cell re-run. --
+stated against spec 4's non-claims: it does not change the M3 gate or any verdict M3b, M3c or
+M3d recorded (`beats_persistence` at h=45 on val stays the recorded 45-step stress test, and
+every val cell still fails it); it does not rank arms (every contrast here is within-arm, train
+against val, and the between-arm differences in `G` are printed and not tested); a
+`MEMORISATION` reading would have said the fix is data and no arm produced one; `train_probe`
+is confounded by construction and decided nothing (its two least-negative `gap_closed(45)`
+values, -0.10 and -0.06, are the in-sample probe, not the model); probe-based numbers inherit a
+probe R² of 0.018–0.383 and the decision channel is probe-free, with the probe channel agreeing
+on `NO GAP` in every arm; and everything is `my_way_home`'s 122 episodes at context 5 /
+horizon 45, one split, the M3c checkpoints -- the rising-embedding-loss observation in
+particular is about these nine training runs and says nothing about whether the same objective
+behaves the same way on another dataset or budget.
