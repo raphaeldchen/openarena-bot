@@ -66,6 +66,8 @@ Run before any reading is printed, per cell, in this order, each with the exit s
 | 30 | the `val` stratum's `np.stack(rows).mean(axis=0)` of the model and persistence errors equals the diagnostic's `reference_position` / `persistence_position` at **max \|Δ\| == 0.0** at every h, and its `windows_total` and `window_episode` equal the diagnostic's | `trust_horizon.py`'s `EXIT_SELF_CHECK_FAILED`: the instrument is the ladder's and the trust pass's, or nothing is read |
 | **31** | the three strata are pairwise disjoint, their union is `buffer.episode_paths()`, and `train_probe` equals the `used` list `probe_episodes` handed `fit_probes` | new, `EXIT_STRATA_NOT_A_PARTITION`; a CODE defect, not a data one |
 
+In the running script, 31 is judged once, up front, right after 11 and before any cell's refit, because a non-partition is a code defect identical for every cell and catching it first saves the whole run.
+
 Any failure names the cell, the check and (for 14 and 30) the curve and the step, and no reading is printed. 31 is distinct from every other tool's exit status and from argparse's 2, and joins `test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own`.
 
 ## 3. How it decides

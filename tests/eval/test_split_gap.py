@@ -17,14 +17,12 @@ from mbfps.eval.diagnostics import Trajectories
 from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.split_gap import (
     ArmInputs,
-    ArmReading,
     CHANNELS,
     CURVE_NAMES,
     DECISION,
     DECISION_H,
     FAMILY,
     GapInputs,
-    GapReading,
     REPORTED_H,
     SEEDS_REQUIRED,
     STRATA,

@@ -305,6 +305,7 @@ def test_a_protocol_that_disagrees_with_the_diagnostic_is_exit_14_before_the_ref
     assert script.main(_argv(cell, "--context", "3")) == script.EXIT_RECORD_MISMATCH
     out = capsys.readouterr().out
     assert "RECORD MISMATCH for random_vit seed 1" in out and "--context 3" in out
+    assert not (cell.out / SPLIT_GAP).exists()
 
 
 def test_a_study_record_the_rollout_no_longer_reproduces_is_exit_14(cell, capsys):

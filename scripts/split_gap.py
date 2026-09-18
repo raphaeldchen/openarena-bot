@@ -67,7 +67,7 @@ import mbfps.eval.pooling as pooling
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
-from mbfps.eval.diagnostics import Trajectories, reference_trajectories
+from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.probe import probe_episodes
 from mbfps.eval.split_gap import (
     CHANNELS,
