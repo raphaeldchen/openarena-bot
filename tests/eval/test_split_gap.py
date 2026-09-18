@@ -344,13 +344,44 @@ def test_reading_gap_reads_every_arm_independently_in_the_callers_order():
     ]
 
 
-def test_reading_gap_with_no_per_seed_leaves_never_reaches_memorisation():
-    """Per-seed inputs absent (None): zero seeds clear, so the pooled gap can
-    at most be NO_GAP with the seed count named -- never MEMORISATION."""
-    arm = ArmInputs(gap_free=_contrast(4.0), gap_probe=_contrast(1.0),
-                    train_held_gap_final={0: 0.2}, per_seed=None)
-    r = reading_gap(_inputs(a=arm)).arms["a"]
-    assert r.status is Status.NO_GAP and (r.seeds_clearing, r.seeds_total) == (0, 0)
+def test_reading_gap_on_a_single_seed_leaf_has_a_vacuous_replication_clause():
+    """A single-seed leaf (`per_seed=None`), read alone -- the per-seed line
+    of `scripts/split_gap.py` -- has nothing to replicate across, so a
+    clearing `G_free` reaches MEMORISATION or PARTIAL_GAP on its own, always
+    with (seeds_clearing, seeds_total) == (1, 1) and "this seed alone" named
+    in the rule."""
+    memorisation = reading_gap(_inputs(a=ArmInputs(
+        gap_free=_contrast(4.0), gap_probe=_contrast(1.0),
+        train_held_gap_final={0: 0.2}, per_seed=None,
+    ))).arms["a"]
+    assert memorisation.status is Status.MEMORISATION
+    assert (memorisation.seeds_clearing, memorisation.seeds_total) == (1, 1)
+    assert "this seed alone" in memorisation.rule
+
+    partial = reading_gap(_inputs(a=ArmInputs(
+        gap_free=_contrast(4.0), gap_probe=_contrast(1.0),
+        train_held_gap_final={0: -0.2}, per_seed=None,
+    ))).arms["a"]
+    assert partial.status is Status.PARTIAL_GAP
+    assert (partial.seeds_clearing, partial.seeds_total) == (1, 1)
+    assert "this seed alone" in partial.rule
+
+    no_gap = reading_gap(_inputs(a=ArmInputs(
+        gap_free=_contrast(1.0), gap_probe=_contrast(1.0),
+        train_held_gap_final={0: 0.2}, per_seed=None,
+    ))).arms["a"]
+    assert no_gap.status is Status.NO_GAP
+    assert (no_gap.seeds_clearing, no_gap.seeds_total) == (0, 1)
+
+    # The pooled path (a dict, possibly empty) is unchanged: 0 of 0 seeds
+    # does not replicate, and the rule still names it that way.
+    pooled_empty = reading_gap(_inputs(a=ArmInputs(
+        gap_free=_contrast(4.0), gap_probe=_contrast(1.0),
+        train_held_gap_final={0: 0.2}, per_seed={},
+    ))).arms["a"]
+    assert pooled_empty.status is Status.NO_GAP
+    assert (pooled_empty.seeds_clearing, pooled_empty.seeds_total) == (0, 0)
+    assert "only 0 of 0 seeds" in pooled_empty.rule
 
 
 def test_format_reading_gap_prints_each_arm_with_its_status_and_rule():

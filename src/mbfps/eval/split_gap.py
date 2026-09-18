@@ -242,6 +242,15 @@ class Status(str, Enum):
 
 @dataclass(frozen=True)
 class ArmReading:
+    """`seeds_clearing` / `seeds_total` are the replication count the status
+    was decided on. For a pooled reading (the input's `per_seed` a dict,
+    possibly empty) they are the count and size of that dict. For a
+    single-seed leaf read alone (`per_seed=None`) the replication clause is
+    vacuous: `seeds_total = 1` and `seeds_clearing` is 1 if `G_free` clears,
+    0 otherwise -- there is nothing to replicate across, so a clearing leaf
+    reads MEMORISATION or PARTIAL_GAP on its own, never held to
+    `SEEDS_REQUIRED`."""
+
     arm: str
     status: Status
     rule: str
@@ -288,22 +297,36 @@ def _gate_detail(gap_final: dict[int, float]) -> str:
 
 def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
     """The rules of spec 3.3, in the table's precedence, each status carrying
-    the sentence that decided it."""
+    the sentence that decided it.
+
+    `a.per_seed is None` means `a` IS a single-seed leaf, read alone (the
+    per-seed line of `scripts/split_gap.py`): the replication clause is
+    vacuous, since there is nothing to replicate a single seed across, so a
+    clearing `G_free` reaches MEMORISATION or PARTIAL_GAP on its own. A dict
+    (the pooled reading, `a.per_seed` one leaf per seed) is read as before:
+    replication is `seeds_clearing >= SEEDS_REQUIRED`, and an empty dict is 0
+    of 0 seeds, which does not replicate."""
     free_up, free_down = clears(a.gap_free.z, z_fam), clears(-a.gap_free.z, z_fam)
     probe_up, probe_down = clears(a.gap_probe.z, z_fam), clears(-a.gap_probe.z, z_fam)
-    per_seed = a.per_seed or {}
-    seeds_clearing = sum(1 for leaf in per_seed.values() if clears(leaf.gap_free.z, z_fam))
+    if a.per_seed is None:
+        # A single-seed leaf, read alone: there is nothing to replicate across.
+        seeds_clearing, seeds_total, replicated = (1 if free_up else 0), 1, True
+        seeds = "this seed alone"
+    else:
+        seeds_clearing = sum(1 for leaf in a.per_seed.values() if clears(leaf.gap_free.z, z_fam))
+        seeds_total = len(a.per_seed)
+        replicated = seeds_clearing >= SEEDS_REQUIRED
+        seeds = f"{seeds_clearing} of {seeds_total} seeds"
     unanimous = train_held_passes_gate(a.train_held_gap_final)
     fz, pz, bar = _fmt(a.gap_free.z), _fmt(a.gap_probe.z), f"{z_fam:.2f}"
-    seeds = f"{seeds_clearing} of {len(per_seed)} seeds"
     if (free_up and probe_down) or (free_down and probe_up):
         status = Status.UNRESOLVED_PROBE
         rule = f"G_free z {fz} and G_probe z {pz} both clear +-{bar} with opposite signs"
-    elif free_up and seeds_clearing >= SEEDS_REQUIRED and unanimous:
+    elif free_up and replicated and unanimous:
         status = Status.MEMORISATION
         rule = (f"G_free z {fz} > {bar} pooled and in {seeds}; train_held passes spec 4.1 "
                 f"({_gate_detail(a.train_held_gap_final)})")
-    elif free_up and seeds_clearing >= SEEDS_REQUIRED:
+    elif free_up and replicated:
         status = Status.PARTIAL_GAP
         rule = (f"G_free z {fz} > {bar} pooled and in {seeds}; train_held FAILS spec 4.1 "
                 f"({_gate_detail(a.train_held_gap_final)})")
@@ -321,7 +344,7 @@ def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
         arm=arm, status=status, rule=rule,
         free_clears_up=free_up, free_clears_down=free_down,
         probe_clears_up=probe_up, probe_clears_down=probe_down,
-        seeds_clearing=seeds_clearing, seeds_total=len(per_seed),
+        seeds_clearing=seeds_clearing, seeds_total=seeds_total,
         train_held_unanimous=unanimous,
     )
 
