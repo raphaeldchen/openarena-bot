@@ -1719,7 +1719,6 @@ diagnose 11-17, pool 18-22, trust 30, split_gap 31, ladder 32-33, argparse
 import argparse
 import importlib.util
 import sys
-import types
 from pathlib import Path
 
 import numpy as np
@@ -1812,12 +1811,10 @@ def record_path(out_dir: Path, kind: str, arm: str, seed: int) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _cell_args(args, source: Path) -> types.SimpleNamespace:
-    """`prepare_cell` reads `out`, `device`, `context` and `horizon` off its
-    args; a cell is read with `out` pointed at the directory it lives in."""
-    return types.SimpleNamespace(
-        out=Path(source), device=args.device, context=args.context, horizon=args.horizon,
-    )
+_cell_args = _ladder._cell_args
+"""`prepare_cell` reads `out`, `device`, `context` and `horizon` off its
+args; a cell is read with `out` pointed at the directory it lives in -- the
+ladder's helper, imported rather than copied."""
 
 
 def cell_statistics(traj, *, context: int) -> dict:
