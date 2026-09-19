@@ -34,6 +34,7 @@
 | `src/mbfps/eval/study.py` | `evaluate_job` (the evaluation half of `run_job`, moved); `run_job` = train + evaluate |
 | `src/mbfps/eval/objective.py` | new: `val_objective` |
 | `src/mbfps/eval/ladder.py` | new: constants, `primary_rung`, `anchor_delta`, Reading T |
+| `src/mbfps/eval/split_gap.py`, `scripts/split_gap.py` | Task 4b: `survival_indicator`, `margin_at`, `cell_series`, `decision_horizon` extracted; the script's wrappers over them |
 | `scripts/checkpoint_ladder.py` | new: `train` / `evaluate` / `read` phases, records, pooling glue, tables, figure, `ladder.txt` |
 | `tests/training/test_world_model.py` | rung and `history_at` pins |
 | `tests/eval/test_run_study.py` | `evaluate_job` pin |
@@ -780,15 +781,16 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: `mbfps.eval.ladder` — the primary rung, the anchor, and Reading T
+### Task 4: `mbfps.eval.ladder` — the primary rung, the anchor, and Reading T; and the shared pooling helpers
 
 **Files:**
 - Create: `src/mbfps/eval/ladder.py`
-- Test: `tests/eval/test_ladder.py`
+- Modify (part b): `src/mbfps/eval/split_gap.py` (four pure helpers), `scripts/split_gap.py:191-227,296-300` (its wrappers rewritten over them, behaviour-preserving)
+- Test: `tests/eval/test_ladder.py`; part (b) in `tests/eval/test_split_gap.py`
 
 **Interfaces:**
 - Consumes: `mbfps.eval.split_gap.StratumContrast` (`estimate, se, z, clusters`), `clears(z, bar)`, `train_held_passes_gate(gap_final: dict[int, float]) -> bool`; `mbfps.eval.trust_readings.Q_REPORTED`.
-- Produces (Task 5/6 consume): the constants `RUNGS, STEPS, REFERENCE_RUNG, DECISION_H, REPORTED_H, FAMILY, SEEDS_REQUIRED, R2_SENSITIVITY, CURVE_WINDOW, OBJECTIVE_BATCHES`; `primary_rung(min_step: int, rungs=RUNGS) -> int`; `anchor_delta(retrain_loss, reference_loss, steps: int) -> tuple[float, int | None]`; `gate_passes` (= `train_held_passes_gate`); `ArmInputs(t_free, t_probe, primary_rungs: dict[int, int], per_seed: dict[int, ArmInputs] | None)`; `TimingInputs(arms: dict[str, ArmInputs], z_fam: float, h: int)`; `Status`; `ArmReading`; `TimingReading(arms, h, z_fam)`; `reading_timing(inputs) -> TimingReading`; `format_reading_timing(reading, inputs) -> str`.
+- Produces (Task 5/6 consume): the constants `RUNGS, STEPS, REFERENCE_RUNG, DECISION_H` (re-exported from `split_gap` -- one decision horizon, M3e's), `REPORTED_H, FAMILY, SEEDS_REQUIRED, R2_SENSITIVITY, CURVE_WINDOW, OBJECTIVE_BATCHES`; part (b), in `mbfps.eval.split_gap`: `survival_indicator(summary, channel, h) -> (values, changed)`, `margin_at(summary, channel, h) -> (values, changed)`, `cell_series(summary, values, changed, *, arm, seed, rung, channel, val, horizon, context, device, torch_version) -> pooling.CellSeries`, `decision_horizon(horizon) -> (h, clamped)`; `primary_rung(min_step: int, rungs=RUNGS) -> int`; `anchor_delta(retrain_loss, reference_loss, steps: int) -> tuple[float, int | None]`; `gate_passes` (= `train_held_passes_gate`); `ArmInputs(t_free, t_probe, primary_rungs: dict[int, int], per_seed: dict[int, ArmInputs] | None)`; `TimingInputs(arms: dict[str, ArmInputs], z_fam: float, h: int)`; `Status`; `ArmReading`; `TimingReading(arms, h, z_fam)`; `reading_timing(inputs) -> TimingReading`; `format_reading_timing(reading, inputs) -> str`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1056,7 +1058,7 @@ from enum import Enum
 
 import numpy as np
 
-from mbfps.eval.split_gap import StratumContrast, clears, train_held_passes_gate
+from mbfps.eval.split_gap import DECISION_H, StratumContrast, clears, train_held_passes_gate
 
 RUNGS: tuple[int, ...] = (1000, 2000, 3000, 4000, 5000)
 """The checkpoint steps saved during the retrain (spec 2.1)."""
@@ -1064,7 +1066,8 @@ STEPS: int = 5000
 """The retrain's length; every rung lies at or before it."""
 REFERENCE_RUNG: int = 20000
 """The M3c study's checkpoint, read from `--reference`, never retrained."""
-DECISION_H: int = 15
+# DECISION_H is M3e's, imported above: one decision horizon (15) for both
+# readings, so `split_gap.decision_horizon` serves this script unchanged.
 REPORTED_H: tuple[int, ...] = (5, 15, 45)
 FAMILY: int = 6
 """Reading T's family: three arms x two channels at one horizon (spec 3.1)."""
@@ -1281,6 +1284,185 @@ Expected: 26 passed.
 ```bash
 git add src/mbfps/eval/ladder.py tests/eval/test_ladder.py
 git commit -m "feat: the pre-registered rules of M3f -- the primary rung, the anchor delta, and Reading T over paired rung contrasts with the single-seed clause built in
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+#### Part (b): the shared pooling helpers
+
+`scripts/split_gap.py` builds `pooling.CellSeries` from a stratum summary in `_series`, `survival_series` and `margin_series`, and clamps the decision horizon in `decision_horizon`. Task 6 needs exactly the same four operations on a rung's summary. The pure parts move into `mbfps.eval.split_gap`; the script's functions become wrappers; its existing tests (`test_survival_series_is_the_indicator_over_the_windows_that_ever_moved`, `test_margin_series_masks_by_moved_at_h_not_ever_moved`, `test_decision_horizon_is_fifteen_unless_the_run_is_shorter` in `tests/eval/test_split_gap_script.py`) pin that nothing moved.
+
+- [ ] **Step 6: Write the failing tests**
+
+Append to `tests/eval/test_split_gap.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# The shared pooling helpers (M3f Task 4b): from a summary to a CellSeries.
+# ---------------------------------------------------------------------------
+
+import mbfps.eval.pooling as pooling  # noqa: E402
+from mbfps.eval.split_gap import cell_series, decision_horizon, margin_at, survival_indicator  # noqa: E402
+
+
+def _summary(crossing, margin, moved, episode=(0, 0, 1, 1)) -> dict:
+    return {
+        "windows": {"total": len(episode), "episode": list(episode), "clusters": len(set(episode))},
+        "crossing": {"free": list(crossing), "probe": list(crossing)},
+        "margin": {"free": [list(row) for row in margin], "probe": [list(row) for row in margin]},
+        "moved": [list(row) for row in moved],
+    }
+
+
+IDENTITY = dict(arm="random_vit", seed=0, rung="val", channel="S/free", val=("ep0", "ep1"),
+                horizon=3, context=2, device="cpu", torch_version="2.13.0")
+
+
+def test_survival_indicator_is_alive_at_h_over_the_windows_that_ever_moved():
+    values, changed = survival_indicator(_summary([4, 2, np.nan, 1], [[0] * 3] * 4, [[True] * 3] * 4), "free", 2)
+    np.testing.assert_array_equal(values, [1.0, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(changed, [True, True, False, True])
+
+
+def test_margin_at_reads_column_h_minus_one_under_moved_at_h():
+    margin = [[3, 30], [-1, -10], [2, 20], [0, np.nan]]
+    moved = [[False, True], [False, True], [False, True], [False, True]]
+    values, changed = margin_at(_summary([4] * 4, margin, moved), "free", 2)
+    np.testing.assert_array_equal(values[:3], [30.0, -10.0, 20.0])
+    assert changed.tolist() == [True, True, True, False], "a NaN margin is not a measurement"
+    _, at_one = margin_at(_summary([4] * 4, margin, moved), "free", 1)
+    assert not at_one.any(), "nothing has moved at h=1"
+
+
+def test_cell_series_carries_the_summarys_windows_and_the_identity_it_is_given():
+    summary = _summary([4, 2, 3, 1], [[0] * 3] * 4, [[True] * 3] * 4)
+    s = cell_series(summary, [1.0, 0.0, 1.0, 0.0], [True, True, False, True], **IDENTITY)
+    assert isinstance(s, pooling.CellSeries)
+    assert (s.arm, s.seed, s.rung, s.channel) == ("random_vit", 0, "val", "S/free")
+    np.testing.assert_array_equal(s.episode, [0, 0, 1, 1])
+    assert s.windows_total == 4 and s.val == ("ep0", "ep1")
+    assert (s.horizon, s.context, s.device, s.torch_version) == (3, 2, "cpu", "2.13.0")
+    assert s.embedding is None and s.noise is None
+    pooled = pooling.pool_arm([s])
+    assert pooled.mean == pytest.approx(2 / 3) and pooled.windows == 3
+
+
+def test_cell_series_refuses_values_that_are_not_one_per_window():
+    summary = _summary([4, 2, 3, 1], [[0] * 3] * 4, [[True] * 3] * 4)
+    with pytest.raises(ValueError, match="n_windows"):
+        cell_series(summary, [1.0, 0.0], [True, True], **IDENTITY)
+    with pytest.raises(ValueError, match="n_windows"):
+        cell_series(summary, [1.0, 0.0, 1.0, 0.0], [True, True], **IDENTITY)
+
+
+def test_decision_horizon_is_the_pre_registered_one_unless_the_run_is_shorter():
+    assert decision_horizon(45) == (DECISION_H, False)
+    assert decision_horizon(DECISION_H) == (DECISION_H, False)
+    assert decision_horizon(3) == (3, True)
+```
+
+(`DECISION_H` and `np`/`pytest` are already imported at the top of that file.)
+
+- [ ] **Step 7: Run the new tests to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_split_gap.py -q -k "indicator or margin_at or cell_series or decision_horizon"`
+Expected: FAIL — `ImportError: cannot import name 'cell_series'`.
+
+- [ ] **Step 8: Implement**
+
+In `src/mbfps/eval/split_gap.py`, add `import mbfps.eval.pooling as pooling` to the imports and append, after `learning_curve_summary`:
+
+```python
+# ---------------------------------------------------------------------------
+# From a stratum summary to the series the pool reads (spec 3.1; shared with
+# the M3f ladder, which pools a rung's summary the same way).
+# ---------------------------------------------------------------------------
+
+
+def survival_indicator(summary: dict, channel: str, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """`1[h_x > h]` per window, and the mask of the windows that moved within
+    the horizon (finite crossing) -- so the pooled mean is S(h) exactly."""
+    crossing = np.asarray(summary["crossing"][channel], dtype=float)
+    return (crossing > h).astype(float), np.isfinite(crossing)
+
+
+def margin_at(summary: dict, channel: str, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """`Delta(h)` per window, and the mask of the windows moved AT h whose
+    margin is a number."""
+    values = np.asarray(summary["margin"][channel], dtype=float)[:, h - 1]
+    moved = np.asarray(summary["moved"], dtype=bool)[:, h - 1]
+    return values, moved & np.isfinite(values)
+
+
+def cell_series(summary: dict, values, changed, *, arm: str, seed: int, rung: str, channel: str,
+                val, horizon: int, context: int, device: str, torch_version: str) -> pooling.CellSeries:
+    """One per-window series of one cell, in the shape the pool reads: the
+    summary's window index as the cluster labels, `values` under `changed`,
+    and the identity `require_compatible` checks. `arm` and `rung` are
+    labels: the split gap passes the arm and the stratum, the ladder a rung
+    group and `val`."""
+    values = np.asarray(values, dtype=float)
+    changed = np.asarray(changed, dtype=bool)
+    episode = np.asarray(summary["windows"]["episode"], dtype=int)
+    if not (values.shape == changed.shape == episode.shape):
+        raise ValueError(
+            f"{arm} seed {seed} {rung}/{channel}: values {values.shape}, changed {changed.shape} "
+            f"and windows.episode {episode.shape} must all be (n_windows,)"
+        )
+    return pooling.CellSeries(
+        arm=arm, seed=int(seed), rung=rung, channel=channel,
+        delta=values, changed=changed, episode=episode, embedding=None, noise=None,
+        windows_total=int(summary["windows"]["total"]), val=tuple(val),
+        horizon=int(horizon), context=int(context), device=str(device), torch_version=str(torch_version),
+    )
+
+
+def decision_horizon(horizon: int) -> tuple[int, bool]:
+    """`DECISION_H`, clamped to the run's horizon; the flag says it was."""
+    if DECISION_H <= horizon:
+        return DECISION_H, False
+    return int(horizon), True
+```
+
+In `scripts/split_gap.py`, extend the `from mbfps.eval.split_gap import (...)` list with `cell_series`, `decision_horizon`, `margin_at`, `survival_indicator`; replace the bodies of `_series`, `survival_series` and `margin_series` with:
+
+```python
+def _series(record: dict, stratum: str, channel: str, values, changed) -> pooling.CellSeries:
+    """One per-window series of one cell's stratum, in the shape the pool
+    reads. `rung` is the stratum and `channel` the reading ("S/free",
+    "margin/probe"), so `require_compatible` pools seeds of one stratum only
+    and `unpaired_contrast` refuses two different readings."""
+    return cell_series(
+        record["strata"][stratum], values, changed,
+        arm=record["arm"], seed=record["seed"], rung=stratum, channel=channel,
+        val=record["episodes"][stratum], horizon=record["horizon"], context=record["context"],
+        device=record["device"], torch_version=record["torch_version"],
+    )
+
+
+def survival_series(record: dict, stratum: str, channel: str, h: int) -> pooling.CellSeries:
+    """`1[h_x > h]` per window over the windows that moved within the horizon
+    (finite crossing) -- so the pooled mean is S(h) exactly."""
+    return _series(record, stratum, f"S/{channel}", *survival_indicator(record["strata"][stratum], channel, h))
+
+
+def margin_series(record: dict, stratum: str, channel: str, h: int) -> pooling.CellSeries:
+    """`Delta(h)` per window over the windows moved AT h."""
+    return _series(record, stratum, f"margin/{channel}", *margin_at(record["strata"][stratum], channel, h))
+```
+
+and delete the script's own `def decision_horizon(...)` (the imported name serves every caller, including the tests' `script.decision_horizon`).
+
+- [ ] **Step 9: Run the helper tests and the split-gap script tests that pin the wrappers**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_split_gap.py tests/eval/test_split_gap_script.py -q`
+Expected: all pass (20 + 5 new in the pure file; the 25 script tests unchanged, including the three that pin `survival_series`, `margin_series` and `decision_horizon`).
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/mbfps/eval/split_gap.py scripts/split_gap.py tests/eval/test_split_gap.py
+git commit -m "refactor: the split gap's series builders and decision_horizon become pure helpers in mbfps.eval.split_gap, shared with the ladder; the script's wrappers pinned unchanged
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -2223,8 +2405,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `tests/eval/test_checkpoint_ladder_script.py` (append), `tests/eval/test_diagnose_dynamics_script.py` (the distinctness test gains `checkpoint_ladder`)
 
 **Interfaces:**
-- Consumes: the ladder record (Task 5); `pooling.CellSeries`, `pooling.paired_contrast`, `pooling.cluster_threshold`; `ladder.ArmInputs/TimingInputs/reading_timing/format_reading_timing/gate_passes`, `DECISION_H`, `REPORTED_H`, `FAMILY`, `R2_SENSITIVITY`; `split_gap.CHANNELS`, `TERMS`, `StratumContrast`, `q_key`; `trust.survival/trust_horizon`; `trust_horizon.py`'s `unmoved_fraction`, `conditional_survival` (by path); `split_gap.py`'s `SURVIVAL_STEPS` (by path).
-- Produces: `survival_series(record, step, channel, h, label)`, `margin_series(...)`, `arm_inputs(records, arm, seeds, *, h, series, min_r2) -> ArmInputs`, `timing_inputs(records, *, arms, seeds, h, series, min_r2) -> TimingInputs`, `readings_text(...) -> str`, `write_curves(records, figure, rungs) -> str`, `write_readings(out_dir, text) -> Path` (`ladder.txt`), `read_phase(args, cells, rungs) -> int`; `--phase read`.
+- Consumes: the ladder record (Task 5); `pooling.paired_contrast`, `pooling.cluster_threshold`; `ladder.ArmInputs/TimingInputs/reading_timing/format_reading_timing/gate_passes`, `DECISION_H`, `REPORTED_H`, `FAMILY`, `R2_SENSITIVITY`; `split_gap.CHANNELS`, `TERMS`, `StratumContrast`, `q_key`, and Task 4b's `cell_series`, `survival_indicator`, `margin_at`, `decision_horizon`; `trust.survival/trust_horizon`; `trust_horizon.py`'s `unmoved_fraction`, `conditional_survival` (by path); `split_gap.py`'s `SURVIVAL_STEPS` (by path).
+- Produces: `survival_series(record, step, channel, h, label)`, `margin_series(...)` (thin wrappers over Task 4b's helpers), `arm_inputs(records, arm, seeds, *, h, series, min_r2) -> ArmInputs`, `timing_inputs(records, *, arms, seeds, h, series, min_r2) -> TimingInputs`, `readings_text(...) -> str`, `write_curves(records, figure, rungs) -> str`, `write_readings(out_dir, text) -> Path` (`ladder.txt`), `read_phase(args, cells, rungs) -> int`; `--phase read`. `decision_horizon` is imported from `split_gap`, not redefined.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2463,7 +2645,18 @@ from mbfps.eval.ladder import (
     primary_rung,
     reading_timing,
 )
-from mbfps.eval.split_gap import CHANNELS, TERMS, StratumContrast, learning_curve_summary, q_key, stratum_summary
+from mbfps.eval.split_gap import (
+    CHANNELS,
+    TERMS,
+    StratumContrast,
+    cell_series,
+    decision_horizon,
+    learning_curve_summary,
+    margin_at,
+    q_key,
+    stratum_summary,
+    survival_indicator,
+)
 from mbfps.eval.trust import survival, trust_horizon
 from mbfps.eval.trust_readings import ARMS_ORDER, Q_REPORTED
 ```
@@ -2497,42 +2690,29 @@ def _entry(record: dict, step: int) -> dict:
 
 
 def _series(record: dict, step: int, channel: str, values, changed, label: str) -> pooling.CellSeries:
-    """One per-window series of one cell at one rung, in the shape the pool
-    reads. `arm` is the GROUP label (`<arm>@primary` / `<arm>@20000`): the
-    two rung groups of one arm are two "arms" on the same windows to
-    `paired_contrast`, which refuses an arm against itself. `rung` is the
-    stratum (val); `channel` the reading."""
-    block = _entry(record, step)["summary"]
-    values = np.asarray(values, dtype=float)
-    changed = np.asarray(changed, dtype=bool)
-    episode = np.asarray(block["windows"]["episode"], dtype=int)
-    if not (values.shape == changed.shape == episode.shape):
-        raise ValueError(
-            f"{record['arm']} seed {record['seed']} step {step}/{channel}: values {values.shape}, "
-            f"changed {changed.shape} and windows.episode {episode.shape} must all be (n_windows,)"
-        )
-    return pooling.CellSeries(
-        arm=label, seed=int(record["seed"]), rung="val", channel=channel,
-        delta=values, changed=changed, episode=episode, embedding=None, noise=None,
-        windows_total=int(block["windows"]["total"]), val=tuple(record["episodes"]["val"]),
-        horizon=int(record["horizon"]), context=int(record["context"]),
-        device=str(record["device"]), torch_version=str(record["torch_version"]),
+    """One per-window series of one cell at one rung, through
+    `split_gap.cell_series`. `arm` is the GROUP label (`<arm>@primary` /
+    `<arm>@20000`): the two rung groups of one arm are two "arms" on the same
+    windows to `paired_contrast`, which refuses an arm against itself. `rung`
+    is the stratum (val); `channel` the reading."""
+    return cell_series(
+        _entry(record, step)["summary"], values, changed,
+        arm=label, seed=record["seed"], rung="val", channel=channel,
+        val=record["episodes"]["val"], horizon=record["horizon"], context=record["context"],
+        device=record["device"], torch_version=record["torch_version"],
     )
 
 
 def survival_series(record: dict, step: int, channel: str, h: int, label: str) -> pooling.CellSeries:
-    """`1[h_x > h]` per window over the windows that moved within the horizon
-    (finite crossing) -- so the pooled mean is S(h) exactly."""
-    crossing = np.asarray(_entry(record, step)["summary"]["crossing"][channel], dtype=float)
-    return _series(record, step, f"S/{channel}", (crossing > h).astype(float), np.isfinite(crossing), label)
+    """`split_gap.survival_indicator` on this rung's summary: `1[h_x > h]`
+    over the windows that moved within the horizon."""
+    return _series(record, step, f"S/{channel}", *survival_indicator(_entry(record, step)["summary"], channel, h), label)
 
 
 def margin_series(record: dict, step: int, channel: str, h: int, label: str) -> pooling.CellSeries:
-    """`Delta(h)` per window over the windows moved AT h."""
-    block = _entry(record, step)["summary"]
-    values = np.asarray(block["margin"][channel], dtype=float)[:, h - 1]
-    moved = np.asarray(block["moved"], dtype=bool)[:, h - 1]
-    return _series(record, step, f"margin/{channel}", values, moved & np.isfinite(values), label)
+    """`split_gap.margin_at` on this rung's summary: `Delta(h)` over the
+    windows moved AT h."""
+    return _series(record, step, f"margin/{channel}", *margin_at(_entry(record, step)["summary"], channel, h), label)
 
 
 _NO_CONTRAST = StratumContrast(estimate=float("nan"), se=float("nan"), z=float("nan"), clusters=0)
@@ -2609,11 +2789,8 @@ def timing_inputs(records: dict, *, arms, seeds, h: int, series=survival_series,
     )
 
 
-def decision_horizon(horizon: int) -> tuple[int, bool]:
-    """`DECISION_H`, clamped to the run's horizon; the flag says it was."""
-    if DECISION_H <= horizon:
-        return DECISION_H, False
-    return int(horizon), True
+# `decision_horizon` is `split_gap`'s, imported: one decision horizon (M3e's
+# DECISION_H) for both readings.
 
 
 # ---------------------------------------------------------------------------
@@ -3050,7 +3227,7 @@ This task is run by the controller, not a subagent: it takes ~7 hours of wall-cl
 - [ ] **Step 1: The full suite at the code state that will run**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider`
-Expected: 1490 (the M3e count) + 8 (Task 1) + 1 (Task 2) + 7 (Task 3) + 26 (Task 4) + 19 (Task 5) + 12 (Task 6) = **1573 passed**, 0 skipped with `runs/` reachable, 0 warnings. Record the count.
+Expected: 1490 (the M3e count) + 8 (Task 1) + 1 (Task 2) + 7 (Task 3) + 26 + 5 (Task 4 and 4b) + 19 (Task 5) + 12 (Task 6) = **1578 passed**, 0 skipped with `runs/` reachable, 0 warnings. Record the count.
 
 - [ ] **Step 2: The smoke — one cell, the full ladder, `--anchor report`**
 
