@@ -7,7 +7,6 @@ only that rule can decide, so a rule dropped or reordered fails a named test.
 
 import math
 
-import numpy as np
 import pytest
 
 from mbfps.eval.ladder import (

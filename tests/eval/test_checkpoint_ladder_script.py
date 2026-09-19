@@ -133,7 +133,7 @@ def test_the_parser_defaults_are_the_specs():
     assert args.data == Path("data/my_way_home") and args.device == "mps"
     assert args.context is None and args.horizon is None
     assert args.steps == STEPS and args.phase == "all"
-    assert args.anchor in script.ANCHOR_POLICIES == ("hard", "report")
+    assert script.ANCHOR_POLICIES == ("hard", "report") and args.anchor == script.ANCHOR_DEFAULT == "hard"
     assert args.objective_batches == OBJECTIVE_BATCHES and args.window == CURVE_WINDOW
     assert args.figure is None
 
@@ -142,6 +142,16 @@ def test_steps_below_the_last_rung_is_argparses_own_usage_error():
     """Judged at the parser, before any directory is read."""
     with pytest.raises(SystemExit) as raised:
         script.main(["--steps", "1"], rungs=LADDER_RUNGS)
+    assert raised.value.code == 2
+
+
+def test_out_equal_to_reference_is_refused_at_the_parser_before_anything_is_read(tmp_path):
+    """`train` writes world_model_<arm>_seed<n>.pt at the top of --out; pointed
+    at the reference study it would overwrite the only copy of the M3c
+    checkpoints. Refused as a usage error, before any directory is opened."""
+    same = tmp_path / "study"
+    with pytest.raises(SystemExit) as raised:
+        script.main(["--out", str(same), "--reference", str(same)], rungs=LADDER_RUNGS)
     assert raised.value.code == 2
 
 
@@ -508,7 +518,7 @@ def test_read_prints_every_block_in_order(ladder_run):
     assert "verdict: random_vit" in text and "decided by:" in text
     assert f"h={HORIZON}" in text and "(pre-registered DECISION_H = 15)" in text, \
         "the fixture's horizon is 3, so the decision horizon is clamped and says so"
-    assert "GATE PASSES" in text or "gap_closed(3)" in text
+    assert "gap_closed(3) on position per seed" in text
     assert "20000" in text
 
 
@@ -525,6 +535,17 @@ def test_a_single_seed_run_reads_this_seed_alone_per_seed_and_zero_of_one_pooled
 
 def test_read_refuses_a_ladder_record_whose_self_check_is_not_ok(evaluated, capsys):
     _doctor(evaluated.ladder / LADDER, lambda r: r["entries"][str(REFERENCE_RUNG)]["self_check"].update({"ok": False}))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    assert "SELF-CHECK FAILED" in capsys.readouterr().out
+    assert not (evaluated.ladder / "ladder.txt").exists()
+
+
+def test_read_refuses_a_ladder_record_whose_self_check_delta_is_not_zero_even_if_ok_says_so(evaluated, capsys):
+    """`ok` alone is not enough: a nonzero recorded delta means the reference
+    rollout it was measured against did not reproduce bitwise, whatever the
+    `ok` flag says."""
+    _doctor(evaluated.ladder / LADDER, lambda r: r["entries"][str(REFERENCE_RUNG)]["self_check"].update(
+        {"reference_position_max_delta": 1e-3}))
     assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
     assert "SELF-CHECK FAILED" in capsys.readouterr().out
     assert not (evaluated.ladder / "ladder.txt").exists()

@@ -2864,7 +2864,7 @@ def _gate_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
         f"--- the gate at every rung: gap_closed({horizon}) on position per seed (spec 4.1's metric; "
         "NaN = non-positive band); GATE PASSES = > 0 in every seed. Reported, not decided on. ---",
         f"  {'arm':<12}{'step':>7}" + "".join(f"{f's{s}':>10}" for s in seeds)
-        + f"{'nanmean':>10}{'degenerate':>11}  gate",
+        + f"{'nanmean':>10}{'degen(max)':>11}  gate",
     ]
     for arm in arms:
         for step in _steps_in_order(rungs):

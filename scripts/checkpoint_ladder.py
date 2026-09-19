@@ -673,7 +673,7 @@ def _gate_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
         f"--- the gate at every rung: gap_closed({horizon}) on position per seed (spec 4.1's metric; "
         "NaN = non-positive band); GATE PASSES = > 0 in every seed. Reported, not decided on. ---",
         f"  {'arm':<12}{'step':>7}" + "".join(f"{f's{s}':>10}" for s in seeds)
-        + f"{'nanmean':>10}{'degenerate':>11}  gate",
+        + f"{'nanmean':>10}{'degen(max)':>11}  gate",
     ]
     for arm in arms:
         for step in _steps_in_order(rungs):
@@ -934,7 +934,14 @@ def read_phase(args, cells, rungs) -> int:
         records[(arm, seed)] = load_record(path)
     for (arm, seed), record in records.items():
         check = _entry(record, REFERENCE_RUNG)["self_check"]
-        if not check or not check.get("ok"):
+        trustworthy = bool(check) and (
+            check.get("ok") is True
+            and check.get("reference_position_max_delta") == 0.0
+            and check.get("persistence_position_max_delta") == 0.0
+            and check.get("windows_total_match")
+            and check.get("windows_episode_match")
+        )
+        if not trustworthy:
             print(
                 f"\nSELF-CHECK FAILED for {arm} seed {seed}: the ladder record's reference "
                 f"self-check is {check!r}; the record is not read against a ruler that reproduced."
@@ -995,6 +1002,11 @@ def main(argv: list[str] | None = None, *, rungs=RUNGS) -> int:
     rungs = tuple(sorted({int(r) for r in rungs}))
     if args.steps < max(rungs):
         parser.error(f"--steps {args.steps} is below the last rung {max(rungs)}")
+    if args.out.resolve() == args.reference.resolve():
+        parser.error(
+            "--out and --reference are the same directory; the train phase would overwrite the "
+            "reference study's checkpoints"
+        )
     device = get_device(prefer=args.device)
     cells = [(arm, int(seed)) for arm in args.arms for seed in args.seeds]
 
