@@ -20,7 +20,7 @@ from enum import Enum
 
 import numpy as np
 
-from mbfps.eval.split_gap import DECISION_H, StratumContrast, clears, train_held_passes_gate
+from mbfps.eval.split_gap import DECISION_H, StratumContrast, clears, fmt_z, train_held_passes_gate
 
 RUNGS: tuple[int, ...] = (1000, 2000, 3000, 4000, 5000)
 """The checkpoint steps saved during the retrain (spec 2.1)."""
@@ -150,10 +150,6 @@ class TimingReading:
     z_fam: float
 
 
-def _fmt(value: float, spec: str = "+.2f") -> str:
-    return format(value, spec) if np.isfinite(value) else str(value)
-
-
 def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
     """The rules of spec 3.3, in the table's precedence, each status carrying
     the sentence that decided it."""
@@ -172,7 +168,7 @@ def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
         replicated_down = seeds_down >= SEEDS_REQUIRED
         up_words = f"{seeds_up} of {seeds_total} seeds"
         down_words = f"{seeds_down} of {seeds_total} seeds"
-    fz, pz, bar = _fmt(a.t_free.z), _fmt(a.t_probe.z), f"{z_fam:.2f}"
+    fz, pz, bar = fmt_z(a.t_free.z), fmt_z(a.t_probe.z), f"{z_fam:.2f}"
     if (free_up and probe_down) or (free_down and probe_up):
         status = Status.UNRESOLVED_PROBE
         rule = f"T_free z {fz} and T_probe z {pz} both clear +-{bar} with opposite signs"
@@ -222,8 +218,8 @@ def format_reading_timing(reading: TimingReading, inputs: TimingInputs) -> str:
         for channel, c in (("free", a.t_free), ("probe", a.t_probe)):
             verdict = "yes" if clears(abs(c.z), reading.z_fam) else "no"
             lines.append(
-                f"  {arm:<12}{channel:<9}{_fmt(c.estimate, '+.4f'):>10}{_fmt(c.se, '.4f'):>9}"
-                f"{_fmt(c.z):>8}  {verdict}"
+                f"  {arm:<12}{channel:<9}{fmt_z(c.estimate, '+.4f'):>10}{fmt_z(c.se, '.4f'):>9}"
+                f"{fmt_z(c.z):>8}  {verdict}"
             )
     lines.append("  primary rung per seed (the rung nearest the reference run's smoothed embedding minimum):")
     for arm, a in inputs.arms.items():

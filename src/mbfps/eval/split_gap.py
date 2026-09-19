@@ -286,13 +286,14 @@ def train_held_passes_gate(gap_final: dict[int, float]) -> bool:
     return bool(values) and all(np.isfinite(v) and v > 0.0 for v in values)
 
 
-def _fmt(value: float, spec: str = "+.2f") -> str:
+def fmt_z(value: float, spec: str = "+.2f") -> str:
+    """A z or an estimate for a table: `spec` when finite, `nan`/`inf` spelled out otherwise."""
     return format(value, spec) if np.isfinite(value) else str(value)
 
 
 def _gate_detail(gap_final: dict[int, float]) -> str:
     return "gap_closed(45) per seed " + " / ".join(
-        f"s{seed} {_fmt(gap_final[seed], '+.3f')}" for seed in sorted(gap_final)
+        f"s{seed} {fmt_z(gap_final[seed], '+.3f')}" for seed in sorted(gap_final)
     )
 
 
@@ -319,7 +320,7 @@ def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
         replicated = seeds_clearing >= SEEDS_REQUIRED
         seeds = f"{seeds_clearing} of {seeds_total} seeds"
     unanimous = train_held_passes_gate(a.train_held_gap_final)
-    fz, pz, bar = _fmt(a.gap_free.z), _fmt(a.gap_probe.z), f"{z_fam:.2f}"
+    fz, pz, bar = fmt_z(a.gap_free.z), fmt_z(a.gap_probe.z), f"{z_fam:.2f}"
     if (free_up and probe_down) or (free_down and probe_up):
         status = Status.UNRESOLVED_PROBE
         rule = f"G_free z {fz} and G_probe z {pz} both clear +-{bar} with opposite signs"
@@ -370,8 +371,8 @@ def format_reading_gap(reading: GapReading, inputs: GapInputs) -> str:
         for channel, c in (("free", a.gap_free), ("probe", a.gap_probe)):
             verdict = "yes" if clears(abs(c.z), reading.z_fam) else "no"
             lines.append(
-                f"  {arm:<12}{channel:<9}{_fmt(c.estimate, '+.4f'):>10}{_fmt(c.se, '.4f'):>9}"
-                f"{_fmt(c.z):>8}  {verdict}"
+                f"  {arm:<12}{channel:<9}{fmt_z(c.estimate, '+.4f'):>10}{fmt_z(c.se, '.4f'):>9}"
+                f"{fmt_z(c.z):>8}  {verdict}"
             )
     lines.append("  train_held, spec 4.1 (gap_closed(45) position > 0 in every seed):")
     for arm, a in inputs.arms.items():
