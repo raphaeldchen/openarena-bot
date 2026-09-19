@@ -3230,7 +3230,7 @@ This task is run by the controller, not a subagent: it takes ~7 hours of wall-cl
 - [ ] **Step 1: The full suite at the code state that will run**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider`
-Expected: 1490 (the M3e count) + 8 (Task 1) + 1 (Task 2) + 7 (Task 3) + 26 + 5 (Task 4 and 4b) + 19 (Task 5) + 12 (Task 6) = **1578 passed**, 0 skipped with `runs/` reachable, 0 warnings. Record the count.
+Expected: 1490 (the M3e count) + 8 (Task 1) + 1 (Task 2) + 7 (Task 3) + 26 + 5 (Task 4 and 4b) + 19 (Task 5) + 12 + 1 (Task 6 and its NaN fix) = **1569 passed**, 0 skipped with `runs/` reachable, 0 warnings. Record the count.
 
 - [ ] **Step 2: The smoke — one cell, the full ladder, `--anchor report`**
 
