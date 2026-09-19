@@ -457,6 +457,25 @@ def test_timing_inputs_reads_z_fam_off_the_val_clusters_and_orders_the_arms():
     assert inputs.z_fam == pytest.approx(script.pooling.cluster_threshold(6, 2))
 
 
+def test_objective_table_names_the_smallest_finite_rung_and_ignores_a_nan():
+    """A NaN objective at the first rung must not pin the "smallest at step"
+    line to it: `x < nan` is always False, so a naive running minimum sticks."""
+    r = _fake_record(0, primary=2, crossing_primary=[3, 3, 3, 3], crossing_reference=[1, 1, 1, 1])
+    r["objective_batches"], r["curve_window"] = 2, 100
+    r["entries"]["2"]["objective"]["embedding"] = float("nan")
+    r["entries"]["4"]["objective"]["embedding"] = 0.5
+    r["entries"][str(REFERENCE_RUNG)]["objective"]["embedding"] = 0.3
+    r["entries"]["2"]["objective"]["loss"] = 0.2
+    r["entries"]["4"]["objective"]["loss"] = float("nan")
+    r["entries"][str(REFERENCE_RUNG)]["objective"]["loss"] = 0.4
+    text = script._objective_table({("random_vit", 0): r}, (2, 4))
+    assert f"val embedding smallest at step {REFERENCE_RUNG}; val loss smallest at step 2" in text
+    for step in ("2", "4", str(REFERENCE_RUNG)):
+        r["entries"][step]["objective"]["embedding"] = float("nan")
+    text = script._objective_table({("random_vit", 0): r}, (2, 4))
+    assert "val embedding smallest at step n/a" in text
+
+
 def test_decision_horizon_is_fifteen_unless_the_run_is_shorter():
     assert script.decision_horizon(45) == (DECISION_H, False)
     assert script.decision_horizon(3) == (3, True)

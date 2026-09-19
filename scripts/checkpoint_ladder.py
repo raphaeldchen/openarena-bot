@@ -772,13 +772,14 @@ def _objective_table(records: dict, rungs) -> str:
                 f"{_num(e['train_embedding'], '.4f'):>10}"
                 + "".join(f"{_num(o[term], '.4f'):>10}" for term in TERMS if term != "embedding")
             )
-            if best_emb is None or o["embedding"] < best_emb[1]:
+            if np.isfinite(o["embedding"]) and (best_emb is None or o["embedding"] < best_emb[1]):
                 best_emb = (step, o["embedding"])
-            if best_loss is None or o["loss"] < best_loss[1]:
+            if np.isfinite(o["loss"]) and (best_loss is None or o["loss"] < best_loss[1]):
                 best_loss = (step, o["loss"])
+        smallest_at = lambda best: "n/a" if best is None else str(best[0])
         lines.append(
-            f"  {arm:<12}{seed:>5}  val embedding smallest at step {best_emb[0]}; val loss smallest at "
-            f"step {best_loss[0]}; primary rung {r['primary_rung']}"
+            f"  {arm:<12}{seed:>5}  val embedding smallest at step {smallest_at(best_emb)}; val loss smallest at "
+            f"step {smallest_at(best_loss)}; primary rung {r['primary_rung']}"
         )
     return "\n".join(lines) + "\n"
 
