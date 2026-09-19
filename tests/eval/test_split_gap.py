@@ -444,3 +444,69 @@ def test_learning_curve_summary_shrinks_the_window_to_the_history_and_refuses_ju
     broken["parts"] = broken["parts"][:-1]
     with pytest.raises(ValueError, match="disagree"):
         learning_curve_summary(broken)
+
+
+# ---------------------------------------------------------------------------
+# The shared pooling helpers (M3f Task 4b): from a summary to a CellSeries.
+# ---------------------------------------------------------------------------
+
+import mbfps.eval.pooling as pooling  # noqa: E402
+from mbfps.eval.split_gap import cell_series, decision_horizon, margin_at, survival_indicator  # noqa: E402
+
+
+def _summary(crossing, margin, moved, episode=(0, 0, 1, 1)) -> dict:
+    return {
+        "windows": {"total": len(episode), "episode": list(episode), "clusters": len(set(episode))},
+        "crossing": {"free": list(crossing), "probe": list(crossing)},
+        "margin": {"free": [list(row) for row in margin], "probe": [list(row) for row in margin]},
+        "moved": [list(row) for row in moved],
+    }
+
+
+IDENTITY = dict(arm="random_vit", seed=0, rung="val", channel="S/free", val=("ep0", "ep1"),
+                horizon=3, context=2, device="cpu", torch_version="2.13.0")
+
+
+def test_survival_indicator_is_alive_at_h_over_the_windows_that_ever_moved():
+    values, changed = survival_indicator(_summary([4, 2, np.nan, 1], [[0] * 3] * 4, [[True] * 3] * 4), "free", 2)
+    np.testing.assert_array_equal(values, [1.0, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(changed, [True, True, False, True])
+
+
+def test_margin_at_reads_column_h_minus_one_under_moved_at_h():
+    margin = [[3, 30], [-1, -10], [2, 20], [0, np.nan]]
+    moved = [[False, True], [False, True], [False, True], [False, True]]
+    values, changed = margin_at(_summary([4] * 4, margin, moved), "free", 2)
+    np.testing.assert_array_equal(values[:3], [30.0, -10.0, 20.0])
+    assert changed.tolist() == [True, True, True, False], "a NaN margin is not a measurement"
+    _, at_one = margin_at(_summary([4] * 4, margin, moved), "free", 1)
+    assert not at_one.any(), "nothing has moved at h=1"
+
+
+def test_cell_series_carries_the_summarys_windows_and_the_identity_it_is_given():
+    summary = _summary([4, 2, 3, 1], [[0] * 3] * 4, [[True] * 3] * 4)
+    s = cell_series(summary, [1.0, 0.0, 1.0, 0.0], [True, True, False, True], **IDENTITY)
+    assert isinstance(s, pooling.CellSeries)
+    assert (s.arm, s.seed, s.rung, s.channel) == ("random_vit", 0, "val", "S/free")
+    np.testing.assert_array_equal(s.episode, [0, 0, 1, 1])
+    assert s.windows_total == 4 and s.val == ("ep0", "ep1")
+    assert (s.horizon, s.context, s.device, s.torch_version) == (3, 2, "cpu", "2.13.0")
+    assert s.embedding is None and s.noise is None
+    # Windows 0, 1 and 3 are kept (window 2 is `changed=False`): the mean
+    # over [1.0, 0.0, 0.0] is 1/3, whatever window 2 holds.
+    pooled = pooling.pool_arm([s])
+    assert pooled.mean == pytest.approx(1 / 3) and pooled.windows == 3
+
+
+def test_cell_series_refuses_values_that_are_not_one_per_window():
+    summary = _summary([4, 2, 3, 1], [[0] * 3] * 4, [[True] * 3] * 4)
+    with pytest.raises(ValueError, match="n_windows"):
+        cell_series(summary, [1.0, 0.0], [True, True], **IDENTITY)
+    with pytest.raises(ValueError, match="n_windows"):
+        cell_series(summary, [1.0, 0.0, 1.0, 0.0], [True, True], **IDENTITY)
+
+
+def test_decision_horizon_is_the_pre_registered_one_unless_the_run_is_shorter():
+    assert decision_horizon(45) == (DECISION_H, False)
+    assert decision_horizon(DECISION_H) == (DECISION_H, False)
+    assert decision_horizon(3) == (3, True)
