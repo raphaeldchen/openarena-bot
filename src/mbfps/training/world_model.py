@@ -99,14 +99,52 @@ def _kl_rate(kl_values: list[float]) -> float:
     return sum(1 for v in kl_values if v > KL_FREE_BITS) / len(kl_values)
 
 
+def _save_checkpoint(model: nn.Module, cfg: Config, directory: Path, step: int | None = None) -> Path:
+    """The checkpoint file every reader of a study directory opens:
+    `world_model_{arm}_seed{seed}.pt` under `directory`, with the arm and the
+    seed in the payload so a mislabelled file is caught at load. A rung adds
+    its `step`; the final save carries exactly the three keys it always has."""
+    directory.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "arm": cfg.arm, "seed": cfg.train.seed, "state_dict": model.state_dict(),
+    }
+    if step is not None:
+        payload["step"] = int(step)
+    path = directory / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt"
+    torch.save(payload, path)
+    return path
+
+
 def train_world_model(
     cfg: Config,
     buffer: ReplayBuffer,
     out_dir: Path | None,
     log_every: int = 100,
+    checkpoint_steps: tuple[int, ...] = (),
 ) -> dict[str, Any]:
-    """Train one arm's world model and return its history."""
+    """Train one arm's world model and return its history.
+
+    `checkpoint_steps` (M3f): 1-based steps at which the weights are ALSO
+    saved, each into `out_dir / f"step{N}"` under the final checkpoint's own
+    file name and payload plus a `"step"` key -- a rung directory in the
+    study's layout, so every reader of a study directory reads a rung
+    unchanged. The elapsed seconds at each rung go to
+    `history["checkpoint_seconds"]`. Empty (the default) leaves the final save
+    as it was and adds only that empty dict to the history. A rung outside
+    `1..cfg.train.steps` is refused before anything is built: a rung the run
+    never reaches would be a checkpoint that is never written.
+    """
     from mbfps.utils.device import to_device
+
+    rungs = tuple(sorted({int(s) for s in checkpoint_steps}))
+    outside = [s for s in rungs if s < 1 or s > cfg.train.steps]
+    if outside:
+        raise ValueError(
+            f"checkpoint_steps {outside} lie outside 1..{cfg.train.steps}: a rung the run "
+            "never reaches would be a checkpoint that is never written"
+        )
+    if rungs and out_dir is None:
+        raise ValueError("checkpoint_steps need an out_dir to write the rungs into")
 
     seed_everything(cfg.train.seed)
     device = get_device(prefer=cfg.train.device)
@@ -134,6 +172,7 @@ def train_world_model(
 
     losses: list[float] = []
     history_parts: list[dict[str, float]] = []
+    checkpoint_seconds: dict[int, float] = {}
     start = time.perf_counter()
     for step in range(cfg.train.steps):
         loss, parts = model(to_device(loader.sample(), device))
@@ -143,6 +182,9 @@ def train_world_model(
         optimiser.step()
         losses.append(float(loss.detach()))
         history_parts.append(parts)
+        if (step + 1) in rungs:
+            checkpoint_seconds[step + 1] = time.perf_counter() - start
+            _save_checkpoint(model, cfg, Path(out_dir) / f"step{step + 1}", step=step + 1)
         if log_every and (step + 1) % log_every == 0:
             print(f"[{cfg.arm}] step {step + 1}/{cfg.train.steps} loss={losses[-1]:.5f}")
 
@@ -163,6 +205,8 @@ def train_world_model(
         # than assume it.
         "kl_dyn_max": kl_dyn_max,
         "kl_rate_above_free_bits": kl_rate,
+        # Elapsed seconds at each rung of `checkpoint_steps` (M3f).
+        "checkpoint_seconds": checkpoint_seconds,
     }
     if kl_rate < 0.5:
         print(
@@ -173,9 +217,43 @@ def train_world_model(
             "much each prior trained, not the representations."
         )
     if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"arm": cfg.arm, "seed": cfg.train.seed, "state_dict": model.state_dict()},
-            out_dir / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt",
-        )
+        _save_checkpoint(model, cfg, Path(out_dir))
     return history
+
+
+def history_at(history: dict[str, Any], step: int) -> dict[str, Any]:
+    """The training history as it stood at 1-based `step` (M3f): `loss` and
+    `parts` cut to the prefix, `steps` = `step`, `seconds` the elapsed time
+    the trainer recorded at that rung (`checkpoint_seconds[step]`, or the
+    run's total when `step` is its last), the two KL summaries recomputed over
+    the prefix, and `checkpoint_seconds` cut to the rungs at or before it --
+    the numbers a run stopped at that step would have recorded, so a rung's
+    study record carries the same fields as the study's with the same
+    meaning. `checkpoint_seconds` keys may be int or str (a JSON round trip
+    makes them str)."""
+    step = int(step)
+    n = len(history["loss"])
+    if not 1 <= step <= n:
+        raise ValueError(f"step {step} is outside the history's 1..{n}")
+    recorded = {int(k): float(v) for k, v in dict(history.get("checkpoint_seconds", {})).items()}
+    if step in recorded:
+        seconds = recorded[step]
+    elif step == n:
+        seconds = float(history["seconds"])
+    else:
+        raise ValueError(
+            f"no checkpoint_seconds entry for step {step}; the trainer records one per rung "
+            f"and this history has {sorted(recorded)}"
+        )
+    parts = [dict(p) for p in list(history["parts"])[:step]]
+    kl_values = [float(p["kl_dyn"]) for p in parts]
+    return {
+        "arm": history["arm"],
+        "steps": step,
+        "loss": [float(v) for v in list(history["loss"])[:step]],
+        "parts": parts,
+        "seconds": seconds,
+        "kl_dyn_max": max(kl_values, default=0.0),
+        "kl_rate_above_free_bits": _kl_rate(kl_values),
+        "checkpoint_seconds": {k: v for k, v in recorded.items() if k <= step},
+    }
