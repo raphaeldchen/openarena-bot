@@ -77,7 +77,7 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import Trajectories, reference_trajectories
 from mbfps.eval.probe import fit_probes
-from mbfps.eval.rollout import evaluate_rollout
+from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.study import (
     SPLIT_SEED,
     StudyJob,
@@ -1153,11 +1153,27 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_cell(args, cell: Cell, device, train, val) -> tuple[int, dict | None]:
-    """One cell: 12, the protocol (14), the refit, the reproduction (14), the
-    reference pass, 30, the record. Returns `(EXIT_OK, record)` once the
-    record is written, `(status, None)` on any refusal: `main` keeps the live
-    records for the pooling that follows the loop."""
+@dataclass(frozen=True)
+class Prepared:
+    """One cell past its checks: the loaded model, the refit probe, the
+    protocol kwargs every pass takes, the resolved protocol, and the val
+    rollout that reproduced the record bitwise."""
+
+    model: object
+    embedding_probe: dict
+    common: dict
+    context: int
+    horizon: int
+    reference: RolloutResult
+
+
+def prepare_cell(args, cell: Cell, device, train, val) -> tuple[int, Prepared | None]:
+    """12, the protocol (14), the refit, the reproduction (14): everything a
+    per-cell pass needs before it can start, and every refusal that comes
+    before a pass. `(EXIT_OK, Prepared)` once the record reproduces;
+    `(status, None)` with the refusal printed. Shared by this script's
+    `_run_cell` and by `scripts/split_gap.py` (imported by path), so the two
+    tools refuse a cell for the same reasons in the same words."""
     arm, seed = cell.arm, cell.seed
     names = [p.name for p in val]
     if cell.record["episodes"]["val"] != names:
@@ -1203,6 +1219,23 @@ def _run_cell(args, cell: Cell, device, train, val) -> tuple[int, dict | None]:
             f"This run used device={device} torch={torch.__version__}."
         )
         return EXIT_RECORD_MISMATCH, None
+    return EXIT_OK, Prepared(
+        model=model, embedding_probe=embedding_probe, common=common,
+        context=context, horizon=horizon, reference=reference,
+    )
+
+
+def _run_cell(args, cell: Cell, device, train, val) -> tuple[int, dict | None]:
+    """One cell: 12, the protocol (14), the refit, the reproduction (14), the
+    reference pass, 30, the record. Returns `(EXIT_OK, record)` once the
+    record is written, `(status, None)` on any refusal: `main` keeps the live
+    records for the pooling that follows the loop."""
+    arm, seed = cell.arm, cell.seed
+    status, prepared = prepare_cell(args, cell, device, train, val)
+    if status != EXIT_OK:
+        return status, None
+    context, horizon = prepared.context, prepared.horizon
+    model, embedding_probe, common = prepared.model, prepared.embedding_probe, prepared.common
 
     traj = reference_trajectories(model, val, embedding_probe, **common)
     check = self_check(traj, cell.diagnostic)

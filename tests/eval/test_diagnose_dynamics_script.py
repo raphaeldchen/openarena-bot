@@ -507,6 +507,24 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"trust_horizon collides with {other} on {clash}"
 
+    split_gap = statuses("split_gap")
+    reused_by_split_gap = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in split_gap.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_split_gap, (
+        f"split_gap shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_split_gap} is shared on purpose"
+    )
+    assert len(set(split_gap.values())) == len(split_gap), split_gap
+    assert 1 not in split_gap.values() and 2 not in split_gap.values()
+    assert split_gap["EXIT_STRATA_NOT_A_PARTITION"] == 31
+    own = set(split_gap.values()) - set(reused_by_split_gap.values()) - {0}
+    assert own == {31}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"split_gap collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys

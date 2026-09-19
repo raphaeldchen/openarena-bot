@@ -8,15 +8,12 @@ from mbfps.envs.protocol import OBS_SHAPE
 KEYS = ("health", "pos_x", "pos_y", "pos_z", "angle")
 
 
-@pytest.fixture
-def small_buffer(tmp_path):
-    """Six episodes long enough for context+horizon, with cached features.
-
-    Six, not four: `episode_split(val_fraction=0.2)` floors to zero validation
-    episodes below five and raises.
-    """
+def _build_buffer(tmp_path, n_episodes: int) -> ReplayBuffer:
+    """`n_episodes` synthetic 40-step episodes with cached features, one
+    per study backbone at its own row width. `fill` runs 1..n so the
+    six-episode fixture is exactly what it always was."""
     buf = ReplayBuffer(tmp_path / "data", capacity_transitions=100_000)
-    for fill in range(1, 7):
+    for fill in range(1, n_episodes + 1):
         t = 40
         steps = np.arange(t)
         obs = np.zeros((t + 1, *OBS_SHAPE), dtype=np.uint8)
@@ -51,3 +48,21 @@ def small_buffer(tmp_path):
             np.save(path.with_suffix(suffix),
                     rng.random((41, 64, width)).astype(np.float16))
     return buf
+
+
+@pytest.fixture
+def small_buffer(tmp_path):
+    """Six episodes long enough for context+horizon, with cached features.
+
+    Six, not four: `episode_split(val_fraction=0.2)` floors to zero validation
+    episodes below five and raises.
+    """
+    return _build_buffer(tmp_path, 6)
+
+
+@pytest.fixture
+def wide_buffer(tmp_path):
+    """Thirty episodes: `episode_split(0.2)` holds out six, leaving 24 to
+    train on -- more than `PROBE_EPISODE_LIMIT`, so the split-gap strata are
+    non-empty: train_probe 20, train_held 4, val 6."""
+    return _build_buffer(tmp_path, 30)

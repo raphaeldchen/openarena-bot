@@ -669,6 +669,41 @@ def test_a_study_record_the_rollout_no_longer_reproduces_is_exit_14(cell, capsys
     assert not (cell.out / TRUST).exists()
 
 
+def test_prepare_cell_is_the_check_and_refit_block_and_run_cell_uses_it(cell, monkeypatch):
+    """The extraction is behaviour-preserving: `prepare_cell` on the clean
+    fixture returns EXIT_OK and a `Prepared` whose val rollout IS the
+    record's curve, and `_run_cell` reaches its pass through it -- so the
+    two scripts that share it refuse a cell for one set of reasons."""
+    import argparse
+
+    from mbfps.data.buffer import ReplayBuffer
+    from mbfps.data.split import VAL_FRACTION, episode_split
+    from mbfps.utils.device import get_device
+
+    args = argparse.Namespace(out=cell.out, device="cpu", context=None, horizon=None)
+    loaded = script.load_cell(cell.out, JOB.arm, JOB.seed)
+    train, val = episode_split(
+        ReplayBuffer(cell.data, capacity_transitions=10**9).episode_paths(),
+        val_fraction=VAL_FRACTION, seed=0,
+    )
+    status, prepared = script.prepare_cell(args, loaded, get_device(prefer="cpu"), train, val)
+    assert status == script.EXIT_OK and isinstance(prepared, script.Prepared)
+    assert (prepared.context, prepared.horizon) == (CONTEXT, HORIZON)
+    assert prepared.common["context"] == CONTEXT and prepared.common["seed"] == JOB.seed
+    assert list(prepared.reference.rssm_position) == loaded.record["curves"]["rssm_position"]
+
+    calls = []
+    real = script.prepare_cell
+
+    def spy(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(script, "prepare_cell", spy)
+    assert script.main(_argv(cell)) == script.EXIT_OK
+    assert len(calls) == 1 and calls[0][1].arm == JOB.arm
+
+
 @pytest.mark.parametrize(
     "earlier, later, status",
     [

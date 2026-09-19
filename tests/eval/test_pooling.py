@@ -29,7 +29,10 @@ from mbfps.eval.pooling import (
     IncompatibleCells,
     MislabelledRecord,
     MissingCell,
+    PooledMean,
     StaleRecord,
+    UnpairedContrast,
+    _z,
     cluster_standard_error,
     cluster_threshold,
     load_cells,
@@ -42,6 +45,7 @@ from mbfps.eval.pooling import (
     read_series,
     require_compatible,
     student_t_quantile,
+    unpaired_contrast,
 )
 from mbfps.eval.study import write_record
 
@@ -731,3 +735,65 @@ def test_the_pathway_reading_is_a_function_of_the_three_verdicts_and_not_of_the_
     assert pathway_reading(treatment, control, contrast) == expected
     with pytest.raises(ValueError, match="sign"):
         pathway_reading(treatment, control, 2)
+
+
+# ---------------------------------------------------------------------------
+# unpaired_contrast -- two pools over DIFFERENT windows (two strata of one arm).
+# ---------------------------------------------------------------------------
+
+
+def _pooled(arm, rung, mean, se, *, clusters=24, windows=229, channel="free") -> PooledMean:
+    """A `PooledMean` by hand: only the fields the contrast reads carry
+    meaning; the rest are shaped correctly and otherwise inert."""
+    return PooledMean(
+        arm=arm, rung=rung, channel=channel, seeds=(0, 1, 2),
+        windows=windows, windows_excluded=0, excluded_windows=(), clusters=clusters,
+        series=np.full(windows, float(mean)), mean=float(mean), se=float(se),
+        se_independent=float("nan"), z=_z(float(mean), float(se)),
+    )
+
+
+def test_unpaired_contrast_differences_the_means_adds_the_variances_and_takes_the_smaller_cluster_count():
+    """0.62 - 0.22 = 0.40; se sqrt(0.03^2 + 0.04^2) = 0.05 EXACTLY (a 3-4-5
+    triangle, so no rounding); z = 8. Clusters 24 against 78: the ruler is
+    read against the smaller, conservative for the larger."""
+    held = _pooled("frozen_ssl", "train_held", 0.62, 0.03, clusters=78, windows=740)
+    val = _pooled("frozen_ssl", "val", 0.22, 0.04, clusters=24, windows=229)
+    c = unpaired_contrast(held, val)
+    assert isinstance(c, UnpairedContrast)
+    assert (c.a, c.b, c.channel) == ("frozen_ssl/train_held", "frozen_ssl/val", "free")
+    assert c.mean == pytest.approx(0.40)
+    assert c.se == pytest.approx(0.05)
+    assert c.z == pytest.approx(8.0)
+    assert (c.windows_a, c.windows_b, c.clusters) == (740, 229, 24)
+    flipped = unpaired_contrast(val, held)
+    assert flipped.mean == pytest.approx(-0.40) and flipped.z == pytest.approx(-8.0)
+
+
+def test_unpaired_contrast_identical_means_give_zero_and_a_lone_ruler_passes_through():
+    c = unpaired_contrast(
+        _pooled("pixel_ae", "train_held", 0.5, 0.02), _pooled("pixel_ae", "val", 0.5, 0.0)
+    )
+    assert c.mean == 0.0 and c.se == pytest.approx(0.02) and c.z == 0.0
+
+
+def test_unpaired_contrast_nan_ruler_propagates_and_never_falls_back():
+    """A clustered SE that could not be estimated (one cluster) is NaN, and so
+    is the contrast's -- `_z`'s policy, never the naive standard error."""
+    c = unpaired_contrast(
+        _pooled("pixel_ae", "train_held", 0.5, float("nan"), clusters=1),
+        _pooled("pixel_ae", "val", 0.2, 0.01),
+    )
+    assert c.mean == pytest.approx(0.3)
+    assert np.isnan(c.se) and np.isnan(c.z)
+    assert c.clusters == 1
+
+
+def test_unpaired_contrast_refuses_a_different_reading_and_a_pool_against_itself():
+    with pytest.raises(IncompatibleCells, match="not the same reading"):
+        unpaired_contrast(
+            _pooled("pixel_ae", "train_held", 0.5, 0.1, channel="free"),
+            _pooled("pixel_ae", "val", 0.5, 0.1, channel="probe"),
+        )
+    with pytest.raises(IncompatibleCells, match="against itself"):
+        unpaired_contrast(_pooled("pixel_ae", "val", 0.5, 0.1), _pooled("pixel_ae", "val", 0.4, 0.1))
