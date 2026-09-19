@@ -153,9 +153,10 @@ SURVIVAL_STEPS = _split.SURVIVAL_STEPS
 
 PHASES: tuple[str, ...] = ("train", "evaluate", "read", "all")
 ANCHOR_POLICIES: tuple[str, ...] = ("hard", "report")
-ANCHOR_DEFAULT: str = "report"
-"""The smoke run's measurement pins this (spec 2.4, Task 7); until then the
-default is the policy that cannot stop a run."""
+ANCHOR_DEFAULT: str = "hard"
+"""Pinned by the smoke run (spec 2.4): random_vit/s0 retrained 5,000 steps on
+mps under torch 2.13.0 reproduced the M3c record's per-step loss with max
+|delta| exactly 0.0 at every step, so a retrain that does not is refused."""
 
 
 # ---------------------------------------------------------------------------

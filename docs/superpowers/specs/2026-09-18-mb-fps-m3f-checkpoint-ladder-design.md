@@ -45,6 +45,8 @@ The other rungs are evaluated for the shape of `H*(step)`, `gap_closed(step)` an
 
 **Anchor.** After each cell trains, `anchor_delta(retrain.loss, reference.history.loss, STEPS)` = max |Δ| over the first 5,000 per-step losses. The smoke run (one cell, the full 5,000 steps, `--anchor report`) measures it once. If it is exactly 0.0, MPS training is deterministic on this box and the real run pins `--anchor hard`: a non-zero delta is **exit 32 `EXIT_ANCHOR_MISMATCH`**, naming the cell and the first differing step, and every rung is then a state the original run passed through. If it is not 0.0, the real run pins `--anchor report`: the delta is printed in the anchor table and the results say the rungs are "a run with this seed", not the original run's states. The policy is written into this spec as one sentence after the smoke, marked as such, and not changed after the real run.
 
+*Pinned after the smoke run (random_vit/s0, 5,000 steps, MPS, torch 2.13.0, code state `3d6c562`, 2026-09-19): the anchor delta measured exactly 0.0 at every one of the 5,000 steps, so the real run is `--anchor hard` and every rung is a state the original run passed through.*
+
 **Self-checks**, per cell, by phase — `train`: 11, 32; `evaluate`: 11, then rung 20000's 12, 14, 30 **before any rung of that cell is evaluated**, then per rung 33, 12, 14 — with their exit statuses:
 
 | exit | check | meaning |
