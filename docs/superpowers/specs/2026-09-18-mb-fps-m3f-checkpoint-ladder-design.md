@@ -25,7 +25,7 @@ All nine cells (3 arms × 3 seeds), retrained with the study's configuration —
 
 ### 2.2 The primary rung
 
-Per cell, the primary rung is the rung nearest the step at which the 100-step moving mean of the cell's `embedding` term reached its minimum in the M3c record — M3e's `learning_curve_summary(history, window=100)["embedding"]["min_step"]`, recomputed from the reference record at run time — with ties to the earlier rung and a minimum beyond the ladder mapped to the last rung: `primary_rung(min_step, rungs)`. The rule is code; the values it yields on the shipped records are listed here so they are on record before the run:
+Per cell, the primary rung is the rung nearest the step at which the 100-step moving mean of the cell's `embedding` term reached its minimum in the M3c record — M3e's `learning_curve_summary(history, window=100)["terms"]["embedding"]["smoothed_min_step"]`, recomputed from the reference record at run time — with ties to the earlier rung and a minimum beyond the ladder mapped to the last rung: `primary_rung(min_step, rungs)`. The rule is code; the values it yields on the shipped records are listed here so they are on record before the run:
 
 | cell | `embedding` min step (M3e) | primary rung |
 |---|---|---|
@@ -116,9 +116,9 @@ A single-seed leaf has no replication clause: a clearing seed reads `EARLIER_BET
 
 Five units, one job each; three extend what exists, two are new.
 
-**`src/mbfps/training/world_model.py`** — `train_world_model(cfg, buffer, out_dir, log_every=100, checkpoint_steps: tuple[int, ...] = ())`. When `step + 1` is in `checkpoint_steps` and `out_dir` is set: `torch.save({"arm", "seed", "step", "state_dict"}, out_dir / f"step{N}" / f"world_model_{arm}_seed{seed}.pt")` and `history["checkpoint_seconds"][N] = elapsed`. The default `()` leaves the final save and the history byte-identical; a step beyond `cfg.train.steps` is a `ValueError` before training starts. Pinned: default unchanged; `(2, 4)` on a tiny config writes two labelled files and two elapsed times, and the step-4 `state_dict` equals the final when `steps=4`; two runs from one seed give identical loss histories on CPU (the anchor's premise, where it can be asserted in a test).
+**`src/mbfps/training/world_model.py`** — `train_world_model(cfg, buffer, out_dir, log_every=100, checkpoint_steps: tuple[int, ...] = ())`, and `history_at(history, step) -> dict`, which slices a training history to a prefix and recomputes the derived fields (`seconds` from `checkpoint_seconds`, the two KL summaries over the prefix) beside the `_kl_rate` it needs. When `step + 1` is in `checkpoint_steps` and `out_dir` is set: `torch.save({"arm", "seed", "step", "state_dict"}, out_dir / f"step{N}" / f"world_model_{arm}_seed{seed}.pt")` and `history["checkpoint_seconds"][N] = elapsed`. The default `()` leaves the final save and the history byte-identical; a step beyond `cfg.train.steps` is a `ValueError` before training starts. Pinned: default unchanged; `(2, 4)` on a tiny config writes two labelled files and two elapsed times, and the step-4 `state_dict` equals the final when `steps=4`; a shorter run's losses are the longer run's prefix on CPU (the anchor's premise, where it can be asserted in a test); `history_at` on a synthetic history.
 
-**`src/mbfps/eval/study.py`** — `evaluate_job(job, buffer, out_dir, *, history, steps, seq_len, context, horizon, device) -> dict`: the block of `run_job` from the checkpoint load to `write_record`, moved, unchanged; `run_job` = `train_world_model` + `evaluate_job`. `history_at(history, step) -> dict` slices a training history to a prefix and recomputes the derived fields, beside `history_record`. Pinned: `run_job`'s record on the fixture equals `train_world_model` + `evaluate_job`'s in the sanitised projection; `history_at` on a synthetic history.
+**`src/mbfps/eval/study.py`** — `evaluate_job(job, buffer, out_dir, *, history, steps, seq_len, context, horizon, device) -> dict`: the block of `run_job` from the checkpoint load to `write_record`, moved, unchanged; `run_job` = `train_world_model` + `evaluate_job`. Pinned: `run_job`'s record on the fixture equals `train_world_model` + `evaluate_job`'s in the sanitised projection.
 
 **`src/mbfps/eval/objective.py`** (new) — `val_objective(model, buffer, paths, cfg, device, *, batches=50, seed=0) -> dict[str, float]`: mean `loss` and mean of each `parts` entry over `batches` draws from `SequenceLoader(buffer, batch_size=cfg.train.batch_size, seq_len=cfg.train.seq_len, seed=seed, paths=paths, ...)` with the model in eval mode and no gradient. Pinned: finite, seed-deterministic, different for two differently initialised models, and equal to `model(batch)`'s own `parts` on one batch.
 
@@ -141,7 +141,7 @@ Five units, one job each; three extend what exists, two are new.
 
 ## 6. The run
 
-- **Smoke:** `random_vit`/s0, `--phase all --anchor report` — the full 5,000 steps (~22 min) plus six evaluations (~12 min). Its anchor delta pins `--anchor` (§2.4); its `ladder.txt` is read for format, its outputs removed before the real run so no record predates `ladder.started`.
+- **Smoke:** `random_vit`/s0, `--phase all --anchor report`, into `runs/m3f_smoke` — a directory the real run never reads, since nothing under `runs/` is ever removed — the full 5,000 steps (~22 min) plus six evaluations (~18 min). Its anchor delta pins `--anchor` (§2.4); its `ladder.txt` is read for format.
 - **Real run:** all nine cells, `--phase all`, under `caffeinate -dimsu` and `nohup`, with `ladder.started` / `ladder.head` / `ladder.finished` and the log. Cost: 9 × ~22 min training + 45 × ~3.5 min evaluation + 9 reference self-checks ≈ **6.5 h**; ~1.8 GB of checkpoints. Phases are resumable: a failure in `evaluate` is re-run on the saved checkpoints without retraining.
 - **Acceptance:** nine `ladder_*.json` at one `git_sha` == HEAD (tree clean under `src/` and `scripts/`), device `mps`; rung 20000's self-check exactly 0.0 on 9/9; the anchor 0.0 on 9/9 under `hard`; 229 windows over 24 clusters on every rung of every cell; the primary rungs equal to §2.2's table.
 
@@ -149,8 +149,8 @@ Five units, one job each; three extend what exists, two are new.
 
 | file | change |
 |---|---|
-| `src/mbfps/training/world_model.py` | `checkpoint_steps`, the rung saves, `checkpoint_seconds` |
-| `src/mbfps/eval/study.py` | `evaluate_job` extracted from `run_job`; `history_at` |
+| `src/mbfps/training/world_model.py` | `checkpoint_steps`, the rung saves, `checkpoint_seconds`; `history_at` |
+| `src/mbfps/eval/study.py` | `evaluate_job` extracted from `run_job` |
 | `src/mbfps/eval/objective.py` | new: `val_objective` |
 | `src/mbfps/eval/ladder.py` | new: the constants, `primary_rung`, `anchor_delta`, Reading T |
 | `scripts/checkpoint_ladder.py` | new: the three phases, records, pooling, Reading T, figure, `ladder.txt` |
