@@ -1343,8 +1343,10 @@ def test_cell_series_carries_the_summarys_windows_and_the_identity_it_is_given()
     assert s.windows_total == 4 and s.val == ("ep0", "ep1")
     assert (s.horizon, s.context, s.device, s.torch_version) == (3, 2, "cpu", "2.13.0")
     assert s.embedding is None and s.noise is None
+    # Windows 0, 1 and 3 are kept (window 2 is `changed=False`): the mean
+    # over [1.0, 0.0, 0.0] is 1/3, whatever window 2 holds.
     pooled = pooling.pool_arm([s])
-    assert pooled.mean == pytest.approx(2 / 3) and pooled.windows == 3
+    assert pooled.mean == pytest.approx(1 / 3) and pooled.windows == 3
 
 
 def test_cell_series_refuses_values_that_are_not_one_per_window():
