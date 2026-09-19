@@ -351,3 +351,182 @@ def test_rung_cell_carries_the_rung_records_own_protocol_in_the_diagnostics_slot
     assert cell.record["steps"] == 2 and cell.checkpoint.is_file()
     with pytest.raises(script.CellMissing, match="no checkpoint"):
         script.rung_cell(evaluated.ladder / "step3", JOB.arm, JOB.seed)
+
+
+# ---------------------------------------------------------------------------
+# read (Task 6): pooling glue on fabricated records, then the fixture run.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.ladder import DECISION_H  # noqa: E402
+
+
+def _fake_entry(step: int, crossing, *, windows: int, horizon: int, measurable: bool, r2: float) -> dict:
+    crossing = np.asarray(crossing, dtype=float)
+    moved = np.ones((windows, horizon), dtype=bool)
+    margin = np.tile(np.arange(1, horizon + 1, dtype=float), (windows, 1))
+    return {
+        "step": step, "record_git_sha": "ref",
+        "gate": {"gap_final": 0.1, "steps_degenerate": 0},
+        "probe": {"selection_r2": r2, "measurable": measurable},
+        "objective": {k: 0.1 for k in OBJECTIVE_KEYS},
+        "train_embedding": 0.1,
+        "self_check": ({"reference_position_max_delta": 0.0, "persistence_position_max_delta": 0.0,
+                        "windows_total_match": True, "windows_episode_match": True, "ok": True}
+                       if step == REFERENCE_RUNG else None),
+        "summary": {
+            "windows": {"total": windows, "episode": [0, 0, 1, 1][:windows], "clusters": 2},
+            "crossing": {"free": crossing.tolist(), "probe": crossing.tolist()},
+            "margin": {"free": margin.tolist(), "probe": margin.tolist()},
+            "moved": moved.tolist(),
+            "first_moved": [1.0] * windows,
+            "survival": {"free": [1.0] * (horizon + 1), "probe": [1.0] * (horizon + 1)},
+            "trust_horizon": {"free": {"q50": 1, "q75": 1, "q90": 0}, "probe": {"q50": 1, "q75": 1, "q90": 0}},
+            "counts": {"not_moved": [0] * horizon, "never_moved": 0},
+        },
+    }
+
+
+def _fake_record(seed: int, *, primary: int, crossing_primary, crossing_reference,
+                 measurable_reference: bool = True, r2: float = 0.5) -> dict:
+    kw = dict(windows=4, horizon=3, r2=r2)
+    entries = {
+        "2": _fake_entry(2, crossing_primary if primary == 2 else [1, 1, 1, 1], measurable=True, **kw),
+        "4": _fake_entry(4, crossing_primary if primary == 4 else [1, 1, 1, 1], measurable=True, **kw),
+        str(REFERENCE_RUNG): _fake_entry(REFERENCE_RUNG, crossing_reference, measurable=measurable_reference, **kw),
+    }
+    return {
+        "arm": "random_vit", "seed": seed, "context": 2, "horizon": 3, "device": "cpu",
+        "torch_version": "t", "episodes": {"val": ["a", "b"]}, "primary_rung": primary,
+        "rungs": [2, 4], "entries": entries,
+    }
+
+
+def test_survival_series_is_the_indicator_over_the_windows_that_ever_moved():
+    r = _fake_record(0, primary=2, crossing_primary=[3, 3, float("nan"), 1], crossing_reference=[1, 1, 1, 1])
+    s = script.survival_series(r, 2, "free", 2, "random_vit@primary")
+    assert s.arm == "random_vit@primary" and s.rung == "val" and s.channel == "S/free"
+    assert s.delta.tolist() == [1.0, 1.0, 0.0, 0.0]
+    assert s.changed.tolist() == [True, True, False, True]
+    assert s.episode.tolist() == [0, 0, 1, 1] and s.windows_total == 4
+
+
+def test_margin_series_masks_by_moved_at_h_not_ever_moved():
+    r = _fake_record(0, primary=2, crossing_primary=[3, 3, 3, 3], crossing_reference=[1, 1, 1, 1])
+    r["entries"]["2"]["summary"]["moved"][1][1] = False
+    s = script.margin_series(r, 2, "probe", 2, "random_vit@primary")
+    assert s.channel == "margin/probe" and s.delta.tolist() == [2.0, 2.0, 2.0, 2.0]
+    assert s.changed.tolist() == [True, False, True, True]
+
+
+def test_arm_inputs_pairs_each_seeds_primary_rung_against_its_reference_on_the_same_windows():
+    """Seed 0's primary is rung 2, seed 1's is rung 4; at h=2 the indicator is
+    `crossing > 2`. Treatment seed-mean [1, .5, .5, 0] against control [0, 0,
+    0, 0]: the paired mean is 0.5, over 2 episode clusters."""
+    records = {
+        ("random_vit", 0): _fake_record(0, primary=2, crossing_primary=[3, 3, 1, 1], crossing_reference=[1, 1, 1, 1]),
+        ("random_vit", 1): _fake_record(1, primary=4, crossing_primary=[3, 1, 3, 1], crossing_reference=[1, 1, 1, 1]),
+    }
+    a = script.arm_inputs(records, "random_vit", [0, 1], h=2)
+    assert a.primary_rungs == {0: 2, 1: 4}
+    assert a.t_free.estimate == pytest.approx(0.5) and a.t_free.clusters == 2
+    assert a.t_probe.estimate == pytest.approx(0.5)
+    assert a.per_seed[0].t_free.estimate == pytest.approx(0.5) and a.per_seed[0].per_seed is None
+    assert a.per_seed[1].t_free.estimate == pytest.approx(0.5) and a.per_seed[1].primary_rungs == {1: 4}
+
+
+def test_a_cell_unmeasurable_at_either_rung_leaves_the_probe_channel_only():
+    records = {
+        ("random_vit", 0): _fake_record(0, primary=2, crossing_primary=[3, 3, 3, 3], crossing_reference=[1, 1, 1, 1],
+                                        measurable_reference=False),
+    }
+    a = script.arm_inputs(records, "random_vit", [0], h=2)
+    assert a.t_free.estimate == pytest.approx(1.0)
+    assert np.isnan(a.t_probe.estimate) and a.t_probe.clusters == 0
+    # The sensitivity line drops a low-R2 cell the same way.
+    low = _fake_record(0, primary=2, crossing_primary=[3, 3, 3, 3], crossing_reference=[1, 1, 1, 1], r2=0.05)
+    b = script.arm_inputs({("random_vit", 0): low}, "random_vit", [0], h=2, min_r2=0.1)
+    assert np.isnan(b.t_probe.estimate) and b.t_free.estimate == pytest.approx(1.0)
+
+
+def test_timing_inputs_reads_z_fam_off_the_val_clusters_and_orders_the_arms():
+    records = {
+        ("random_vit", 0): _fake_record(0, primary=2, crossing_primary=[3, 3, 3, 3], crossing_reference=[1, 1, 1, 1]),
+    }
+    inputs = script.timing_inputs(records, arms=["random_vit"], seeds=[0], h=2)
+    assert inputs.h == 2 and list(inputs.arms) == ["random_vit"]
+    assert inputs.z_fam == pytest.approx(script.pooling.cluster_threshold(6, 2))
+
+
+def test_decision_horizon_is_fifteen_unless_the_run_is_shorter():
+    assert script.decision_horizon(45) == (DECISION_H, False)
+    assert script.decision_horizon(3) == (3, True)
+
+
+@pytest.fixture
+def ladder_run(evaluated, capsys):
+    status = _run(evaluated, "--phase", "read")
+    out = capsys.readouterr().out
+    assert status == script.EXIT_OK, out
+    return types.SimpleNamespace(cell=evaluated, out=out, text=(evaluated.ladder / "ladder.txt").read_text())
+
+
+def test_read_writes_ladder_txt_identical_to_stdout(ladder_run):
+    assert ladder_run.text == ladder_run.out
+    assert (ladder_run.cell.ladder / "ladder_curves.png").is_file()
+
+
+def test_read_prints_every_block_in_order(ladder_run):
+    text = ladder_run.text
+    headers = [
+        "--- anchor:", "--- primary rung per cell:", "--- reference self-check",
+        "--- the gate at every rung:", "--- survival per rung:", "--- conditional survival per rung:",
+        "--- the validation objective per rung", "  pooling: z_fam = cluster_threshold(6, 6)",
+        "--- Reading T:", "--- T at the reported horizons", "--- sensitivity", "--- per seed",
+        "figure=",
+    ]
+    positions = [text.index(h) for h in headers]
+    assert positions == sorted(positions), "the blocks are printed in the spec's order"
+    assert "verdict: random_vit" in text and "decided by:" in text
+    assert f"h={HORIZON}" in text and "(pre-registered DECISION_H = 15)" in text, \
+        "the fixture's horizon is 3, so the decision horizon is clamped and says so"
+    assert "GATE PASSES" in text or "gap_closed(3)" in text
+    assert "20000" in text
+
+
+def test_a_single_seed_run_reads_this_seed_alone_per_seed_and_zero_of_one_pooled(ladder_run):
+    text = ladder_run.text
+    assert "  random_vit  s1:" in text
+    # With one seed the pooled reading can never replicate: whatever the
+    # fixture's contrast is, the status is NO DIFFERENCE and the rule says why
+    # if it cleared.
+    line = next(l for l in text.splitlines() if l.startswith("  verdict: random_vit"))
+    assert "NO DIFFERENCE" in line
+    assert ("does not clear" in line) or ("only 1 of 1 seeds" in line)
+
+
+def test_read_refuses_a_ladder_record_whose_self_check_is_not_ok(evaluated, capsys):
+    _doctor(evaluated.ladder / LADDER, lambda r: r["entries"][str(REFERENCE_RUNG)]["self_check"].update({"ok": False}))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    assert "SELF-CHECK FAILED" in capsys.readouterr().out
+    assert not (evaluated.ladder / "ladder.txt").exists()
+
+
+def test_read_without_a_ladder_record_is_exit_11(trained, capsys):
+    assert _run(trained, "--phase", "read") == script.EXIT_NO_CHECKPOINTS
+    assert "NO CELL" in capsys.readouterr().out
+
+
+def test_write_curves_handles_a_missing_matplotlib_by_costing_the_figure_only(evaluated, monkeypatch, tmp_path):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_matplotlib(name, *args, **kwargs):
+        if name.startswith("matplotlib"):
+            raise ImportError("no matplotlib here")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_matplotlib)
+    records = {(JOB.arm, JOB.seed): load_record(evaluated.ladder / LADDER)}
+    line = script.write_curves(records, tmp_path / "curves.png", LADDER_RUNGS)
+    assert line.startswith("figure NOT written:") and not (tmp_path / "curves.png").exists()

@@ -18,7 +18,7 @@ its own loss minimum rolls out better (spec 2026-09-18 M3f):
             prepare_cell reads it back, the trust pass, the objective. One
             ladder_<arm>_seed<n>.json per cell holding all six rungs.
   read      pool the ladder records, decide Reading T, print the tables,
-            write ladder.txt and ladder_curves.png (Task 6).
+            write ladder.txt and ladder_curves.png.
 
 LOADING IS `trust_horizon.py`'S: `Cell`, `load_cell`, `self_check`,
 `prepare_cell` and the checkpoint path are imported by path, and the trust
@@ -47,6 +47,9 @@ THE CHECKS, BY PHASE, each with its own status:
                                           any rung of the cell is evaluated.
             EXIT_RUNG_MISLABELLED (33)    NEW. a rung checkpoint's arm, seed or
                                           step is not the rung's.
+  read:     EXIT_NO_CHECKPOINTS (11)     a requested ladder record is missing.
+            EXIT_SELF_CHECK_FAILED (30)   a ladder record's recorded reference
+                                          self-check is not ok.
 
 11 / 12 / 14 / 30 carry `trust_horizon.py`'s meanings on purpose; 32 and 33
 are in no other tool's range (run_study 1/3-6/23, report_study 7-10, spike
@@ -67,17 +70,40 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import reference_trajectories
+import mbfps.eval.pooling as pooling
 from mbfps.eval.ladder import (
     CURVE_WINDOW,
+    DECISION_H,
+    FAMILY,
     OBJECTIVE_BATCHES,
+    R2_SENSITIVITY,
     REFERENCE_RUNG,
+    REPORTED_H,
     RUNGS,
     STEPS,
+    ArmInputs,
+    TimingInputs,
     anchor_delta,
+    format_reading_timing,
+    gate_passes,
     primary_rung,
+    reading_timing,
 )
 from mbfps.eval.objective import val_objective
-from mbfps.eval.split_gap import learning_curve_summary, stratum_summary
+from mbfps.eval.split_gap import (
+    CHANNELS,
+    TERMS,
+    StratumContrast,
+    cell_series,
+    decision_horizon,
+    learning_curve_summary,
+    margin_at,
+    q_key,
+    stratum_summary,
+    survival_indicator,
+)
+from mbfps.eval.trust import survival, trust_horizon
+from mbfps.eval.trust_readings import ARMS_ORDER, Q_REPORTED
 from mbfps.eval.study import (
     SPLIT_SEED,
     StudyJob,
@@ -121,7 +147,11 @@ EXIT_RUNG_MISLABELLED = 33
 """0 / 11 / 12 / 14 / 30 are `trust_horizon.py`'s, imported so they cannot
 drift; 32 and 33 are new and in no other tool's range."""
 
-PHASES: tuple[str, ...] = ("train", "evaluate", "all")
+_split = _sibling("split_gap")
+SURVIVAL_STEPS = _split.SURVIVAL_STEPS
+"""The survival table's columns, M3d's and M3e's, filtered to <= the run's horizon."""
+
+PHASES: tuple[str, ...] = ("train", "evaluate", "read", "all")
 ANCHOR_POLICIES: tuple[str, ...] = ("hard", "report")
 ANCHOR_DEFAULT: str = "report"
 """The smoke run's measurement pins this (spec 2.4, Task 7); until then the
@@ -455,6 +485,477 @@ def evaluate_cell(args, buffer, arm: str, seed: int, device, train, val, rungs) 
 
 
 # ---------------------------------------------------------------------------
+# read: pooling glue -- ladder records -> the inputs Reading T is decided on.
+# ---------------------------------------------------------------------------
+# Every estimator is `pooling.py`'s. What is decided here is only WHICH
+# series goes in under WHICH mask (spec 3.1): the survival indicator over the
+# windows that moved within the horizon; the margin over the windows moved AT
+# h. The rung contrast is the PAIRED one -- both rungs score the same val
+# windows -- with the two rung groups labelled as two arms so
+# `paired_contrast` reads them as such.
+
+
+def _entry(record: dict, step: int) -> dict:
+    return record["entries"][str(int(step))]
+
+
+def _series(record: dict, step: int, channel: str, values, changed, label: str) -> pooling.CellSeries:
+    """One per-window series of one cell at one rung, through
+    `split_gap.cell_series`. `arm` is the GROUP label (`<arm>@primary` /
+    `<arm>@20000`): the two rung groups of one arm are two "arms" on the same
+    windows to `paired_contrast`, which refuses an arm against itself. `rung`
+    is the stratum (val); `channel` the reading."""
+    return cell_series(
+        _entry(record, step)["summary"], values, changed,
+        arm=label, seed=record["seed"], rung="val", channel=channel,
+        val=record["episodes"]["val"], horizon=record["horizon"], context=record["context"],
+        device=record["device"], torch_version=record["torch_version"],
+    )
+
+
+def survival_series(record: dict, step: int, channel: str, h: int, label: str) -> pooling.CellSeries:
+    """`split_gap.survival_indicator` on this rung's summary: `1[h_x > h]`
+    over the windows that moved within the horizon."""
+    return _series(record, step, f"S/{channel}", *survival_indicator(_entry(record, step)["summary"], channel, h), label)
+
+
+def margin_series(record: dict, step: int, channel: str, h: int, label: str) -> pooling.CellSeries:
+    """`split_gap.margin_at` on this rung's summary: `Delta(h)` over the
+    windows moved AT h."""
+    return _series(record, step, f"margin/{channel}", *margin_at(_entry(record, step)["summary"], channel, h), label)
+
+
+_NO_CONTRAST = StratumContrast(estimate=float("nan"), se=float("nan"), z=float("nan"), clusters=0)
+
+
+def _paired(treatment, control) -> StratumContrast:
+    """`pooling.paired_contrast`, or the NaN contrast when there is nothing to
+    pair -- no cell, or no window every cell of both groups changed."""
+    if not treatment or not control:
+        return _NO_CONTRAST
+    if not np.logical_and.reduce([c.changed for c in list(treatment) + list(control)]).any():
+        return _NO_CONTRAST
+    c = pooling.paired_contrast(treatment, control)
+    return StratumContrast(estimate=c.mean, se=c.se, z=c.z, clusters=c.clusters)
+
+
+def _probe_ok(record: dict, step: int, min_r2: float | None) -> bool:
+    entry = _entry(record, step)
+    if not entry["probe"]["measurable"]:
+        return False
+    if min_r2 is None:
+        return True
+    r2 = float(entry["probe"]["selection_r2"])
+    return bool(np.isfinite(r2) and r2 >= min_r2)
+
+
+def _included(record: dict, channel: str, min_r2: float | None) -> bool:
+    """Spec 3.1: the free channel pools every cell; the probe channel the
+    cells measurable (and, on the sensitivity line, at or above `min_r2`) at
+    BOTH rungs of the pair."""
+    if channel == "free":
+        return True
+    return _probe_ok(record, record["primary_rung"], min_r2) and _probe_ok(record, REFERENCE_RUNG, min_r2)
+
+
+def arm_inputs(records: dict, arm: str, seeds, *, h: int, series=survival_series,
+               min_r2: float | None = None) -> ArmInputs:
+    """One arm's `ArmInputs` at step `h`: each seed's primary rung paired
+    against its reference, pooled over `seeds`, and the same within each seed
+    alone."""
+    def contrast(channel, seed_list):
+        kept = [records[(arm, s)] for s in seed_list if _included(records[(arm, s)], channel, min_r2)]
+        treatment = [series(r, int(r["primary_rung"]), channel, h, f"{arm}@primary") for r in kept]
+        control = [series(r, REFERENCE_RUNG, channel, h, f"{arm}@{REFERENCE_RUNG}") for r in kept]
+        return _paired(treatment, control)
+
+    primary = {int(s): int(records[(arm, s)]["primary_rung"]) for s in seeds}
+    per_seed = {
+        int(s): ArmInputs(
+            t_free=contrast("free", [s]), t_probe=contrast("probe", [s]),
+            primary_rungs={int(s): primary[int(s)]}, per_seed=None,
+        )
+        for s in seeds
+    }
+    return ArmInputs(
+        t_free=contrast("free", list(seeds)), t_probe=contrast("probe", list(seeds)),
+        primary_rungs=primary, per_seed=per_seed,
+    )
+
+
+def _clusters(records: dict) -> int:
+    return int(_entry(next(iter(records.values())), REFERENCE_RUNG)["summary"]["windows"]["clusters"])
+
+
+def timing_inputs(records: dict, *, arms, seeds, h: int, series=survival_series,
+                  min_r2: float | None = None) -> TimingInputs:
+    """Every arm's inputs at `h`, and `z_fam` over the val stratum's cluster
+    count (spec 3.1)."""
+    ordered = sorted(arms, key=lambda a: ARMS_ORDER.index(a) if a in ARMS_ORDER else len(ARMS_ORDER))
+    return TimingInputs(
+        arms={arm: arm_inputs(records, arm, seeds, h=h, series=series, min_r2=min_r2) for arm in ordered},
+        z_fam=pooling.cluster_threshold(FAMILY, _clusters(records)),
+        h=h,
+    )
+
+
+# `decision_horizon` is `split_gap`'s, imported: one decision horizon (M3e's
+# DECISION_H) for both readings.
+
+
+# ---------------------------------------------------------------------------
+# The printed tables.
+# ---------------------------------------------------------------------------
+
+
+def _num(value, spec: str = ".3f") -> str:
+    value = float(value)
+    return format(value, spec) if np.isfinite(value) else "n/a"
+
+
+def _cells_in_order(records: dict) -> list[tuple[str, int]]:
+    return sorted(records, key=lambda k: (ARMS_ORDER.index(k[0]) if k[0] in ARMS_ORDER else 9, k[1]))
+
+
+def _steps_in_order(rungs) -> list[int]:
+    return [*sorted(int(r) for r in rungs), REFERENCE_RUNG]
+
+
+def _anchor_table(records: dict) -> str:
+    lines = [
+        "--- anchor: the retrain's per-step loss against the reference run's (spec 2.4; exact equality) ---",
+        f"  {'arm':<12}{'seed':>5}{'steps':>7}{'policy':>8}{'max|delta|':>12}{'first_step':>11}  train git_sha",
+    ]
+    for arm, seed in _cells_in_order(records):
+        r = records[(arm, seed)]
+        a = r["anchor"]
+        first = "-" if a["first_step"] is None else str(a["first_step"])
+        lines.append(
+            f"  {arm:<12}{seed:>5}{a['steps']:>7}{a['policy']:>8}{float(a['max_delta']):>12.1e}"
+            f"{first:>11}  {r['train_git_sha'][:12]}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _primary_table(records: dict, rungs) -> str:
+    first = next(iter(records.values()))
+    lines = [
+        f"--- primary rung per cell: the rung nearest the reference run's smoothed embedding minimum "
+        f"({first['curve_window']}-step window; ties to the earlier; rungs {list(rungs)}) ---",
+        f"  {'arm':<12}{'seed':>5}{'min_step':>10}{'primary':>9}",
+    ]
+    for arm, seed in _cells_in_order(records):
+        r = records[(arm, seed)]
+        lines.append(f"  {arm:<12}{seed:>5}{r['embedding_min_step']:>10}{r['primary_rung']:>9}")
+    return "\n".join(lines) + "\n"
+
+
+def _self_check_table(records: dict) -> str:
+    lines = [
+        f"--- reference self-check (step {REFERENCE_RUNG}'s trust pass against its diagnostic; exact) ---",
+        f"  {'arm':<12}{'seed':>5}{'ref max|d|':>12}{'pers max|d|':>13}{'windows':>9}{'probe R2':>10}{'measurable':>12}  ok",
+    ]
+    for arm, seed in _cells_in_order(records):
+        e = _entry(records[(arm, seed)], REFERENCE_RUNG)
+        c = e["self_check"]
+        lines.append(
+            f"  {arm:<12}{seed:>5}{c['reference_position_max_delta']:>12.1e}"
+            f"{c['persistence_position_max_delta']:>13.1e}"
+            f"{str(c['windows_total_match'] and c['windows_episode_match']):>9}"
+            f"{_num(e['probe']['selection_r2']):>10}{str(e['probe']['measurable']):>12}  {c['ok']}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _gate_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
+    lines = [
+        f"--- the gate at every rung: gap_closed({horizon}) on position per seed (spec 4.1's metric; "
+        "NaN = non-positive band); GATE PASSES = > 0 in every seed. Reported, not decided on. ---",
+        f"  {'arm':<12}{'step':>7}" + "".join(f"{f's{s}':>10}" for s in seeds)
+        + f"{'nanmean':>10}{'degenerate':>11}  gate",
+    ]
+    for arm in arms:
+        for step in _steps_in_order(rungs):
+            finals = {int(s): float(_entry(records[(arm, s)], step)["gate"]["gap_final"]) for s in seeds}
+            degenerate = max(int(_entry(records[(arm, s)], step)["gate"]["steps_degenerate"]) for s in seeds)
+            values = list(finals.values())
+            mean = float(np.nanmean(values)) if np.isfinite(values).any() else float("nan")
+            flag = f"GATE PASSES at step {step}" if gate_passes(finals) else ""
+            lines.append(
+                f"  {arm:<12}{step:>7}" + "".join(f"{_num(finals[int(s)], '+.4f'):>10}" for s in seeds)
+                + f"{_num(mean, '+.4f'):>10}{degenerate:>11}  {flag}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _stacked(records: dict, arm: str, step: int, channel: str, seeds, key: str) -> np.ndarray:
+    """One per-window array of `key` -- `crossing` (per channel) or
+    `first_moved` -- concatenated over the seeds included in `channel` at this
+    rung: every cell in the free channel, the measurable cells in the probe
+    one."""
+    rows = []
+    for s in seeds:
+        if channel != "free" and not _probe_ok(records[(arm, s)], step, None):
+            continue
+        block = _entry(records[(arm, s)], step)["summary"]
+        rows.append(np.asarray(block["crossing"][channel] if key == "crossing" else block[key], dtype=float))
+    return np.concatenate(rows) if rows else np.zeros(0)
+
+
+def _survival_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
+    steps = [h for h in SURVIVAL_STEPS if h <= horizon]
+    lines = [
+        "--- survival per rung: S(h) = fraction of moved draws with h_x > h "
+        "(a window not yet moved at h survives vacuously, as in M3d); seeds stacked ---",
+        f"  {'arm':<12}{'step':>7}{'channel':<8}" + "".join(f"{f'S({h})':>7}" for h in steps)
+        + "".join(f"{'H*' + q_key(q)[1:]:>8}" for q in Q_REPORTED),
+    ]
+    for arm in arms:
+        for step in _steps_in_order(rungs):
+            for channel in CHANNELS:
+                crossings = _stacked(records, arm, step, channel, seeds, "crossing")
+                s = survival(crossings, horizon) if crossings.size else np.full(horizon + 1, np.nan)
+                lines.append(
+                    f"  {arm:<12}{step:>7} {channel:<7}" + "".join(f"{_num(s[h], '.2f'):>7}" for h in steps)
+                    + "".join(f"{trust_horizon(s, q):>8d}" if crossings.size else f"{'n/a':>8}" for q in Q_REPORTED)
+                )
+    return "\n".join(lines) + "\n"
+
+
+def _conditional_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
+    """M3d's `u(h)` and `S_c(h)` beside S(h), through `trust_horizon.py`'s own
+    functions imported by path; printed, never decided on."""
+    steps = [h for h in SURVIVAL_STEPS if h <= horizon]
+    lines = [
+        "--- conditional survival per rung: u(h) = unmoved fraction, S_c(h) = (S(h) - u(h)) / (1 - u(h)) "
+        "(M3d's series; printed, not decided on) ---",
+        f"  {'arm':<12}{'step':>7}{'channel':<8}" + "".join(f"{f'u({h})':>7}" for h in steps)
+        + "".join(f"{f'Sc({h})':>8}" for h in steps),
+    ]
+    for arm in arms:
+        for step in _steps_in_order(rungs):
+            for channel in CHANNELS:
+                crossings = _stacked(records, arm, step, channel, seeds, "crossing")
+                first = _stacked(records, arm, step, channel, seeds, "first_moved")
+                if not crossings.size:
+                    lines.append(f"  {arm:<12}{step:>7} {channel:<7}" + "".join(f"{'n/a':>7}" for _ in steps)
+                                 + "".join(f"{'n/a':>8}" for _ in steps))
+                    continue
+                s = (survival(crossings, horizon) if np.isfinite(crossings).any()
+                     else np.full(horizon + 1, np.nan))
+                u = _trust.unmoved_fraction(crossings, first, horizon)
+                sc = _trust.conditional_survival(s, u)
+                lines.append(
+                    f"  {arm:<12}{step:>7} {channel:<7}"
+                    + "".join(f"{_num(u[h], '.2f'):>7}" for h in steps)
+                    + "".join(f"{_num(sc[h], '.2f'):>8}" for h in steps)
+                )
+    return "\n".join(lines) + "\n"
+
+
+def _objective_table(records: dict, rungs) -> str:
+    first = next(iter(records.values()))
+    lines = [
+        f"--- the validation objective per rung (val_objective over {first['objective_batches']} draws; "
+        "descriptive, no verdict) beside the smoothed training embedding at that step ---",
+        f"  {'arm':<12}{'seed':>5}{'step':>7}{'val loss':>10}{'val emb':>9}{'train emb':>10}"
+        + "".join(f"{term:>10}" for term in TERMS if term != "embedding"),
+    ]
+    for arm, seed in _cells_in_order(records):
+        r = records[(arm, seed)]
+        best_emb = best_loss = None
+        for step in _steps_in_order(rungs):
+            e = _entry(r, step)
+            o = e["objective"]
+            lines.append(
+                f"  {arm:<12}{seed:>5}{step:>7}{_num(o['loss'], '.4f'):>10}{_num(o['embedding'], '.4f'):>9}"
+                f"{_num(e['train_embedding'], '.4f'):>10}"
+                + "".join(f"{_num(o[term], '.4f'):>10}" for term in TERMS if term != "embedding")
+            )
+            if best_emb is None or o["embedding"] < best_emb[1]:
+                best_emb = (step, o["embedding"])
+            if best_loss is None or o["loss"] < best_loss[1]:
+                best_loss = (step, o["loss"])
+        lines.append(
+            f"  {arm:<12}{seed:>5}  val embedding smallest at step {best_emb[0]}; val loss smallest at "
+            f"step {best_loss[0]}; primary rung {r['primary_rung']}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _reported_table(records: dict, arms, seeds, horizon: int) -> str:
+    steps = sorted({h for h in REPORTED_H if h <= horizon} | {horizon})
+    lines = [
+        f"--- T at the reported horizons (primary - {REFERENCE_RUNG}; z only; not decided on) ---",
+        f"  {'arm':<12}{'channel':<8}" + "".join(f"{f'z@{h}':>9}" for h in steps) + f"{'dFree@dec':>11}",
+    ]
+    dec, _ = decision_horizon(horizon)
+    for arm in arms:
+        by_h = {h: arm_inputs(records, arm, seeds, h=h) for h in steps}
+        margin = arm_inputs(records, arm, seeds, h=dec, series=margin_series).t_free
+        for channel in CHANNELS:
+            zs = [getattr(by_h[h], f"t_{channel}").z for h in steps]
+            extra = (f"{_num(margin.estimate, '+.4f')} (z {_num(margin.z, '+.2f')})"
+                     if channel == "free" else "")
+            lines.append(
+                f"  {arm:<12}{channel:<8}" + "".join(f"{_num(z, '+.2f'):>9}" for z in zs) + f"  {extra}"
+            )
+    lines.append("  dFree@dec: the paired rung difference of the embedding-space margin Delta_free "
+                 "at the decision horizon -- the continuous companion, in the loss's units.")
+    return "\n".join(lines) + "\n"
+
+
+def _sensitivity_text(records: dict, arms, seeds, h: int, z_fam: float) -> str:
+    dropped = [
+        f"{a} s{s}" for a, s in _cells_in_order(records)
+        if any(not _probe_ok(records[(a, s)], step, R2_SENSITIVITY)
+               and _probe_ok(records[(a, s)], step, None)
+               for step in (records[(a, s)]["primary_rung"], REFERENCE_RUNG))
+    ]
+    inputs = timing_inputs(records, arms=arms, seeds=seeds, h=h, min_r2=R2_SENSITIVITY)
+    lines = [
+        f"--- sensitivity (changes no verdict): probe channel with selection R2 < {R2_SENSITIVITY} at "
+        f"either rung excluded -- dropped: {', '.join(dropped) if dropped else 'none'} ---",
+    ]
+    for arm, a in inputs.arms.items():
+        lines.append(
+            f"  {arm:<12}T_probe estimate {_num(a.t_probe.estimate, '+.4f')} se "
+            f"{_num(a.t_probe.se, '.4f')} z {_num(a.t_probe.z, '+.2f')} "
+            f"(bar {z_fam:.2f}; clusters {a.t_probe.clusters})"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _per_seed_text(inputs: TimingInputs) -> str:
+    lines = ["--- per seed (the same contrast within one seed alone; no seed averaging) ---"]
+    for arm, a in inputs.arms.items():
+        for seed, leaf in sorted((a.per_seed or {}).items()):
+            leaf_reading = reading_timing(TimingInputs(arms={arm: leaf}, z_fam=inputs.z_fam, h=inputs.h)).arms[arm]
+            lines.append(
+                f"  {arm:<12}s{seed}: primary rung {leaf.primary_rungs[seed]}; T_free z "
+                f"{_num(leaf.t_free.z, '+.2f')}, T_probe z {_num(leaf.t_probe.z, '+.2f')} -> "
+                f"{leaf_reading.status.name.replace('_', ' ')}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def write_curves(records: dict, figure: Path, rungs) -> str:
+    """Three panels against the rung (the reference at the right): H*_0.75 on
+    the free channel, gap_closed at the horizon, and the validation
+    embedding; arms coloured, seeds as thin lines. A missing or broken
+    matplotlib, or an unwritable path, costs the FIGURE and nothing else
+    (report_study's guard)."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except (ImportError, ValueError, OSError) as error:
+        return f"figure NOT written: {error}"
+    colours = {"pixel_ae": "tab:orange", "frozen_ssl": "tab:blue", "random_vit": "tab:gray"}
+    steps = _steps_in_order(rungs)
+    x = np.arange(len(steps))
+    panels = (
+        ("H*_0.75, free channel", lambda e: e["summary"]["trust_horizon"]["free"][q_key(0.75)]),
+        ("gap_closed at the horizon (position)", lambda e: e["gate"]["gap_final"]),
+        ("validation embedding loss", lambda e: e["objective"]["embedding"]),
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), squeeze=False)
+    try:
+        for ax, (title, pick) in zip(axes.flat, panels):
+            for (arm, seed), record in records.items():
+                y = [float(pick(_entry(record, step))) for step in steps]
+                ax.plot(x, y, marker="o", markersize=3, color=colours.get(arm, "black"),
+                        linewidth=0.9, alpha=0.85, label=f"{arm} s{seed}")
+            if title.startswith("gap_closed"):
+                ax.axhline(0.0, color="black", linestyle=":", linewidth=0.8)
+            ax.set_title(title)
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(s) for s in steps], rotation=45)
+            ax.set_xlabel("training step (rung)")
+        handles, labels = axes.flat[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 5), fontsize=8)
+        fig.tight_layout(rect=(0, 0.12, 1, 1))
+        figure.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figure, dpi=110)
+    except (ValueError, OSError) as error:
+        return f"figure NOT written: {error}"
+    finally:
+        plt.close(fig)
+    return f"figure={figure}"
+
+
+def readings_text(records: dict, *, arms, seeds, rungs, horizon: int, figure_line: str) -> str:
+    """Everything `read` prints, in `split_gap.txt`'s style; written to
+    `ladder.txt` byte-identical."""
+    h, clamped = decision_horizon(horizon)
+    inputs = timing_inputs(records, arms=arms, seeds=seeds, h=h)
+    reading = reading_timing(inputs)
+    note = (f"  NOTE: decision horizon clamped to the run's horizon h={h} "
+            f"(pre-registered DECISION_H = {DECISION_H}).\n" if clamped else "")
+    return "".join([
+        _anchor_table(records),
+        _primary_table(records, rungs),
+        _self_check_table(records),
+        _gate_table(records, arms, seeds, rungs, horizon),
+        _survival_table(records, arms, seeds, rungs, horizon),
+        _conditional_table(records, arms, seeds, rungs, horizon),
+        _objective_table(records, rungs),
+        note,
+        f"  pooling: z_fam = cluster_threshold({FAMILY}, {_clusters(records)}) = {inputs.z_fam:.2f}; "
+        "each seed's primary rung is paired against its reference on the same val windows; the "
+        "survival indicator pools windows that moved within the horizon; the probe channel pools "
+        "cells measurable at both rungs.\n",
+        format_reading_timing(reading, inputs),
+        _reported_table(records, arms, seeds, horizon),
+        _sensitivity_text(records, arms, seeds, h, inputs.z_fam),
+        _per_seed_text(inputs),
+        f"  {figure_line}\n",
+    ])
+
+
+def write_readings(out_dir: Path, text: str) -> Path:
+    path = Path(out_dir) / "ladder.txt"
+    path.write_text(text)
+    return path
+
+
+def read_phase(args, cells, rungs) -> int:
+    """Load every requested ladder record (11), refuse one whose reference
+    self-check is not ok (30), then the figure, the text, `ladder.txt`."""
+    records: dict[tuple[str, int], dict] = {}
+    for arm, seed in cells:
+        path = ladder_record_path(args.out, arm, seed)
+        if not path.exists():
+            print(f"NO CELL: {arm} seed {seed}: no ladder record at {path}; run --phase evaluate first")
+            return EXIT_NO_CHECKPOINTS
+        records[(arm, seed)] = load_record(path)
+    for (arm, seed), record in records.items():
+        check = _entry(record, REFERENCE_RUNG)["self_check"]
+        if not check or not check.get("ok"):
+            print(
+                f"\nSELF-CHECK FAILED for {arm} seed {seed}: the ladder record's reference "
+                f"self-check is {check!r}; the record is not read against a ruler that reproduced."
+            )
+            return EXIT_SELF_CHECK_FAILED
+        if record["rungs"] != [int(r) for r in rungs]:
+            raise ValueError(
+                f"{arm} seed {seed}: the ladder record holds rungs {record['rungs']}, not the "
+                f"requested {list(rungs)}; a different ladder is a different --out"
+            )
+    horizon = int(next(iter(records.values()))["horizon"])
+    figure = args.figure if args.figure is not None else args.out / "ladder_curves.png"
+    figure_line = write_curves(records, figure, rungs)
+    text = readings_text(
+        records, arms=list(args.arms), seeds=[int(s) for s in args.seeds],
+        rungs=rungs, horizon=horizon, figure_line=figure_line,
+    )
+    print(text, end="")
+    write_readings(args.out, text)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -495,28 +996,29 @@ def main(argv: list[str] | None = None, *, rungs=RUNGS) -> int:
     device = get_device(prefer=args.device)
     cells = [(arm, int(seed)) for arm in args.arms for seed in args.seeds]
 
-    buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
-    train, val = episode_split(buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED)
-
-    references: dict[tuple[str, int], Cell] = {}
-    if args.phase in ("train", "all"):
-        # Every requested reference cell is loaded before anything trains.
-        try:
-            references = {(arm, seed): load_cell(args.reference, arm, seed) for arm, seed in cells}
-        except CellMissing as error:
-            print(f"NO CELL: {error}")
-            return EXIT_NO_CHECKPOINTS
-        args.out.mkdir(parents=True, exist_ok=True)
-
-    for arm, seed in cells:
+    if args.phase in ("train", "evaluate", "all"):
+        buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+        train, val = episode_split(buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED)
+        references: dict[tuple[str, int], Cell] = {}
         if args.phase in ("train", "all"):
-            status, _ = train_cell(args, buffer, arm, seed, references[(arm, seed)], device, rungs)
-            if status != EXIT_OK:
-                return status
-        if args.phase in ("evaluate", "all"):
-            status, _ = evaluate_cell(args, buffer, arm, seed, device, train, val, rungs)
-            if status != EXIT_OK:
-                return status
+            # Every requested reference cell is loaded before anything trains.
+            try:
+                references = {(arm, seed): load_cell(args.reference, arm, seed) for arm, seed in cells}
+            except CellMissing as error:
+                print(f"NO CELL: {error}")
+                return EXIT_NO_CHECKPOINTS
+            args.out.mkdir(parents=True, exist_ok=True)
+        for arm, seed in cells:
+            if args.phase in ("train", "all"):
+                status, _ = train_cell(args, buffer, arm, seed, references[(arm, seed)], device, rungs)
+                if status != EXIT_OK:
+                    return status
+            if args.phase in ("evaluate", "all"):
+                status, _ = evaluate_cell(args, buffer, arm, seed, device, train, val, rungs)
+                if status != EXIT_OK:
+                    return status
+    if args.phase in ("read", "all"):
+        return read_phase(args, cells, rungs)
     return EXIT_OK
 
 
