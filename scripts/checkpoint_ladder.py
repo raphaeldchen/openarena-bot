@@ -708,7 +708,7 @@ def _survival_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
     lines = [
         "--- survival per rung: S(h) = fraction of moved draws with h_x > h "
         "(a window not yet moved at h survives vacuously, as in M3d); seeds stacked ---",
-        f"  {'arm':<12}{'step':>7}{'channel':<8}" + "".join(f"{f'S({h})':>7}" for h in steps)
+        f"  {'arm':<12}{'step':>7} {'channel':<7}" + "".join(f"{f'S({h})':>7}" for h in steps)
         + "".join(f"{'H*' + q_key(q)[1:]:>8}" for q in Q_REPORTED),
     ]
     for arm in arms:
@@ -730,7 +730,7 @@ def _conditional_table(records: dict, arms, seeds, rungs, horizon: int) -> str:
     lines = [
         "--- conditional survival per rung: u(h) = unmoved fraction, S_c(h) = (S(h) - u(h)) / (1 - u(h)) "
         "(M3d's series; printed, not decided on) ---",
-        f"  {'arm':<12}{'step':>7}{'channel':<8}" + "".join(f"{f'u({h})':>7}" for h in steps)
+        f"  {'arm':<12}{'step':>7} {'channel':<7}" + "".join(f"{f'u({h})':>7}" for h in steps)
         + "".join(f"{f'Sc({h})':>8}" for h in steps),
     ]
     for arm in arms:
