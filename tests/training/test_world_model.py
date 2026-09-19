@@ -6,7 +6,7 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import Episode
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.models.rssm import KL_FREE_BITS
-from mbfps.training.world_model import WorldModel, train_world_model
+from mbfps.training.world_model import WorldModel, history_at, train_world_model
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.seeding import seed_everything
 
@@ -736,6 +736,115 @@ def test_history_records_every_step(buffer):
     assert len(history["parts"]) == 4
     assert history["seconds"] > 0
     assert history["arm"] == "cnn"
+
+
+# ---------------------------------------------------------------------------
+# M3f: a ladder of rungs during training, and a history sliced to one.
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_steps_default_leaves_the_final_save_and_the_history_as_they_were(buffer, tmp_path):
+    """The M3c study and every reader of its checkpoints must not notice this
+    change: no rung directories, the same three payload keys, and the history
+    gains only an empty `checkpoint_seconds`."""
+    out = tmp_path / "ckpt"
+    history = train_world_model(tiny(seed=3), buffer, out_dir=out)
+    assert sorted(p.name for p in out.iterdir()) == ["world_model_cnn_seed3.pt"]
+    payload = torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)
+    assert set(payload) == {"arm", "seed", "state_dict"}
+    assert history["checkpoint_seconds"] == {}
+
+
+def test_checkpoint_steps_write_labelled_rungs_in_the_studys_layout(buffer, tmp_path):
+    """Each rung is a study directory: the final checkpoint's own file name
+    under `step{N}/`, labelled with the step it was saved at, and the elapsed
+    seconds recorded so a rung's record can carry an honest `seconds`."""
+    out = tmp_path / "ckpt"
+    history = train_world_model(
+        tiny(steps=4, seed=3), buffer, out_dir=out, checkpoint_steps=(2, 4)
+    )
+    for step in (2, 4):
+        payload = torch.load(out / f"step{step}" / "world_model_cnn_seed3.pt", weights_only=True)
+        assert (payload["arm"], payload["seed"], payload["step"]) == ("cnn", 3, step)
+        assert any(k.startswith("rssm.") for k in payload["state_dict"])
+    assert sorted(history["checkpoint_seconds"]) == [2, 4]
+    assert 0.0 < history["checkpoint_seconds"][2] <= history["checkpoint_seconds"][4] <= history["seconds"]
+    # The final save is still written beside the rungs, unchanged.
+    assert set(torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)) == {"arm", "seed", "state_dict"}
+
+
+def test_the_last_rung_holds_the_same_weights_as_the_final_checkpoint(buffer, tmp_path):
+    out = tmp_path / "ckpt"
+    train_world_model(tiny(steps=4, seed=3), buffer, out_dir=out, checkpoint_steps=(4,))
+    final = torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)["state_dict"]
+    rung = torch.load(out / "step4" / "world_model_cnn_seed3.pt", weights_only=True)["state_dict"]
+    assert final.keys() == rung.keys()
+    assert all(torch.equal(final[k], rung[k]) for k in final)
+
+
+def test_a_rung_is_a_state_the_longer_run_passed_through(buffer, tmp_path):
+    """THE ANCHOR'S PREMISE (spec 2.4): the first N steps of a run do not depend
+    on how many steps follow -- the loader's draws and the optimiser's updates
+    are a function of the seed alone. Asserted on the loss curve on CPU, where
+    a test can assert it; the smoke run measures it on MPS."""
+    longer = train_world_model(tiny(steps=4, seed=3), buffer, out_dir=None)
+    shorter = train_world_model(tiny(steps=2, seed=3), buffer, out_dir=None)
+    assert shorter["loss"] == longer["loss"][:2]
+
+
+def test_a_rung_outside_the_run_or_without_an_out_dir_is_refused_before_training(buffer, tmp_path):
+    out = tmp_path / "ckpt"
+    with pytest.raises(ValueError, match="outside 1..3"):
+        train_world_model(tiny(steps=3), buffer, out_dir=out, checkpoint_steps=(5,))
+    with pytest.raises(ValueError, match="outside 1..3"):
+        train_world_model(tiny(steps=3), buffer, out_dir=out, checkpoint_steps=(0,))
+    with pytest.raises(ValueError, match="out_dir"):
+        train_world_model(tiny(steps=3), buffer, out_dir=None, checkpoint_steps=(2,))
+    assert not out.exists(), "a refused run must write nothing"
+
+
+def _four_step_history() -> dict:
+    return {
+        "arm": "cnn", "steps": 4,
+        "loss": [4.0, 3.0, 2.0, 1.0],
+        "parts": [{"embedding": 1.0, "kl_dyn": v, "kl_rep": v} for v in (0.1, 0.3, 0.3, 0.3)],
+        "seconds": 8.0, "kl_dyn_max": 0.3, "kl_rate_above_free_bits": 0.75,
+        "checkpoint_seconds": {2: 3.0, 4: 8.0},
+    }
+
+
+def test_history_at_cuts_the_prefix_and_recomputes_what_a_shorter_run_would_have_recorded():
+    """`kl_dyn` 0.1 / 0.3 / 0.3 / 0.3 against KL_FREE_BITS = 0.20: the rate over
+    the first two steps is 0.5, over all four 0.75 -- the prefix's own number,
+    not the full run's copied down."""
+    assert KL_FREE_BITS == 0.20
+    at2 = history_at(_four_step_history(), 2)
+    assert at2["steps"] == 2
+    assert at2["loss"] == [4.0, 3.0]
+    assert [p["kl_dyn"] for p in at2["parts"]] == [0.1, 0.3]
+    assert at2["seconds"] == 3.0
+    assert at2["kl_dyn_max"] == 0.3
+    assert at2["kl_rate_above_free_bits"] == 0.5
+    assert at2["checkpoint_seconds"] == {2: 3.0}
+    assert at2["arm"] == "cnn"
+    at4 = history_at(_four_step_history(), 4)
+    assert at4["kl_rate_above_free_bits"] == 0.75 and at4["seconds"] == 8.0
+    assert at4["checkpoint_seconds"] == {2: 3.0, 4: 8.0}
+
+
+def test_history_at_accepts_the_string_keys_a_json_round_trip_leaves():
+    history = _four_step_history()
+    history["checkpoint_seconds"] = {"2": 3.0, "4": 8.0}
+    assert history_at(history, 2)["seconds"] == 3.0
+
+
+def test_history_at_refuses_a_step_outside_the_history_or_one_no_rung_was_saved_at():
+    with pytest.raises(ValueError, match="outside"):
+        history_at(_four_step_history(), 5)
+    with pytest.raises(ValueError, match="outside"):
+        history_at(_four_step_history(), 0)
+    with pytest.raises(ValueError, match="checkpoint_seconds"):
+        history_at(_four_step_history(), 3)
 
 
 # --------------------------------------------------------------------------

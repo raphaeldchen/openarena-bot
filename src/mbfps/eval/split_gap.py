@@ -24,6 +24,7 @@ from itertools import combinations
 
 import numpy as np
 
+import mbfps.eval.pooling as pooling
 from mbfps.eval.diagnostics import Trajectories
 from mbfps.eval.summary import METRICS, metric_summary
 from mbfps.eval.trust import (
@@ -285,13 +286,14 @@ def train_held_passes_gate(gap_final: dict[int, float]) -> bool:
     return bool(values) and all(np.isfinite(v) and v > 0.0 for v in values)
 
 
-def _fmt(value: float, spec: str = "+.2f") -> str:
+def fmt_z(value: float, spec: str = "+.2f") -> str:
+    """A z or an estimate for a table: `spec` when finite, `nan`/`inf` spelled out otherwise."""
     return format(value, spec) if np.isfinite(value) else str(value)
 
 
 def _gate_detail(gap_final: dict[int, float]) -> str:
     return "gap_closed(45) per seed " + " / ".join(
-        f"s{seed} {_fmt(gap_final[seed], '+.3f')}" for seed in sorted(gap_final)
+        f"s{seed} {fmt_z(gap_final[seed], '+.3f')}" for seed in sorted(gap_final)
     )
 
 
@@ -318,7 +320,7 @@ def _arm_reading(arm: str, a: ArmInputs, z_fam: float) -> ArmReading:
         replicated = seeds_clearing >= SEEDS_REQUIRED
         seeds = f"{seeds_clearing} of {seeds_total} seeds"
     unanimous = train_held_passes_gate(a.train_held_gap_final)
-    fz, pz, bar = _fmt(a.gap_free.z), _fmt(a.gap_probe.z), f"{z_fam:.2f}"
+    fz, pz, bar = fmt_z(a.gap_free.z), fmt_z(a.gap_probe.z), f"{z_fam:.2f}"
     if (free_up and probe_down) or (free_down and probe_up):
         status = Status.UNRESOLVED_PROBE
         rule = f"G_free z {fz} and G_probe z {pz} both clear +-{bar} with opposite signs"
@@ -369,8 +371,8 @@ def format_reading_gap(reading: GapReading, inputs: GapInputs) -> str:
         for channel, c in (("free", a.gap_free), ("probe", a.gap_probe)):
             verdict = "yes" if clears(abs(c.z), reading.z_fam) else "no"
             lines.append(
-                f"  {arm:<12}{channel:<9}{_fmt(c.estimate, '+.4f'):>10}{_fmt(c.se, '.4f'):>9}"
-                f"{_fmt(c.z):>8}  {verdict}"
+                f"  {arm:<12}{channel:<9}{fmt_z(c.estimate, '+.4f'):>10}{fmt_z(c.se, '.4f'):>9}"
+                f"{fmt_z(c.z):>8}  {verdict}"
             )
     lines.append("  train_held, spec 4.1 (gap_closed(45) position > 0 in every seed):")
     for arm, a in inputs.arms.items():
@@ -430,3 +432,54 @@ def learning_curve_summary(history: dict, window: int = 100) -> dict:
             "smoothed_final": float(smoothed[-1]),
         }
     return {"steps": n, "window": window, "quarter": int(quarter), "terms": terms}
+
+
+# ---------------------------------------------------------------------------
+# From a stratum summary to the series the pool reads (spec 3.1; shared with
+# the M3f ladder, which pools a rung's summary the same way).
+# ---------------------------------------------------------------------------
+
+
+def survival_indicator(summary: dict, channel: str, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """`1[h_x > h]` per window, and the mask of the windows that moved within
+    the horizon (finite crossing) -- so the pooled mean is S(h) exactly."""
+    crossing = np.asarray(summary["crossing"][channel], dtype=float)
+    return (crossing > h).astype(float), np.isfinite(crossing)
+
+
+def margin_at(summary: dict, channel: str, h: int) -> tuple[np.ndarray, np.ndarray]:
+    """`Delta(h)` per window, and the mask of the windows moved AT h whose
+    margin is a number."""
+    values = np.asarray(summary["margin"][channel], dtype=float)[:, h - 1]
+    moved = np.asarray(summary["moved"], dtype=bool)[:, h - 1]
+    return values, moved & np.isfinite(values)
+
+
+def cell_series(summary: dict, values, changed, *, arm: str, seed: int, rung: str, channel: str,
+                val, horizon: int, context: int, device: str, torch_version: str) -> pooling.CellSeries:
+    """One per-window series of one cell, in the shape the pool reads: the
+    summary's window index as the cluster labels, `values` under `changed`,
+    and the identity `require_compatible` checks. `arm` and `rung` are
+    labels: the split gap passes the arm and the stratum, the ladder a rung
+    group and `val`."""
+    values = np.asarray(values, dtype=float)
+    changed = np.asarray(changed, dtype=bool)
+    episode = np.asarray(summary["windows"]["episode"], dtype=int)
+    if not (values.shape == changed.shape == episode.shape):
+        raise ValueError(
+            f"{arm} seed {seed} {rung}/{channel}: values {values.shape}, changed {changed.shape} "
+            f"and windows.episode {episode.shape} must all be (n_windows,)"
+        )
+    return pooling.CellSeries(
+        arm=arm, seed=int(seed), rung=rung, channel=channel,
+        delta=values, changed=changed, episode=episode, embedding=None, noise=None,
+        windows_total=int(summary["windows"]["total"]), val=tuple(val),
+        horizon=int(horizon), context=int(context), device=str(device), torch_version=str(torch_version),
+    )
+
+
+def decision_horizon(horizon: int) -> tuple[int, bool]:
+    """`DECISION_H`, clamped to the run's horizon; the flag says it was."""
+    if DECISION_H <= horizon:
+        return DECISION_H, False
+    return int(horizon), True

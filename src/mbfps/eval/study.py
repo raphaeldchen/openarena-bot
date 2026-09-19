@@ -483,14 +483,53 @@ def run_job(
                             the scalar fields and never touches it, and
                             `_sanitise` maps a non-finite loss at step k to
                             `history.loss.k` like any other nested field.
+
+    M3f: the evaluation half is `evaluate_job`, so a rung's checkpoint can be
+    scored into a rung directory with no retraining. This function is
+    `train_world_model` followed by it.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cfg = get_config(job.arm, steps=steps, seq_len=seq_len, seed=job.seed, device=device)
-    torch_device = get_device(prefer=device)
 
     started = time.perf_counter()
     history = train_world_model(cfg, buffer, out_dir=out_dir)
+    return evaluate_job(
+        job, buffer, out_dir, history=history, steps=steps, seq_len=seq_len,
+        context=context, horizon=horizon, device=device, started=started,
+    )
+
+
+def evaluate_job(
+    job: StudyJob,
+    buffer: ReplayBuffer,
+    out_dir: Path,
+    *,
+    history: dict,
+    steps: int = 20_000,
+    seq_len: int = 64,
+    context: int = 5,
+    horizon: int = 45,
+    device: str = "mps",
+    started: float | None = None,
+) -> dict:
+    """The evaluation half of `run_job` (M3f): load the checkpoint `out_dir`
+    holds for `job`, fit the probes, score the rollout and the filtering, and
+    write `result_<arm>_seed<n>.json` into `out_dir`. Returns the LIVE record
+    (see `run_job` for what that means).
+
+    `history` is the training history the record carries -- the run's own from
+    `run_job`, or a rung's prefix (`training.world_model.history_at`) when the
+    checkpoint is a rung's; `steps` should agree with `history["steps"]`.
+    `started` is the `perf_counter` the record's `seconds` is measured from;
+    None measures the evaluation alone, which is what a rung's record means
+    by it (its training time is `history["seconds"]`, as `steps_per_second`
+    reads it).
+    """
+    out_dir = Path(out_dir)                                       # M3f
+    started = time.perf_counter() if started is None else started  # M3f
+    cfg = get_config(job.arm, steps=steps, seq_len=seq_len, seed=job.seed, device=device)  # M3f
+    torch_device = get_device(prefer=device)                      # M3f
     train_paths, val_paths = episode_split(
         buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED
     )

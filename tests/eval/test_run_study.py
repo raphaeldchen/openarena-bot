@@ -37,7 +37,8 @@ from mbfps.eval.study import (
     to_json_record,
     write_record,
 )
-from mbfps.utils.config import ARMS, Config
+from mbfps.training.world_model import train_world_model
+from mbfps.utils.config import ARMS, Config, get_config
 
 _SPEC = importlib.util.spec_from_file_location(
     "run_study", Path(__file__).resolve().parents[2] / "scripts" / "run_study.py")
@@ -1154,6 +1155,28 @@ def test_a_real_record_from_run_job_is_recognised_as_complete(
     assert job not in run_study.pending_jobs(tmp_path, ARMS, SEEDS)
     # The live record is what `main` prints from, and it is not the file.
     assert run_study.record_names_the_job(record, job)
+
+
+def test_run_job_is_train_world_model_followed_by_evaluate_job(tmp_path, small_buffer):
+    """M3f evaluates a rung by calling the evaluation half alone on a rung
+    directory. This pins that half as `evaluate_job`: the same cell trained
+    and evaluated through `run_job` and through the two halves writes the same
+    record, field for field, in the sanitised projection -- `seconds` and
+    `steps_per_second` aside, which are wall-clock."""
+    job = StudyJob("random_vit", INCOMPLETE_JOB.seed)
+    whole = study.run_job(job, small_buffer, tmp_path / "whole", **RUN_KW)
+
+    cfg = get_config(job.arm, steps=RUN_KW["steps"], seq_len=RUN_KW["seq_len"],
+                     seed=job.seed, device=RUN_KW["device"])
+    history = train_world_model(cfg, small_buffer, out_dir=tmp_path / "halves")
+    halves = study.evaluate_job(job, small_buffer, tmp_path / "halves", history=history, **RUN_KW)
+
+    timing = {"seconds", "steps_per_second"}
+    assert {k: v for k, v in study.to_json_record(whole).items() if k not in timing} == \
+        {k: v for k, v in study.to_json_record(halves).items() if k not in timing}
+    assert job_record_path(tmp_path / "halves", job).is_file()
+    assert halves["steps"] == RUN_KW["steps"] and halves["history"]["loss"] == history["loss"]
+    assert halves["seconds"] > 0.0
 
 
 # ---------------------------------------------------------------------------

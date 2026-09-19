@@ -81,12 +81,16 @@ from mbfps.eval.split_gap import (
     GapInputs,
     StrataNotAPartition,
     StratumContrast,
+    cell_series,
+    decision_horizon,
     format_reading_gap,
     learning_curve_summary,
+    margin_at,
     q_key,
     reading_gap,
     strata_partition,
     stratum_summary,
+    survival_indicator,
 )
 from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
 from mbfps.eval.trust import survival, trust_horizon
@@ -193,38 +197,23 @@ def _series(record: dict, stratum: str, channel: str, values, changed) -> poolin
     reads. `rung` is the stratum and `channel` the reading ("S/free",
     "margin/probe"), so `require_compatible` pools seeds of one stratum only
     and `unpaired_contrast` refuses two different readings."""
-    block = record["strata"][stratum]
-    values = np.asarray(values, dtype=float)
-    changed = np.asarray(changed, dtype=bool)
-    episode = np.asarray(block["windows"]["episode"], dtype=int)
-    if not (values.shape == changed.shape == episode.shape):
-        raise ValueError(
-            f"{record['arm']} seed {record['seed']} {stratum}/{channel}: values "
-            f"{values.shape}, changed {changed.shape} and windows.episode {episode.shape} "
-            "must all be (n_windows,)"
-        )
-    return pooling.CellSeries(
-        arm=record["arm"], seed=int(record["seed"]), rung=stratum, channel=channel,
-        delta=values, changed=changed, episode=episode, embedding=None, noise=None,
-        windows_total=int(block["windows"]["total"]), val=tuple(record["episodes"][stratum]),
-        horizon=int(record["horizon"]), context=int(record["context"]),
-        device=str(record["device"]), torch_version=str(record["torch_version"]),
+    return cell_series(
+        record["strata"][stratum], values, changed,
+        arm=record["arm"], seed=record["seed"], rung=stratum, channel=channel,
+        val=record["episodes"][stratum], horizon=record["horizon"], context=record["context"],
+        device=record["device"], torch_version=record["torch_version"],
     )
 
 
 def survival_series(record: dict, stratum: str, channel: str, h: int) -> pooling.CellSeries:
     """`1[h_x > h]` per window over the windows that moved within the horizon
     (finite crossing) -- so the pooled mean is S(h) exactly."""
-    crossing = np.asarray(record["strata"][stratum]["crossing"][channel], dtype=float)
-    return _series(record, stratum, f"S/{channel}", (crossing > h).astype(float), np.isfinite(crossing))
+    return _series(record, stratum, f"S/{channel}", *survival_indicator(record["strata"][stratum], channel, h))
 
 
 def margin_series(record: dict, stratum: str, channel: str, h: int) -> pooling.CellSeries:
     """`Delta(h)` per window over the windows moved AT h."""
-    block = record["strata"][stratum]
-    values = np.asarray(block["margin"][channel], dtype=float)[:, h - 1]
-    moved = np.asarray(block["moved"], dtype=bool)[:, h - 1]
-    return _series(record, stratum, f"margin/{channel}", values, moved & np.isfinite(values))
+    return _series(record, stratum, f"margin/{channel}", *margin_at(record["strata"][stratum], channel, h))
 
 
 def _pooled(cells) -> pooling.PooledMean | None:
@@ -303,13 +292,6 @@ def gap_inputs(records: dict, *, arms, seeds, h: int, series=survival_series,
         z_fam=pooling.cluster_threshold(FAMILY, clusters),
         h=h,
     )
-
-
-def decision_horizon(horizon: int) -> tuple[int, bool]:
-    """`DECISION_H`, clamped to the run's horizon; the flag says it was."""
-    if DECISION_H <= horizon:
-        return DECISION_H, False
-    return int(horizon), True
 
 
 # ---------------------------------------------------------------------------
