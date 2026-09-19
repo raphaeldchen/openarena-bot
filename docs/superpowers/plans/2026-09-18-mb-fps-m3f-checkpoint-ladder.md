@@ -3353,7 +3353,7 @@ captured by the shell that ran the script. Per cell: 5,000 training steps in 1,4
 is byte-identical to the `read` phase's stdout. `ls -lt runs/m3f_ladder | head` shows nothing newer
 than `ladder.finished`, `ladder.exit` and `ladder.txt`; the directory holds 2.0 GB (45 rung
 checkpoints of 39 MB, 45 rung study records, 9 train records, 9 ladder records, the figure), and
-nine top-level `world_model_<arm>_seed<n>.pt` — the trainer's final save, identical to `step5000/`
+nine top-level `world_model_<arm>_seed<n>.pt` — the trainer's final save, holding the same weights as `step5000/` (bitwise-equal `state_dict`s; the final payload lacks the `step` key the rung save carries)
 because `STEPS == max(RUNGS)`; the top level holds no study record, so no instrument reads it as a
 cell.
 
