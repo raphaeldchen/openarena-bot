@@ -3338,9 +3338,218 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
+## Task 7 results
+
+**Provenance.** Nine ladder records under one code state, `git_sha` = `train_git_sha` =
+`7a6c228a2acf3d08c5951694dc167b275edc4401` (= `ladder.head` = `git rev-parse HEAD`, tree clean),
+device `mps`, torch `2.13.0`, in all nine `ladder_<arm>_seed<n>.json`; every reference entry's
+`record_git_sha` = `ca3e140772d6bc741d4d04312763afe3dd754166`, the M3c study's. Launched
+`2026-09-19T08:27:13Z` (`ladder.started`) under `caffeinate -dimsu` with `PYTHONUNBUFFERED=1`,
+`--out runs/m3f_ladder --phase all` and the pinned `--anchor hard` default, from the
+`feat/m3f-checkpoint-ladder` worktree with `runs/` and `data/` symlinked to the main checkout's;
+finished `2026-09-19T14:07:22Z` (`ladder.finished`), wall **5 h 40 min 09 s**; `ladder.exit` = `0`,
+captured by the shell that ran the script. Per cell: 5,000 training steps in 1,415–1,468 s
+(3.41–3.53 steps/s; `pixel_ae` the fastest arm) and six evaluations in about 13 min. `ladder.txt`
+is byte-identical to the `read` phase's stdout. `ls -lt runs/m3f_ladder | head` shows nothing newer
+than `ladder.finished`, `ladder.exit` and `ladder.txt`; the directory holds 2.0 GB (45 rung
+checkpoints of 39 MB, 45 rung study records, 9 train records, 9 ladder records, the figure).
+
+**The anchor** (`--anchor hard`, spec 2.4): the retrain's per-step loss equals the M3c record's
+`history.loss` at **every one of the 5,000 steps in every one of the nine cells** — max |Δ| `0.0e+00`,
+first differing step `-` on nine lines of the anchor table. MPS training is bitwise deterministic on
+this box under torch 2.13.0, and every rung below is a state the original run passed through. (The
+smoke run that pinned the policy — `random_vit`/s0 into `runs/m3f_smoke`, 07:48:41Z–08:25:50Z, exit
+0, code state `3d6c562` — measured the same 0.0.)
+
+**Suite.** `pytest` at `3d6c562` (the last code commit before the smoke): `1569 passed` in 13 min 44 s,
+0 skipped with `runs/` reachable, 0 warnings, exit 0 — 1490 + 8 + 1 + 7 + 26 + 5 + 19 + 12 + 1, as
+the plan's header now reads. At the launched HEAD `7a6c228` (two docs commits, `ANCHOR_DEFAULT =
+"hard"`, and a header space in two tables later): `1569 passed` in 13 min 42 s, 0 skipped, 0 warnings, exit 0 — the same count.
+
+**Acceptance** (`runs/m3f_ladder`, run inline): `OK: nine records, one git_sha == HEAD 7a6c228,
+device mps, self-check 0.0 on 9/9, 229/24 on every rung, primary rungs == spec 2.2`.
+
+**Primary rungs** — `learning_curve_summary(reference.history, window=100)["terms"]["embedding"]["smoothed_min_step"]`
+→ `primary_rung`, computed at run time, against spec §2.2's pre-registered table:
+
+| cell | `embedding` min step | primary rung | spec §2.2 |
+|---|---|---|---|
+| `pixel_ae` s0 / s1 / s2 | 8,359 / 19,096 / 16,873 | **5000 / 5000 / 5000** | 5000 / 5000 / 5000 ✓ |
+| `frozen_ssl` s0 / s1 / s2 | 2,045 / 3,555 / 4,510 | **2000 / 4000 / 5000** | 2000 / 4000 / 5000 ✓ |
+| `random_vit` s0 / s1 / s2 | 1,610 / 4,535 / 3,275 | **2000 / 5000 / 3000** | 2000 / 5000 / 3000 ✓ |
+
+**Reference self-check** (step 20000's trust pass against its M3c diagnostic; exact): `ref max|d|`
+`0.0e+00` and `pers max|d|` `0.0e+00` on 9/9 cells, windows `True` on 9/9, `measurable` True on 9/9;
+probe selection R² `0.366 / 0.018 / 0.272` (`pixel_ae`), `0.360 / 0.334 / 0.383` (`frozen_ssl`),
+`0.297 / 0.330 / 0.249` (`random_vit`) — the M3d/M3e numbers. Every rung of every cell scores the
+same 229 val windows over 24 episode-clusters; `u(h)` is identical on every line of the conditional
+table (0.58 / 0.35 / 0.21 / 0.13 / 0.05 / 0.03 / 0.00 / 0.00 at h = 1 / 2 / 3 / 5 / 10 / 15 / 30 / 45),
+as it must be — the moved mask is the truth's.
+
+**The gate at every rung** (`gap_closed(45)` on position per seed; NaN = non-positive band;
+`GATE PASSES` = > 0 in every seed; reported, not decided on). **No arm passes at any rung.**
+
+| arm | step | s0 | s1 | s2 | nanmean | degenerate |
+|---|---|---|---|---|---|---|
+| `pixel_ae` | 1000 | −1.7644 | −3.7309 | n/a | −2.7477 | 1 |
+| `pixel_ae` | 2000 | −3.6633 | −3.2706 | −2.6703 | −3.2014 | 1 |
+| `pixel_ae` | 3000 | −1.0851 | −63.1216 | −4.1054 | −22.7707 | 2 |
+| `pixel_ae` | 4000 | −0.7270 | −2.8571 | −0.7349 | −1.4396 | 0 |
+| `pixel_ae` | 5000 | −0.1831 | −2.0846 | −5.5826 | −2.6168 | 0 |
+| `pixel_ae` | 20000 | −1.1630 | −0.5878 | −0.6739 | −0.8082 | 0 |
+| `frozen_ssl` | 1000 | n/a | n/a | +1.3845 | +1.3845 | 44 |
+| `frozen_ssl` | 2000 | n/a | +1.9942 | +0.9828 | +1.4885 | 45 |
+| `frozen_ssl` | 3000 | −2.3192 | n/a | +1.2144 | −0.5524 | 11 |
+| `frozen_ssl` | 4000 | −0.9903 | n/a | n/a | −0.9903 | 2 |
+| `frozen_ssl` | 5000 | −1.5876 | −1.7580 | n/a | −1.6728 | 1 |
+| `frozen_ssl` | 20000 | −0.8523 | −0.6470 | −0.6491 | −0.7161 | 0 |
+| `random_vit` | 1000 | −2.9910 | −1.8782 | −15.1137 | −6.6610 | 1 |
+| `random_vit` | 2000 | −1.1611 | −1.7363 | −0.5918 | −1.1631 | 1 |
+| `random_vit` | 3000 | −1.1065 | −2.8457 | −2.9254 | −2.2925 | 0 |
+| `random_vit` | 4000 | −1.3049 | −1.7059 | −1.2567 | −1.4225 | 1 |
+| `random_vit` | 5000 | −0.9090 | −1.7879 | −1.8623 | −1.5197 | 0 |
+| `random_vit` | 20000 | −0.4419 | −0.3875 | −0.5452 | −0.4582 | 0 |
+
+The 20000 row reproduces the M3c records' `gap_final` to four decimals in every arm. The positive
+`frozen_ssl` entries at 1000–3000 (+0.98 to +1.99) sit beside `degenerate` 44, 45 and 11 — the
+persistence-to-floor band is non-positive or vanishing over most of the horizon at those rungs (the
+posterior's own probe-read position is no better than persistence), so the metric there reads the
+band's collapse, not a rollout that beats persistence; the NaN seeds beside them are the same
+collapse, and unanimity fails. For the ViT arms the 20000 row is the least negative row in the
+table; for `pixel_ae` s0 the least negative is 5000 (−0.1831), for s1 and s2 it is 20000.
+
+**Survival and H\*** (free channel; `S(h)` over the moved (window, seed) draws of the arm's three
+seeds stacked, 687 per line; `H*_0.75 = 1` on every line of every arm, rung and channel but
+`random_vit` 4000 probe = 0; `H*_0.9 = 0` everywhere):
+
+| arm | step | `S(5)` | `S(15)` | `S(45)` | `H*_0.5` | `S_c(15)` | probe `S(15)` |
+|---|---|---|---|---|---|---|---|
+| `pixel_ae` | 1000 / 2000 / 3000 / 4000 / 5000 | 0.27 / 0.28 / 0.27 / 0.35 / 0.41 | 0.08 / 0.07 / 0.08 / 0.13 / 0.16 | 0.02 / 0.00 / 0.00 / 0.03 / 0.02 | 2 / 2 / 2 / 2 / 3 | 0.05 / 0.04 / 0.05 / 0.10 / 0.13 | 0.14 / 0.13 / 0.13 / 0.20 / 0.20 |
+| `pixel_ae` | **20000** | 0.40 | **0.17** | 0.04 | 3 | 0.14 | 0.23 |
+| `frozen_ssl` | 1000 / 2000 / 3000 / 4000 / 5000 | 0.35 / 0.27 / 0.27 / 0.32 / 0.28 | 0.11 / 0.06 / 0.07 / 0.09 / 0.07 | 0.01 / 0.00 / 0.00 / 0.01 / 0.01 | 2 / 2 / 2 / 2 / 2 | 0.07 / 0.02 / 0.04 / 0.06 / 0.04 | 0.18 / 0.16 / 0.10 / 0.22 / 0.12 |
+| `frozen_ssl` | **20000** | 0.39 | **0.14** | 0.02 | 3 | 0.11 | 0.22 |
+| `random_vit` | 1000 / 2000 / 3000 / 4000 / 5000 | 0.29 / 0.27 / 0.30 / 0.26 / 0.34 | 0.11 / 0.08 / 0.11 / 0.07 / 0.11 | 0.02 / 0.01 / 0.02 / 0.00 / 0.02 | 2 / 2 / 2 / 2 / 2 | 0.08 / 0.05 / 0.07 / 0.04 / 0.08 | 0.13 / 0.15 / 0.14 / 0.13 / 0.15 |
+| `random_vit` | **20000** | 0.39 | **0.18** | 0.05 | 3 | 0.15 | 0.27 |
+
+In every arm the 20000 row has the highest free-channel `S(15)` and `S(45)` of the six rungs and
+the only `H*_0.5 = 3` (`pixel_ae` reaches 3 at 5000 too). No rung anywhere lifts `H*_0.75` off 1.
+
+**The validation objective** (`val_objective` over 50 seeded draws per rung; `val emb` = the
+one-step `embedding` term on validation sequences, `train emb` = the 100-step moving mean of the
+training term at that step; the `reward` term is 0.0000 and `continue` ≤ 0.0007 on every line):
+
+| cell | rung | val loss | val emb | train emb | val `kl_dyn` | val emb smallest at | val loss smallest at |
+|---|---|---|---|---|---|---|---|
+| `pixel_ae` s0 | 1000 / 2000 / 3000 / 4000 / 5000 / **20000** | 0.7541 / 0.5059 / 0.3551 / 0.3315 / 0.3862 / 0.4406 | 0.2300 / 0.1955 / 0.1802 / 0.1766 / 0.1732 / **0.1562** | 0.2337 / 0.1892 / 0.1769 / 0.1692 / 0.1678 / 0.1473 | 0.873 / 0.516 / 0.291 / 0.256 / 0.354 / 0.473 | 20000 | 4000 |
+| `pixel_ae` s1 | — | 0.7156 / 0.5105 / 0.3218 / 0.5400 / 0.4358 / 0.2249 | 0.2289 / 0.1815 / 0.1746 / 0.1624 / 0.1598 / **0.0847** | 0.2238 / 0.1737 / 0.1714 / 0.1637 / 0.1524 / 0.0790 | 0.811 / 0.548 / 0.242 / 0.629 / 0.460 / 0.219 | 20000 | 20000 |
+| `pixel_ae` s2 | — | 0.7525 / 0.6542 / 0.3425 / 0.4788 / 0.4109 / 0.3248 | 0.2220 / 0.1770 / 0.1745 / 0.1768 / 0.1631 / **0.1282** | 0.2196 / 0.1725 / 0.1697 / 0.1713 / 0.1625 / 0.1241 | 0.884 / 0.795 / 0.279 / 0.503 / 0.412 / 0.327 | 20000 | 20000 |
+| `frozen_ssl` s0 | — | 0.3230 / 0.3118 / 0.6762 / 0.6584 / 0.4515 / 0.7358 | 0.2022 / **0.1914** / 0.2190 / 0.2294 / 0.2415 / 0.3146 | 0.1999 / 0.1966 / 0.2117 / 0.2170 / 0.2324 / 0.2941 | 0.063 / 0.148 / 0.761 / 0.714 / 0.349 / 0.702 | 2000 | 2000 |
+| `frozen_ssl` s1 | — | 0.3056 / 0.2909 / 0.2849 / 0.2814 / 0.3971 / 0.4840 | 0.1855 / 0.1709 / 0.1649 / **0.1614** / 0.1877 / 0.2136 | 0.1867 / 0.1691 / 0.1672 / 0.1595 / 0.1830 / 0.2065 | 0.065 / 0.079 / 0.071 / 0.073 / 0.349 / 0.451 | 4000 | 4000 |
+| `frozen_ssl` s2 | — | 0.3017 / 0.2987 / 0.2894 / 0.2813 / 0.6046 / 0.6809 | 0.1812 / 0.1784 / 0.1691 / **0.1610** / 0.2282 / 0.3654 | 0.1818 / 0.1772 / 0.1671 / 0.1591 / 0.1659 / 0.3454 | 0.098 / 0.064 / 0.042 / 0.030 / 0.627 / 0.526 | 4000 | 4000 |
+| `random_vit` s0 | — | 0.4351 / 0.4539 / 0.2550 / 0.2966 / 0.3010 / 0.5131 | **0.0915** / 0.0961 / 0.0928 / 0.0933 / 0.0954 / 0.1945 | 0.1076 / 0.0945 / 0.0955 / 0.0921 / 0.0960 / 0.1904 | 0.572 / 0.596 / 0.266 / 0.338 / 0.342 / 0.530 | 1000 | 3000 |
+| `random_vit` s1 | — | 0.3774 / 0.4028 / 0.3637 / 0.6346 / 0.3285 / 0.5281 | **0.0715** / 0.0880 / 0.0833 / 0.1049 / 0.0895 / 0.1952 | 0.0793 / 0.0988 / 0.0835 / 0.0988 / 0.0886 / 0.1846 | 0.510 / 0.525 / 0.467 / 0.883 / 0.398 / 0.555 | 1000 | 5000 |
+| `random_vit` s2 | — | 0.8819 / 0.3685 / 0.4422 / 0.5096 / 0.4163 / 0.4737 | 0.1457 / **0.0780** / 0.0792 / 0.0804 / 0.0908 / 0.1298 | 0.2275 / 0.0887 / 0.0865 / 0.0885 / 0.0953 / 0.1380 | 1.226 / 0.484 / 0.604 / 0.715 / 0.542 / 0.573 | 2000 | 2000 |
+
+The training minimum is also the validation minimum, arm by arm: `val emb` is smallest at 20000
+in all three `pixel_ae` cells (the arm still descending at 20k) and at 1000–4000 in all six ViT
+cells, where it is 1.3–2.7× smaller than at 20000 (`frozen_ssl` 0.19 → 0.31, 0.16 → 0.21,
+0.16 → 0.37; `random_vit` 0.09 → 0.19, 0.07 → 0.20, 0.08 → 0.13); at the primary rung itself it is
+1.3–2.2× smaller than at 20000. `train emb` tracks `val emb` to
+within 0.01–0.02 on every line but `frozen_ssl` s2 at 5000 (0.1659 vs 0.2282) and `random_vit` s2 at
+1000 (0.2275 vs 0.1457, the smoothing window straddling a fast descent): the rise of the ViT arms'
+one-step loss over training is a rise on validation too, not overfitting-in-time.
+
+**The KL regime by rung** (from the rung study records' `kl_rate_above_free_bits`, the share of
+training steps up to that rung whose `kl_dyn` cleared `KL_FREE_BITS = 0.20` — the only steps on
+which `prior_net` receives gradient — and the val `kl_dyn` above; read for §4's "does not say why"):
+
+| cell | clearance rate over the first 1000 / 2000 / 3000 / 4000 / 5000 steps | at 20000 |
+|---|---|---|
+| `pixel_ae` s0 / s1 / s2 | 0.17 / 0.59 / 0.72 / 0.77 / 0.81 — 0.22 / 0.61 / 0.67 / 0.75 / 0.80 — 0.23 / 0.62 / 0.74 / 0.80 / 0.82 | 0.91 / 0.83 / 0.84 |
+| `frozen_ssl` s0 / s1 / s2 | 0.01 / 0.01 / 0.33 / 0.50 / 0.60 — **0.01 / 0.01 / 0.01 / 0.01 / 0.14** — **0.01 / 0.00 / 0.00 / 0.01 / 0.01** | 0.90 / 0.78 / 0.75 |
+| `random_vit` s0 / s1 / s2 | 0.60 / 0.80 / 0.84 / 0.87 / 0.89 — 0.52 / 0.76 / 0.84 / 0.88 / 0.90 — 0.25 / 0.62 / 0.74 / 0.81 / 0.85 | 0.97 / 0.98 / 0.96 |
+
+In `frozen_ssl` s1 and s2 the dynamics KL cleared the floor on about 1 % of the first 4,000–5,000
+steps — the prior was essentially untrained at every rung of those cells, including their primary
+rungs (4000, 5000), and the val `kl_dyn` there is 0.03–0.08, below the floor. Those are the rungs
+at which the one-step `embedding` loss is smallest. `frozen_ssl` s0's prior begins training between
+2000 and 3000 (rate 0.01 → 0.33); its primary rung, 2000, is before that. The `random_vit` and
+`pixel_ae` priors clear the floor from the first 1,000–2,000 steps on.
+
+**Reading T at h = 15** (`primary − 20000`, paired on the 229 val windows, seeds averaged per
+window, episode-clustered; `z_fam = cluster_threshold(6, 24) = 2.89`):
+
+| arm | `T_free(15)` estimate ± se (z) | `T_probe(15)` estimate ± se (z) | seeds clearing | **status** | decided by |
+|---|---|---|---|---|---|
+| `pixel_ae` (control) | −0.0116 ± 0.0193 (−0.60) | −0.0277 ± 0.0199 (−1.39) | 0 / 3 | **NO DIFFERENCE** | `T_free z -0.60 does not clear +-2.89` |
+| `frozen_ssl` | **−0.0844 ± 0.0123 (−6.88)** | n/a (no cell measurable at both rungs) | 3 / 3 down | **EARLIER WORSE** | `T_free z -6.88 < -2.89 pooled and in 3 of 3 seeds` |
+| `random_vit` | **−0.0771 ± 0.0146 (−5.30)** | −0.1485 ± 0.0273 (−5.43) | 2 / 3 down | **EARLIER WORSE** | `T_free z -5.30 < -2.89 pooled and in 2 of 3 seeds` |
+
+The control reads as a control: `pixel_ae`, whose loss minimum lies beyond the ladder and whose
+primary rung is the last one, shows no difference between 5000 and 20000 (per seed z +0.56 /
+−0.58 / −2.01, none clearing). Both ViT arms read `EARLIER_WORSE`: the model at its one-step-loss
+minimum keeps ahead of embedding-space persistence at 15 imagined steps on 7.7–8.4 percentage
+points FEWER of the moved draws than the step-20,000 model does, with z at −5.3 and −6.9 against a
+bar of 2.89, replicated in 3 of 3 (`frozen_ssl`: per-seed z −3.24 / −3.04 / −5.84) and 2 of 3
+(`random_vit`: −3.14 / −0.88 / −6.42) seeds. `random_vit`'s probe channel agrees (z −5.43, per seed
+−3.91 / −3.20 / −4.61). `frozen_ssl`'s probe channel is unmeasurable at its primary rungs — the
+band at h=45 is non-positive there (the gate table's NaNs and `degenerate` 44/45/11) — so the free
+channel decides alone, as spec 3.1 provides; no `UNRESOLVED_PROBE` was reachable.
+
+**Companions** (change no verdict). z at the reported horizons, `primary − 20000`:
+
+| arm | channel | z@5 | z@15 | z@45 | `Δ_free(15)` paired difference |
+|---|---|---|---|---|---|
+| `pixel_ae` | free | +0.23 | −0.60 | −2.23 | −0.2091 (z −1.91) |
+| `pixel_ae` | probe | −0.46 | −1.39 | −1.58 | |
+| `frozen_ssl` | free | −5.54 | −6.88 | −1.89 | +0.2323 (z +1.81) |
+| `frozen_ssl` | probe | n/a | n/a | n/a | |
+| `random_vit` | free | −4.36 | −5.30 | −3.44 | −0.9410 (z −5.18) |
+| `random_vit` | probe | −4.26 | −5.43 | −4.05 | |
+
+The ViT arms' deficit at the primary rung holds at h = 5 (z −5.54, −4.36) and, for `random_vit`, at
+h = 45 too (−3.44 free, −4.05 probe); `frozen_ssl`'s h = 45 contrast is −1.89 (both rungs near
+zero survival there). The margin companion agrees in sign for `random_vit` (−0.94 embedding units,
+z −5.18) and has the opposite sign for `frozen_ssl` (+0.23, z +1.81, not clearing): at h = 15 the
+early `frozen_ssl` model's embedding-space margin is slightly larger on the windows still moving
+while far fewer of its draws are still ahead — the two statistics measure different things and the
+pre-registered one is the survival. Sensitivity: dropping the two `pixel_ae` cells with probe R²
+< 0.1 at either rung of their pair (s1: 0.018 at 20000; s2: 0.060 at its primary rung 5000) moves `pixel_ae`'s `T_probe` from −0.0277 (z
+−1.39) to +0.0131 (z +0.31) — still not clearing — and nothing else. Per seed: `NO DIFFERENCE` on
+all three `pixel_ae` seeds and on `random_vit` s1 (z −0.88); `EARLIER WORSE` on the other five.
+
+**Figure.** `runs/m3f_ladder/ladder_curves.png` (106 KB): `H*_0.75` (free), `gap_closed(45)` and the
+validation `embedding` against the rung, the reference at the right; arms coloured, seeds thin.
+
+**Read against §4.** The M3 gate is unchanged: no arm passes `beats_persistence` at any rung, and
+every recorded M3b–M3e verdict stands. No arm is ranked against another. What this run says is the
+pre-registered thing and one descriptive thing beside it:
+
+- The timing hypothesis is **refuted for both ViT arms, in the opposite direction**: evaluated at
+  its own one-step-loss minimum — a minimum that is a validation minimum too — the model rolls out
+  WORSE than at step 20,000, by every survival statistic at every reported horizon, while its
+  one-step loss is 1.3–2.2× lower. The control arm shows no difference. Checkpoint selection on the
+  `embedding` loss would make M3 worse, not better; the M3 gate is not an artefact of when the
+  model was evaluated.
+- The one-step embedding loss is therefore not the rollout's ruler (spec 3.3's `EARLIER_WORSE`
+  reading): the training that raises it from step ~4,000 to 20,000 is the training that lengthens
+  imagination. The KL-regime table names the candidate mechanism without deciding it: in
+  `frozen_ssl` the loss minimum falls where the dynamics prior has received gradient on ~1 % of
+  steps — a low one-step loss with an untrained prior — and the loss rises exactly as the KL clears
+  the free-bits floor and the prior begins to train; in `random_vit` the prior trains from the
+  start and the same rise-with-better-rollouts appears, so the trade is not only the floor. Either
+  way the next M3 study is the objective — the balance between the one-step reconstruction, the
+  KL terms and what a 15-step rollout needs — and not the schedule, the data (M3e) or the budget.
+- Everything is `my_way_home`'s 24 validation episodes at context 5 / horizon 45, the M3c seeds
+  and configuration, a 1,000-step ladder to 5,000 and the shipped 20,000-step checkpoints; the
+  rungs are bitwise the original runs' states. A finer ladder, a longer one, or another environment
+  is a different measurement.
+
+---
+
 ## Exit criteria
 
-- [ ] Tasks 1–6 committed, each reviewed; the full suite green with 0 warnings at the launched HEAD.
-- [ ] The anchor policy pinned in spec §2.4 and `ANCHOR_DEFAULT` from the smoke's measurement, before the real run.
-- [ ] Nine `ladder_*.json` at one `git_sha` == HEAD on `mps`; reference self-check 0.0 on 9/9; 229 windows / 24 clusters on every rung; primary rungs equal to spec §2.2.
-- [ ] `## Task 7 results` written, numbers copied, verdicts stated against spec §4.
+- [x] Tasks 1–6 committed, each reviewed; the full suite green with 0 warnings at the launched HEAD (`1569 passed` at `7a6c228`).
+- [x] The anchor policy pinned in spec §2.4 and `ANCHOR_DEFAULT` from the smoke's measurement, before the real run (`hard`, commit `219b4c6`).
+- [x] Nine `ladder_*.json` at one `git_sha` == HEAD on `mps`; reference self-check 0.0 on 9/9; 229 windows / 24 clusters on every rung; primary rungs equal to spec §2.2.
+- [x] `## Task 7 results` written, numbers copied, verdicts stated against spec §4.
