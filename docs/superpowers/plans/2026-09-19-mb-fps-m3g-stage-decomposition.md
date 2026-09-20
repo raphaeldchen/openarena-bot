@@ -2304,6 +2304,8 @@ from mbfps.eval.stages import (
 from mbfps.eval.trust_readings import ARMS_ORDER
 ```
 
+Bind `trustworthy = _trust.trustworthy` beside the other `_trust.*` names (added to `trust_horizon.py` in this task as the shared predicate).
+
 and change `PHASES` to:
 
 ```python
@@ -2659,14 +2661,7 @@ def load_records(args, cells, controls) -> tuple[int, dict]:
     return EXIT_OK, records
 
 
-def _trustworthy(check) -> bool:
-    return bool(check) and (
-        check.get("ok") is True
-        and check.get("reference_position_max_delta") == 0.0
-        and check.get("persistence_position_max_delta") == 0.0
-        and bool(check.get("windows_total_match"))
-        and bool(check.get("windows_episode_match"))
-    )
+# `trustworthy` is trust_horizon's, bound beside the other `_trust.*` names at the top.
 
 
 def read_phase(args, cells, controls) -> int:
@@ -2677,7 +2672,7 @@ def read_phase(args, cells, controls) -> int:
     if status != EXIT_OK:
         return status
     for (label, seed), r in records.items():
-        if r["kind"] == "cell" and not _trustworthy(r["self_check"]):
+        if r["kind"] == "cell" and not trustworthy(r["self_check"]):
             print(
                 f"\nSELF-CHECK FAILED for {r['arm']} seed {seed}: the record's self-check is "
                 f"{r['self_check']!r}; it is not read against a ruler that reproduced."

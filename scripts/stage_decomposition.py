@@ -117,6 +117,7 @@ CellMissing = _trust.CellMissing
 load_cell = _trust.load_cell
 self_check = _trust.self_check
 prepare_cell = _trust.prepare_cell
+trustworthy = _trust.trustworthy
 _ladder = _sibling("checkpoint_ladder")
 rung_cell = _ladder.rung_cell
 
@@ -667,16 +668,6 @@ def load_records(args, cells, controls) -> tuple[int, dict]:
     return EXIT_OK, records
 
 
-def _trustworthy(check) -> bool:
-    return bool(check) and (
-        check.get("ok") is True
-        and check.get("reference_position_max_delta") == 0.0
-        and check.get("persistence_position_max_delta") == 0.0
-        and bool(check.get("windows_total_match"))
-        and bool(check.get("windows_episode_match"))
-    )
-
-
 def read_phase(args, cells, controls) -> int:
     """Load every record (11), refuse one whose self-check is not ok or
     whose identity is unset (30), refuse records at different protocols,
@@ -685,7 +676,7 @@ def read_phase(args, cells, controls) -> int:
     if status != EXIT_OK:
         return status
     for (label, seed), r in records.items():
-        if r["kind"] == "cell" and not _trustworthy(r["self_check"]):
+        if r["kind"] == "cell" and not trustworthy(r["self_check"]):
             print(
                 f"\nSELF-CHECK FAILED for {r['arm']} seed {seed}: the record's self-check is "
                 f"{r['self_check']!r}; it is not read against a ruler that reproduced."
