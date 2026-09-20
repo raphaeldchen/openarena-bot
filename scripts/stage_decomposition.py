@@ -664,6 +664,11 @@ def load_records(args, cells, controls) -> tuple[int, dict]:
                 print(f"NO CELL: {arm} seed {seed} ({kind}): no stages record at {path}; run --phase evaluate first")
                 return EXIT_NO_CHECKPOINTS, {}
             record = load_record(path)
+            if record["kind"] != kind or record["arm"] != arm or int(record["seed"]) != int(seed):
+                raise ValueError(
+                    f"{path}: the record inside is {record['kind']} {record['arm']} seed "
+                    f"{record['seed']}, not the {kind} {arm} seed {seed} its name says"
+                )
             records[(str(record["label"]), int(seed))] = record
     return EXIT_OK, records
 
@@ -671,7 +676,8 @@ def load_records(args, cells, controls) -> tuple[int, dict]:
 def read_phase(args, cells, controls) -> int:
     """Load every record (11), refuse one whose self-check is not ok or
     whose identity is unset (30), refuse records at different protocols,
-    read the control FIRST (34), then the figure, the text, `stages.txt`."""
+    read the control FIRST: its encode must read failed (34), then the
+    figure, the text, `stages.txt`."""
     status, records = load_records(args, cells, controls)
     if status != EXIT_OK:
         return status
@@ -706,13 +712,15 @@ def read_phase(args, cells, controls) -> int:
     reading, control_reading = reading_stages(inputs), reading_stages(control_inputs)
     control_text = _control_text(control_reading, control_inputs, records, control_seeds)
     control = control_reading.arms[CONTROL_LABEL]
-    if control.status is not Status.ENCODE_FAILS:
+    encode = control.stages["encode"]
+    if control.status is not Status.ENCODE_FAILS or encode.wording != "failed":
         print(control_text, end="")
         print(
-            f"\nCONTROL MISREAD: the known-blind control reads {control.status.name.replace('_', ' ')} -- "
-            f"decided by: {control.rule}. An instrument that does not read ENCODE FAILS on a posterior "
-            "equal to its prior is not reading encode; no arm's reading is printed and stages.txt is not "
-            "written."
+            f"\nCONTROL MISREAD: the known-blind control reads {control.status.name.replace('_', ' ')} with "
+            f"encode {encode.wording!r} -- decided by: {control.rule}. The control's encode must read failed "
+            "-- a clear the wrong way or a non-positive estimate, not merely not passed -- because a "
+            "posterior equal to its prior injects no information at all; a not-shown encode is absence of "
+            "evidence and validates nothing. No arm's reading is printed and stages.txt is not written."
         )
         return EXIT_CONTROL_MISREAD
     groups = _groups(records, arms, seeds, control_seeds)

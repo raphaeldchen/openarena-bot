@@ -330,17 +330,26 @@ def stages_run(evaluated, capsys):
     return types.SimpleNamespace(ref=evaluated, text=text, path=evaluated.stages / "stages.txt")
 
 
-def _fabricated_reading(status: Status):
+def _fabricated_reading(status: Status, encode_wording: str = "failed"):
     """A `reading_stages` stand-in giving every arm one status, with a full
-    stage table so the control text can still be formatted."""
+    stage table so the control text can still be formatted. The encode
+    stage's wording is `encode_wording` -- "failed" by default, which is
+    what a fabricated ENCODE_FAILS control must show for the pass-through
+    test below; every other stage passes."""
     def fake(inputs):
         arms = {}
         for arm in inputs.arms:
-            stages = {
-                stage: StageResult(stage=stage, passes=True, wording="passes",
-                                   rule=f"{stage} passes: fabricated", seeds_holding=2, seeds_total=2)
-                for stage in STAGES
-            }
+            stages = {}
+            for stage in STAGES:
+                if stage == "encode":
+                    passes = encode_wording == "passes"
+                    stages[stage] = StageResult(
+                        stage=stage, passes=passes, wording=encode_wording,
+                        rule=f"encode {encode_wording}: fabricated", seeds_holding=2, seeds_total=2,
+                    )
+                else:
+                    stages[stage] = StageResult(stage=stage, passes=True, wording="passes",
+                                                 rule=f"{stage} passes: fabricated", seeds_holding=2, seeds_total=2)
             arms[arm] = ArmReading(arm=arm, status=status, rule="fabricated", stages=stages)
         return StagesReading(arms=arms, h=inputs.h, z_fam=inputs.z_fam)
     return fake
@@ -446,6 +455,16 @@ def test_read_raises_on_records_at_different_protocols(evaluated):
         _run(evaluated, "--phase", "read")
 
 
+def test_read_raises_on_a_record_whose_contents_are_not_its_name(evaluated):
+    """`load_records` opens each path by the (kind, arm, seed) its file name
+    promises; a record whose contents disagree -- doctored here, but the same
+    failure mode as a copied or hand-edited file -- is refused by name rather
+    than pooled under the wrong key."""
+    _doctor(evaluated.stages / STAGES_RECORD, lambda r: r.__setitem__("seed", 7))
+    with pytest.raises(ValueError, match="its name says"):
+        _run(evaluated, "--phase", "read")
+
+
 def test_a_control_that_does_not_read_encode_fails_is_exit_34_with_no_reading_and_no_file(evaluated, monkeypatch, capsys):
     """The known-blind control is the instrument's validation: read as
     anything but ENCODE_FAILS, the control tables are printed with the
@@ -466,6 +485,23 @@ def test_a_control_reading_encode_fails_lets_the_reading_through(evaluated, monk
     out = capsys.readouterr().out
     assert "CONTROL MISREAD" not in out and f"verdict: {JOB.arm}" in out
     assert (evaluated.stages / "stages.txt").exists()
+
+
+def test_a_control_whose_encode_is_only_not_shown_is_exit_34_too(evaluated, monkeypatch, capsys):
+    """ENCODE_FAILS alone is not enough: a control whose encode did not clear
+    the bar -- rather than clearing it the wrong way, or a non-positive
+    estimate -- has shown no information injected, which is absence of
+    evidence, not the evidence of blindness the control exists to supply. It
+    is refused exactly as any other misread."""
+    monkeypatch.setattr(
+        script, "reading_stages", _fabricated_reading(Status.ENCODE_FAILS, encode_wording="not shown"),
+    )
+    assert _run(evaluated, "--phase", "read") == script.EXIT_CONTROL_MISREAD
+    out = capsys.readouterr().out
+    assert "CONTROL MISREAD" in out and "encode 'not shown'" in out
+    assert "--- Reading S" not in out.split("CONTROL MISREAD")[1]
+    assert f"verdict: {JOB.arm}" not in out
+    assert not (evaluated.stages / "stages.txt").exists()
 
 
 def test_read_prints_every_section_writes_it_byte_identical_and_draws_the_figure(stages_run):

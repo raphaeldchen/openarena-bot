@@ -3704,3 +3704,69 @@ def test_a_broken_step_one_identity_is_refused_by_name(tmp_path, monkeypatch):
     with pytest.raises(diagnostics_module.LatentIdentityError, match="window at start"):
         latent_pass(model, paths, probe, keep=True)
     assert issubclass(diagnostics_module.LatentIdentityError, ValueError)
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_kept_posterior_and_priors_are_the_passs_own_observe_and_imagine_outputs_in_order(
+    tmp_path, device, monkeypatch
+):
+    """The one pin that would catch the concatenation order in `_diagnose`'s
+    canonical-pass body being reversed -- `kept.post_logits` is `torch.cat(
+    [observed["post_logits"], real["post_logits"]], dim=1)`, the CONTEXT
+    FILTER's posterior then the FLOOR's -- or a prior swapped for the wrong
+    one: `kept.prior_teacher_logits` is the FLOOR observe's own
+    `prior_logits`, `kept.prior_open_logits` the CANONICAL imagine's. Every
+    shape and identity test survives that mutation, because the two priors
+    agree at step 1 by construction and the shapes never move.
+
+    Read against the pass's OWN `observe`/`imagine` calls, recorded (not
+    replayed -- the originals still run, so the stream this test observes
+    is the real one) in the order `_diagnose` makes them. `arms={}` in
+    `latent_pass`, so per window the calls are: observe (the context
+    filter), imagine (the canonical), observe (the floor), then
+    `_noise_reference`'s own imagine -- two of each per window, and the
+    canonical imagine is the FIRST of the two."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    real_observe = model.rssm.observe
+    real_imagine = model.rssm.imagine
+    observe_post: list[np.ndarray] = []
+    observe_prior: list[np.ndarray] = []
+    imagine_prior: list[np.ndarray] = []
+
+    def recording_observe(*args, **kwargs):
+        result = real_observe(*args, **kwargs)
+        observe_post.append(result["post_logits"].detach().cpu().numpy())
+        observe_prior.append(result["prior_logits"].detach().cpu().numpy())
+        return result
+
+    def recording_imagine(*args, **kwargs):
+        result = real_imagine(*args, **kwargs)
+        imagine_prior.append(result["prior_logits"].detach().cpu().numpy())
+        return result
+
+    monkeypatch.setattr(model.rssm, "observe", recording_observe)
+    monkeypatch.setattr(model.rssm, "imagine", recording_imagine)
+
+    kept = latent_pass(model, paths, probe, keep=True, device=device)
+
+    windows = kept.windows_total
+    assert windows > 0
+    assert len(observe_post) == len(observe_prior) == 2 * windows
+    assert len(imagine_prior) == 2 * windows
+    first_observe_post = observe_post[0::2]
+    second_observe_post = observe_post[1::2]
+    second_observe_prior = observe_prior[1::2]
+    first_imagine_prior = imagine_prior[0::2]
+    for w in range(windows):
+        np.testing.assert_array_equal(
+            kept.post_logits[w, :CONTEXT], first_observe_post[w][0], err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            kept.post_logits[w, CONTEXT:], second_observe_post[w][0], err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            kept.prior_teacher_logits[w], second_observe_prior[w][0], err_msg=f"window {w}"
+        )
+        np.testing.assert_array_equal(
+            kept.prior_open_logits[w], first_imagine_prior[w][0], err_msg=f"window {w}"
+        )

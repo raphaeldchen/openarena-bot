@@ -315,6 +315,21 @@ def test_predict_needs_both_contrasts_and_names_the_first_not_clearing():
     assert "teacher - marginal" not in persistence_short.rule.split("(")[0]
 
 
+def test_a_two_contrast_stage_with_the_first_clearing_and_the_second_unreadable_is_not_shown():
+    """`predict`'s two contrasts are read in `CONTRAST_LABELS`' order: the
+    persistence contrast clears, and the marginal one -- the second, and the
+    one actually blocking -- is a NaN z, unreadable rather than failed. The
+    rule names the blocking (unreadable) contrast first, then the one that
+    did clear, matching `test_z_exactly_at_the_bar_does_not_clear_and_a_nan_
+    cannot_be_read`'s single-contrast NaN wording but for the two-contrast
+    stage the untested path left uncovered."""
+    r = read(a=arm(pm=float("nan"))).arms["a"]
+    assert r.status is Status.PREDICT_FAILS
+    assert r.stages["predict"].wording == "not shown"
+    assert r.rule.startswith("predict not shown: teacher - marginal z nan cannot be read")
+    assert "teacher - persistence z +5.00 clears +2.81" in r.rule
+
+
 def test_carry_and_decode_fail_in_their_turn():
     assert read(a=arm(carry=-4.0)).arms["a"].status is Status.CARRY_FAILS
     assert read(a=arm(carry=-4.0)).arms["a"].rule.startswith("carry failed: open - persistence z -4.00 < -2.81")
