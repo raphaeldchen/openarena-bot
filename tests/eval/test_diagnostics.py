@@ -3539,3 +3539,168 @@ def test_reference_trajectories_carries_the_pass_band(tmp_path):
     assert band.position_gap_closed().shape == (HORIZON,)
     # Additive: a fabricated Trajectories that reads no band need not build one.
     assert Trajectories.__dataclass_fields__["band"].default is None
+
+
+# ---------------------------------------------------------------------------
+# The latent fields (M3g): `keep_latents` on `_diagnose` and
+# `reference_trajectories`. The stage decomposition reads the posterior over
+# the whole window, the teacher-forced prior (`observe` computes it already)
+# and the open-loop prior, in the model's own categorical latent. Two things
+# can go wrong without breaking a shape: the flag can move a field the trust
+# pass pins bitwise, and the open-loop prior at step 1 can stop being the
+# teacher-forced prior at step 1 -- which would mean the two passes no longer
+# start from the same context state. The real sampling rig pins both.
+# ---------------------------------------------------------------------------
+
+LATENT_FIELDS = (
+    "post_logits", "prior_teacher_logits", "prior_open_logits",
+    "posterior_rendering_distance", "true_step_displacement",
+)
+"""Literal, deliberately NOT `diagnostics_module._LATENT_FIELDS`: a field
+dropped from the module's tuple must be a missing attribute here, not a
+shorter loop."""
+
+
+def latent_pass(model, paths, probe, *, keep, device=None, seed=0, trajectories=True):
+    """`_diagnose` as `reference_trajectories` calls it, with the latent flag chosen."""
+    with torch.no_grad():
+        return diagnostics_module._diagnose(
+            model, paths, probe, arms={}, context=CONTEXT, horizon=HORIZON,
+            seed=seed, device=device or torch.device("cpu"), feature_backbone=None,
+            noise_reference=True, keep_trajectories=trajectories, keep_latents=keep,
+        )
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_keep_latents_leaves_every_existing_field_bitwise_and_fills_the_five(tmp_path, device):
+    """The trust pass's pin, from the other side: the latent flag is the ONLY
+    difference between two passes on the real sampling rig, and every field
+    the trust pass reads -- the nine trajectory arrays, the six curves, the
+    six per-window matrices, the noise reference and its two self-checks,
+    the counts and the labels -- must be bitwise the same across them, and
+    the generator must end at the same state, so the flag drew nothing from
+    the stream. Without the flag all five latent fields are None; with it
+    none of them is."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+
+    plain = latent_pass(model, paths, probe, keep=False, device=device)
+    left_by_plain = diagnostics_module._rng_snapshot(device)
+    kept = latent_pass(model, paths, probe, keep=True, device=device)
+    left_by_kept = diagnostics_module._rng_snapshot(device)
+
+    for name in LATENT_FIELDS:
+        assert getattr(plain, name) is None, name
+        assert getattr(kept, name) is not None, name
+    for name in TRAJECTORY_FIELDS:
+        np.testing.assert_array_equal(getattr(kept, name), getattr(plain, name), err_msg=name)
+    for name in ("horizon", "rssm_position", "persistence_position", "floor_position",
+                 "rssm_angle", "persistence_angle", "floor_angle"):
+        np.testing.assert_array_equal(
+            getattr(kept.reference, name), getattr(plain.reference, name), err_msg=name
+        )
+    for name, rows in plain.reference_windows.items():
+        np.testing.assert_array_equal(kept.reference_windows[name], rows, err_msg=name)
+    np.testing.assert_array_equal(kept.noise_embedding, plain.noise_embedding)
+    np.testing.assert_array_equal(kept.noise_bitwise_real, plain.noise_bitwise_real)
+    np.testing.assert_array_equal(kept.noise_stream_restored, plain.noise_stream_restored)
+    assert kept.windows_total == plain.windows_total == 4
+    np.testing.assert_array_equal(kept.window_episode, plain.window_episode)
+    assert set(left_by_kept) == set(left_by_plain)
+    for key in left_by_plain:
+        assert torch.equal(left_by_kept[key], left_by_plain[key]), key
+
+
+def test_the_latent_flag_is_keyword_only_off_by_default_and_needs_the_trajectories(tmp_path):
+    """Off by default so the ladder, the sweep and the trust pass keep running
+    the pass they pin bitwise. The latent fields are read beside the
+    trajectory rows (the decode stage is the free-channel margin), so asking
+    for them without the rows is refused before any window is cut."""
+    parameter = inspect.signature(diagnostics_module._diagnose).parameters["keep_latents"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+    parameter = inspect.signature(reference_trajectories).parameters["keep_latents"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+    model, paths, probe = _two_episode_rig(tmp_path, torch.device("cpu"))
+    with pytest.raises(ValueError, match="keep_trajectories"):
+        latent_pass(model, paths, probe, keep=True, trajectories=False)
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_latent_fields_have_their_shapes_and_the_step_one_identity_holds(tmp_path, device):
+    """Four windows, three context frames, five horizon steps, the real
+    32 x 32 latent: the posterior spans the whole window `(4, 8, 32, 32)`,
+    the two priors the horizon `(4, 5, 32, 32)`, both float32 as the model
+    emits them; the two distances `(4, 5)` float64 like the trajectory rows.
+    The open-loop prior at step 1 is the teacher-forced prior at step 1
+    BITWISE -- both are `prior_net` on the same `h` after the same context
+    state and the same action -- and `Trajectories` carries the same five
+    arrays bitwise when asked, None when not."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    groups, classes = model.rssm.cfg.z_cats, model.rssm.cfg.z_classes
+    kept = latent_pass(model, paths, probe, keep=True, device=device)
+
+    assert kept.post_logits.shape == (4, CONTEXT + HORIZON, groups, classes)
+    assert kept.prior_teacher_logits.shape == (4, HORIZON, groups, classes)
+    assert kept.prior_open_logits.shape == (4, HORIZON, groups, classes)
+    for name in ("post_logits", "prior_teacher_logits", "prior_open_logits"):
+        assert getattr(kept, name).dtype == np.float32, name
+        assert np.isfinite(getattr(kept, name)).all(), name
+    for name in ("posterior_rendering_distance", "true_step_displacement"):
+        assert getattr(kept, name).shape == (4, HORIZON), name
+        assert getattr(kept, name).dtype == np.float64, name
+        assert (getattr(kept, name) >= 0).all() and np.isfinite(getattr(kept, name)).all(), name
+    np.testing.assert_array_equal(kept.prior_open_logits[:, 0], kept.prior_teacher_logits[:, 0])
+    # The posterior is not the prior: the posterior saw the frame.
+    assert not np.array_equal(kept.post_logits[:, CONTEXT:], kept.prior_teacher_logits)
+
+    with torch.no_grad():
+        with_latents = reference_trajectories(
+            model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=0, device=device,
+            feature_backbone=None, keep_latents=True,
+        )
+        without = reference_trajectories(
+            model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=0, device=device,
+            feature_backbone=None,
+        )
+    for name in LATENT_FIELDS:
+        np.testing.assert_array_equal(getattr(with_latents, name), getattr(kept, name), err_msg=name)
+        assert getattr(without, name) is None, name
+    for name in TRAJECTORY_FIELDS:
+        np.testing.assert_array_equal(getattr(with_latents, name), getattr(without, name), err_msg=name)
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_step_displacement_is_the_one_frame_jitter_of_the_true_embedding(tmp_path, device):
+    """`true_step_displacement[:, h-1]` is `||e(h) - e(h-1)||` with e(0) the
+    last context frame, so at h = 1 it is `true_embedding_displacement`'s
+    own first column (`||e(1) - e(0)||`) bitwise, and the cumulative path
+    it traces bounds the straight-line displacement at every h (the
+    triangle inequality) -- a row taken one frame off fails the first;
+    a row taken against the wrong anchor fails the second."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    kept = latent_pass(model, paths, probe, keep=True, device=device)
+    np.testing.assert_array_equal(
+        kept.true_step_displacement[:, 0], kept.true_embedding_displacement[:, 0]
+    )
+    path = np.cumsum(kept.true_step_displacement, axis=1)
+    assert (kept.true_embedding_displacement <= path + 1e-9).all()
+    assert (kept.true_step_displacement[:, 1:] > 0).all()
+
+
+def test_a_broken_step_one_identity_is_refused_by_name(tmp_path, monkeypatch):
+    """A pass whose open-loop prior at step 1 is not the teacher-forced prior
+    at step 1 did not start both from the same context state; it is refused
+    as `LatentIdentityError` (a ValueError) naming the window, and nothing
+    is returned. Forced by making `imagine` advance from a perturbed state."""
+    model, paths, probe = _two_episode_rig(tmp_path, torch.device("cpu"))
+    real_imagine = model.rssm.imagine
+
+    def perturbed_imagine(actions, state):
+        h, z = state
+        return real_imagine(actions, (h + 1.0, z))
+
+    monkeypatch.setattr(model.rssm, "imagine", perturbed_imagine)
+    with pytest.raises(diagnostics_module.LatentIdentityError, match="window at start"):
+        latent_pass(model, paths, probe, keep=True)
+    assert issubclass(diagnostics_module.LatentIdentityError, ValueError)
