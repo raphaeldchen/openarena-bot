@@ -21,8 +21,10 @@ arrays are indexed by h - 1.
 """
 
 import numpy as np
+from dataclasses import dataclass
+from enum import Enum
 
-from mbfps.eval.split_gap import DECISION_H
+from mbfps.eval.split_gap import DECISION_H, StratumContrast, clears, fmt_z
 from mbfps.models.rssm import KL_FREE_BITS
 
 FAMILY: int = 5
@@ -40,6 +42,8 @@ __all__ = [
     "categorical_kl", "decode_margin", "entropy_by_group", "information", "log_softmax",
     "marginal_accuracy", "marginal_classes", "mode", "open_accuracy", "open_marginal",
     "open_persistence", "persistence_accuracy", "teacher_accuracy", "teacher_nll",
+    "CONTRAST_LABELS", "FAILING_STATUS", "ArmInputs", "ArmReading", "StageResult",
+    "StagesInputs", "StagesReading", "Status", "format_reading_stages", "reading_stages",
 ]
 
 
@@ -238,3 +242,200 @@ def decode_margin(persistence_distance, distance_to_truth, h: int) -> np.ndarray
     if not 1 <= h <= persistence.shape[1]:
         raise ValueError(f"h must be in 1..{persistence.shape[1]}, got {h}")
     return persistence[:, h - 1] - model[:, h - 1]
+
+
+# ---------------------------------------------------------------------------
+# The reading (spec 3.2), over pooled inputs.
+# ---------------------------------------------------------------------------
+
+CONTRAST_LABELS: dict[str, tuple[str, ...]] = {
+    "encode": (f"information - {KL_FREE_BITS:.2f}",),
+    "predict": ("teacher - persistence", "teacher - marginal"),
+    "carry": ("open - persistence",),
+    "decode": ("free margin",),
+}
+"""Each stage's contrasts in the order its sentence names them: predict's
+persistence contrast before its marginal one."""
+
+
+@dataclass(frozen=True)
+class ArmInputs:
+    """One arm's five pooled contrasts at the decision horizon, and the same
+    within each seed alone (leaves carry `per_seed=None`). `contrasts(stage)`
+    is the stage's contrasts under `CONTRAST_LABELS`' names and order."""
+
+    encode: StratumContrast
+    predict_persistence: StratumContrast
+    predict_marginal: StratumContrast
+    carry: StratumContrast
+    decode: StratumContrast
+    per_seed: "dict[int, ArmInputs] | None"
+
+    def contrasts(self, stage: str) -> tuple[tuple[str, StratumContrast], ...]:
+        labels = CONTRAST_LABELS[stage]
+        values = {
+            "encode": (self.encode,),
+            "predict": (self.predict_persistence, self.predict_marginal),
+            "carry": (self.carry,),
+            "decode": (self.decode,),
+        }[stage]
+        return tuple(zip(labels, values))
+
+
+@dataclass(frozen=True)
+class StagesInputs:
+    arms: dict[str, ArmInputs]
+    z_fam: float
+    h: int
+
+
+class Status(str, Enum):
+    """Spec 3.2's five outcomes: the first stage not passed, or none."""
+
+    ENCODE_FAILS = "encode fails"
+    PREDICT_FAILS = "predict fails"
+    CARRY_FAILS = "carry fails"
+    DECODE_FAILS = "decode fails"
+    NO_STAGE_FAILS = "no stage fails"
+
+
+FAILING_STATUS: dict[str, Status] = {
+    "encode": Status.ENCODE_FAILS,
+    "predict": Status.PREDICT_FAILS,
+    "carry": Status.CARRY_FAILS,
+    "decode": Status.DECODE_FAILS,
+}
+
+
+@dataclass(frozen=True)
+class StageResult:
+    """One stage of one arm: whether it passed, the word the sentence uses
+    (`passes` / `failed` / `not shown`), the sentence, the replication."""
+
+    stage: str
+    passes: bool
+    wording: str
+    rule: str
+    seeds_holding: int
+    seeds_total: int
+
+
+@dataclass(frozen=True)
+class ArmReading:
+    """`stages` carries every stage's result, in `STAGES` order, so the
+    tables can print the ones after the first not passed; `status` and
+    `rule` are the first not passed's, or `NO_STAGE_FAILS`."""
+
+    arm: str
+    status: Status
+    rule: str
+    stages: dict[str, StageResult]
+
+
+@dataclass(frozen=True)
+class StagesReading:
+    arms: dict[str, ArmReading]
+    h: int
+    z_fam: float
+
+
+def _holds(a: ArmInputs, stage: str, z_fam: float) -> bool:
+    """Every contrast of the stage clears within these inputs."""
+    return all(clears(contrast.z, z_fam) for _, contrast in a.contrasts(stage))
+
+
+def _stage_result(stage: str, a: ArmInputs, z_fam: float) -> StageResult:
+    """Spec 3.2's rule for one stage: pooled clears on every contrast AND
+    replicated in >= SEEDS_REQUIRED seeds. The sentence names the first
+    contrast not clearing (`failed` when its estimate is <= 0 or it clears
+    the wrong way, `not shown` otherwise), then the contrasts that do clear,
+    then the seeds holding."""
+    pooled = a.contrasts(stage)
+    bar = f"{z_fam:.2f}"
+    if a.per_seed is None:
+        # A single-seed leaf, read alone: there is nothing to replicate across.
+        seeds_holding, seeds_total, replicated = int(_holds(a, stage, z_fam)), 1, True
+        seeds_words = "this seed alone"
+    else:
+        seeds_holding = sum(1 for one in a.per_seed.values() if _holds(one, stage, z_fam))
+        seeds_total = len(a.per_seed)
+        replicated = seeds_holding >= SEEDS_REQUIRED
+        seeds_words = f"seeds holding {seeds_holding} of {seeds_total}"
+    clearing = [
+        f"{label} z {fmt_z(contrast.z)} clears +{bar}"
+        for label, contrast in pooled if clears(contrast.z, z_fam)
+    ]
+    blocking = [(label, contrast) for label, contrast in pooled if not clears(contrast.z, z_fam)]
+    if blocking:
+        label, contrast = blocking[0]
+        passes = False
+        if not np.isfinite(contrast.z):
+            wording, verdict = "not shown", f"{label} z {fmt_z(contrast.z)} cannot be read"
+        elif clears(-contrast.z, z_fam):
+            wording, verdict = "failed", f"{label} z {fmt_z(contrast.z)} < -{bar}"
+        elif not contrast.estimate > 0:
+            wording = "failed"
+            verdict = f"{label} estimate {fmt_z(contrast.estimate, '+.4f')} <= 0 (z {fmt_z(contrast.z)})"
+        else:
+            wording, verdict = "not shown", f"{label} z {fmt_z(contrast.z)} does not clear +{bar}"
+        rest = clearing + [seeds_words]
+    elif not replicated:
+        passes, wording = False, "not shown"
+        verdict = f"{clearing[0]} pooled"
+        rest = clearing[1:] + [f"{seeds_words} (>= {SEEDS_REQUIRED} required)"]
+    else:
+        passes, wording = True, "passes"
+        verdict = clearing[0]
+        rest = clearing[1:] + [seeds_words]
+    return StageResult(
+        stage=stage, passes=passes, wording=wording,
+        rule=f"{stage} {wording}: {verdict} ({'; '.join(rest)})",
+        seeds_holding=seeds_holding, seeds_total=seeds_total,
+    )
+
+
+def _arm_reading(arm: str, a: ArmInputs, z_fam: float, h: int) -> ArmReading:
+    """The stages in order; the status is the first not passed."""
+    results = {stage: _stage_result(stage, a, z_fam) for stage in STAGES}
+    for stage in STAGES:
+        if not results[stage].passes:
+            return ArmReading(arm=arm, status=FAILING_STATUS[stage], rule=results[stage].rule, stages=results)
+    summary = "; ".join(results[stage].rule for stage in STAGES)
+    return ArmReading(
+        arm=arm, status=Status.NO_STAGE_FAILS,
+        rule=f"every stage passes at h={h}: {summary}", stages=results,
+    )
+
+
+def reading_stages(inputs: StagesInputs) -> StagesReading:
+    """One `ArmReading` per arm, in the caller's order; arms never read each
+    other (spec 4: no ranking)."""
+    return StagesReading(
+        arms={arm: _arm_reading(arm, a, inputs.z_fam, inputs.h) for arm, a in inputs.arms.items()},
+        h=inputs.h, z_fam=inputs.z_fam,
+    )
+
+
+def format_reading_stages(reading: StagesReading, inputs: StagesInputs) -> str:
+    """The contrast table (every contrast of every arm, pooled), each stage's
+    sentence, and the verdict lines, in `ladder.txt`'s style."""
+    lines = [
+        f"--- Reading S: the first failing stage at h={reading.h} (each contrast pooled over "
+        f"the val windows, seeds averaged per window, episode-clustered); z_fam = {reading.z_fam:.2f} ---",
+        f"  {'arm':<12}{'stage':<9}{'contrast':<24}{'estimate':>10}{'se':>9}{'z':>8}  clears",
+    ]
+    for arm, a in inputs.arms.items():
+        for stage in STAGES:
+            for label, contrast in a.contrasts(stage):
+                verdict = "yes" if clears(contrast.z, reading.z_fam) else "no"
+                lines.append(
+                    f"  {arm:<12}{stage:<9}{label:<24}{fmt_z(contrast.estimate, '+.4f'):>10}"
+                    f"{fmt_z(contrast.se, '.4f'):>9}{fmt_z(contrast.z):>8}  {verdict}"
+                )
+    lines.append("  stage by stage:")
+    for arm, r in reading.arms.items():
+        for stage in STAGES:
+            lines.append(f"    {arm:<12}{r.stages[stage].rule}")
+    for arm, r in reading.arms.items():
+        lines.append(f"  verdict: {arm:<12}{r.status.name.replace('_', ' ')} -- decided by: {r.rule}")
+    return "\n".join(lines) + "\n"

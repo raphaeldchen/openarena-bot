@@ -186,3 +186,197 @@ def test_the_shapes_and_the_context_are_checked_before_anything_is_reduced():
         marginal_accuracy(POST, np.array([2]), CONTEXT)
     with pytest.raises(ValueError, match="groups, classes"):
         mode(np.zeros(3))
+
+
+# ---------------------------------------------------------------------------
+# The reading (spec 3.2): four stages in order, one status per arm, the
+# sentence that decided it. Fabricated contrasts; one rule mutated per test.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.split_gap import StratumContrast  # noqa: E402
+from mbfps.eval.stages import (  # noqa: E402
+    CONTRAST_LABELS,
+    FAILING_STATUS,
+    ArmInputs,
+    ArmReading,
+    StageResult,
+    StagesInputs,
+    StagesReading,
+    Status,
+    format_reading_stages,
+    reading_stages,
+)
+
+Z_FAM = 2.81
+
+
+def c(z: float, estimate: float | None = None) -> StratumContrast:
+    """A contrast with the given z; the estimate follows its sign unless given."""
+    if estimate is None:
+        estimate = float("nan") if not np.isfinite(z) else 0.01 * z
+    return StratumContrast(estimate=estimate, se=0.01, z=z, clusters=24)
+
+
+def leaf(encode=5.0, pp=5.0, pm=5.0, carry=5.0, decode=5.0) -> ArmInputs:
+    return ArmInputs(
+        encode=c(encode), predict_persistence=c(pp), predict_marginal=c(pm),
+        carry=c(carry), decode=c(decode), per_seed=None,
+    )
+
+
+def arm(encode=5.0, pp=5.0, pm=5.0, carry=5.0, decode=5.0, seeds=None) -> ArmInputs:
+    """Pooled inputs whose three leaves equal the pooled contrasts unless
+    `seeds` gives each leaf its own `(encode, pp, pm, carry, decode)`."""
+    pooled = leaf(encode, pp, pm, carry, decode)
+    leaves = (
+        {0: pooled, 1: pooled, 2: pooled} if seeds is None
+        else {i: leaf(*values) for i, values in enumerate(seeds)}
+    )
+    return ArmInputs(
+        encode=pooled.encode, predict_persistence=pooled.predict_persistence,
+        predict_marginal=pooled.predict_marginal, carry=pooled.carry, decode=pooled.decode,
+        per_seed=leaves,
+    )
+
+
+def read(**arms) -> StagesReading:
+    return reading_stages(StagesInputs(arms=arms, z_fam=Z_FAM, h=15))
+
+
+def test_the_status_order_and_the_contrast_labels_are_the_specs():
+    assert [s.name for s in Status] == [
+        "ENCODE_FAILS", "PREDICT_FAILS", "CARRY_FAILS", "DECODE_FAILS", "NO_STAGE_FAILS",
+    ]
+    assert FAILING_STATUS == {
+        "encode": Status.ENCODE_FAILS, "predict": Status.PREDICT_FAILS,
+        "carry": Status.CARRY_FAILS, "decode": Status.DECODE_FAILS,
+    }
+    assert CONTRAST_LABELS == {
+        "encode": ("information - 0.20",),
+        "predict": ("teacher - persistence", "teacher - marginal"),
+        "carry": ("open - persistence",),
+        "decode": ("free margin",),
+    }
+    a = leaf()
+    assert [label for label, _ in a.contrasts("predict")] == ["teacher - persistence", "teacher - marginal"]
+    assert a.contrasts("encode")[0][1] is a.encode
+    with pytest.raises(KeyError):
+        a.contrasts("render")
+
+
+def test_every_stage_clearing_in_every_seed_reads_no_stage_fails():
+    reading = read(pixel_ae=arm())
+    r = reading.arms["pixel_ae"]
+    assert isinstance(r, ArmReading) and r.status is Status.NO_STAGE_FAILS
+    assert all(isinstance(s, StageResult) and s.passes and s.wording == "passes" for s in r.stages.values())
+    assert list(r.stages) == list(STAGES)
+    assert r.rule.startswith("every stage passes")
+    assert "seeds holding 3 of 3" in r.stages["encode"].rule
+    assert reading.h == 15 and reading.z_fam == Z_FAM
+
+
+def test_a_negative_encode_contrast_reads_encode_fails_as_failed():
+    r = read(a=arm(encode=-5.0)).arms["a"]
+    assert r.status is Status.ENCODE_FAILS
+    assert r.rule == r.stages["encode"].rule
+    assert r.stages["encode"].wording == "failed"
+    assert r.rule.startswith("encode failed: information - 0.20 z -5.00 < -2.81")
+    assert "seeds holding 0 of 3" in r.rule
+
+
+def test_an_encode_contrast_below_the_bar_reads_encode_fails_as_not_shown():
+    r = read(a=arm(encode=1.0)).arms["a"]
+    assert r.status is Status.ENCODE_FAILS
+    assert r.stages["encode"].wording == "not shown"
+    assert r.rule.startswith("encode not shown: information - 0.20 z +1.00 does not clear +2.81")
+
+
+def test_a_non_positive_estimate_with_a_small_z_reads_failed_not_not_shown():
+    inputs = arm()
+    inputs = ArmInputs(
+        encode=c(-0.5, estimate=-0.002), predict_persistence=inputs.predict_persistence,
+        predict_marginal=inputs.predict_marginal, carry=inputs.carry, decode=inputs.decode,
+        per_seed=inputs.per_seed,
+    )
+    r = read(a=inputs).arms["a"]
+    assert r.status is Status.ENCODE_FAILS and r.stages["encode"].wording == "failed"
+    assert "estimate -0.0020 <= 0" in r.rule
+
+
+def test_predict_needs_both_contrasts_and_names_the_first_not_clearing():
+    marginal_short = read(a=arm(pm=1.2)).arms["a"]
+    assert marginal_short.status is Status.PREDICT_FAILS
+    assert marginal_short.rule.startswith("predict not shown: teacher - marginal z +1.20 does not clear +2.81")
+    assert "teacher - persistence z +5.00 clears +2.81" in marginal_short.rule
+    assert "seeds holding 0 of 3" in marginal_short.rule
+    persistence_short = read(a=arm(pp=1.0, pm=1.0)).arms["a"]
+    assert persistence_short.status is Status.PREDICT_FAILS
+    assert "teacher - persistence z +1.00 does not clear" in persistence_short.rule
+    assert "teacher - marginal" not in persistence_short.rule.split("(")[0]
+
+
+def test_carry_and_decode_fail_in_their_turn():
+    assert read(a=arm(carry=-4.0)).arms["a"].status is Status.CARRY_FAILS
+    assert read(a=arm(carry=-4.0)).arms["a"].rule.startswith("carry failed: open - persistence z -4.00 < -2.81")
+    assert read(a=arm(decode=0.5)).arms["a"].status is Status.DECODE_FAILS
+    assert read(a=arm(decode=0.5)).arms["a"].rule.startswith("decode not shown: free margin z +0.50 does not clear")
+
+
+def test_the_first_stage_not_passed_decides_even_when_later_stages_fail_too():
+    r = read(a=arm(encode=1.0, carry=-9.0, decode=-9.0)).arms["a"]
+    assert r.status is Status.ENCODE_FAILS
+    assert not r.stages["carry"].passes and r.stages["carry"].wording == "failed"
+
+
+def test_a_pooled_clear_that_replicates_in_one_seed_only_is_not_passed():
+    r = read(a=arm(seeds=[(5.0, 5, 5, 5, 5), (1.0, 5, 5, 5, 5), (1.0, 5, 5, 5, 5)])).arms["a"]
+    assert r.status is Status.ENCODE_FAILS
+    assert r.stages["encode"].wording == "not shown"
+    assert r.stages["encode"].seeds_holding == 1 and r.stages["encode"].seeds_total == 3
+    assert "seeds holding 1 of 3 (>= 2 required)" in r.rule
+    assert r.rule.startswith("encode not shown: information - 0.20 z +5.00 clears +2.81 pooled")
+
+
+def test_a_seed_holds_predict_only_when_both_its_contrasts_clear():
+    r = read(a=arm(seeds=[(5, 5.0, 5.0, 5, 5), (5, 5.0, 1.0, 5, 5), (5, 1.0, 5.0, 5, 5)])).arms["a"]
+    assert r.status is Status.PREDICT_FAILS
+    assert r.stages["predict"].seeds_holding == 1
+    two = read(a=arm(seeds=[(5, 5.0, 5.0, 5, 5), (5, 5.0, 5.0, 5, 5), (5, 1.0, 5.0, 5, 5)])).arms["a"]
+    assert two.status is Status.NO_STAGE_FAILS and two.stages["predict"].seeds_holding == 2
+
+
+def test_a_single_seed_leaf_read_alone_has_a_vacuous_replication_clause():
+    r = read(a=leaf()).arms["a"]
+    assert r.status is Status.NO_STAGE_FAILS
+    assert "this seed alone" in r.stages["encode"].rule
+    assert r.stages["encode"].seeds_holding == 1 and r.stages["encode"].seeds_total == 1
+    assert read(a=leaf(carry=1.0)).arms["a"].status is Status.CARRY_FAILS
+
+
+def test_z_exactly_at_the_bar_does_not_clear_and_a_nan_cannot_be_read():
+    assert read(a=arm(encode=Z_FAM)).arms["a"].status is Status.ENCODE_FAILS
+    nan = read(a=arm(carry=float("nan"))).arms["a"]
+    assert nan.status is Status.CARRY_FAILS and nan.stages["carry"].wording == "not shown"
+    assert "open - persistence z nan cannot be read" in nan.rule
+    assert read(a=arm(decode=float("inf"))).arms["a"].status is Status.DECODE_FAILS
+
+
+def test_arms_are_read_independently_and_in_the_callers_order():
+    reading = read(b=arm(encode=-5.0), a=arm())
+    assert list(reading.arms) == ["b", "a"]
+    assert reading.arms["b"].status is Status.ENCODE_FAILS
+    assert reading.arms["a"].status is Status.NO_STAGE_FAILS
+
+
+def test_format_reading_stages_prints_every_contrast_and_the_verdicts():
+    inputs = StagesInputs(arms={"pixel_ae": arm(pm=1.2), "frozen_ssl": arm()}, z_fam=Z_FAM, h=15)
+    text = format_reading_stages(reading_stages(inputs), inputs)
+    assert text.startswith("--- Reading S: the first failing stage at h=15")
+    assert "z_fam = 2.81" in text
+    for label in ("information - 0.20", "teacher - persistence", "teacher - marginal",
+                  "open - persistence", "free margin"):
+        assert text.count(label) >= 2, label
+    assert "  verdict: pixel_ae    PREDICT FAILS -- decided by: predict not shown" in text
+    assert "  verdict: frozen_ssl  NO STAGE FAILS -- decided by: every stage passes" in text
+    assert "+1.20" in text and "yes" in text and "no" in text
+    assert text.endswith("\n")
