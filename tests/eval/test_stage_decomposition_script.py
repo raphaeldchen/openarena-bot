@@ -294,3 +294,205 @@ def test_the_decode_inputs_and_the_marginal_classes_are_what_read_will_consume(e
     assert np.isfinite(probe).all()
     assert record["companions"]["marginal_classes"] == [int(c) for c in record["companions"]["marginal_classes"]]
     assert all(0 <= c < CLASSES for c in record["companions"]["marginal_classes"])
+
+
+# ---------------------------------------------------------------------------
+# read: the pooling glue, the control rule, Reading S, stages.txt.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.pooling import cluster_threshold  # noqa: E402
+from mbfps.eval.split_gap import StratumContrast  # noqa: E402
+from mbfps.eval.stages import (  # noqa: E402
+    FAMILY,
+    STAGES,
+    ArmReading,
+    StageResult,
+    StagesReading,
+    Status,
+)
+
+SECTIONS = (
+    "--- self-check per record",
+    "--- stage components per arm",
+    "--- carry: open-loop accuracy against k",
+    "--- decode: the paired margin",
+    "--- companions (change no verdict)",
+    "--- the known-answer control",
+    "--- Reading S: the first failing stage at h=3",
+    "--- per seed",
+)
+
+
+@pytest.fixture
+def stages_run(evaluated, capsys):
+    assert _run(evaluated, "--phase", "read") == script.EXIT_OK
+    text = capsys.readouterr().out
+    return types.SimpleNamespace(ref=evaluated, text=text, path=evaluated.stages / "stages.txt")
+
+
+def _fabricated_reading(status: Status):
+    """A `reading_stages` stand-in giving every arm one status, with a full
+    stage table so the control text can still be formatted."""
+    def fake(inputs):
+        arms = {}
+        for arm in inputs.arms:
+            stages = {
+                stage: StageResult(stage=stage, passes=True, wording="passes",
+                                   rule=f"{stage} passes: fabricated", seeds_holding=2, seeds_total=2)
+                for stage in STAGES
+            }
+            arms[arm] = ArmReading(arm=arm, status=status, rule="fabricated", stages=stages)
+        return StagesReading(arms=arms, h=inputs.h, z_fam=inputs.z_fam)
+    return fake
+
+
+def _record(n=4, horizon=3, information=(0.5, 0.1, 0.3, 0.9)):
+    """A fabricated stages record: four windows, three steps, hand-typed series."""
+    return {
+        "label": "arm", "seed": 0, "arm": "arm", "kind": "cell",
+        "episodes": {"val": ["a", "b"]}, "horizon": horizon, "context": 2, "decision_h": horizon,
+        "device": "cpu", "torch_version": "x",
+        "windows": {"total": n, "episode": [0, 0, 1, 1], "clusters": 2},
+        "information": list(information),
+        "accuracy": {"teacher": [0.9, 0.8, 0.7, 0.6], "persistence": [0.5, 0.5, 0.5, 0.5],
+                     "marginal": [0.4, 0.3, 0.2, 0.1]},
+        "open": {"accuracy": [[1.0, 0.8, 0.6]] * n, "persistence": [[0.5, 0.4, 0.3]] * n,
+                 "marginal": [[0.2, 0.2, 0.2]] * n},
+        "decode": {"persistence_distance": [[3.0, 4.0, 5.0]] * n, "distance_to_truth": [[1.0, 2.0, 6.0]] * n,
+                   "probe_persistence": [[30.0, 40.0, 50.0]] * n, "probe_model": [[10.0, 20.0, 60.0]] * n,
+                   "moved": [[True, True, True], [True, True, False], [True, True, True], [False, False, False]]},
+    }
+
+
+def test_contrast_values_are_the_pre_registered_differences_under_their_masks():
+    r = _record()
+    values, changed = script.contrast_values(r, "encode", 3)
+    np.testing.assert_allclose(values, np.array([0.5, 0.1, 0.3, 0.9]) - KL_FREE_BITS)
+    assert changed.all() and changed.shape == (4,)
+    np.testing.assert_allclose(script.contrast_values(r, "predict_persistence", 3)[0], [0.4, 0.3, 0.2, 0.1])
+    np.testing.assert_allclose(script.contrast_values(r, "predict_marginal", 3)[0], [0.5, 0.5, 0.5, 0.5])
+    np.testing.assert_allclose(script.contrast_values(r, "carry", 2)[0], [0.4] * 4)
+    np.testing.assert_allclose(script.contrast_values(r, "carry_marginal", 3)[0], [0.4] * 4)
+    values, changed = script.contrast_values(r, "decode", 3)
+    np.testing.assert_allclose(values, [-1.0] * 4)
+    np.testing.assert_array_equal(changed, [True, False, True, False])
+    values, changed = script.contrast_values(r, "decode_probe", 1)
+    np.testing.assert_allclose(values, [20.0] * 4)
+    np.testing.assert_array_equal(changed, [True, True, True, False])
+    assert script.CONTRASTS == ("encode", "predict_persistence", "predict_marginal", "carry", "decode")
+    with pytest.raises(KeyError):
+        script.contrast_values(r, "render", 1)
+
+
+def test_pooled_is_pool_arm_reduced_to_a_contrast_and_nan_with_nothing_to_pool():
+    r = _record()
+    series = script._series(r, *script.contrast_values(r, "encode", 3), channel="encode")
+    p = script.pooled([series])
+    assert isinstance(p, StratumContrast)
+    assert p.estimate == pytest.approx(np.mean([0.5, 0.1, 0.3, 0.9]) - KL_FREE_BITS)
+    assert p.clusters == 2 and np.isfinite(p.se)
+    unmoved = dict(r, decode=dict(r["decode"], moved=[[False] * 3] * 4))
+    empty = script.pooled([script._series(unmoved, *script.contrast_values(unmoved, "decode", 3), channel="decode")])
+    assert np.isnan(empty.z) and empty.clusters == 0
+    assert np.isnan(script.pooled([]).z)
+
+
+def test_stages_inputs_pool_each_arm_and_the_control_under_the_family_bar(stages_run):
+    status, records = script.load_records(
+        types.SimpleNamespace(out=stages_run.ref.stages),
+        [(JOB.arm, JOB.seed)], [(job.arm, job.seed) for job in CONTROL_JOBS],
+    )
+    assert status == script.EXIT_OK
+    assert set(records) == {(JOB.arm, JOB.seed), (script.CONTROL_LABEL, 1), (script.CONTROL_LABEL, 2)}
+    inputs, control = script.stages_inputs(
+        records, arms=[JOB.arm], seeds=[JOB.seed], control_seeds=[1, 2], h=HORIZON,
+    )
+    assert inputs.z_fam == control.z_fam == cluster_threshold(FAMILY, CLUSTERS)
+    assert inputs.h == control.h == HORIZON
+    assert list(inputs.arms) == [JOB.arm] and list(control.arms) == [script.CONTROL_LABEL]
+    a = inputs.arms[JOB.arm]
+    assert set(a.per_seed) == {JOB.seed} and a.per_seed[JOB.seed].per_seed is None
+    assert set(control.arms[script.CONTROL_LABEL].per_seed) == {1, 2}
+    for stage in STAGES:
+        for _, contrast in a.contrasts(stage):
+            assert contrast.clusters == CLUSTERS and np.isfinite(contrast.estimate)
+
+
+def test_read_without_records_is_exit_11(reference, capsys):
+    assert _run(reference, "--phase", "read") == script.EXIT_NO_CHECKPOINTS
+    assert "run --phase evaluate first" in capsys.readouterr().out
+
+
+def test_read_refuses_a_record_whose_self_check_is_not_ok_or_whose_identity_is_unset(evaluated, capsys):
+    path = evaluated.stages / STAGES_RECORD
+    original = path.read_text()
+    _doctor(path, lambda r: r["self_check"].update({"ok": False}))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    assert "SELF-CHECK FAILED" in capsys.readouterr().out
+    path.write_text(original)
+    _doctor(path, lambda r: r["self_check"].update({"reference_position_max_delta": 1e-6}))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    capsys.readouterr()
+    path.write_text(original)
+    _doctor(evaluated.stages / CONTROL_RECORDS[1], lambda r: r.__setitem__("identity", False))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    assert "identity" in capsys.readouterr().out
+    assert not (evaluated.stages / "stages.txt").exists()
+
+
+def test_read_raises_on_records_at_different_protocols(evaluated):
+    _doctor(evaluated.stages / CONTROL_RECORDS[0], lambda r: r.__setitem__("horizon", 2))
+    with pytest.raises(ValueError, match="horizon"):
+        _run(evaluated, "--phase", "read")
+
+
+def test_a_control_that_does_not_read_encode_fails_is_exit_34_with_no_reading_and_no_file(evaluated, monkeypatch, capsys):
+    """The known-blind control is the instrument's validation: read as
+    anything but ENCODE_FAILS, the control tables are printed with the
+    sentence, no arm's reading is, and stages.txt is not written."""
+    monkeypatch.setattr(script, "reading_stages", _fabricated_reading(Status.NO_STAGE_FAILS))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_CONTROL_MISREAD
+    out = capsys.readouterr().out
+    assert "CONTROL MISREAD" in out and "NO STAGE FAILS" in out and "fabricated" in out
+    assert "--- the known-answer control" in out
+    assert "--- Reading S" not in out.split("CONTROL MISREAD")[1]
+    assert f"verdict: {JOB.arm}" not in out
+    assert not (evaluated.stages / "stages.txt").exists()
+
+
+def test_a_control_reading_encode_fails_lets_the_reading_through(evaluated, monkeypatch, capsys):
+    monkeypatch.setattr(script, "reading_stages", _fabricated_reading(Status.ENCODE_FAILS))
+    assert _run(evaluated, "--phase", "read") == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert "CONTROL MISREAD" not in out and f"verdict: {JOB.arm}" in out
+    assert (evaluated.stages / "stages.txt").exists()
+
+
+def test_read_prints_every_section_writes_it_byte_identical_and_draws_the_figure(stages_run):
+    text = stages_run.text
+    for section in SECTIONS:
+        assert section in text, section
+    assert stages_run.path.read_text() == text
+    assert "z_fam = cluster_threshold(5, 6)" in text
+    assert f"verdict: {JOB.arm:<12}ENCODE FAILS" in text  # one seed: nothing can replicate
+    assert "seeds holding" in text and "this seed alone" in text
+    assert "control" in text and "must read ENCODE FAILS" in text
+    assert "NOTE: decision horizon clamped to the run's horizon h=3" in text
+    figure = stages_run.ref.stages / "stages_curves.png"
+    assert (f"figure={figure}" in text) == figure.exists()
+    assert "figure NOT written" in text or figure.stat().st_size > 0
+
+
+def test_read_is_idempotent_and_all_runs_both_phases(stages_run, capsys):
+    assert _run(stages_run.ref, "--phase", "read") == script.EXIT_OK
+    assert capsys.readouterr().out == stages_run.text
+    assert _run(stages_run.ref, "--phase", "all") == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert out.endswith(stages_run.text) and "wrote" in out
+
+
+def test_the_groups_order_the_arms_as_the_readings_do_and_put_the_control_last():
+    records = {("random_vit", 0): {}, ("pixel_ae", 0): {}, ("control", 1): {}, ("control", 2): {}}
+    groups = script._groups(records, ["random_vit", "pixel_ae"], [0], [1, 2])
+    assert [label for label, _ in groups] == ["pixel_ae", "random_vit", "control"]
+    assert groups[-1][1] == [("control", 1), ("control", 2)]
