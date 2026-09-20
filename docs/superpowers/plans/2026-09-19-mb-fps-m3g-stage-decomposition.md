@@ -1953,7 +1953,10 @@ def load_requested(args, cells, controls) -> list[tuple[str, Path, Cell]]:
 def evaluate_phase(args, cells, controls, device, train, val) -> int:
     try:
         loaded = load_requested(args, cells, controls)
-    except CellMissing as error:
+    # Two classes, one name: `_sibling` executes each script afresh, so the
+    # ladder's `rung_cell` raises the ladder's own `CellMissing`, a distinct
+    # class from the one this module took from trust_horizon.
+    except (CellMissing, _ladder.CellMissing) as error:
         print(f"NO CELL: {error}")
         return EXIT_NO_CHECKPOINTS
     args.out.mkdir(parents=True, exist_ok=True)
