@@ -69,8 +69,11 @@ Append to `tests/models/test_rssm.py`:
 # ---------------------------------------------------------------------------
 
 
-def _logits(seed: int = 0, batch: int = 4) -> torch.Tensor:
-    """Logits with a deliberate spread, so tempering visibly changes the draw."""
+def _temperature_logits(seed: int = 0, batch: int = 4) -> torch.Tensor:
+    """Logits with a deliberate spread, so tempering visibly changes the draw.
+
+    Named apart from the module's existing `_logits` (the KL tests' peak-based
+    helper): redefining that one would shadow it for the whole file."""
     return torch.randn(batch, 32 * 32, generator=torch.Generator().manual_seed(seed)) * 2.0
 
 
@@ -83,19 +86,31 @@ def test_at_one_the_sample_is_bitwise_what_the_untempered_sampler_draws(rssm):
     """The default path is skipped, not divided: `x / 1.0` is exact in IEEE 754,
     but the pin is on the code taking no division at all, so a future change to
     the tempering arithmetic cannot move a shipped record."""
-    logits = _logits()
+    logits = _temperature_logits()
     torch.manual_seed(7)
     explicit = rssm._sample(logits, temperature=1.0)
     torch.manual_seed(7)
     default = rssm._sample(logits)
     assert torch.equal(explicit, default)
+    # The equality above cannot catch the regression this test exists for:
+    # `x / 1.0` is bit-exact, so replacing the special case with an
+    # unconditional `shaped / tau` would keep every number identical. The
+    # guarantee is structural, so it is pinned on the source, as Task 2 pins
+    # `prepare_cell`'s threading.
+    source = inspect.getsource(rssm_module.RSSM._sample)
+    division = [line for line in source.splitlines() if "/ tau" in line]
+    assert division, "no tempering division found in _sample; has it been rewritten?"
+    assert all("tau in (0.0, 1.0)" in line for line in division), (
+        "the tempering division must be guarded so that 1.0 (and 0.0) take no division at "
+        f"all; found {division}"
+    )
 
 
 def test_a_lower_temperature_draws_the_argmax_more_often_and_zero_always_does(rssm):
     """Sharper means sharper: over many draws of the same logits the sampled
     class agrees with the argmax monotonically more often as the temperature
     falls, and at 0 it agrees always."""
-    logits = _logits(seed=1, batch=64)
+    logits = _temperature_logits(seed=1, batch=64)
     argmax = logits.view(64, 32, 32).argmax(-1)
 
     def agreement(tau):
@@ -114,7 +129,7 @@ def test_every_temperature_consumes_exactly_one_draw_per_call(rssm):
     -- the obvious implementation -- would leave the generator at a different
     point and the floor, the persistence anchor and the probe would all move.
     Every temperature draws once and tau = 0 discards what it drew."""
-    logits = _logits(seed=2)
+    logits = _temperature_logits(seed=2)
     states = {}
     for tau in (1.0, 0.7, 0.3, 0.0):
         torch.manual_seed(5)
@@ -130,7 +145,7 @@ def test_the_straight_through_gradient_survives_every_temperature(rssm):
     both cases a gradient reaches the logits, which is what lets the encoder
     train at all."""
     for tau in (1.0, 0.5, 0.0):
-        logits = _logits(seed=3).requires_grad_(True)
+        logits = _temperature_logits(seed=3).requires_grad_(True)
         rssm._sample(logits, temperature=tau).sum().backward()
         assert logits.grad is not None and torch.isfinite(logits.grad).all(), tau
         assert logits.grad.abs().sum() > 0, tau
@@ -138,7 +153,7 @@ def test_the_straight_through_gradient_survives_every_temperature(rssm):
 
 def test_a_negative_temperature_is_refused(rssm):
     with pytest.raises(ValueError, match="temperature"):
-        rssm._sample(_logits(), temperature=-0.5)
+        rssm._sample(_temperature_logits(), temperature=-0.5)
 
 
 def test_imagine_takes_a_rollout_override_and_observe_does_not(rssm):
@@ -167,7 +182,7 @@ def test_a_configured_temperature_drives_both_paths(rssm):
     `observe` as well as `imagine` -- the retrain's whole intervention."""
     cfg = RSSMConfig(sample_temperature=0.0)
     sharp = RSSM(cfg, seed=0)
-    logits = _logits(seed=4)
+    logits = _temperature_logits(seed=4)
     assert torch.equal(
         sharp._sample(logits), sharp._sample(logits, temperature=0.0)
     )
@@ -181,7 +196,7 @@ def test_a_configured_temperature_drives_both_paths(rssm):
     assert torch.equal(modes, drawn), "a configured tau=0 posterior must draw its own mode"
 ```
 
-Add to the imports at the top of `tests/models/test_rssm.py` (it already imports `pytest`, `torch`, and `RSSM`/`RSSMConfig` from `mbfps.models.rssm`, and defines a module-level `rssm` fixture returning `RSSM(RSSMConfig())`): `import mbfps.models.rssm as rssm_module`.
+Add to the imports at the top of `tests/models/test_rssm.py` (it already imports `pytest`, `torch`, and `RSSM`/`RSSMConfig` from `mbfps.models.rssm`, and defines a module-level `rssm` fixture returning `RSSM(RSSMConfig())`): `import inspect` and `import mbfps.models.rssm as rssm_module`. The file's existing `_logits(b=2, t=3, peak=0.0)` helper is left exactly as it is — the new helper above is named apart from it, because redefining it would shadow it for every KL test in the file.
 
 Append to `tests/utils/test_config.py`:
 
