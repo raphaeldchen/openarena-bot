@@ -472,6 +472,29 @@ class _Pass:
     """`(n_windows, horizon)`: `||e(h) - e(0)||`, how far the encoder's
     embedding of the real frames moved."""
 
+    # The latent-space fields (M3g). None unless the traversal ran with
+    # `keep_latents=True`; then every one is set, for the CANONICAL pass only.
+    post_logits: np.ndarray | None = None
+    """`(n_windows, context + horizon, groups, classes)`: the posterior's
+    logits over the whole window -- the context filter's steps, then the
+    floor's over the real future frames. Index `context - 1` is the last
+    context frame t0; index `context - 1 + h` is horizon step h. float32, as
+    the model emits them; the consumer reduces in float64."""
+    prior_teacher_logits: np.ndarray | None = None
+    """`(n_windows, horizon, groups, classes)`: the floor pass's
+    `prior_logits` -- at horizon step h, `prior_net` on the `h` advanced by
+    the POSTERIOR's sample at h - 1 and the true action: the teacher-forced
+    one-step prediction, which `observe` computes already."""
+    prior_open_logits: np.ndarray | None = None
+    """`(n_windows, horizon, groups, classes)`: the canonical `imagine`'s
+    `prior_logits` -- the prior fed its own samples from t0."""
+    posterior_rendering_distance: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e_post(h) - e(h)||`, the head on the floor's
+    latent against the encoder's embedding of the same frame."""
+    true_step_displacement: np.ndarray | None = None
+    """`(n_windows, horizon)`: `||e(h) - e(h - 1)||`, with e(0) the last
+    context frame -- the one-frame jitter of the encoder's embedding."""
+
 
 _TRAJECTORY_FIELDS: tuple[str, ...] = (
     "positions", "positions_at_context", "positions_real",
@@ -482,6 +505,24 @@ _TRAJECTORY_FIELDS: tuple[str, ...] = (
 """The nine `_Pass` fields `keep_trajectories` fills, in `_Pass` order; the
 one list `_diagnose` collects by and `reference_trajectories` repackages
 by, so a field added to one cannot be forgotten by the other."""
+
+
+_LATENT_FIELDS: tuple[str, ...] = (
+    "post_logits", "prior_teacher_logits", "prior_open_logits",
+    "posterior_rendering_distance", "true_step_displacement",
+)
+"""The five `_Pass` fields `keep_latents` fills (M3g), in `_Pass` order;
+`reference_trajectories` copies them onto `Trajectories` by this name.
+Separate from `_TRAJECTORY_FIELDS` so the M3d list, and the tests that pin
+it literally, stand as they are."""
+
+
+class LatentIdentityError(ValueError):
+    """The open-loop prior at step 1 is not the teacher-forced prior at step
+    1 bitwise. Both are `prior_net` on the same `h` after the same context
+    state and the same action, so a difference means the two passes did not
+    start from the same state -- a plumbing fault, refused by name rather
+    than left to surface as one more ValueError among the window guards."""
 
 
 def _diagnose(
@@ -498,6 +539,7 @@ def _diagnose(
     arm_pairs: dict | None = None,
     noise_reference: bool = True,
     keep_trajectories: bool = False,
+    keep_latents: bool = False,
 ) -> _Pass:
     """`evaluate_rollout`, plus extra imagination arms on a matched stream.
 
@@ -543,6 +585,17 @@ def _diagnose(
     the extra work is numpy on rows already in hand, draws nothing from the
     stream, and calls `probe_targets` once more only inside the flag.
 
+    `keep_latents` (M3g) additionally carries, on the CANONICAL pass only,
+    the posterior's logits over the whole window (the context filter's then
+    the floor's), the floor pass's `prior_logits` -- the teacher-forced
+    one-step prediction `observe` computes anyway -- and the canonical
+    `imagine`'s `prior_logits`, plus the head's rendering error on the
+    floor's latent and the one-frame jitter of the true embedding. Nothing
+    is run that the pass did not already run and nothing is drawn from the
+    stream. It needs `keep_trajectories`: the stage decomposition reads the
+    latents beside the rows. The open-loop and teacher-forced priors at
+    step 1 are asserted bitwise equal per window (`LatentIdentityError`).
+
     Deliberately NOT separately decorated with `@torch.no_grad()`: both public
     entry points are, so a second decorator here is a guard no mutation can
     turn red, which this repo treats as a defect rather than as depth.
@@ -573,6 +626,14 @@ def _diagnose(
     window_episode: list[int] = []
     kept: dict[str, list[np.ndarray]] | None = (
         {name: [] for name in _TRAJECTORY_FIELDS} if keep_trajectories else None
+    )
+    if keep_latents and not keep_trajectories:
+        raise ValueError(
+            "keep_latents needs keep_trajectories: the latent fields are read beside the "
+            "trajectory rows, and a pass that keeps one without the other reads nothing"
+        )
+    kept_latents: dict[str, list[np.ndarray]] | None = (
+        {name: [] for name in _LATENT_FIELDS} if keep_latents else None
     )
 
     for path in val_paths:
@@ -715,6 +776,32 @@ def _diagnose(
                 kept["true_embedding_displacement"].append(
                     _embedding_distance(true_embedding[1:], held_truth)
                 )
+                if kept_latents is not None:
+                    # Both priors below were computed above: `real` by the
+                    # floor's observe, `imagined` by the canonical imagine,
+                    # each from `state` with `actions[:, context]` first. So
+                    # their step-1 logits are `prior_net` on the same `h`,
+                    # and a difference is a fault, not a measurement.
+                    teacher = real["prior_logits"][0]
+                    opened = imagined["prior_logits"][0]
+                    if not torch.equal(opened[0], teacher[0]):
+                        raise LatentIdentityError(
+                            f"window at start {start}: the open-loop prior at step 1 is not "
+                            "the teacher-forced prior at step 1 bitwise; the two passes did "
+                            "not start from the same context state"
+                        )
+                    kept_latents["post_logits"].append(
+                        torch.cat([observed["post_logits"], real["post_logits"]], dim=1)[0]
+                        .cpu().numpy()
+                    )
+                    kept_latents["prior_teacher_logits"].append(teacher.cpu().numpy())
+                    kept_latents["prior_open_logits"].append(opened.cpu().numpy())
+                    kept_latents["posterior_rendering_distance"].append(
+                        _embedding_distance(floor_embeddings, true_embedding[1:])
+                    )
+                    kept_latents["true_step_displacement"].append(
+                        _embedding_distance(true_embedding[1:], true_embedding[:-1])
+                    )
 
             arm_embeddings = {}
             for name, latent in arm_latents.items():
@@ -754,6 +841,7 @@ def _diagnose(
         windows_total=stacked["rssm_position"].shape[0],
         window_episode=np.array(window_episode, dtype=int),
         **({} if kept is None else {name: np.stack(rows) for name, rows in kept.items()}),
+        **({} if kept_latents is None else {name: np.stack(rows) for name, rows in kept_latents.items()}),
     )
 
 
@@ -800,6 +888,14 @@ class Trajectories:
     `persistence_position` above are `band.rssm_position` and
     `band.persistence_position`, kept under their own names because the
     self-check reads them by name."""
+    post_logits: np.ndarray | None = None
+    prior_teacher_logits: np.ndarray | None = None
+    prior_open_logits: np.ndarray | None = None
+    posterior_rendering_distance: np.ndarray | None = None
+    true_step_displacement: np.ndarray | None = None
+    """The five `_LATENT_FIELDS` (M3g), under `_Pass`'s names and shapes;
+    None unless `reference_trajectories` was asked for them. The nine
+    trajectory arrays above are unchanged by the request."""
 
 
 @torch.no_grad()
@@ -813,6 +909,7 @@ def reference_trajectories(
     seed: int,
     device,
     feature_backbone,
+    keep_latents: bool = False,
 ) -> Trajectories:
     """The canonical pass alone, with its per-window trajectories kept.
 
@@ -829,15 +926,19 @@ def reference_trajectories(
     `feature_backbone`: the caller reads every one of them from the cell's
     diagnostic record, and a default here would let a mismatch pass in
     silence.
+
+    `keep_latents` (M3g) asks the pass for the five latent fields as well;
+    the nine trajectory arrays and the band are bitwise the same either way.
     """
     result = _diagnose(
         model, val_paths, embedding_probe_weights,
         arms={}, context=context, horizon=horizon, seed=seed, device=device,
         feature_backbone=feature_backbone, noise_reference=True,
-        keep_trajectories=True,
+        keep_trajectories=True, keep_latents=keep_latents,
     )
     return Trajectories(
         **{name: getattr(result, name) for name in _TRAJECTORY_FIELDS},
+        **({name: getattr(result, name) for name in _LATENT_FIELDS} if keep_latents else {}),
         window_episode=result.window_episode,
         windows_total=result.windows_total,
         reference_position=result.reference.rssm_position,

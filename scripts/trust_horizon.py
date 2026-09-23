@@ -245,6 +245,20 @@ class SelfCheck:
         }
 
 
+def trustworthy(check) -> bool:
+    """Is a RECORDED self-check (`SelfCheck.record()` read back from disk) one
+    a reader may trust: `ok`, both curves at exactly 0.0, both window flags.
+    The deltas are checked beside `ok` on purpose -- a record whose `ok` says
+    True over a nonzero delta is a record that was edited, and is refused."""
+    return bool(check) and (
+        check.get("ok") is True
+        and check.get("reference_position_max_delta") == 0.0
+        and check.get("persistence_position_max_delta") == 0.0
+        and bool(check.get("windows_total_match"))
+        and bool(check.get("windows_episode_match"))
+    )
+
+
 def _curve_failure(name: str, delta: float, step: int) -> str:
     if step == 0:
         return f"{name} has a different length from the diagnostic's"

@@ -412,6 +412,21 @@ def test_self_check_refuses_a_window_count_or_episode_index_that_differs():
     assert no_index.windows_episode_match is False and no_index.ok is False
 
 
+def test_trustworthy_needs_ok_both_zero_deltas_and_both_window_flags():
+    """The recorded self-check a reader may trust. `ok` alone is not enough:
+    a record whose `ok` says True over a nonzero delta was edited."""
+    good = {"ok": True, "reference_position_max_delta": 0.0, "persistence_position_max_delta": 0.0,
+            "windows_total_match": True, "windows_episode_match": True}
+    assert script.trustworthy(good) is True
+    assert script.trustworthy(None) is False
+    assert script.trustworthy({}) is False
+    assert script.trustworthy({**good, "ok": False}) is False
+    assert script.trustworthy({**good, "reference_position_max_delta": 1e-6}) is False
+    assert script.trustworthy({**good, "persistence_position_max_delta": -0.0}) is True  # -0.0 == 0.0
+    assert script.trustworthy({**good, "windows_total_match": False}) is False
+    assert script.trustworthy({**good, "windows_episode_match": None}) is False
+
+
 # ---------------------------------------------------------------------------
 # trust_record and write_trust_record, on the fabricated trajectories.
 # ---------------------------------------------------------------------------

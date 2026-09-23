@@ -136,6 +136,7 @@ self_check = _trust.self_check
 prepare_cell = _trust.prepare_cell
 probe_is_measurable = _trust.probe_is_measurable
 checkpoint_path = _trust.checkpoint_path
+trustworthy = _trust.trustworthy
 
 EXIT_OK = _trust.EXIT_OK
 EXIT_NO_CHECKPOINTS = _trust.EXIT_NO_CHECKPOINTS
@@ -934,14 +935,7 @@ def read_phase(args, cells, rungs) -> int:
         records[(arm, seed)] = load_record(path)
     for (arm, seed), record in records.items():
         check = _entry(record, REFERENCE_RUNG)["self_check"]
-        trustworthy = bool(check) and (
-            check.get("ok") is True
-            and check.get("reference_position_max_delta") == 0.0
-            and check.get("persistence_position_max_delta") == 0.0
-            and check.get("windows_total_match")
-            and check.get("windows_episode_match")
-        )
-        if not trustworthy:
+        if not trustworthy(check):
             print(
                 f"\nSELF-CHECK FAILED for {arm} seed {seed}: the ladder record's reference "
                 f"self-check is {check!r}; the record is not read against a ruler that reproduced."
