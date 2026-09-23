@@ -23,6 +23,21 @@ import torch.nn.functional as F
 from mbfps.utils.seeding import seeded_init
 
 
+SAMPLE_TEMPERATURE: float = 1.0
+"""The temperature the categorical state is drawn at, in `observe` and in
+`imagine` alike. 1.0 is what every M3b-M3g artefact was trained and evaluated
+at, and `_sample` skips the division entirely at that value, so the shipped
+path is bitwise unchanged by this parameter existing.
+
+Below 1.0 the draw concentrates on the mode. M3h's measurement is why the
+parameter is here: at 20k the posterior carries 0.71-0.87 nats per group over
+32 groups, so every imagined step injects ~23-28 nats of fresh entropy against
+the ~0.4-0.6 nats of dynamics information -- and two draws of the same model
+from the same state separate, from h = 5 onward, by more than that model's
+entire imagined displacement.
+"""
+
+
 @dataclass(frozen=True)
 class RSSMConfig:
     """Shared byte-for-byte across arms."""
@@ -33,6 +48,7 @@ class RSSMConfig:
     embed_dim: int = 2048
     n_actions: int = 6
     hidden: int = 512
+    sample_temperature: float = SAMPLE_TEMPERATURE
 
 
 LATENT_DIM = 512 + 32 * 32
@@ -74,7 +90,7 @@ class RSSM(nn.Module):
             torch.zeros(batch_size, self.z_dim, device=device),
         )
 
-    def _sample(self, logits: torch.Tensor) -> torch.Tensor:
+    def _sample(self, logits: torch.Tensor, temperature: float | None = None) -> torch.Tensor:
         """One-hot sample with a straight-through gradient.
 
         `argmax` has zero gradient everywhere, so the backward pass uses the
@@ -88,10 +104,31 @@ class RSSM(nn.Module):
         degrades WITH training, as sharpening logits make the mode more
         dominant, so an untrained smoke test will not reveal it. Reproducibility
         comes from seeding the generator -- see `evaluate_rollout`.
+
+        `temperature` (M3h) divides the logits before the softmax; None uses
+        the model's own `cfg.sample_temperature`. At 1.0 NO division is taken
+        -- the shipped path is bitwise unchanged by construction rather than
+        by `x / 1.0` happening to be exact. At 0.0 the draw is the argmax, and
+        the straight-through gradient is the untempered softmax.
+
+        **Every temperature consumes exactly one categorical draw**, including
+        0.0, where the draw is taken and discarded. The diagnostic pass runs
+        the floor's `observe` AFTER the rollout, so a sampler that skipped the
+        draw would leave the generator at a different point and the floor, the
+        persistence anchor and the probe -- the fixed brackets of every
+        comparison -- would move with the temperature.
         """
+        tau = self.cfg.sample_temperature if temperature is None else float(temperature)
+        if tau < 0.0:
+            raise ValueError(f"sampling temperature must be >= 0, got {tau}")
         shaped = logits.view(*logits.shape[:-1], self.cfg.z_cats, self.cfg.z_classes)
-        probs = F.softmax(shaped, dim=-1)
+        # No division at 1.0 or 0.0: the first is the shipped path, the second
+        # has no tempered distribution to build.
+        probs = F.softmax(shaped if tau in (0.0, 1.0) else shaped / tau, dim=-1)
         index = torch.distributions.Categorical(probs=probs).sample()
+        if tau == 0.0:
+            # Drawn and discarded above: the stream must not depend on tau.
+            index = shaped.argmax(dim=-1)
         onehot = F.one_hot(index, self.cfg.z_classes).to(probs.dtype)
         return (probs + (onehot - probs).detach()).flatten(-2)
 
@@ -136,15 +173,19 @@ class RSSM(nn.Module):
             priors.append(prior_logits); posts.append(post_logits)
         return self._pack(hs, zs, priors, posts)
 
-    def imagine(self, actions, state) -> dict[str, torch.Tensor]:
-        """Roll forward on the prior alone -- no embeddings consumed."""
+    def imagine(self, actions, state, temperature: float | None = None) -> dict[str, torch.Tensor]:
+        """Roll forward on the prior alone -- no embeddings consumed.
+
+        `temperature` (M3h) sharpens THIS rollout only; `observe` always draws
+        at the model's own, so a sweep over rollout temperatures leaves the
+        context filter and the floor exactly as the gate scored them."""
         h, z = state
         actions_onehot = self._onehot_actions(actions)
         hs, zs, priors = [], [], []
         for i in range(actions.shape[1]):
             h = self._step(h, z, actions_onehot[:, i])
             prior_logits = self.prior_net(h)
-            z = self._sample(prior_logits)
+            z = self._sample(prior_logits, temperature)
             hs.append(h); zs.append(z); priors.append(prior_logits)
         return self._pack(hs, zs, priors, None)
 

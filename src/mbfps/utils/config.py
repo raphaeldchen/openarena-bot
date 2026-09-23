@@ -13,6 +13,8 @@ arm's settings drift silently; here a stray field is a TypeError at call time.
 import dataclasses
 from dataclasses import dataclass, replace
 
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
+
 ARMS: tuple[str, ...] = ("pixel_ae", "frozen_ssl", "random_vit")
 """The study's arms. Every M3 tool -- the driver, report, aggregation, rollout
 evaluation, diagnostics, pooling -- takes `choices=ARMS`.
@@ -74,6 +76,7 @@ class TrainConfig:
     steps: int = 20_000
     seed: int = 0
     device: str = "mps"
+    sample_temperature: float = SAMPLE_TEMPERATURE
 
 
 @dataclass(frozen=True)

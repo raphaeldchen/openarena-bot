@@ -36,7 +36,11 @@ class WorldModel(nn.Module):
         self.input_kind = encoder_input_kind(cfg.encoder)
         self.encoder = build_encoder(cfg.encoder)
         self.rssm = RSSM(
-            RSSMConfig(embed_dim=cfg.encoder.embed_dim), seed=cfg.train.seed
+            RSSMConfig(
+                embed_dim=cfg.encoder.embed_dim,
+                sample_temperature=cfg.train.sample_temperature,
+            ),
+            seed=cfg.train.seed,
         )
         self.heads = WorldModelHeads(
             embed_dim=cfg.encoder.embed_dim, seed=cfg.train.seed

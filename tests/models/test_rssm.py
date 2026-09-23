@@ -1,6 +1,9 @@
+import inspect
+
 import pytest
 import torch
 
+import mbfps.models.rssm as rssm_module
 from mbfps.models.rssm import KL_FREE_BITS, LATENT_DIM, RSSM, RSSMConfig, _categorical_kl, kl_loss
 
 B, T = 3, 7
@@ -502,3 +505,137 @@ def test_free_bits_floor_applies_to_rep_independently_of_dyn():
     assert unclamped.item() < clamped.item(), (
         "rep does not appear to be floored independently of dyn"
     )
+
+
+# ---------------------------------------------------------------------------
+# The sampling temperature (M3h). The imagination's own resampling noise
+# exceeds its imagined displacement from h = 5 onward, so M3h asks what a
+# sharper sampler does. Two things can go wrong without breaking a shape: the
+# default path can stop being bitwise what every shipped record was produced
+# with, and a temperature can change how much randomness the sampler CONSUMES
+# -- which would move the floor that runs after the rollout.
+# ---------------------------------------------------------------------------
+
+
+def _temperature_logits(seed: int = 0, batch: int = 4) -> torch.Tensor:
+    """Logits with a deliberate spread, so tempering visibly changes the draw."""
+    return torch.randn(batch, 32 * 32, generator=torch.Generator().manual_seed(seed)) * 2.0
+
+
+def test_the_temperature_defaults_to_one_and_is_the_shipped_value():
+    assert rssm_module.SAMPLE_TEMPERATURE == 1.0
+    assert RSSMConfig().sample_temperature == 1.0
+
+
+def test_at_one_the_sample_is_bitwise_what_the_untempered_sampler_draws(rssm):
+    """The default path is skipped, not divided: `x / 1.0` is exact in IEEE 754,
+    but the pin is on the code taking no division at all, so a future change to
+    the tempering arithmetic cannot move a shipped record."""
+    logits = _temperature_logits()
+    torch.manual_seed(7)
+    explicit = rssm._sample(logits, temperature=1.0)
+    torch.manual_seed(7)
+    default = rssm._sample(logits)
+    assert torch.equal(explicit, default)
+    # The equality above cannot catch the regression this test exists for:
+    # `x / 1.0` is bit-exact, so replacing the special case with an
+    # unconditional `shaped / tau` would keep every number identical. The
+    # guarantee is structural, so it is pinned on the source, as Task 2 pins
+    # `prepare_cell`'s threading.
+    source = inspect.getsource(rssm_module.RSSM._sample)
+    division = [line for line in source.splitlines() if "/ tau" in line]
+    assert division, "no tempering division found in _sample; has it been rewritten?"
+    assert all("tau in (0.0, 1.0)" in line for line in division), (
+        "the tempering division must be guarded so that 1.0 (and 0.0) take no division at "
+        f"all; found {division}"
+    )
+
+
+def test_a_lower_temperature_draws_the_argmax_more_often_and_zero_always_does(rssm):
+    """Sharper means sharper: over many draws of the same logits the sampled
+    class agrees with the argmax monotonically more often as the temperature
+    falls, and at 0 it agrees always."""
+    logits = _temperature_logits(seed=1, batch=64)
+    argmax = logits.view(64, 32, 32).argmax(-1)
+
+    def agreement(tau):
+        torch.manual_seed(11)
+        drawn = rssm._sample(logits, temperature=tau).view(64, 32, 32).argmax(-1)
+        return float((drawn == argmax).float().mean())
+
+    one, seven, three, zero = agreement(1.0), agreement(0.7), agreement(0.3), agreement(0.0)
+    assert zero == 1.0
+    assert one < seven < three < zero, (one, seven, three, zero)
+
+
+def test_every_temperature_consumes_exactly_one_draw_per_call(rssm):
+    """THE stream pin. The floor's `observe` runs AFTER the rollout in the
+    diagnostic pass, so a sampler that skipped the categorical draw at tau = 0
+    -- the obvious implementation -- would leave the generator at a different
+    point and the floor, the persistence anchor and the probe would all move.
+    Every temperature draws once and tau = 0 discards what it drew."""
+    logits = _temperature_logits(seed=2)
+    states = {}
+    for tau in (1.0, 0.7, 0.3, 0.0):
+        torch.manual_seed(5)
+        rssm._sample(logits, temperature=tau)
+        states[tau] = torch.random.get_rng_state()
+    for tau, state in states.items():
+        assert torch.equal(state, states[1.0]), f"tau={tau} left the generator elsewhere"
+
+
+def test_the_straight_through_gradient_survives_every_temperature(rssm):
+    """The backward pass is the softmax of the UNTEMPERED logits at tau = 0 (no
+    tempered distribution exists there) and of the tempered ones otherwise; in
+    both cases a gradient reaches the logits, which is what lets the encoder
+    train at all."""
+    for tau in (1.0, 0.5, 0.0):
+        logits = _temperature_logits(seed=3).requires_grad_(True)
+        rssm._sample(logits, temperature=tau).sum().backward()
+        assert logits.grad is not None and torch.isfinite(logits.grad).all(), tau
+        assert logits.grad.abs().sum() > 0, tau
+
+
+def test_a_negative_temperature_is_refused(rssm):
+    with pytest.raises(ValueError, match="temperature"):
+        rssm._sample(_temperature_logits(), temperature=-0.5)
+
+
+def test_imagine_takes_a_rollout_override_and_observe_does_not(rssm):
+    """The sweep sharpens the ROLLOUT on shipped checkpoints: `imagine` takes
+    an override, `observe` always uses the model's own, so the context filter
+    and the floor are untouched by it."""
+    import inspect
+
+    assert inspect.signature(rssm.imagine).parameters["temperature"].default is None
+    assert "temperature" not in inspect.signature(rssm.observe).parameters
+    b, t = 2, 5
+    actions = torch.zeros(b, t, dtype=torch.long)
+    state = (torch.zeros(b, 512), torch.zeros(b, 1024))
+    torch.manual_seed(13)
+    warm = rssm.imagine(actions, state)
+    torch.manual_seed(13)
+    sharp = rssm.imagine(actions, state, temperature=0.0)
+    assert not torch.equal(warm["z"], sharp["z"])
+    torch.manual_seed(13)
+    again = rssm.imagine(actions, state, temperature=1.0)
+    assert torch.equal(warm["z"], again["z"])
+
+
+def test_a_configured_temperature_drives_both_paths(rssm):
+    """`RSSMConfig.sample_temperature` is what a TRAINED model samples at, in
+    `observe` as well as `imagine` -- the retrain's whole intervention."""
+    cfg = RSSMConfig(sample_temperature=0.0)
+    sharp = RSSM(cfg, seed=0)
+    logits = _temperature_logits(seed=4)
+    assert torch.equal(
+        sharp._sample(logits), sharp._sample(logits, temperature=0.0)
+    )
+    b, t = 2, 4
+    embeddings = torch.randn(b, t, cfg.embed_dim, generator=torch.Generator().manual_seed(9))
+    actions = torch.zeros(b, t, dtype=torch.long)
+    torch.manual_seed(17)
+    out = sharp.observe(embeddings, actions)
+    modes = out["post_logits"].argmax(-1)
+    drawn = out["z"].view(b, t, 32, 32).argmax(-1)
+    assert torch.equal(modes, drawn), "a configured tau=0 posterior must draw its own mode"
