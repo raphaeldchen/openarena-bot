@@ -170,6 +170,7 @@ from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, StudyJob, job_record_path, load_record, write_record
 from mbfps.models.encoders import encoder_backbone
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
 from mbfps.training.world_model import WorldModel
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
@@ -207,6 +208,30 @@ class MislabelledCheckpoint(ValueError):
     """
 
 
+class TemperatureMismatch(ValueError):
+    """The checkpoint was trained at a sampling temperature other than the one
+    this configuration builds. Loading it anyway would evaluate weights with a
+    sampler their training never saw -- silently, since nothing about the
+    state_dict says how it was drawn from. Absent from the payload means 1.0,
+    which is every M3b-M3g artefact."""
+
+
+def configured_temperature(cfg) -> float:
+    """The sampling temperature `cfg` would build its model at.
+
+    Absent, it is the shipped `SAMPLE_TEMPERATURE` -- the same 1.0 a payload
+    without the key reads as, so a pre-M3h checkpoint and a pre-M3h
+    configuration agree by default rather than by coincidence.
+
+    Tolerant of a configuration object with no `train` block on purpose: this
+    script's own tests patch `get_config` with a bare namespace for the ~30
+    cases that never reach a model, and a checkpoint's temperature must not
+    become the reason those refuse.
+    """
+    train = getattr(cfg, "train", None)
+    return float(getattr(train, "sample_temperature", SAMPLE_TEMPERATURE))
+
+
 def checkpoint_path(out_dir: Path, arm: str, seed: int) -> Path:
     """BOTH the arm and the seed are in the name.
 
@@ -233,6 +258,13 @@ def load_checkpoint_model(out_dir: Path, arm: str, seed: int, cfg, device):
             f"checkpoint in {out_dir} is arm={checkpoint.get('arm')!r} "
             f"seed={checkpoint.get('seed')!r}, not this cell's arm={arm!r} "
             f"seed={seed!r}"
+        )
+    trained_at = float(checkpoint.get("sample_temperature", SAMPLE_TEMPERATURE))
+    asked_for = configured_temperature(cfg)
+    if trained_at != asked_for:
+        raise TemperatureMismatch(
+            f"checkpoint in {out_dir} was trained at sample_temperature={trained_at}, "
+            f"but this configuration samples at {asked_for}"
         )
     model = WorldModel(cfg).to(device)
     model.load_state_dict(checkpoint["state_dict"])

@@ -2805,3 +2805,34 @@ def test_a_record_this_script_writes_is_readable_by_the_pooling_reader(monkeypat
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
     with pytest.raises(pooling.StaleRecord, match="episode"):
         pooling.read_series(load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0)), "shuffled")
+
+
+def test_the_loader_applies_the_payloads_temperature_and_refuses_a_mismatch(tmp_path):
+    """The loader builds the model it is asked for and then checks that the
+    weights it is about to load were produced by a model that samples the same
+    way. A shipped checkpoint (no key) reads as 1.0, so every M3b-M3g artefact
+    loads unchanged; a sharper checkpoint asked for at 1.0 is refused by name
+    rather than evaluated as something it is not."""
+    import torch
+
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    cfg = get_config("random_vit", seed=1, device="cpu")
+    model = WorldModel(cfg)
+    path = tmp_path / "world_model_random_vit_seed1.pt"
+
+    torch.save({"arm": "random_vit", "seed": 1, "state_dict": model.state_dict()}, path)
+    loaded = script.load_checkpoint_model(tmp_path, "random_vit", 1, cfg, torch.device("cpu"))
+    assert loaded.rssm.cfg.sample_temperature == 1.0
+
+    torch.save(
+        {"arm": "random_vit", "seed": 1, "state_dict": model.state_dict(), "sample_temperature": 0.5},
+        path,
+    )
+    with pytest.raises(script.TemperatureMismatch, match="0.5"):
+        script.load_checkpoint_model(tmp_path, "random_vit", 1, cfg, torch.device("cpu"))
+    sharp = get_config("random_vit", seed=1, device="cpu", sample_temperature=0.5)
+    loaded = script.load_checkpoint_model(tmp_path, "random_vit", 1, sharp, torch.device("cpu"))
+    assert loaded.rssm.cfg.sample_temperature == 0.5
+    assert issubclass(script.TemperatureMismatch, ValueError)

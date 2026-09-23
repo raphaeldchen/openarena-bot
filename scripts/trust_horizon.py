@@ -111,6 +111,7 @@ from mbfps.eval.trust_readings import (
     reading_two,
 )
 from mbfps.models.encoders import encoder_backbone
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
 
@@ -132,6 +133,11 @@ def _sibling(name: str):
 _diagnose_dynamics = _sibling("diagnose_dynamics")
 checkpoint_path = _diagnose_dynamics.checkpoint_path
 load_checkpoint_model = _diagnose_dynamics.load_checkpoint_model
+TemperatureMismatch = _diagnose_dynamics.TemperatureMismatch
+"""Re-exported because `_sibling` executes `diagnose_dynamics.py` afresh for
+every importer, so each one holds its OWN class object: a caller that catches
+its own copy's `TemperatureMismatch` would not catch the one `prepare_cell`
+raises. Catch THIS name (M3h)."""
 diagnostic_record_path = _diagnose_dynamics.diagnostic_record_path
 probe_is_measurable = _diagnose_dynamics.probe_is_measurable
 
@@ -1208,7 +1214,13 @@ def prepare_cell(args, cell: Cell, device, train, val) -> tuple[int, Prepared | 
     context = int(cell.diagnostic["context"]) if args.context is None else args.context
     horizon = int(cell.diagnostic["horizon"]) if args.horizon is None else args.horizon
 
-    cfg = get_config(arm, seed=seed, device=args.device)
+    # Every existing caller sets no temperature and gets the shipped 1.0, which
+    # is what every cell they read was trained at; M3h's script sets it, so the
+    # model returned here samples the way its checkpoint was trained to.
+    cfg = get_config(
+        arm, seed=seed, device=args.device,
+        sample_temperature=getattr(args, "sample_temperature", SAMPLE_TEMPERATURE),
+    )
     model = load_checkpoint_model(args.out, arm, seed, cfg, device)
     backbone = encoder_backbone(cfg.encoder)
     # The probe is REFIT at the rollout's own context/horizon and at the

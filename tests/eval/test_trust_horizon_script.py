@@ -1535,3 +1535,44 @@ def test_a_single_arm_run_still_exits_ok_and_says_both_readings_are_not_computed
     assert "--- self-check per cell" in text and "random_vit/s1" in text
     assert "--- Reading 1:" in text and "--- Reading 2:" in text
     assert text.rstrip("\n") in capsys.readouterr().out
+
+
+def test_prepare_cell_builds_its_config_at_the_temperature_its_args_name(cell):
+    """Every existing caller sets no temperature and therefore gets 1.0, which
+    is what every cell they read was trained at; M3h's script sets it, so the
+    model `prepare_cell` returns samples the way its checkpoint was trained to.
+
+    Pinned through the LOADER rather than on the source: this cell's checkpoint
+    was trained at 1.0, so asking for it at 0.5 must be refused -- and it can
+    only be refused if the 0.5 travelled from the args through `get_config`
+    into the configuration `load_checkpoint_model` checks the payload against.
+    A test that read the source for the attribute's name would pass on code
+    that named it and then used the wrong one.
+    """
+    import argparse
+
+    from mbfps.data.buffer import ReplayBuffer
+    from mbfps.data.split import VAL_FRACTION, episode_split
+    from mbfps.models.rssm import SAMPLE_TEMPERATURE
+    from mbfps.utils.device import get_device
+
+    loaded = script.load_cell(cell.out, JOB.arm, JOB.seed)
+    train, val = episode_split(
+        ReplayBuffer(cell.data, capacity_transitions=10**9).episode_paths(),
+        val_fraction=VAL_FRACTION, seed=0,
+    )
+    device = get_device(prefer="cpu")
+
+    warm = argparse.Namespace(out=cell.out, device="cpu", context=None, horizon=None)
+    status, prepared = script.prepare_cell(warm, loaded, device, train, val)
+    assert status == script.EXIT_OK
+    assert prepared.model.rssm.cfg.sample_temperature == SAMPLE_TEMPERATURE == 1.0
+
+    sharp = argparse.Namespace(
+        out=cell.out, device="cpu", context=None, horizon=None, sample_temperature=0.5
+    )
+    # `script.TemperatureMismatch`, not the test's own `diagnose` copy: each
+    # `_sibling` load builds a distinct class object, so the one `prepare_cell`
+    # raises is trust_horizon's, and a caller catching any other misses it.
+    with pytest.raises(script.TemperatureMismatch, match="0.5"):
+        script.prepare_cell(sharp, loaded, device, train, val)

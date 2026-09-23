@@ -107,10 +107,16 @@ def _save_checkpoint(model: nn.Module, cfg: Config, directory: Path, step: int |
     """The checkpoint file every reader of a study directory opens:
     `world_model_{arm}_seed{seed}.pt` under `directory`, with the arm and the
     seed in the payload so a mislabelled file is caught at load. A rung adds
-    its `step`; the final save carries exactly the three keys it always has."""
+    its `step`.
+    The payload also carries the `sample_temperature` the model was trained
+    at (M3h), so a loader can refuse a checkpoint whose sampler is not the one
+    it is about to build."""
     directory.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "arm": cfg.arm, "seed": cfg.train.seed, "state_dict": model.state_dict(),
+        "arm": cfg.arm,
+        "seed": cfg.train.seed,
+        "sample_temperature": float(cfg.train.sample_temperature),
+        "state_dict": model.state_dict(),
     }
     if step is not None:
         payload["step"] = int(step)
