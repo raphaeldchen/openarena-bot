@@ -509,3 +509,108 @@ def test_evaluating_a_checkpoint_at_the_wrong_temperature_is_exit_36(trained, mo
 def test_evaluate_without_a_retrain_record_is_exit_11(swept, capsys):
     assert _run(swept, "--phase", "evaluate") == script.EXIT_NO_CHECKPOINTS
     assert "run --phase train first" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# read (Task 8): the sweep's table and verdict always; the retrain's, when a
+# retrain exists. stages.txt's discipline -- what is printed is what is
+# written, byte for byte.
+# ---------------------------------------------------------------------------
+
+SWEEP_SECTIONS = (
+    "--- self-check per cell",
+    "--- the gate at every temperature",
+    "--- the noise reference against the imagined displacement",
+    "--- survival by temperature",
+    "--- Reading N: is the rollout noise-limited at h=3",
+)
+
+
+@pytest.fixture
+def swept_read(swept, capsys):
+    assert _run(swept, "--phase", "read") == script.EXIT_OK
+    text = capsys.readouterr().out
+    return types.SimpleNamespace(ref=swept, text=text, path=swept.sweep / "sweep.txt")
+
+
+def test_read_without_a_sweep_record_is_exit_11(reference, capsys):
+    assert _run(reference, "--phase", "read") == script.EXIT_NO_CHECKPOINTS
+    assert "run --phase sweep first" in capsys.readouterr().out
+
+
+def test_read_refuses_a_sweep_record_whose_self_check_is_not_exact(swept, capsys):
+    _doctor(swept.sweep / SWEEP, lambda r: r["self_check"].update({"reference_position_max_delta": 1e-6}))
+    assert _run(swept, "--phase", "read") == script.EXIT_SELF_CHECK_FAILED
+    assert "SELF-CHECK FAILED" in capsys.readouterr().out
+    assert not (swept.sweep / "sweep.txt").exists()
+
+
+def test_read_prints_the_sweep_sections_and_writes_them_byte_identical(swept_read):
+    for section in SWEEP_SECTIONS:
+        assert section in swept_read.text, section
+    assert swept_read.path.read_text() == swept_read.text
+    assert "z_fam = cluster_threshold(9, 6)" in swept_read.text
+    assert "verdict:" in swept_read.text
+    assert f"{REFERENCE_TAU:.1f}" in swept_read.text
+    assert "NOTE: decision horizon clamped to the run's horizon h=3" in swept_read.text
+
+
+def test_the_sweep_read_alone_writes_no_retrain_text(swept_read):
+    assert not (swept_read.ref.sharper / "sharper.txt").exists()
+    assert "Reading M" not in swept_read.text
+
+
+def test_read_after_a_retrain_adds_reading_m_against_the_reference_cells(trained, capsys, monkeypatch):
+    """With both phases on disk the read pairs the retrained cells against the
+    M3c ones on the same windows and prints Reading M beside Reading N."""
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    assert _run(trained, "--phase", "evaluate", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+    assert _run(trained, "--phase", "read", "--steps", "4") == script.EXIT_OK
+    text = capsys.readouterr().out
+    assert "--- Reading M: the retrain at tau=0.5" in text
+    assert (trained.sharper / "sharper.txt").read_text() in text
+    assert "verdict: random_vit" in text
+
+
+def test_reading_m_is_the_retrain_minus_the_m3c_cells_not_the_other_way(trained, capsys, monkeypatch):
+    """Reading M's orientation is the study's central claim: `retrain - M3c`.
+    Swapped, "sharper is worse" reads as "sharper is better" and the
+    milestone reports the opposite of what it measured. Pinned through
+    `retrain_inputs` itself against a difference computed straight off the
+    two records, as Reading N's orientation is pinned through `_tau_inputs`.
+    """
+    import types as _types
+
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    assert _run(trained, "--phase", "evaluate", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+
+    status, records = script.load_sweep(
+        _types.SimpleNamespace(sweep_out=trained.sweep), [(JOB.arm, JOB.seed)]
+    )
+    assert status == script.EXIT_OK
+    h = int(records[(JOB.arm, JOB.seed)]["decision_h"])
+    new_trust = script._load_trust(trained.sharper, [(JOB.arm, JOB.seed)])
+    old_trust = script._reference_trust(records, [(JOB.arm, JOB.seed)])
+    assert new_trust and old_trust
+
+    inputs = script.retrain_inputs(
+        new_trust, old_trust, arms=[JOB.arm], seeds=[JOB.seed], h=h, tau=RETRAIN_TAU,
+    )
+
+    def survival(source, channel):
+        return survival_indicator(source[(JOB.arm, JOB.seed)], channel, h)
+
+    for channel, contrast in (("free", inputs.arms[JOB.arm].free),
+                              ("probe", inputs.arms[JOB.arm].probe)):
+        values, changed = survival(new_trust, channel)
+        control, control_changed = survival(old_trust, channel)
+        keep = changed & control_changed
+        direct = float(np.mean(values[keep] - control[keep]))
+        assert contrast.estimate == pytest.approx(direct, abs=1e-12), (channel, contrast.estimate, direct)
+
+
+def test_read_is_idempotent(swept_read, capsys):
+    assert _run(swept_read.ref, "--phase", "read") == script.EXIT_OK
+    assert capsys.readouterr().out == swept_read.text

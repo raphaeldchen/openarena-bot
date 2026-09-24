@@ -2948,6 +2948,44 @@ def test_read_after_a_retrain_adds_reading_m_against_the_reference_cells(trained
     assert "verdict: random_vit" in text
 
 
+def test_reading_m_is_the_retrain_minus_the_m3c_cells_not_the_other_way(trained, capsys, monkeypatch):
+    """Reading M's orientation is the study's central claim: `retrain - M3c`.
+    Swapped, "sharper is worse" reads as "sharper is better" and the
+    milestone reports the opposite of what it measured. Pinned through
+    `retrain_inputs` itself against a difference computed straight off the
+    two records, as Reading N's orientation is pinned through `_tau_inputs`.
+    """
+    import types as _types
+
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    assert _run(trained, "--phase", "evaluate", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+
+    status, records = script.load_sweep(
+        _types.SimpleNamespace(sweep_out=trained.sweep), [(JOB.arm, JOB.seed)]
+    )
+    assert status == script.EXIT_OK
+    h = int(records[(JOB.arm, JOB.seed)]["decision_h"])
+    new_trust = script._load_trust(trained.sharper, [(JOB.arm, JOB.seed)])
+    old_trust = script._reference_trust(records, [(JOB.arm, JOB.seed)])
+    assert new_trust and old_trust
+
+    inputs = script.retrain_inputs(
+        new_trust, old_trust, arms=[JOB.arm], seeds=[JOB.seed], h=h, tau=RETRAIN_TAU,
+    )
+
+    def survival(source, channel):
+        return survival_indicator(source[(JOB.arm, JOB.seed)], channel, h)
+
+    for channel, contrast in (("free", inputs.arms[JOB.arm].free),
+                              ("probe", inputs.arms[JOB.arm].probe)):
+        values, changed = survival(new_trust, channel)
+        control, control_changed = survival(old_trust, channel)
+        keep = changed & control_changed
+        direct = float(np.mean(values[keep] - control[keep]))
+        assert contrast.estimate == pytest.approx(direct, abs=1e-12), (channel, contrast.estimate, direct)
+
+
 def test_read_is_idempotent(swept_read, capsys):
     assert _run(swept_read.ref, "--phase", "read") == script.EXIT_OK
     assert capsys.readouterr().out == swept_read.text
@@ -2996,16 +3034,24 @@ def _self_check_table(records: dict) -> str:
 def _gate_table(records: dict, taus) -> str:
     """`gap_closed(45)` per seed at every temperature, with the unanimity flag.
     Reported, never decided on (spec 3.2)."""
+    # The seed columns are the records' own, not a hardcoded (0, 1, 2): a run
+    # over a subset would otherwise print seed 1's gap under an `s0` caption.
+    seed_columns = sorted({int(seed) for _, seed in records})
     lines = [
         "--- the gate at every temperature: gap_closed at the horizon on position per seed "
         "(NaN = non-positive band); GATE PASSES = > 0 in every seed. Reported, not decided on. ---",
-        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f's{s}':>10}" for s in (0, 1, 2)) + f"{'passes':>9}{'degen(max)':>12}",
+        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f's{s}':>10}" for s in seed_columns)
+        + f"{'passes':>9}{'degen(max)':>12}",
     ]
     arms = sorted({arm for arm, _ in records}, key=lambda a: _ordered([a] + list(ARMS_ORDER)).index(a))
     for arm in arms:
         seeds = sorted(seed for a, seed in records if a == arm)
         for tau in taus:
-            gaps = [float(_entry(records[(arm, s)], tau)["gate"]["gap_final"]) for s in seeds]
+            gaps = [
+                float(_entry(records[(arm, s)], tau)["gate"]["gap_final"])
+                if (arm, s) in records else float("nan")
+                for s in seed_columns
+            ]
             degen = max(int(_entry(records[(arm, s)], tau)["gate"]["degenerate"]) for s in seeds)
             passes = bool(gaps) and all(np.isfinite(g) and g > 0 for g in gaps)
             cells = "".join(f"{_num(g, '+.4f'):>10}" for g in gaps)
@@ -3188,6 +3234,35 @@ def _load_trust(directory: Path, cells) -> dict:
     return records
 
 
+def _reference_trust(records: dict, cells) -> dict:
+    """The M3c side of Reading M, taken from the sweep's own REFERENCE_TAU
+    entry.
+
+    ALWAYS this, never a `trust_<arm>_seed<n>.json` that happens to sit in
+    `--reference`. The shipped M3c directory does carry M3d's trust records,
+    so preferring them would have meant the real run reading a file and every
+    test reading this -- two paths, and the untested one shipping. Beyond
+    that, this entry is the better control: `load_sweep` has already proven
+    it bitwise identical to the M3c diagnostic in THIS run (exit 30
+    otherwise), it scores the same windows at the same protocol as the
+    retrain it is compared against, and it carries `crossing`/`windows` in
+    the shape a trust record does, for both channels."""
+    out = {}
+    for arm, seed in cells:
+        record = records[(arm, int(seed))]
+        summary = _entry(record, REFERENCE_TAU)["summary"]
+        out[(arm, int(seed))] = {
+            "crossing": summary["crossing"],
+            "windows": summary["windows"],
+            "episodes": record["episodes"],
+            "horizon": record["horizon"],
+            "context": record["context"],
+            "device": record["device"],
+            "torch_version": record["torch_version"],
+        }
+    return out
+
+
 def sharper_text(new_trust: dict, old_trust: dict, *, arms, seeds, h: int, tau: float) -> str:
     inputs = retrain_inputs(new_trust, old_trust, arms=arms, seeds=seeds, h=h, tau=tau)
     reading = reading_sharper(inputs)
@@ -3207,7 +3282,14 @@ def write_text(path: Path, text: str) -> Path:
 
 def read_phase(args, cells) -> int:
     """The sweep's records (11, 30) and its reading always; the retrain's
-    reading too when both its trust records and the reference's are on disk."""
+    reading too when the retrained cells' own trust records are on disk.
+
+    `old_trust`, Reading M's control arm, is ALWAYS `_reference_trust` -- the
+    sweep's own REFERENCE_TAU entry, which `load_sweep` has already proven
+    bitwise identical to the M3c diagnostic in this run. It is never a
+    `trust_<arm>_seed<n>.json` that happens to sit under `--reference`: the
+    shipped M3c directory carries M3d's, so preferring those would mean the
+    real run reading files and every test reading the derived path."""
     status, records = load_sweep(args, cells)
     if status != EXIT_OK:
         return status
@@ -3220,7 +3302,7 @@ def read_phase(args, cells) -> int:
     write_text(args.sweep_out / "sweep.txt", text)
 
     new_trust = _load_trust(args.out, cells)
-    old_trust = _load_trust(args.reference, cells)
+    old_trust = _reference_trust(records, cells)
     if new_trust and old_trust:
         retrain = load_record(retrain_record_path(args.out, *cells[0]))
         h = int(next(iter(records.values()))["decision_h"])

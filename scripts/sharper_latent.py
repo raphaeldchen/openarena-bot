@@ -113,6 +113,24 @@ FOUR CORRECTIONS TO THE M3H TASK-7 BRIEF, found running its own tests:
     `curves.floor_position` / `probe.embedding_selection_r2` (which
     `self_check` never compares) from the study record `evaluate_job` just
     wrote.
+
+ONE CORRECTION TO THE M3H TASK-8 BRIEF, found running its own tests:
+
+  * The brief read Reading M's control arm, `old_trust`, as
+    `_load_trust(args.reference, cells)` -- a `trust_<arm>_seed<n>.json` per
+    M3c cell from an earlier `trust_horizon.py` pass over `--reference`. The
+    shipped M3c directory does carry those (M3d's own `--out` was the same
+    `runs/m3_study_v2`), but this file's fixtures never write them, so the
+    tests would have exercised an empty control while the real run read the
+    files: two paths, with the untested one shipping.
+
+    The control is now ALWAYS `_reference_trust`, built from the sweep's own
+    REFERENCE_TAU entry. It is also the better control of the two:
+    `load_sweep` has proven that entry bitwise identical to the M3c
+    diagnostic in THIS run (exit 30 otherwise), and it scores the same
+    windows at the same protocol as the retrain it is compared against,
+    rather than being a file another milestone happened to leave behind. No
+    exit code, message or record key changed.
 """
 
 import argparse
@@ -401,11 +419,25 @@ def _entry(record: dict, tau: float) -> dict:
     return record["entries"][tau_key(tau)]
 
 
-def _series(record: dict, tau: float, h: int, label: str) -> pooling.CellSeries:
-    values, changed = survival_indicator(_entry(record, tau)["summary"], "free", h)
+def _survival_series(summary: dict, h: int, channel: str, *, label: str, seed: int, val,
+                      horizon: int, context: int, device: str, torch_version: str) -> pooling.CellSeries:
+    """One per-window survival series at one channel, from anything shaped
+    like a stratum summary or a trust record -- both carry `crossing` and
+    `windows` the same way (see `retrain_inputs`'s docstring note). The one
+    place `survival_indicator` + `cell_series` are wired together, so
+    Reading N's free-channel series and Reading M's free/probe ones are the
+    same call at a different channel, not two copies of it."""
+    values, changed = survival_indicator(summary, channel, h)
     return cell_series(
-        _entry(record, tau)["summary"], values, changed,
-        arm=label, seed=record["seed"], rung="val", channel="S/free",
+        summary, values, changed, arm=label, seed=int(seed), rung="val", channel=f"S/{channel}",
+        val=val, horizon=int(horizon), context=int(context), device=str(device),
+        torch_version=str(torch_version),
+    )
+
+
+def _series(record: dict, tau: float, h: int, label: str, channel: str = "free") -> pooling.CellSeries:
+    return _survival_series(
+        _entry(record, tau)["summary"], h, channel, label=label, seed=record["seed"],
         val=record["episodes"]["val"], horizon=record["horizon"], context=record["context"],
         device=record["device"], torch_version=record["torch_version"],
     )
@@ -426,12 +458,12 @@ def _paired(treatment, control) -> StratumContrast:
     return StratumContrast(estimate=c.mean, se=c.se, z=c.z, clusters=c.clusters)
 
 
-def _tau_inputs(records: dict, arm: str, seeds, tau: float, h: int) -> TauInputs:
+def _tau_inputs(records: dict, arm: str, seeds, tau: float, h: int, channel: str = "free") -> TauInputs:
     def contrast(seed_list):
         kept = [records[(arm, int(s))] for s in seed_list]
         return _paired(
-            [_series(r, tau, h, f"{arm}@{tau_key(tau)}") for r in kept],
-            [_series(r, REFERENCE_TAU, h, f"{arm}@{tau_key(REFERENCE_TAU)}") for r in kept],
+            [_series(r, tau, h, f"{arm}@{tau_key(tau)}", channel) for r in kept],
+            [_series(r, REFERENCE_TAU, h, f"{arm}@{tau_key(REFERENCE_TAU)}", channel) for r in kept],
         )
 
     return TauInputs(
@@ -750,6 +782,325 @@ def evaluate_phase(args, cells, device, buffer, train, val) -> int:
 
 
 # ---------------------------------------------------------------------------
+# read: the tables, the two readings, sweep.txt and sharper.txt.
+# ---------------------------------------------------------------------------
+
+
+def _num(value, spec: str = ".3f") -> str:
+    return fmt_z(float(value), spec)
+
+
+def _cells_in_order(records: dict) -> list[tuple[str, int]]:
+    return sorted(records, key=lambda c: (_ordered([c[0]] + list(ARMS_ORDER)).index(c[0]), c[1]))
+
+
+def _self_check_table(records: dict) -> str:
+    lines = [
+        "--- self-check per cell: the tau=1.0 pass against the cell's own diagnostic (exact) ---",
+        f"  {'arm':<12}{'seed':>5}{'step':>7}{'ref max|d|':>12}{'pers max|d|':>13}{'windows':>9}{'clusters':>10}",
+    ]
+    for arm, seed in _cells_in_order(records):
+        r = records[(arm, seed)]
+        check = r["self_check"]
+        lines.append(
+            f"  {arm:<12}{seed:>5}{int(r['step']):>7}"
+            f"{_num(check['reference_position_max_delta'], '.1e'):>12}"
+            f"{_num(check['persistence_position_max_delta'], '.1e'):>13}"
+            f"{int(r['windows']['total']):>9}{int(r['windows']['clusters']):>10}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _gate_table(records: dict, taus) -> str:
+    """`gap_closed(45)` per seed at every temperature, with the unanimity flag.
+    Reported, never decided on (spec 3.2)."""
+    # The seed columns are the records' own, not a hardcoded (0, 1, 2): a run
+    # over a subset would otherwise print seed 1's gap under an `s0` caption.
+    seed_columns = sorted({int(seed) for _, seed in records})
+    lines = [
+        "--- the gate at every temperature: gap_closed at the horizon on position per seed "
+        "(NaN = non-positive band); GATE PASSES = > 0 in every seed. Reported, not decided on. ---",
+        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f's{s}':>10}" for s in seed_columns)
+        + f"{'passes':>9}{'degen(max)':>12}",
+    ]
+    arms = sorted({arm for arm, _ in records}, key=lambda a: _ordered([a] + list(ARMS_ORDER)).index(a))
+    for arm in arms:
+        seeds = sorted(seed for a, seed in records if a == arm)
+        for tau in taus:
+            gaps = [
+                float(_entry(records[(arm, s)], tau)["gate"]["gap_final"])
+                if (arm, s) in records else float("nan")
+                for s in seed_columns
+            ]
+            degen = max(int(_entry(records[(arm, s)], tau)["gate"]["degenerate"]) for s in seeds)
+            passes = bool(gaps) and all(np.isfinite(g) and g > 0 for g in gaps)
+            cells = "".join(f"{_num(g, '+.4f'):>10}" for g in gaps)
+            lines.append(
+                f"  {arm:<12}{float(tau):>5.1f}{cells}{'YES' if passes else 'no':>9}{degen:>12}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _noise_table(records: dict, taus, horizon: int) -> str:
+    """The statistic that motivated the study: two draws of the same model
+    against that model's own imagined displacement, at every temperature."""
+    hs = [h for h in (1, 5, 15, 45) if h <= horizon]
+    lines = [
+        "--- the noise reference against the imagined displacement (medians over windows, "
+        "embedding units through the same head): two draws of one model, then how far that "
+        "model imagined it moved ---",
+        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f'noise({h})':>12}{f'moved({h})':>12}" for h in hs),
+    ]
+    for arm, seed in _cells_in_order(records):
+        r = records[(arm, seed)]
+        for tau in taus:
+            entry = _entry(r, tau)
+            noise = np.asarray(entry["noise"]["curve"], dtype=float)
+            moved = np.asarray(entry["summary"]["survival"]["free"], dtype=float)
+            cells = "".join(
+                f"{_num(noise[h - 1]):>12}{_num(moved[h - 1]):>12}" for h in hs
+            )
+            lines.append(f"  {arm + ' s' + str(seed):<12}{float(tau):>5.1f}{cells}")
+    return "\n".join(lines) + "\n"
+
+
+def _survival_table(records: dict, taus, horizon: int) -> str:
+    hs = [h for h in (1, 2, 3, 5, 10, 15, 30, 45) if h <= horizon]
+    lines = [
+        "--- survival by temperature: S(h) = fraction of moved draws with h_x > h, free channel, "
+        "seeds stacked ---",
+        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f'S({h})':>8}" for h in hs),
+    ]
+    arms = sorted({arm for arm, _ in records}, key=lambda a: _ordered([a] + list(ARMS_ORDER)).index(a))
+    for arm in arms:
+        seeds = sorted(seed for a, seed in records if a == arm)
+        for tau in taus:
+            stacked = np.concatenate([
+                np.asarray(_entry(records[(arm, s)], tau)["summary"]["survival"]["free"], dtype=float)[None, :]
+                for s in seeds
+            ])
+            lines.append(
+                f"  {arm:<12}{float(tau):>5.1f}"
+                + "".join(f"{_num(stacked[:, h - 1].mean()):>8}" for h in hs)
+            )
+    return "\n".join(lines) + "\n"
+
+
+def write_curves(records: dict, taus, figure: Path) -> str:
+    """Two panels against the temperature: S(15) on the free channel and the
+    gate's own metric, arms coloured, seeds thin. A missing or broken
+    matplotlib, or an unwritable path, costs the FIGURE and nothing else."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except (ImportError, ValueError, OSError) as error:
+        return f"figure NOT written: {error}"
+    colours = {"pixel_ae": "tab:orange", "frozen_ssl": "tab:blue", "random_vit": "tab:gray"}
+    order = [float(t) for t in taus]
+    x = np.arange(len(order))
+    h = int(next(iter(records.values()))["decision_h"])
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), squeeze=False)
+    try:
+        survival, gate = axes.flat
+        for (arm, seed), record in records.items():
+            colour = colours.get(arm, "black")
+            survival.plot(
+                x, [float(np.asarray(_entry(record, t)["summary"]["survival"]["free"])[h - 1]) for t in order],
+                marker="o", markersize=3, linewidth=0.9, color=colour, label=f"{arm} s{seed}",
+            )
+            gate.plot(
+                x, [float(_entry(record, t)["gate"]["gap_final"]) for t in order],
+                marker="o", markersize=3, linewidth=0.9, color=colour,
+            )
+        gate.axhline(0.0, color="black", linestyle=":", linewidth=0.8)
+        survival.set_title(f"S({h}), free channel")
+        gate.set_title("gap_closed at the horizon (position)")
+        for ax in (survival, gate):
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"{t:.1f}" for t in order])
+            ax.set_xlabel("rollout sampling temperature")
+        handles, labels = survival.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 5), fontsize=8)
+        fig.tight_layout(rect=(0, 0.12, 1, 1))
+        figure.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figure, dpi=110)
+    except (ValueError, OSError) as error:
+        return f"figure NOT written: {error}"
+    finally:
+        plt.close(fig)
+    return f"figure={figure}"
+
+
+def sweep_text(records: dict, *, arms, seeds, taus, figure_line: str) -> str:
+    """Everything the sweep half of `read` prints, written byte-identical."""
+    horizon = int(next(iter(records.values()))["horizon"])
+    h = int(next(iter(records.values()))["decision_h"])
+    _, clamped = decision_horizon(horizon)
+    inputs = sweep_inputs(records, arms=arms, seeds=seeds, h=h, taus=taus)
+    reading = reading_noise(inputs)
+    note = (f"  NOTE: decision horizon clamped to the run's horizon h={h} "
+            f"(pre-registered DECISION_H = {DECISION_H}).\n" if clamped else "")
+    return "".join([
+        _self_check_table(records),
+        _gate_table(records, taus),
+        _noise_table(records, taus, horizon),
+        _survival_table(records, taus, horizon),
+        note,
+        f"  pooling: z_fam = cluster_threshold({SWEEP_FAMILY}, {_clusters(records)}) = "
+        f"{inputs.z_fam:.2f}; every contrast is this cell at this temperature against the same "
+        f"cell at tau={REFERENCE_TAU} on the same val windows; a temperature counts for an arm "
+        f"when it clears pooled and in >= {SEEDS_REQUIRED} of its seeds, and the status needs "
+        f"{ARMS_REQUIRED} arms.\n",
+        format_reading_noise(reading, inputs),
+        f"  {figure_line}\n",
+    ])
+
+
+def retrain_inputs(new_trust: dict, old_trust: dict, *, arms, seeds, h: int, tau: float) -> RetrainInputs:
+    """Reading M's inputs: each retrained cell paired against the M3c cell of
+    the same arm and seed on the same windows, both channels.
+
+    `survival_indicator` reads `summary["crossing"][channel]`, and a trust
+    record stores its crossings under the same key (`crossing: {probe,
+    free}`) with `windows` shaped the same way too, so a trust record can be
+    passed where a stratum summary is expected -- `_survival_series` is the
+    one place that wiring happens, shared with Reading N's free-channel
+    series rather than duplicated here at a second channel."""
+    def contrast(arm, channel, seed_list):
+        def series(records, label):
+            return [
+                _survival_series(
+                    records[(arm, int(s))], h, channel, label=label, seed=int(s),
+                    val=records[(arm, int(s))]["episodes"]["val"],
+                    horizon=records[(arm, int(s))]["horizon"], context=records[(arm, int(s))]["context"],
+                    device=records[(arm, int(s))]["device"],
+                    torch_version=records[(arm, int(s))]["torch_version"],
+                )
+                for s in seed_list
+            ]
+
+        return _paired(series(new_trust, f"{arm}@sharper"), series(old_trust, f"{arm}@m3c"))
+
+    def arm_inputs(arm, seed_list, per_seed):
+        return RetrainArm(
+            free=contrast(arm, "free", seed_list),
+            probe=contrast(arm, "probe", seed_list),
+            per_seed=per_seed,
+        )
+
+    return RetrainInputs(
+        arms={
+            arm: arm_inputs(
+                arm, seeds,
+                {int(s): arm_inputs(arm, [s], None) for s in seeds},
+            )
+            for arm in _ordered(arms)
+        },
+        z_fam=pooling.cluster_threshold(RETRAIN_FAMILY, _clusters_trust(new_trust)),
+        h=h, tau=float(tau),
+    )
+
+
+def _clusters_trust(records: dict) -> int:
+    first = next(iter(records.values()))
+    return int(np.unique(np.asarray(first["windows"]["episode"])).size)
+
+
+def _load_trust(directory: Path, cells) -> dict:
+    """The trust records of a study directory, or an empty dict when any is
+    missing -- the retrain half of the read is simply not printed then."""
+    records = {}
+    for arm, seed in cells:
+        path = Path(directory) / f"trust_{arm}_seed{seed}.json"
+        if not path.exists():
+            return {}
+        records[(arm, int(seed))] = load_record(path)
+    return records
+
+
+def _reference_trust(records: dict, cells) -> dict:
+    """The M3c side of Reading M, taken from the sweep's own REFERENCE_TAU
+    entry.
+
+    ALWAYS this, never a `trust_<arm>_seed<n>.json` that happens to sit in
+    `--reference`. The shipped M3c directory does carry M3d's trust records,
+    so preferring them would have meant the real run reading a file and every
+    test reading this -- two paths, and the untested one shipping. Beyond
+    that, this entry is the better control: `load_sweep` has already proven
+    it bitwise identical to the M3c diagnostic in THIS run (exit 30
+    otherwise), it scores the same windows at the same protocol as the
+    retrain it is compared against, and it carries `crossing`/`windows` in
+    the shape a trust record does, for both channels."""
+    out = {}
+    for arm, seed in cells:
+        record = records[(arm, int(seed))]
+        summary = _entry(record, REFERENCE_TAU)["summary"]
+        out[(arm, int(seed))] = {
+            "crossing": summary["crossing"],
+            "windows": summary["windows"],
+            "episodes": record["episodes"],
+            "horizon": record["horizon"],
+            "context": record["context"],
+            "device": record["device"],
+            "torch_version": record["torch_version"],
+        }
+    return out
+
+
+def sharper_text(new_trust: dict, old_trust: dict, *, arms, seeds, h: int, tau: float) -> str:
+    inputs = retrain_inputs(new_trust, old_trust, arms=arms, seeds=seeds, h=h, tau=tau)
+    reading = reading_sharper(inputs)
+    return "".join([
+        f"  pooling: z_fam = cluster_threshold({RETRAIN_FAMILY}, {_clusters_trust(new_trust)}) = "
+        f"{inputs.z_fam:.2f}; each retrained cell is paired against the M3c cell of the same arm "
+        "and seed on the same val windows.\n",
+        format_reading_sharper(reading, inputs),
+    ])
+
+
+def write_text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def read_phase(args, cells) -> int:
+    """The sweep's records (11, 30) and its reading always; the retrain's
+    reading too when the retrained cells' own trust records are on disk.
+
+    `old_trust`, Reading M's control arm, is ALWAYS `_reference_trust` -- the
+    sweep's own REFERENCE_TAU entry, which `load_sweep` has already proven
+    bitwise identical to the M3c diagnostic in this run. It is never a
+    `trust_<arm>_seed<n>.json` that happens to sit under `--reference`: the
+    shipped M3c directory carries M3d's, so preferring those would mean the
+    real run reading files and every test reading the derived path."""
+    status, records = load_sweep(args, cells)
+    if status != EXIT_OK:
+        return status
+    taus = [float(t) for t in next(iter(records.values()))["taus"]]
+    arms, seeds = list(args.arms), [int(s) for s in args.seeds]
+    figure = args.figure if args.figure is not None else args.sweep_out / "sweep_curves.png"
+    figure_line = write_curves(records, taus, figure)
+    text = sweep_text(records, arms=arms, seeds=seeds, taus=taus, figure_line=figure_line)
+    print(text, end="")
+    write_text(args.sweep_out / "sweep.txt", text)
+
+    new_trust = _load_trust(args.out, cells)
+    old_trust = _reference_trust(records, cells)
+    if new_trust and old_trust:
+        retrain = load_record(retrain_record_path(args.out, *cells[0]))
+        h = int(next(iter(records.values()))["decision_h"])
+        retrain_text = sharper_text(
+            new_trust, old_trust, arms=arms, seeds=seeds, h=h, tau=float(retrain["tau"]),
+        )
+        print(retrain_text, end="")
+        write_text(args.out / "sharper.txt", retrain_text)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -782,10 +1133,6 @@ def _check_usage(parser: argparse.ArgumentParser, args) -> None:
                 f"--out and {name} are the same directory; the retrain would write its "
                 "checkpoints over the ones it is being compared against"
             )
-
-
-def read_phase(args, cells) -> int:
-    raise NotImplementedError("read is Task 8")
 
 
 def main(argv: list[str] | None = None, *, taus=TAU_GRID) -> int:
