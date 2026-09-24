@@ -941,12 +941,13 @@ def test_a_pooled_clear_that_replicates_in_one_seed_does_not_count_for_its_arm()
 
 
 def test_the_largest_pooled_contrast_among_the_clearing_taus_wins():
+    small, large = tau_inputs(4.0), tau_inputs(9.0)
+    assert small.free.z == 4.0 and large.free.z == 9.0
     reading = read(
-        pixel_ae=arm(t07=c_inputs := tau_inputs(4.0), t03=tau_inputs(9.0)),
-        frozen_ssl=arm(t07=tau_inputs(4.0), t03=tau_inputs(9.0)),
+        pixel_ae=arm(t07=small, t03=large),
+        frozen_ssl=arm(t07=small, t03=large),
         random_vit=arm(),
     )
-    assert c_inputs.free.z == 4.0
     assert reading.status is SweepStatus.NOISE_LIMITED
     assert reading.tau_star == 0.3, "0.3 pools the larger contrast"
 
