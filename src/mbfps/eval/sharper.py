@@ -237,3 +237,135 @@ def format_reading_noise(reading: SweepReading, inputs: SweepInputs) -> str:
     if reading.tau_star is not None:
         lines.append(f"  the retrain runs at SAMPLE_TEMPERATURE = {reading.tau_star:.1f}")
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Reading M -- does training it sharper help? (spec 3.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetrainArm:
+    """One arm's paired contrasts, `M3h at tau* minus M3c at 1.0`, on both
+    channels, and the same within each seed alone (leaves carry
+    `per_seed=None`)."""
+
+    free: StratumContrast
+    probe: StratumContrast
+    per_seed: "dict[int, RetrainArm] | None"
+
+
+@dataclass(frozen=True)
+class RetrainInputs:
+    arms: dict[str, RetrainArm]
+    z_fam: float
+    h: int
+    tau: float
+
+
+class RetrainStatus(str, Enum):
+    """Spec 3.3's four outcomes, in the table's order of precedence."""
+
+    UNRESOLVED_PROBE = "unresolved through the probe"
+    SHARPER_BETTER = "sharper better"
+    SHARPER_WORSE = "sharper worse"
+    NO_DIFFERENCE = "no difference"
+
+
+@dataclass(frozen=True)
+class RetrainArmReading:
+    arm: str
+    status: RetrainStatus
+    rule: str
+    free_clears_up: bool
+    free_clears_down: bool
+    probe_clears_up: bool
+    probe_clears_down: bool
+    seeds_up: int
+    seeds_down: int
+    seeds_total: int
+
+
+@dataclass(frozen=True)
+class RetrainReading:
+    arms: dict[str, RetrainArmReading]
+    h: int
+    z_fam: float
+    tau: float
+
+
+def _retrain_arm_reading(arm: str, a: RetrainArm, z_fam: float) -> RetrainArmReading:
+    """Spec 3.3's rules in the table's precedence, each status carrying the
+    sentence that decided it."""
+    free_up, free_down = clears(a.free.z, z_fam), clears(-a.free.z, z_fam)
+    probe_up, probe_down = clears(a.probe.z, z_fam), clears(-a.probe.z, z_fam)
+    if a.per_seed is None:
+        # A single-seed leaf, read alone: there is nothing to replicate across.
+        seeds_up, seeds_down, seeds_total = int(free_up), int(free_down), 1
+        replicated_up = replicated_down = True
+        up_words = down_words = "this seed alone"
+    else:
+        seeds_up = sum(1 for leaf in a.per_seed.values() if clears(leaf.free.z, z_fam))
+        seeds_down = sum(1 for leaf in a.per_seed.values() if clears(-leaf.free.z, z_fam))
+        seeds_total = len(a.per_seed)
+        replicated_up = seeds_up >= SEEDS_REQUIRED
+        replicated_down = seeds_down >= SEEDS_REQUIRED
+        up_words = f"{seeds_up} of {seeds_total} seeds"
+        down_words = f"{seeds_down} of {seeds_total} seeds"
+    fz, pz, bar = fmt_z(a.free.z), fmt_z(a.probe.z), f"{z_fam:.2f}"
+    if (free_up and probe_down) or (free_down and probe_up):
+        status = RetrainStatus.UNRESOLVED_PROBE
+        rule = f"M_free z {fz} and M_probe z {pz} both clear +-{bar} with opposite signs"
+    elif free_up and replicated_up:
+        status = RetrainStatus.SHARPER_BETTER
+        rule = f"M_free z {fz} > {bar} pooled and in {up_words}"
+    elif free_down and replicated_down:
+        status = RetrainStatus.SHARPER_WORSE
+        rule = f"M_free z {fz} < -{bar} pooled and in {down_words}"
+    elif free_up or free_down:
+        words = up_words if free_up else down_words
+        sign = "+" if free_up else "-"
+        status = RetrainStatus.NO_DIFFERENCE
+        rule = (f"M_free z {fz} clears {sign}{bar} pooled but in only {words} "
+                f"(>= {SEEDS_REQUIRED} required)")
+    else:
+        status = RetrainStatus.NO_DIFFERENCE
+        rule = f"M_free z {fz} does not clear +-{bar}"
+    return RetrainArmReading(
+        arm=arm, status=status, rule=rule,
+        free_clears_up=free_up, free_clears_down=free_down,
+        probe_clears_up=probe_up, probe_clears_down=probe_down,
+        seeds_up=seeds_up, seeds_down=seeds_down, seeds_total=seeds_total,
+    )
+
+
+def reading_sharper(inputs: RetrainInputs) -> RetrainReading:
+    """One reading per arm, in the caller's order; arms never read each other
+    (spec 4: no ranking)."""
+    return RetrainReading(
+        arms={
+            arm: _retrain_arm_reading(arm, a, inputs.z_fam) for arm, a in inputs.arms.items()
+        },
+        h=inputs.h, z_fam=inputs.z_fam, tau=inputs.tau,
+    )
+
+
+def format_reading_sharper(reading: RetrainReading, inputs: RetrainInputs) -> str:
+    """The contrast table and the verdict lines, in `ladder.txt`'s style."""
+    lines = [
+        f"--- Reading M: the retrain at tau={reading.tau:.1f} against the M3c cells at "
+        f"h={reading.h} (paired on the val windows); z_fam = {reading.z_fam:.2f} ---",
+        f"  {'arm':<12}{'channel':<9}{'estimate':>10}{'se':>9}{'z':>8}  clears",
+    ]
+    for arm, a in inputs.arms.items():
+        for channel, contrast in (("free", a.free), ("probe", a.probe)):
+            verdict = "yes" if clears(abs(contrast.z), reading.z_fam) else "no"
+            lines.append(
+                f"  {arm:<12}{channel:<9}{fmt_z(contrast.estimate, '+.4f'):>10}"
+                f"{fmt_z(contrast.se, '.4f'):>9}{fmt_z(contrast.z):>8}  {verdict}"
+            )
+    for arm, r in reading.arms.items():
+        lines.append(
+            f"  verdict: {arm:<12}{r.status.name.replace('_', ' ')} -- decided by: {r.rule}"
+        )
+    return "\n".join(lines) + "\n"

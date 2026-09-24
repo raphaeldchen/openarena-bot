@@ -175,3 +175,105 @@ def test_format_reading_noise_prints_every_cell_and_the_verdict():
         assert f"{tau:.1f}" in text
     assert "verdict: NOISE LIMITED" in text and "tau=0.5" in text
     assert text.endswith("\n")
+
+
+# ---------------------------------------------------------------------------
+# Reading M (spec 3.3): does a model TRAINED at tau* roll out better than the
+# one it replaces? The same four-status shape as M3f's Reading T, with the
+# probe channel as the control and the single-seed clause built in.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.sharper import (  # noqa: E402
+    RetrainArm,
+    RetrainArmReading,
+    RetrainInputs,
+    RetrainReading,
+    RetrainStatus,
+    format_reading_sharper,
+    reading_sharper,
+)
+
+M_Z_FAM = 2.89
+
+
+def retrain_arm(free=5.0, probe=5.0, seeds=None) -> RetrainArm:
+    seeds = (free, free, free) if seeds is None else seeds
+    return RetrainArm(
+        free=c(free), probe=c(probe),
+        per_seed={i: RetrainArm(free=c(z), probe=c(probe), per_seed=None) for i, z in enumerate(seeds)},
+    )
+
+
+def read_m(**arms) -> RetrainReading:
+    return reading_sharper(RetrainInputs(arms=arms, z_fam=M_Z_FAM, h=15, tau=0.5))
+
+
+def test_a_positive_clear_replicated_in_two_seeds_reads_sharper_better():
+    reading = read_m(pixel_ae=retrain_arm(free=5.0, seeds=(5.0, 5.0, 1.0)))
+    r = reading.arms["pixel_ae"]
+    assert isinstance(r, RetrainArmReading) and r.status is RetrainStatus.SHARPER_BETTER
+    assert r.seeds_up == 2 and r.seeds_total == 3
+    assert "2 of 3 seeds" in r.rule and "+5.00" in r.rule
+    assert reading.tau == 0.5 and reading.h == 15
+
+
+def test_a_negative_clear_replicated_reads_sharper_worse():
+    r = read_m(a=retrain_arm(free=-5.0, probe=-5.0)).arms["a"]
+    assert r.status is RetrainStatus.SHARPER_WORSE
+    assert r.rule.startswith("M_free z -5.00 < -2.89 pooled and in 3 of 3 seeds")
+
+
+def test_channels_clearing_with_opposite_signs_are_unresolved_through_the_probe():
+    r = read_m(a=retrain_arm(free=5.0, probe=-5.0)).arms["a"]
+    assert r.status is RetrainStatus.UNRESOLVED_PROBE
+    assert "opposite signs" in r.rule
+
+
+def test_a_pooled_clear_that_does_not_replicate_reads_no_difference_and_says_why():
+    r = read_m(a=retrain_arm(free=5.0, seeds=(5.0, 1.0, 1.0))).arms["a"]
+    assert r.status is RetrainStatus.NO_DIFFERENCE
+    assert "only 1 of 3 seeds" in r.rule and f">= {SEEDS_REQUIRED}" in r.rule
+
+
+def test_no_clear_at_all_reads_no_difference():
+    r = read_m(a=retrain_arm(free=1.0, probe=1.0)).arms["a"]
+    assert r.status is RetrainStatus.NO_DIFFERENCE
+    assert r.rule == "M_free z +1.00 does not clear +-2.89"
+
+
+def test_a_single_seed_leaf_read_alone_has_a_vacuous_replication_clause():
+    leaf = RetrainArm(free=c(5.0), probe=c(5.0), per_seed=None)
+    r = read_m(a=leaf).arms["a"]
+    assert r.status is RetrainStatus.SHARPER_BETTER
+    assert "this seed alone" in r.rule and r.seeds_total == 1
+
+
+def test_z_exactly_at_the_bar_does_not_clear_and_a_nan_never_does_on_the_retrain():
+    # Named apart from Reading N's test of the same rule above: two
+    # module-level functions of one name shadow each other, and the first
+    # silently stops running.
+
+    assert read_m(a=retrain_arm(free=M_Z_FAM)).arms["a"].status is RetrainStatus.NO_DIFFERENCE
+    assert read_m(a=retrain_arm(free=float("nan"))).arms["a"].status is RetrainStatus.NO_DIFFERENCE
+    assert read_m(a=retrain_arm(free=float("inf"))).arms["a"].status is RetrainStatus.NO_DIFFERENCE
+
+
+def test_arms_are_read_independently_and_in_the_callers_order():
+    reading = read_m(random_vit=retrain_arm(free=-5.0, probe=-5.0), pixel_ae=retrain_arm())
+    assert list(reading.arms) == ["random_vit", "pixel_ae"]
+    assert reading.arms["random_vit"].status is RetrainStatus.SHARPER_WORSE
+    assert reading.arms["pixel_ae"].status is RetrainStatus.SHARPER_BETTER
+
+
+def test_format_reading_sharper_prints_both_channels_and_the_verdicts():
+    inputs = RetrainInputs(
+        arms={"pixel_ae": retrain_arm(free=5.0), "frozen_ssl": retrain_arm(free=1.0, probe=1.0)},
+        z_fam=M_Z_FAM, h=15, tau=0.5,
+    )
+    text = format_reading_sharper(reading_sharper(inputs), inputs)
+    assert text.startswith("--- Reading M: the retrain at tau=0.5 against the M3c cells at h=15")
+    assert "z_fam = 2.89" in text
+    assert text.count("free") >= 2 and text.count("probe") >= 2
+    assert "verdict: pixel_ae    SHARPER BETTER" in text
+    assert "verdict: frozen_ssl  NO DIFFERENCE" in text
+    assert text.endswith("\n")

@@ -1366,7 +1366,9 @@ def test_a_single_seed_leaf_read_alone_has_a_vacuous_replication_clause():
     assert "this seed alone" in r.rule and r.seeds_total == 1
 
 
-def test_z_exactly_at_the_bar_does_not_clear_and_a_nan_never_does():
+def test_z_exactly_at_the_bar_does_not_clear_and_a_nan_never_does_on_the_retrain():
+    # Named apart from Reading N's test of the same rule: two module-level
+    # functions of one name shadow each other and one silently stops running.
     assert read_m(a=retrain_arm(free=M_Z_FAM)).arms["a"].status is RetrainStatus.NO_DIFFERENCE
     assert read_m(a=retrain_arm(free=float("nan"))).arms["a"].status is RetrainStatus.NO_DIFFERENCE
     assert read_m(a=retrain_arm(free=float("inf"))).arms["a"].status is RetrainStatus.NO_DIFFERENCE
