@@ -540,7 +540,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(ladder.values()) - set(reused_by_ladder.values()) - {0}
     assert own == {32, 33}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "stage_decomposition"):
+                  "stage_decomposition", "sharper_latent"):
         clash = own & set(statuses(other).values())
         assert not clash, f"checkpoint_ladder collides with {other} on {clash}"
 
@@ -559,9 +559,30 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(stages.values()) - set(reused_by_stages.values()) - {0}
     assert own == {34}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "checkpoint_ladder"):
+                  "checkpoint_ladder", "sharper_latent"):
         clash = own & set(statuses(other).values())
         assert not clash, f"stage_decomposition collides with {other} on {clash}"
+
+    sharper = statuses("sharper_latent")
+    reused_by_sharper = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in sharper.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_sharper, (
+        f"sharper_latent shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_sharper} is shared on purpose"
+    )
+    assert len(set(sharper.values())) == len(sharper), sharper
+    assert 1 not in sharper.values() and 2 not in sharper.values()
+    assert sharper["EXIT_NOT_NOISE_LIMITED"] == 35
+    assert sharper["EXIT_TEMPERATURE_MISMATCH"] == 36
+    assert sharper["EXIT_IDENTITY_CHECK_FAILED"] == 37
+    own = set(sharper.values()) - set(reused_by_sharper.values()) - {0}
+    assert own == {35, 36, 37}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"sharper_latent collides with {other} on {clash}"
 
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
