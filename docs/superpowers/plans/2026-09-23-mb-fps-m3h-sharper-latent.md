@@ -1582,7 +1582,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 3's `reference_trajectories(..., rollout_temperature=τ)`; Task 4's constants; `trust_horizon.{Cell, CellMissing, load_cell, self_check, prepare_cell, EXIT_*}` and `split_gap.stratum_summary` by path; `study.{SPLIT_SEED, git_sha, load_record, write_record}`.
 - Produces: `EXIT_NOT_NOISE_LIMITED = 35`, `EXIT_TEMPERATURE_MISMATCH = 36`, `EXIT_IDENTITY_CHECK_FAILED = 37`; `PHASES = ("sweep",)` (Task 7 extends it); `sweep_record_path(out, arm, seed)`; `tau_key(tau) -> str` / `tau_value(key) -> float` (the record's key idiom, `0.7 -> "tau70"`: `write_record` refuses a key containing '.'); `tau_entry(traj, record, horizon) -> dict`; `sweep_cell(args, cell, device, train, val) -> (status, record | None)`; `sweep_phase(args, cells, device, train, val) -> status`; `_parser()`, `main(argv=None, *, taus=TAU_GRID) -> int`.
 
-The record, one per cell (`sweep_<arm>_seed<n>.json`), top-level keys exactly: `arm, seed, source, step, record_git_sha, context, horizon, decision_h, split_seed, device, torch_version, git_sha, taus (the grid, in order), episodes {val}, windows {total, episode, clusters}, self_check (the τ = 1.0 pass against the cell's diagnostic), entries {<τ as `tau_key` spells it, e.g. `tau70`>: {tau, gate {gap_final, degenerate}, probe {selection_r2, measurable}, noise {curve, median}, summary}}, nonfinite`.
+The record, one per cell (`sweep_<arm>_seed<n>.json`), top-level keys exactly: `arm, seed, source, step, record_git_sha, context, horizon, decision_h, split_seed, device, torch_version, git_sha, taus (the grid, in order), episodes {val}, windows {total, episode, clusters}, self_check (the τ = 1.0 pass against the cell's diagnostic), entries {<τ as `tau_key` spells it, e.g. `tau70`>: {tau, gate {gap_final, degenerate}, probe {selection_r2, measurable}, noise {curve, median}, displacement {curve, median}, summary}}, nonfinite`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2023,6 +2023,7 @@ def tau_entry(traj, record: dict, horizon: int) -> dict:
             )),
         },
         "noise": {"curve": None, "median": None},
+        "displacement": {"curve": None, "median": None},
         "summary": summary,
     }
 
@@ -3076,7 +3077,7 @@ def _noise_table(records: dict, taus, horizon: int) -> str:
         for tau in taus:
             entry = _entry(r, tau)
             noise = np.asarray(entry["noise"]["curve"], dtype=float)
-            moved = np.asarray(entry["summary"]["survival"]["free"], dtype=float)
+            moved = np.asarray(entry["displacement"]["curve"], dtype=float)
             cells = "".join(
                 f"{_num(noise[h - 1]):>12}{_num(moved[h - 1]):>12}" for h in hs
             )

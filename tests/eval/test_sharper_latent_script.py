@@ -54,7 +54,7 @@ SWEEP_KEYS = {
     "split_seed", "device", "torch_version", "git_sha", "taus", "episodes", "windows",
     "self_check", "entries", "nonfinite",
 }
-ENTRY_KEYS = {"tau", "gate", "probe", "noise", "summary"}
+ENTRY_KEYS = {"tau", "gate", "probe", "noise", "displacement", "summary"}
 
 
 @pytest.fixture
@@ -167,6 +167,7 @@ def test_the_sweep_writes_one_record_per_cell_holding_every_temperature(swept):
         assert set(entry["summary"]) >= {"windows", "curves", "band", "crossing", "margin", "survival", "counts"}
         assert set(entry["probe"]) == {"selection_r2", "measurable"}
         assert np.asarray(entry["noise"]["curve"]).shape == (HORIZON,)
+        assert np.asarray(entry["displacement"]["curve"]).shape == (HORIZON,)
         crossing = np.asarray(entry["summary"]["crossing"]["free"], dtype=float)
         assert crossing.shape == (WINDOWS,)
 
@@ -245,6 +246,11 @@ def test_a_sharper_temperature_moves_the_rollout_and_not_the_probe_or_the_window
     assert warm["summary"]["counts"]["not_moved"] == sharp["summary"]["counts"]["not_moved"]
     assert warm["summary"]["crossing"]["free"] != sharp["summary"]["crossing"]["free"]
     assert sharp["noise"]["median"] == 0.0, "two draws at tau = 0 are one trajectory"
+    # The displacement is what the noise is compared WITH, and it is the
+    # imagination's own motion -- not the survival fraction, which is what an
+    # earlier version of the noise table printed under this caption.
+    assert sharp["displacement"]["median"] > 0.0, "a deterministic rollout still moves"
+    assert warm["displacement"]["median"] > 0.0
     assert warm["noise"]["median"] > 0.0, "at tau = 1 two draws of a sampling model differ"
     assert np.asarray(warm["noise"]["curve"]).shape == (HORIZON,)
 

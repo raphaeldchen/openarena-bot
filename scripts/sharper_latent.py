@@ -296,6 +296,7 @@ def tau_entry(traj, record: dict, horizon: int) -> dict:
             )),
         },
         "noise": {"curve": None, "median": None},
+        "displacement": {"curve": None, "median": None},
         "summary": summary,
     }
 
@@ -351,6 +352,13 @@ def sweep_cell(args, cell: Cell, device, train, val, taus) -> tuple[int, dict | 
         entry["noise"] = {
             "curve": noise.mean(axis=0),
             "median": float(np.median(noise)),
+        }
+        # The statistic the study turns on, beside the noise it is compared
+        # with: how far the imagination moved in embedding space,
+        # ||e_hat(h) - e_hat(0)||, per horizon step, median over windows.
+        entry["displacement"] = {
+            "curve": np.median(np.asarray(traj.embedding_displacement, dtype=float), axis=0),
+            "median": float(np.median(traj.embedding_displacement)),
         }
         entries[tau_key(tau)] = entry
     record = {
@@ -856,7 +864,7 @@ def _noise_table(records: dict, taus, horizon: int) -> str:
         for tau in taus:
             entry = _entry(r, tau)
             noise = np.asarray(entry["noise"]["curve"], dtype=float)
-            moved = np.asarray(entry["summary"]["survival"]["free"], dtype=float)
+            moved = np.asarray(entry["displacement"]["curve"], dtype=float)
             cells = "".join(
                 f"{_num(noise[h - 1]):>12}{_num(moved[h - 1]):>12}" for h in hs
             )
