@@ -3123,3 +3123,17 @@ def test_main_lists_what_it_is_about_to_do_before_it_starts(
     assert "8 job(s) pending" in header
     assert f"{DONE_JOB.arm}/s{DONE_JOB.seed}" not in header
     assert f"{CORRUPT_JOB.arm}/s{CORRUPT_JOB.seed}" in header
+
+
+def test_evaluate_job_takes_the_temperature_its_checkpoint_was_trained_at(wide_buffer, tmp_path):
+    """A retrained cell's weights are read by a model that must sample the way
+    they were trained to; the default is the shipped 1.0, so every existing
+    caller is unchanged."""
+    import inspect
+
+    from mbfps.eval.study import evaluate_job
+    from mbfps.models.rssm import SAMPLE_TEMPERATURE
+
+    parameter = inspect.signature(evaluate_job).parameters["sample_temperature"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default == SAMPLE_TEMPERATURE == 1.0

@@ -2267,6 +2267,58 @@ def test_train_without_a_sweep_record_is_exit_11(reference, capsys):
     assert "run --phase sweep first" in capsys.readouterr().out
 
 
+def test_the_real_reading_is_what_the_gate_consults(swept, monkeypatch, capsys):
+    """Every other gate test fabricates the reading to drive the decision.
+    This one does not: the fixture is one arm and one seed, so the real
+    `reading_noise` cannot reach NOISE_LIMITED (it needs two arms and two
+    seeds), and the refusal must come from it rather than from a stand-in.
+    Without this, a swapped treatment/control in `_tau_inputs` would invert
+    the gate and every fabricated test would still pass."""
+    monkeypatch.setattr(script, "train_world_model", _never_train)
+    assert _run(swept, "--phase", "train") == script.EXIT_NOT_NOISE_LIMITED
+    out = capsys.readouterr().out
+    assert "NOT NOISE LIMITED" in out
+    assert "fabricated" not in out
+    assert "arms required" in out or "of 1 arms" in out or "of 3 arms" in out
+
+
+def test_the_glue_pairs_a_temperature_against_the_reference_not_the_other_way(swept):
+    """The contrast's orientation is the whole reading: `S_free(h)` at tau
+    MINUS at the reference. Swapped, `SHARPER_WORSE` would read as
+    `NOISE_LIMITED` and spend fifteen hours on it.
+
+    Taken through `_tau_inputs` itself, not through a reconstruction of what
+    it does: a first version of this test called `_series`/`_paired` directly
+    and chose its own treatment and control, so a swap INSIDE `_tau_inputs`
+    left the test and the bug each self-consistent and the suite green.
+    """
+    import types as _types
+
+    status, records = script.load_sweep(
+        _types.SimpleNamespace(sweep_out=swept.sweep), [(JOB.arm, JOB.seed)]
+    )
+    assert status == script.EXIT_OK
+    record = records[(JOB.arm, JOB.seed)]
+    h = int(record["decision_h"])
+    inputs = script._tau_inputs(records, JOB.arm, [JOB.seed], 0.0, h)
+
+    # The same difference, computed straight off the record without touching
+    # the glue: the survival indicator at tau = 0 minus the one at tau = 1,
+    # over the windows both temperatures changed.
+    def survival(tau):
+        return survival_indicator(record["entries"][script.tau_key(tau)]["summary"], "free", h)
+
+    values, changed = survival(0.0)
+    reference_values, reference_changed = survival(REFERENCE_TAU)
+    keep = changed & reference_changed
+    direct = float(np.mean(values[keep] - reference_values[keep]))
+
+    assert inputs.free.estimate == pytest.approx(direct, abs=1e-12), (
+        inputs.free.estimate, direct
+    )
+    assert inputs.per_seed[JOB.seed].estimate == pytest.approx(direct, abs=1e-12)
+
+
 def test_a_sweep_that_is_not_noise_limited_refuses_to_retrain(swept, monkeypatch, capsys):
     """THE gate: fifteen hours are not spent on a refuted premise, and the
     refusal is the script's, not a person's reading of a table."""
@@ -2527,14 +2579,23 @@ def retrain_record_path(out_dir: Path, arm: str, seed: int) -> Path:
     return Path(out_dir) / f"retrain_{arm}_seed{seed}.json"
 
 
-def identity_check(args, buffer, cell: Cell) -> tuple[int, float, int | None]:
+def identity_check(args, buffer, cell: Cell) -> tuple[int, dict | None]:
     """A short retrain at REFERENCE_TAU whose per-step losses must equal the
     M3c record's prefix exactly. M3f measured this box's MPS training to be
     bitwise deterministic, which is what makes the shipped cells the control
     arm without a second fifteen-hour run; this is that premise verified
     rather than assumed, and it is also the only check that the temperature
-    edit is a no-op where it must be."""
+    edit is a no-op where it must be.
+
+    Run for EVERY cell that retrains, not once for the first: the result is
+    written into that cell's record, and a 0.0 measured on another cell would
+    be a number that means nothing sitting where one that means something
+    goes. `prepare_cell`'s own reproduction message notes the delta is
+    arm-dependent across devices, so one cell's result does not stand for
+    another's."""
     steps = min(IDENTITY_STEPS, int(args.steps))
+    if steps < 1:
+        raise ValueError(f"--steps {args.steps} leaves no identity check to run")
     cfg = get_config(
         cell.arm, steps=steps, seq_len=int(cell.record["seq_len"]), seed=cell.seed,
         device=args.device, sample_temperature=REFERENCE_TAU,
@@ -2549,9 +2610,17 @@ def identity_check(args, buffer, cell: Cell) -> tuple[int, float, int | None]:
             "are the control arm only if a retrain at the shipped temperature IS the shipped "
             "run. No cell is retrained."
         )
-        return EXIT_IDENTITY_CHECK_FAILED, delta, first
-    print(f"identity check: tau={REFERENCE_TAU} reproduces {steps} steps exactly (max abs 0.0e+00)")
-    return EXIT_OK, delta, first
+        return EXIT_IDENTITY_CHECK_FAILED, None
+    print(
+        f"identity check: {cell.arm} seed {cell.seed} at tau={REFERENCE_TAU} reproduces "
+        f"{steps} steps exactly (max abs 0.0e+00)"
+    )
+    # Self-describing: the result names the cell it was measured on, so no
+    # record can carry a 0.0 that was measured somewhere else.
+    return EXIT_OK, {
+        "arm": cell.arm, "seed": int(cell.seed), "tau": float(REFERENCE_TAU),
+        "steps": int(steps), "max_delta": float(delta), "first_step": first,
+    }
 
 
 def train_cell(args, buffer, cell: Cell, tau: float, identity: dict) -> tuple[int, dict]:
@@ -2610,12 +2679,11 @@ def train_phase(args, cells, device, buffer, taus) -> int:
     except CellMissing as error:
         print(f"NO CELL: {error}")
         return EXIT_NO_CHECKPOINTS
-    status, delta, first = identity_check(args, buffer, loaded[0])
-    if status != EXIT_OK:
-        return status
-    identity = {"max_delta": float(delta), "first_step": first, "steps": min(IDENTITY_STEPS, int(args.steps))}
     args.out.mkdir(parents=True, exist_ok=True)
     for cell in loaded:
+        status, identity = identity_check(args, buffer, cell)
+        if status != EXIT_OK:
+            return status
         status, _ = train_cell(args, buffer, cell, tau, identity)
         if status != EXIT_OK:
             return status
@@ -2639,12 +2707,37 @@ def evaluate_cell(args, buffer, arm: str, seed: int, device, train, val) -> tupl
         return EXIT_NO_CHECKPOINTS, None
     record = load_record(path)
     tau = float(record["tau"])
+    # The retrain record carries no protocol of its own (`RETRAIN_KEYS`): a
+    # retrained cell is evaluated at the M3c reference's own context/horizon,
+    # read off its study record, unless a flag overrides it -- the same
+    # None-means-the-cell's-own-value rule `_cell_args`/`protocol_mismatch`
+    # apply everywhere else in this file.
+    reference_record = load_record(job_record_path(args.reference, StudyJob(arm=arm, seed=seed)))
+    context = int(args.context) if args.context is not None else int(reference_record["context"])
+    horizon = int(args.horizon) if args.horizon is not None else int(reference_record["horizon"])
+    # The payload's temperature is checked BEFORE `evaluate_job` runs: it
+    # writes `result_<arm>_seed<n>.json` unconditionally, so refusing only
+    # afterwards would persist -- and overwrite any earlier valid record
+    # with -- a record describing a model that never existed.
+    trained_at = float(
+        torch.load(
+            _trust.checkpoint_path(args.out, arm, seed), map_location="cpu", weights_only=True
+        ).get("sample_temperature", REFERENCE_TAU)
+    )
+    if trained_at != tau:
+        print(
+            f"\nTEMPERATURE MISMATCH for {arm} seed {seed}: the checkpoint was trained at "
+            f"sample_temperature={trained_at}, but its retrain record says {tau}. Nothing is "
+            "evaluated: a record written from the wrong sampler describes a model that never "
+            "existed."
+        )
+        return EXIT_TEMPERATURE_MISMATCH, None
     try:
         evaluate_job(
             StudyJob(arm=arm, seed=seed), buffer, args.out,
             history=history_from_record(record), steps=int(record["steps"]),
-            seq_len=int(record["seq_len"]), context=args.context or 5,
-            horizon=args.horizon or 45, device=args.device, sample_temperature=tau,
+            seq_len=int(record["seq_len"]), context=context,
+            horizon=horizon, device=args.device, sample_temperature=tau,
         )
         cell = rung_cell(args.out, arm, seed)
         status, prepared = prepare_cell(_cell_args(args, args.out, tau), cell, device, train, val)
@@ -2658,10 +2751,45 @@ def evaluate_cell(args, buffer, arm: str, seed: int, device, train, val) -> tupl
     if status != EXIT_OK:
         return status, None
     traj = reference_trajectories(prepared.model, val, prepared.embedding_probe, **prepared.common)
+    # `cell.diagnostic` (from `rung_cell`) is only `{context, horizon}` --
+    # exactly what `checkpoint_ladder.py` reads there itself, because a rung
+    # has no diagnostic either (`rung_entry` there passes its own trust pass
+    # `check=None`). `_trust.trust_record` has no such escape hatch: it always
+    # calls `self_check`, which needs a diagnostic's `curves.reference_position`,
+    # `curves.persistence_position` and `windows` to compare the pass against.
+    # A retrained cell has no earlier pass to compare to, so the comparison is
+    # built from THIS SAME pass -- exact against itself by construction -- and
+    # `curves.floor_position` / `probe.embedding_selection_r2`, which self_check
+    # never compares, come from the study record `evaluate_job` just wrote.
+    # The meaningful check for a retrained cell is the temperature the payload
+    # carries (already refused above, 36), not a bitwise reproduction with
+    # nothing earlier to reproduce.
+    diagnostic = {
+        "curves": {
+            "reference_position": _trust._distance(
+                traj.positions, traj.true_positions
+            ).mean(axis=0).tolist(),
+            "persistence_position": _trust._distance(
+                traj.positions_at_context[:, None, :], traj.true_positions
+            ).mean(axis=0).tolist(),
+            "floor_position": list(cell.record["curves"]["floor_position"]),
+        },
+        "probe": {"embedding_selection_r2": cell.record["probe"]["embedding_selection_r2"]},
+        "windows": {"total": int(traj.windows_total), "episode": [int(e) for e in traj.window_episode]},
+        "episodes": {"val": list(cell.record["episodes"]["val"])},
+    }
     trust_record = _trust.trust_record(
-        arm, seed, traj, cell.diagnostic,
+        arm, seed, traj, diagnostic,
         context=prepared.context, horizon=prepared.horizon, device=device,
     )
+    # The self-check that `trust_record` just computed compared this pass with
+    # itself, so it reads 0.0 by construction. A sweep record's 0.0 means the
+    # pass reproduced the shipped diagnostic bitwise; this one would mean
+    # nothing, and the two are indistinguishable once written. So the record
+    # says there was nothing to reproduce, and the check that DOES bind a
+    # retrained cell -- the temperature its payload carries -- has already
+    # refused above (36).
+    trust_record["self_check"] = None
     written = _trust.write_trust_record(args.out, trust_record)
     print(f"{arm} seed {seed}: evaluated at tau={tau}; wrote {written}")
     return EXIT_OK, trust_record
@@ -2675,7 +2803,7 @@ def evaluate_phase(args, cells, device, buffer, train, val) -> int:
     return EXIT_OK
 ```
 
-with `_diagnose = _sibling("diagnose_dynamics")` beside the other siblings, and `history_record` / `history_from_record` imported from `mbfps.eval.study` and `scripts/checkpoint_ladder.py` respectively (`history_from_train_record` there reads the same shape; bind it as `history_from_record = _ladder.history_from_train_record`).
+with `history_record` imported from `mbfps.eval.study`. **`history_from_record` is this script's own function, not `checkpoint_ladder.history_from_train_record`**: that one reads `kl_dyn_max`, `kl_rate_above_free_bits` and `checkpoint_seconds` off its record's top level, where the ladder's `train_record` keeps them; this script's retrain record carries none of the three (`history_record`'s own policy keeps only `loss` and `parts`), so calling it raises `KeyError('kl_dyn_max')` before a single rollout runs. Recompute the two KL summaries from the stored per-step `parts`, exactly as `train_world_model` computes them from the live history.
 
 `evaluate_job` does not take a `sample_temperature` today. Give it one, defaulting to `SAMPLE_TEMPERATURE`, passed to the `get_config` it already calls, and pin in `tests/eval/test_run_study.py` that the default leaves its record unchanged:
 

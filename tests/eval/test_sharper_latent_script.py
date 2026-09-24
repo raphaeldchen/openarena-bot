@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 
 from mbfps.eval.sharper import REFERENCE_TAU, TAU_GRID
+from mbfps.eval.split_gap import survival_indicator
 from mbfps.eval.study import StudyJob, load_record, run_job
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -290,3 +291,221 @@ def test_the_sweep_is_deterministic_on_cpu(swept, capsys):
     assert _run(swept, "--phase", "sweep") == script.EXIT_OK
     capsys.readouterr()
     assert (swept.sweep / SWEEP).read_text() == before
+
+
+# ---------------------------------------------------------------------------
+# The gate, the identity check and the retrain (Task 7). The sweep's own
+# record decides whether fifteen hours are spent; these tests drive that
+# decision by fabricating the reading rather than by finding a cell that
+# happens to clear, so the gate is tested and not the fixture's luck.
+# ---------------------------------------------------------------------------
+
+from mbfps.eval.sharper import IDENTITY_STEPS, SweepStatus  # noqa: E402
+
+RETRAIN = "retrain_random_vit_seed1.json"
+CHECKPOINT = "world_model_random_vit_seed1.pt"
+RETRAIN_TAU = 0.5
+RETRAIN_KEYS = {
+    "arm", "seed", "tau", "steps", "seq_len", "history", "seconds", "identity",
+    "device", "torch_version", "git_sha", "reference_git_sha", "nonfinite",
+}
+
+
+def _reading(status: SweepStatus, tau=None):
+    """A `reading_noise` stand-in with a chosen status and tau*.
+
+    It carries a full cell table, as the real reading does: the gate is what
+    these tests drive, and a fake missing the table would only prove the
+    formatter tolerates one -- which it should not have to."""
+    from mbfps.eval.sharper import ArmTau, SweepReading
+
+    def fake(inputs):
+        cells = {
+            (arm, tau_value): ArmTau(
+                arm=arm, tau=tau_value, clears_up=False, clears_down=False,
+                seeds_up=0, seeds_down=0, seeds_total=3,
+            )
+            for arm, sweep_arm in inputs.arms.items()
+            for tau_value in sweep_arm.taus
+        }
+        return SweepReading(
+            cells=cells, arms_clearing={}, arms_against={}, tau_star=tau,
+            status=status, rule="fabricated", h=inputs.h, z_fam=inputs.z_fam,
+        )
+
+    return fake
+
+
+def _never_train(*args, **kwargs):
+    raise AssertionError("train_world_model ran; this refusal must come before any training")
+
+
+@pytest.fixture
+def trained(swept, monkeypatch, capsys):
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    assert _run(swept, "--phase", "train", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+    return swept
+
+
+def test_train_without_a_sweep_record_is_exit_11(reference, capsys):
+    assert _run(reference, "--phase", "train") == script.EXIT_NO_CHECKPOINTS
+    assert "run --phase sweep first" in capsys.readouterr().out
+
+
+def test_the_real_reading_is_what_the_gate_consults(swept, monkeypatch, capsys):
+    """Every other gate test fabricates the reading to drive the decision.
+    This one does not: the fixture is one arm and one seed, so the real
+    `reading_noise` cannot reach NOISE_LIMITED (it needs two arms and two
+    seeds), and the refusal must come from it rather than from a stand-in.
+    Without this, a swapped treatment/control in `_tau_inputs` would invert
+    the gate and every fabricated test would still pass."""
+    monkeypatch.setattr(script, "train_world_model", _never_train)
+    assert _run(swept, "--phase", "train") == script.EXIT_NOT_NOISE_LIMITED
+    out = capsys.readouterr().out
+    assert "NOT NOISE LIMITED" in out
+    assert "fabricated" not in out
+    assert "arms required" in out or "of 1 arms" in out or "of 3 arms" in out
+
+
+def test_the_glue_pairs_a_temperature_against_the_reference_not_the_other_way(swept):
+    """The contrast's orientation is the whole reading: `S_free(h)` at tau
+    MINUS at the reference. Swapped, `SHARPER_WORSE` would read as
+    `NOISE_LIMITED` and spend fifteen hours on it.
+
+    Taken through `_tau_inputs` itself, not through a reconstruction of what
+    it does: a first version of this test called `_series`/`_paired` directly
+    and chose its own treatment and control, so a swap INSIDE `_tau_inputs`
+    left the test and the bug each self-consistent and the suite green.
+    """
+    import types as _types
+
+    status, records = script.load_sweep(
+        _types.SimpleNamespace(sweep_out=swept.sweep), [(JOB.arm, JOB.seed)]
+    )
+    assert status == script.EXIT_OK
+    record = records[(JOB.arm, JOB.seed)]
+    h = int(record["decision_h"])
+    inputs = script._tau_inputs(records, JOB.arm, [JOB.seed], 0.0, h)
+
+    # The same difference, computed straight off the record without touching
+    # the glue: the survival indicator at tau = 0 minus the one at tau = 1,
+    # over the windows both temperatures changed.
+    def survival(tau):
+        return survival_indicator(record["entries"][script.tau_key(tau)]["summary"], "free", h)
+
+    values, changed = survival(0.0)
+    reference_values, reference_changed = survival(REFERENCE_TAU)
+    keep = changed & reference_changed
+    direct = float(np.mean(values[keep] - reference_values[keep]))
+
+    assert inputs.free.estimate == pytest.approx(direct, abs=1e-12), (
+        inputs.free.estimate, direct
+    )
+    assert inputs.per_seed[JOB.seed].estimate == pytest.approx(direct, abs=1e-12)
+
+
+def test_a_sweep_that_is_not_noise_limited_refuses_to_retrain(swept, monkeypatch, capsys):
+    """THE gate: fifteen hours are not spent on a refuted premise, and the
+    refusal is the script's, not a person's reading of a table."""
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOT_NOISE_LIMITED))
+    monkeypatch.setattr(script, "train_world_model", _never_train)
+    assert _run(swept, "--phase", "train") == script.EXIT_NOT_NOISE_LIMITED
+    out = capsys.readouterr().out
+    assert "NOT NOISE LIMITED" in out and "fabricated" in out
+    assert not (swept.sharper / CHECKPOINT).exists()
+
+
+def test_a_sharper_worse_sweep_also_refuses(swept, monkeypatch, capsys):
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.SHARPER_WORSE))
+    monkeypatch.setattr(script, "train_world_model", _never_train)
+    assert _run(swept, "--phase", "train") == script.EXIT_NOT_NOISE_LIMITED
+    assert "SHARPER WORSE" in capsys.readouterr().out
+
+
+def test_a_broken_identity_check_refuses_before_any_cell_is_retrained(swept, monkeypatch, capsys):
+    """The tau = 1.0 retrain must reproduce the M3c loss prefix exactly -- it
+    is what makes the shipped cells the control arm without spending fifteen
+    hours on one. Doctoring the reference history breaks it."""
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    _doctor(swept.out / RECORD, lambda r: r["history"]["loss"].__setitem__(0, r["history"]["loss"][0] + 1e-3))
+    assert _run(swept, "--phase", "train", "--steps", "4") == script.EXIT_IDENTITY_CHECK_FAILED
+    out = capsys.readouterr().out
+    assert "IDENTITY CHECK FAILED" in out and "step 1" in out
+    assert not (swept.sharper / CHECKPOINT).exists()
+
+
+def test_the_identity_check_is_the_shipped_temperature_and_its_steps_are_pinned(swept, monkeypatch, capsys):
+    """It is a tau = 1.0 retrain, not a tau* one: it asks whether the edit is a
+    no-op where it must be."""
+    monkeypatch.setattr(script, "reading_noise", _reading(SweepStatus.NOISE_LIMITED, RETRAIN_TAU))
+    seen = []
+    real = script.train_world_model
+
+    def recording(cfg, *args, **kwargs):
+        seen.append(cfg.train.sample_temperature)
+        return real(cfg, *args, **kwargs)
+
+    monkeypatch.setattr(script, "train_world_model", recording)
+    assert _run(swept, "--phase", "train", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+    assert seen[0] == REFERENCE_TAU, "the identity check runs first, at the shipped temperature"
+    assert seen[1:] == [RETRAIN_TAU], "then every requested cell at tau*"
+    assert IDENTITY_STEPS == 500
+
+
+def test_the_retrain_writes_a_checkpoint_carrying_its_temperature_and_a_record(trained):
+    import torch
+
+    payload = torch.load(trained.sharper / CHECKPOINT, weights_only=True)
+    assert payload["sample_temperature"] == RETRAIN_TAU
+    assert (payload["arm"], payload["seed"]) == (JOB.arm, JOB.seed)
+    record = load_record(trained.sharper / RETRAIN)
+    assert set(record) == RETRAIN_KEYS
+    assert record["tau"] == RETRAIN_TAU and record["steps"] == 4
+    assert record["identity"]["max_delta"] == 0.0 and record["identity"]["first_step"] is None
+    # Self-describing and measured on THIS cell: a 0.0 taken on another cell
+    # would be a number that means nothing where one that means something goes.
+    assert (record["identity"]["arm"], record["identity"]["seed"]) == (JOB.arm, JOB.seed)
+    assert record["identity"]["tau"] == REFERENCE_TAU
+    assert record["reference_git_sha"] == load_record(trained.out / RECORD)["git_sha"]
+    assert len(record["history"]["loss"]) == 4
+
+
+def test_evaluate_scores_the_retrained_cell_at_its_own_temperature(trained, capsys):
+    assert _run(trained, "--phase", "evaluate", "--steps", "4") == script.EXIT_OK
+    capsys.readouterr()
+    study = load_record(trained.sharper / RECORD)
+    assert study["steps"] == 4
+    trust_record = load_record(trained.sharper / "trust_random_vit_seed1.json")
+    assert trust_record["windows"]["total"] == WINDOWS
+    assert np.asarray(trust_record["crossing"]["free"], dtype=float).shape == (WINDOWS,)
+    # A retrained cell has no earlier pass to reproduce, so its record must not
+    # carry a self-check at all: a 0.0 computed against itself is
+    # indistinguishable from a sweep record's 0.0, which means a real bitwise
+    # reproduction of the pass the gate scored.
+    assert trust_record["self_check"] is None
+
+
+def test_evaluating_a_checkpoint_at_the_wrong_temperature_is_exit_36(trained, monkeypatch, capsys):
+    """The payload says what sampler produced these weights; evaluating them
+    with another one would report a model that never existed."""
+    import torch
+
+    path = trained.sharper / CHECKPOINT
+    payload = torch.load(path, weights_only=True)
+    payload["sample_temperature"] = 0.25
+    torch.save(payload, path)
+    before = (trained.sharper / RECORD).read_text() if (trained.sharper / RECORD).exists() else None
+    assert _run(trained, "--phase", "evaluate", "--steps", "4") == script.EXIT_TEMPERATURE_MISMATCH
+    assert "TEMPERATURE MISMATCH" in capsys.readouterr().out
+    # Refused BEFORE `evaluate_job` writes anything: a study record from the
+    # wrong sampler describes a model that never existed, and writing it would
+    # also overwrite whatever valid record was there.
+    after = (trained.sharper / RECORD).read_text() if (trained.sharper / RECORD).exists() else None
+    assert after == before
+
+
+def test_evaluate_without_a_retrain_record_is_exit_11(swept, capsys):
+    assert _run(swept, "--phase", "evaluate") == script.EXIT_NO_CHECKPOINTS
+    assert "run --phase train first" in capsys.readouterr().out
