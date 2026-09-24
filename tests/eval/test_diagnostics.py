@@ -3518,6 +3518,25 @@ def test_reference_trajectories_raises_when_no_window_is_long_enough(tmp_path):
         trajectories(OracleModel(), [path], oracle_probe(episode))
 
 
+def test_reference_trajectories_carries_the_passs_noise_reference(tmp_path):
+    """`_diagnose` draws the noise reference on every pass -- a second
+    imagination from the canonical one's own stream point -- and used to drop
+    it on the way out, so a consumer that needed it had to run the whole pass
+    again. It is the statistic that says whether a rollout's motion is its
+    own dynamics or its own sampling (M3h), so it makes the trip."""
+    paths = [write(tmp_path, varied_action_episode())]
+    model, probe = real_model_and_probe()
+    result = reference_trajectories(
+        model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=7,
+        device=torch.device("cpu"), feature_backbone=None,
+    )
+    assert result.noise_embedding.shape == (result.windows_total, HORIZON)
+    assert np.isfinite(result.noise_embedding).all()
+    assert (result.noise_embedding > 0).any(), "a sampling model's two draws differ"
+    # Additive: a fabricated Trajectories that reads no noise need not build one.
+    assert Trajectories.__dataclass_fields__["noise_embedding"].default is None
+
+
 def test_reference_trajectories_carries_the_pass_band(tmp_path):
     """The pass already computes all six mean curves (`_Pass.reference` is a
     `RolloutResult`); `Trajectories` used to copy two of them out. `band` is

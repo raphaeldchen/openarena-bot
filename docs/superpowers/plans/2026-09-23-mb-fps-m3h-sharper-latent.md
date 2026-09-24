@@ -589,7 +589,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 1's `imagine(..., temperature=None)`; `_diagnose(..., keep_trajectories=False, keep_latents=False)`; `reference_trajectories(...)`; `_noise_reference(model, handle, tail)`.
-- Produces: `_diagnose(..., rollout_temperature: float | None = None)`, `reference_trajectories(..., rollout_temperature: float | None = None)`, `_noise_reference(model, handle, tail, temperature=None)`. **None means the model's own temperature and the keyword is not passed to `imagine` at all** — a default of 1.0 would evaluate a retrained cell with a sampler it was never trained for, and would break every existing two-argument stand-in for `imagine` in the suite.
+- Produces: `_diagnose(..., rollout_temperature: float | None = None)`, `reference_trajectories(..., rollout_temperature: float | None = None)`, `_noise_reference(model, handle, tail, temperature=None)`, and `Trajectories.noise_embedding` — the pass already computes the noise reference on every call and used to drop it, so Task 6 would otherwise have had to run the whole pass a second time to read the one statistic that says whether a rollout's motion is its own dynamics or its own sampling. **None means the model's own temperature and the keyword is not passed to `imagine` at all** — a default of 1.0 would evaluate a retrained cell with a sampler it was never trained for, and would break every existing two-argument stand-in for `imagine` in the suite.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -614,6 +614,25 @@ def temperature_pass(model, paths, probe, *, tau, device=None, seed=0):
             seed=seed, device=device or torch.device("cpu"), feature_backbone=None,
             noise_reference=True, keep_trajectories=True, rollout_temperature=tau,
         )
+
+
+def test_reference_trajectories_carries_the_passs_noise_reference(tmp_path):
+    """`_diagnose` draws the noise reference on every pass -- a second
+    imagination from the canonical one's own stream point -- and used to drop
+    it on the way out, so a consumer that needed it had to run the whole pass
+    again. It is the statistic that says whether a rollout's motion is its
+    own dynamics or its own sampling (M3h), so it makes the trip."""
+    paths = [write(tmp_path, varied_action_episode())]
+    model, probe = real_model_and_probe()
+    result = reference_trajectories(
+        model, paths, probe, context=CONTEXT, horizon=HORIZON, seed=7,
+        device=torch.device("cpu"), feature_backbone=None,
+    )
+    assert result.noise_embedding.shape == (result.windows_total, HORIZON)
+    assert np.isfinite(result.noise_embedding).all()
+    assert (result.noise_embedding > 0).any(), "a sampling model's two draws differ"
+    # Additive: a fabricated Trajectories that reads no noise need not build one.
+    assert Trajectories.__dataclass_fields__["noise_embedding"].default is None
 
 
 def test_the_rollout_temperature_is_keyword_only_and_the_models_own_by_default():
@@ -799,7 +818,7 @@ appending to its docstring: `` `rollout_temperature` (M3h) is passed to the pass
 - [ ] **Step 5: Run the new tests, then the whole file**
 
 Run: `.venv/bin/python -m pytest tests/eval/test_diagnostics.py -q`
-Expected: every test passes on cpu and mps — the M3d, M3g and the four new pins together.
+Expected: every test passes on cpu and mps — the M3d, M3g and the new pins together (147 at the time of writing).
 
 - [ ] **Step 6: Run the consumers**
 
@@ -1561,9 +1580,9 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 3's `reference_trajectories(..., rollout_temperature=τ)`; Task 4's constants; `trust_horizon.{Cell, CellMissing, load_cell, self_check, prepare_cell, EXIT_*}` and `split_gap.stratum_summary` by path; `study.{SPLIT_SEED, git_sha, load_record, write_record}`.
-- Produces: `EXIT_NOT_NOISE_LIMITED = 35`, `EXIT_TEMPERATURE_MISMATCH = 36`, `EXIT_IDENTITY_CHECK_FAILED = 37`; `PHASES = ("sweep",)` (Task 7 extends it); `sweep_record_path(out, arm, seed)`; `tau_key(tau) -> str`; `tau_entry(traj, horizon) -> dict`; `sweep_cell(args, cell, device, train, val) -> (status, record | None)`; `sweep_phase(args, cells, device, train, val) -> status`; `_parser()`, `main(argv=None, *, taus=TAU_GRID) -> int`.
+- Produces: `EXIT_NOT_NOISE_LIMITED = 35`, `EXIT_TEMPERATURE_MISMATCH = 36`, `EXIT_IDENTITY_CHECK_FAILED = 37`; `PHASES = ("sweep",)` (Task 7 extends it); `sweep_record_path(out, arm, seed)`; `tau_key(tau) -> str` / `tau_value(key) -> float` (the record's key idiom, `0.7 -> "tau70"`: `write_record` refuses a key containing '.'); `tau_entry(traj, record, horizon) -> dict`; `sweep_cell(args, cell, device, train, val) -> (status, record | None)`; `sweep_phase(args, cells, device, train, val) -> status`; `_parser()`, `main(argv=None, *, taus=TAU_GRID) -> int`.
 
-The record, one per cell (`sweep_<arm>_seed<n>.json`), top-level keys exactly: `arm, seed, source, step, record_git_sha, context, horizon, decision_h, split_seed, device, torch_version, git_sha, taus (the grid, in order), episodes {val}, windows {total, episode, clusters}, self_check (the τ = 1.0 pass against the cell's diagnostic), entries {<τ as a fixed 3-decimal string>: {tau, gate {gap_final, degenerate}, probe {selection_r2, measurable}, noise {curve, median}, summary}}, nonfinite`.
+The record, one per cell (`sweep_<arm>_seed<n>.json`), top-level keys exactly: `arm, seed, source, step, record_git_sha, context, horizon, decision_h, split_seed, device, torch_version, git_sha, taus (the grid, in order), episodes {val}, windows {total, episode, clusters}, self_check (the τ = 1.0 pass against the cell's diagnostic), entries {<τ as `tau_key` spells it, e.g. `tau70`>: {tau, gate {gap_final, degenerate}, probe {selection_r2, measurable}, noise {curve, median}, summary}}, nonfinite`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1733,7 +1752,7 @@ def test_the_sweep_writes_one_record_per_cell_holding_every_temperature(swept):
     assert set(record["entries"]) == {script.tau_key(t) for t in SWEEP_TAUS}
     for key, entry in record["entries"].items():
         assert set(entry) == ENTRY_KEYS
-        assert entry["tau"] == float(key)
+        assert entry["tau"] == script.tau_value(key)
         assert set(entry["gate"]) == {"gap_final", "degenerate"}
         assert set(entry["summary"]) >= {"windows", "curves", "band", "crossing", "margin", "survival", "counts"}
         assert set(entry["probe"]) == {"selection_r2", "measurable"}
@@ -1946,9 +1965,17 @@ def sweep_record_path(out_dir: Path, arm: str, seed: int) -> Path:
 
 
 def tau_key(tau: float) -> str:
-    """A temperature as a record key: three decimals, so 0.3 and 0.30 are the
-    same entry and a float's repr never becomes part of the record's shape."""
-    return f"{float(tau):.3f}"
+    """`0.7 -> "tau70"`, `split_gap.q_key`'s idiom: a record key may not
+    contain '.', since `write_record` addresses non-finite fields by dotted
+    path. Hundredths are the grid's own resolution, so 0.3 and 0.30 are one
+    entry and a float's repr never becomes part of the record's shape."""
+    return f"tau{int(round(float(tau) * 100))}"
+
+
+def tau_value(key: str) -> float:
+    """`"tau70" -> 0.7`: `tau_key`'s inverse, so a reader of a record can get
+    back the temperature an entry was scored at without parsing the entry."""
+    return int(key.removeprefix("tau")) / 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -2002,14 +2029,35 @@ def tau_entry(traj, record: dict, horizon: int) -> dict:
 
 def sweep_cell(args, cell: Cell, device, train, val, taus) -> tuple[int, dict | None]:
     """One cell: 12/14 from `prepare_cell`, the reference temperature and its
-    self-check (30) BEFORE any other temperature, then the rest of the grid."""
+    self-check (30) BEFORE any other temperature, then the rest of the grid.
+
+    The reference is scored first because the caller's order says so, not
+    because the pre-registered grid happens to list it first: a cell whose
+    pass at the shipped temperature does not reproduce its diagnostic must
+    cost one pass, not five, and on the real nine cells five passes is an
+    hour. A grid without the reference temperature is refused before any of
+    it runs, for the same reason -- every contrast is against it.
+    """
+    taus = [float(t) for t in taus]
+    if REFERENCE_TAU not in taus:
+        raise ValueError(
+            f"the grid {taus} does not contain the reference temperature {REFERENCE_TAU}; "
+            "every contrast is against it and the self-check is taken on it"
+        )
+    keys = [tau_key(t) for t in taus]
+    if len(set(keys)) != len(keys):
+        raise ValueError(
+            f"the grid {taus} has two temperatures that spell the same record key "
+            f"({keys}); one entry would overwrite the other and `taus` would list a "
+            "temperature no entry was scored at"
+        )
     status, prepared = prepare_cell(_cell_args(args, args.reference), cell, device, train, val)
     if status != EXIT_OK:
         return status, None
     h, _ = decision_horizon(prepared.horizon)
     entries: dict[str, dict] = {}
     check = None
-    for tau in taus:
+    for tau in [REFERENCE_TAU] + [t for t in taus if t != REFERENCE_TAU]:
         traj = reference_trajectories(
             prepared.model, val, prepared.embedding_probe,
             rollout_temperature=float(tau), **prepared.common,
@@ -2032,11 +2080,6 @@ def sweep_cell(args, cell: Cell, device, train, val, taus) -> tuple[int, dict | 
             "median": float(np.median(noise)),
         }
         entries[tau_key(tau)] = entry
-    if check is None:
-        raise ValueError(
-            f"the grid {list(taus)} does not contain the reference temperature "
-            f"{REFERENCE_TAU}; every contrast is against it and the self-check is taken on it"
-        )
     record = {
         "arm": cell.arm,
         "seed": int(cell.seed),
@@ -2144,7 +2187,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/eval/test_sharper_latent_script.py -q`
-Expected: 11 passed. (The fixture trains a tiny cell and runs the diagnostic; expect a minute or two.)
+Expected: 15 passed. (The fixture trains a tiny cell and runs the diagnostic; expect three or four minutes.)
 
 `stratum_summary` returns `windows / curves / band / moved / first_moved / crossing / margin / survival / trust_horizon / counts`, and `band["position"]` carries `gap_final` and `steps_degenerate` (`mbfps.eval.summary.metric_summary`); it carries no probe block, which is why `tau_entry` takes the cell's record for the R². If any of those names differ from what the installed code returns, use the names it actually returns and say so in your report rather than reshaping the record.
 

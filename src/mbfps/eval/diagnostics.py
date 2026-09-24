@@ -919,6 +919,13 @@ class Trajectories:
     `persistence_position` above are `band.rssm_position` and
     `band.persistence_position`, kept under their own names because the
     self-check reads them by name."""
+    noise_embedding: np.ndarray | None = None
+    """`(n_windows, horizon)`: the noise reference -- the embedding-space
+    distance between the canonical imagination and a SECOND draw of the same
+    model from the same state, which `_diagnose` computes on every pass. Kept
+    here (M3h) because it is what says whether a rollout's motion is its own
+    dynamics or its own sampling, and re-deriving it meant running the whole
+    pass twice. None when the traversal drew no reference."""
     post_logits: np.ndarray | None = None
     prior_teacher_logits: np.ndarray | None = None
     prior_open_logits: np.ndarray | None = None
@@ -975,6 +982,7 @@ def reference_trajectories(
     )
     return Trajectories(
         **{name: getattr(result, name) for name in _TRAJECTORY_FIELDS},
+        noise_embedding=result.noise_embedding,
         **({name: getattr(result, name) for name in _LATENT_FIELDS} if keep_latents else {}),
         window_episode=result.window_episode,
         windows_total=result.windows_total,
