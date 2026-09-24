@@ -589,7 +589,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: Task 1's `imagine(..., temperature=None)`; `_diagnose(..., keep_trajectories=False, keep_latents=False)`; `reference_trajectories(...)`; `_noise_reference(model, handle, tail)`.
-- Produces: `_diagnose(..., rollout_temperature: float = 1.0)`, `reference_trajectories(..., rollout_temperature: float = 1.0)`, `_noise_reference(model, handle, tail, temperature=None)`.
+- Produces: `_diagnose(..., rollout_temperature: float | None = None)`, `reference_trajectories(..., rollout_temperature: float | None = None)`, `_noise_reference(model, handle, tail, temperature=None)`. **None means the model's own temperature and the keyword is not passed to `imagine` at all** — a default of 1.0 would evaluate a retrained cell with a sampler it was never trained for, and would break every existing two-argument stand-in for `imagine` in the suite.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -616,13 +616,53 @@ def temperature_pass(model, paths, probe, *, tau, device=None, seed=0):
         )
 
 
-def test_the_rollout_temperature_is_keyword_only_and_one_by_default():
-    parameter = inspect.signature(diagnostics_module._diagnose).parameters["rollout_temperature"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default == 1.0
-    parameter = inspect.signature(reference_trajectories).parameters["rollout_temperature"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default == 1.0
+def test_the_rollout_temperature_is_keyword_only_and_the_models_own_by_default():
+    """None, not 1.0: a model retrained at another temperature must roll out at
+    the temperature it was trained at, and a hardcoded 1.0 here would evaluate
+    it with a sampler its training never saw."""
+    for function in (diagnostics_module._diagnose, reference_trajectories):
+        parameter = inspect.signature(function).parameters["rollout_temperature"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function
+        assert parameter.default is None, function
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_without_an_override_the_rollout_is_drawn_at_the_models_own_temperature(tmp_path, device):
+    """THE pin on the default's meaning. A model whose own temperature is 0
+    rolls out deterministically when nothing is asked for, and asking for 1.0
+    explicitly is a different pass -- so the default cannot be a synonym for
+    1.0, and the keyword is not passed on the default path at all."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    model.rssm.cfg = replace(model.rssm.cfg, sample_temperature=0.0)
+
+    own = temperature_pass(model, paths, probe, tau=None, device=device)
+    again = temperature_pass(model, paths, probe, tau=None, device=device)
+    sharp = temperature_pass(model, paths, probe, tau=0.0, device=device)
+    warm = temperature_pass(model, paths, probe, tau=1.0, device=device)
+
+    np.testing.assert_array_equal(own.positions, sharp.positions)
+    np.testing.assert_array_equal(own.positions, again.positions)
+    assert not np.array_equal(own.positions, warm.positions)
+
+
+def test_the_default_path_passes_no_temperature_keyword_to_imagine(tmp_path):
+    """A stand-in for `imagine` with the signature it has always had must keep
+    working, which is what the suite's own doubles rely on; an override is the
+    only thing that adds the keyword."""
+    model, paths, probe = _two_episode_rig(tmp_path, torch.device("cpu"))
+    seen = []
+    real = model.rssm.imagine
+
+    def recording(actions, state, *args, **kwargs):
+        seen.append(("temperature" in kwargs, kwargs.get("temperature")))
+        return real(actions, state, *args, **kwargs)
+
+    model.rssm.imagine = recording
+    temperature_pass(model, paths, probe, tau=None)
+    assert seen and all(passed is False for passed, _ in seen), seen
+    seen.clear()
+    temperature_pass(model, paths, probe, tau=0.3)
+    assert seen and all(passed and value == 0.3 for passed, value in seen), seen
 
 
 @pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
@@ -702,7 +742,7 @@ def _noise_reference(model, handle: "_Window", tail: dict, temperature: float | 
 `_diagnose`'s signature gains, after `keep_latents`:
 
 ```python
-    rollout_temperature: float = 1.0,
+    rollout_temperature: float | None = None,
 ```
 
 with this appended to its docstring:
@@ -711,16 +751,33 @@ with this appended to its docstring:
     `rollout_temperature` (M3h) sharpens the CANONICAL rollout and the noise
     reference and nothing else: the context filter, the floor's `observe`, the
     persistence anchor and the probe stay exactly what the ladder and the gate
-    scored, and at 1.0 the pass is bitwise what it is without the argument.
-    The noise reference moves with the rollout because it measures what
-    sampling alone produces, which is a statement about the sampler in use.
+    scored. The noise reference moves with the rollout because it measures
+    what sampling alone produces, which is a statement about the sampler in
+    use.
+
+    None -- the default -- means the MODEL'S OWN `cfg.sample_temperature`, and
+    the keyword is then not passed to `imagine` at all, so the default path is
+    the call it has always been. That default is not a synonym for 1.0: a
+    model retrained at another temperature must roll out at the temperature it
+    was trained at, and hardcoding 1.0 here would evaluate it with a sampler
+    its training never saw -- the mis-evaluation the checkpoint payload's
+    temperature exists to catch.
 ```
 
 and in the loop the two calls become:
 
 ```python
-            imagined = model.rssm.imagine(
-                actions[:, context:], state, temperature=rollout_temperature
+            # The keyword is passed only when an override was asked for, so
+            # the default path is the call it has always been -- which is what
+            # keeps `imagine`'s stand-ins in the suite valid -- and a model
+            # trained at its own temperature rolls out at that temperature
+            # rather than at a default someone chose for it.
+            imagined = (
+                model.rssm.imagine(actions[:, context:], state)
+                if rollout_temperature is None
+                else model.rssm.imagine(
+                    actions[:, context:], state, temperature=rollout_temperature
+                )
             )
 ```
 
@@ -733,11 +790,11 @@ and in the loop the two calls become:
 ```python
     feature_backbone,
     keep_latents: bool = False,
-    rollout_temperature: float = 1.0,
+    rollout_temperature: float | None = None,
 ) -> Trajectories:
 ```
 
-appending to its docstring: `` `rollout_temperature` (M3h) is passed to the pass unchanged; at 1.0 every field is bitwise what it is without it. `` — and the `_diagnose(...)` call gains `rollout_temperature=rollout_temperature`.
+appending to its docstring: `` `rollout_temperature` (M3h) is passed to the pass unchanged; None, the default, leaves the model sampling at its own temperature and every field bitwise what it is without the argument. `` — and the `_diagnose(...)` call gains `rollout_temperature=rollout_temperature`.
 
 - [ ] **Step 5: Run the new tests, then the whole file**
 

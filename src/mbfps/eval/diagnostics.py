@@ -363,7 +363,7 @@ def _embedding_distance(intervened: np.ndarray, real: np.ndarray) -> np.ndarray:
     )
 
 
-def _noise_reference(model, handle: "_Window", tail: dict) -> torch.Tensor:
+def _noise_reference(model, handle: "_Window", tail: dict, temperature: float | None = None) -> torch.Tensor:
     """One more imagination over the REAL actions, then the stream put back.
 
     Called AFTER the canonical pass, from the stream point it leaves, so the
@@ -376,7 +376,11 @@ def _noise_reference(model, handle: "_Window", tail: dict) -> torch.Tensor:
     per-window snapshot here instead: that replays the canonical imagination
     bitwise, the noise reads 0 in every window and every ratio is undefined.
     """
-    latent = model.rssm.imagine(handle.horizon_actions, handle.state)["latent"]
+    latent = (
+        model.rssm.imagine(handle.horizon_actions, handle.state)
+        if temperature is None
+        else model.rssm.imagine(handle.horizon_actions, handle.state, temperature=temperature)
+    )["latent"]
     _rng_restore(tail)
     return latent
 
@@ -540,6 +544,7 @@ def _diagnose(
     noise_reference: bool = True,
     keep_trajectories: bool = False,
     keep_latents: bool = False,
+    rollout_temperature: float | None = None,
 ) -> _Pass:
     """`evaluate_rollout`, plus extra imagination arms on a matched stream.
 
@@ -599,6 +604,21 @@ def _diagnose(
     Deliberately NOT separately decorated with `@torch.no_grad()`: both public
     entry points are, so a second decorator here is a guard no mutation can
     turn red, which this repo treats as a defect rather than as depth.
+
+    `rollout_temperature` (M3h) sharpens the CANONICAL rollout and the noise
+    reference and nothing else: the context filter, the floor's `observe`, the
+    persistence anchor and the probe stay exactly what the ladder and the gate
+    scored. The noise reference moves with the rollout because it measures
+    what sampling alone produces, which is a statement about the sampler in
+    use.
+
+    None -- the default -- means the MODEL'S OWN `cfg.sample_temperature`, and
+    the keyword is then not passed to `imagine` at all, so the default path is
+    the call it has always been. That default is not a synonym for 1.0: a
+    model retrained at another temperature must roll out at the temperature it
+    was trained at, and hardcoding 1.0 here would evaluate it with a sampler
+    its training never saw -- the mis-evaluation the checkpoint payload's
+    temperature exists to catch.
     """
     model.eval()
     device = device or next(model.parameters()).device
@@ -683,7 +703,18 @@ def _diagnose(
             # The canonical pass, replayed from the same snapshot and run LAST.
             # This is `evaluate_rollout`'s own sequence, call for call.
             _rng_restore(snapshot)
-            imagined = model.rssm.imagine(actions[:, context:], state)
+            # The keyword is passed only when an override was asked for, so
+            # the default path is the call it has always been -- which is what
+            # keeps `imagine`'s stand-ins in the suite valid -- and a model
+            # trained at its own temperature rolls out at that temperature
+            # rather than at a default someone chose for it.
+            imagined = (
+                model.rssm.imagine(actions[:, context:], state)
+                if rollout_temperature is None
+                else model.rssm.imagine(
+                    actions[:, context:], state, temperature=rollout_temperature
+                )
+            )
             real = model.rssm.observe(
                 embeddings[:, context:], actions[:, context:], state=state
             )
@@ -696,7 +727,7 @@ def _diagnose(
             noise_latent = None
             if noise_reference:
                 tail = _rng_snapshot(device)
-                noise_latent = _noise_reference(model, handle, tail)
+                noise_latent = _noise_reference(model, handle, tail, rollout_temperature)
                 noise_restored.append(_states_equal(_rng_snapshot(device), tail))
                 noise_bitwise.append(bool(torch.equal(noise_latent, imagined["latent"])))
             floor_embeddings = model.heads(real["latent"])["embedding"][0].cpu().numpy()
@@ -910,6 +941,7 @@ def reference_trajectories(
     device,
     feature_backbone,
     keep_latents: bool = False,
+    rollout_temperature: float | None = None,
 ) -> Trajectories:
     """The canonical pass alone, with its per-window trajectories kept.
 
@@ -929,12 +961,17 @@ def reference_trajectories(
 
     `keep_latents` (M3g) asks the pass for the five latent fields as well;
     the nine trajectory arrays and the band are bitwise the same either way.
+
+    `rollout_temperature` (M3h) is passed to the pass unchanged; None, the
+    default, leaves the model sampling at its own temperature and every field
+    bitwise what it is without the argument.
     """
     result = _diagnose(
         model, val_paths, embedding_probe_weights,
         arms={}, context=context, horizon=horizon, seed=seed, device=device,
         feature_backbone=feature_backbone, noise_reference=True,
         keep_trajectories=True, keep_latents=keep_latents,
+        rollout_temperature=rollout_temperature,
     )
     return Trajectories(
         **{name: getattr(result, name) for name in _TRAJECTORY_FIELDS},

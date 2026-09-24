@@ -1853,8 +1853,10 @@ def test_a_noise_reference_that_forgets_to_restore_the_stream_moves_the_canonica
     reference = rollout(model, paths, probe, device=device)
     real_helper = diagnostics_module._noise_reference
 
-    def forgetful(model, handle, tail):
-        latent = real_helper(model, handle, tail)
+    # `temperature` mirrors the real helper's signature (M3h); this test
+    # exercises the default path, where it is None.
+    def forgetful(model, handle, tail, temperature=None):
+        latent = real_helper(model, handle, tail, temperature)
         model.rssm.imagine(handle.horizon_actions, handle.state)
         return latent
 
@@ -3770,3 +3772,130 @@ def test_the_kept_posterior_and_priors_are_the_passs_own_observe_and_imagine_out
         np.testing.assert_array_equal(
             kept.prior_open_logits[w], first_imagine_prior[w][0], err_msg=f"window {w}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The rollout temperature (M3h). The sweep sharpens the canonical rollout on
+# shipped checkpoints and must leave everything the rollout is judged against
+# exactly where it was: the context filter, the floor, the persistence anchor
+# and the probe. The noise reference moves WITH the rollout, because "two
+# draws of the same model" has to mean two draws of the same sampler.
+# ---------------------------------------------------------------------------
+
+
+def temperature_pass(model, paths, probe, *, tau, device=None, seed=0):
+    with torch.no_grad():
+        return diagnostics_module._diagnose(
+            model, paths, probe, arms={}, context=CONTEXT, horizon=HORIZON,
+            seed=seed, device=device or torch.device("cpu"), feature_backbone=None,
+            noise_reference=True, keep_trajectories=True, rollout_temperature=tau,
+        )
+
+
+def test_the_rollout_temperature_is_keyword_only_and_the_models_own_by_default():
+    """None, not 1.0: a model retrained at another temperature must roll out at
+    the temperature it was trained at, and a hardcoded 1.0 here would evaluate
+    it with a sampler its training never saw."""
+    for function in (diagnostics_module._diagnose, reference_trajectories):
+        parameter = inspect.signature(function).parameters["rollout_temperature"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function
+        assert parameter.default is None, function
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_without_an_override_the_rollout_is_drawn_at_the_models_own_temperature(tmp_path, device):
+    """THE pin on the default's meaning. A model whose own temperature is 0
+    rolls out deterministically when nothing is asked for, and asking for 1.0
+    explicitly is a different pass -- so the default cannot be a synonym for
+    1.0, and the keyword is not passed on the default path at all."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    model.rssm.cfg = replace(model.rssm.cfg, sample_temperature=0.0)
+
+    own = temperature_pass(model, paths, probe, tau=None, device=device)
+    again = temperature_pass(model, paths, probe, tau=None, device=device)
+    sharp = temperature_pass(model, paths, probe, tau=0.0, device=device)
+    warm = temperature_pass(model, paths, probe, tau=1.0, device=device)
+
+    np.testing.assert_array_equal(own.positions, sharp.positions)
+    np.testing.assert_array_equal(own.positions, again.positions)
+    assert not np.array_equal(own.positions, warm.positions)
+
+
+def test_the_default_path_passes_no_temperature_keyword_to_imagine(tmp_path):
+    """A stand-in for `imagine` with the signature it has always had must keep
+    working, which is what the suite's own doubles rely on; an override is the
+    only thing that adds the keyword."""
+    model, paths, probe = _two_episode_rig(tmp_path, torch.device("cpu"))
+    seen = []
+    real = model.rssm.imagine
+
+    def recording(actions, state, *args, **kwargs):
+        seen.append(("temperature" in kwargs, kwargs.get("temperature")))
+        return real(actions, state, *args, **kwargs)
+
+    model.rssm.imagine = recording
+    temperature_pass(model, paths, probe, tau=None)
+    assert seen and all(passed is False for passed, _ in seen), seen
+    seen.clear()
+    temperature_pass(model, paths, probe, tau=0.3)
+    assert seen and all(passed and value == 0.3 for passed, value in seen), seen
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_at_one_the_pass_is_bitwise_what_it_is_without_the_argument(tmp_path, device):
+    """The anchor the sweep's self-check depends on: on a model whose own
+    temperature is the shipped 1.0, asking for 1.0 explicitly and not asking
+    at all are the same pass, field for field, and both leave the generator in
+    the same state."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    plain = reference_pass(model, paths, probe, keep=True, device=device)
+    left_by_plain = diagnostics_module._rng_snapshot(device)
+    tempered = temperature_pass(model, paths, probe, tau=1.0, device=device)
+    left_by_tempered = diagnostics_module._rng_snapshot(device)
+
+    for name in TRAJECTORY_FIELDS:
+        np.testing.assert_array_equal(getattr(tempered, name), getattr(plain, name), err_msg=name)
+    for name in ("rssm_position", "persistence_position", "floor_position",
+                 "rssm_angle", "persistence_angle", "floor_angle"):
+        np.testing.assert_array_equal(
+            getattr(tempered.reference, name), getattr(plain.reference, name), err_msg=name
+        )
+    np.testing.assert_array_equal(tempered.noise_embedding, plain.noise_embedding)
+    for key in left_by_plain:
+        assert torch.equal(left_by_tempered[key], left_by_plain[key]), key
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_a_sharper_rollout_moves_the_imagination_and_nothing_it_is_judged_against(tmp_path, device):
+    """The whole point, pinned: at tau = 0 the imagined rows differ from tau = 1
+    and the floor, the persistence anchor and the true positions are bitwise
+    identical -- because every temperature consumes the same draws, so the
+    floor's `observe`, which runs after the rollout, starts from the same
+    generator state."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    warm = temperature_pass(model, paths, probe, tau=1.0, device=device)
+    sharp = temperature_pass(model, paths, probe, tau=0.0, device=device)
+
+    assert not np.array_equal(sharp.positions, warm.positions)
+    assert not np.array_equal(sharp.reference.rssm_position, warm.reference.rssm_position)
+    for name in ("positions_real", "positions_at_context", "true_positions", "true_at_context",
+                 "true_embedding_displacement"):
+        np.testing.assert_array_equal(getattr(sharp, name), getattr(warm, name), err_msg=name)
+    for name in ("floor_position", "persistence_position", "floor_angle", "persistence_angle"):
+        np.testing.assert_array_equal(
+            getattr(sharp.reference, name), getattr(warm.reference, name), err_msg=name
+        )
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_noise_reference_is_drawn_at_the_rollouts_temperature(tmp_path, device):
+    """It measures what sampling alone produces; at tau = 0 sampling produces
+    nothing, so the second draw is the canonical one bitwise and the reference
+    collapses to zero. At tau = 1 it does not."""
+    model, paths, probe = _two_episode_rig(tmp_path, device)
+    warm = temperature_pass(model, paths, probe, tau=1.0, device=device)
+    sharp = temperature_pass(model, paths, probe, tau=0.0, device=device)
+    assert (warm.noise_embedding > 0).any()
+    assert sharp.noise_bitwise_real.all(), "at tau = 0 two draws must be the same trajectory"
+    np.testing.assert_array_equal(sharp.noise_embedding, np.zeros_like(sharp.noise_embedding))
+    assert sharp.noise_stream_restored.all()
