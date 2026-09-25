@@ -63,10 +63,13 @@ def reproduces(delta, magnitude, *, ulps: int = REPRODUCTION_ULPS) -> bool:
     `inf` for a shape mismatch and `ladder.anchor_delta` for a NaN, and both
     must stay refusals rather than becoming unorderable comparisons. The
     comparison below would refuse those two on its own; the guard is what also
-    refuses `-inf`, which no caller can produce -- both helpers return a max of
-    absolute values -- but which the predicate should not silently accept.
+    refuses a NEGATIVE delta, `-inf` and `-5.0` alike. No caller can produce
+    one -- both helpers return a max of absolute values -- but a predicate
+    whose contract is "how far apart are these" should not silently accept a
+    distance below zero, and a future caller returning a signed difference
+    would otherwise get a free pass.
     """
     delta = float(delta)
-    if not math.isfinite(delta):
+    if not 0.0 <= delta < math.inf:
         return False
     return delta <= reproduction_bound(magnitude, ulps=ulps)

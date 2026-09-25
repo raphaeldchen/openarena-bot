@@ -44,10 +44,12 @@ and each has its own status:
     refused under this status too, UP FRONT: a rollout at another protocol
     cannot reproduce the record, which is how `diagnose_dynamics.py` surfaces
     the same mismatch -- after its refit, twenty seconds later.
-  EXIT_SELF_CHECK_FAILED (30) -- the trust pass's own mean curves are not
-    bitwise the diagnostic's `curves.reference_position` and
-    `curves.persistence_position` (`max |delta| == 0.0`, the ladder's own
-    `record_reproduction` rule), or its windows are not the diagnostic's.
+  EXIT_SELF_CHECK_FAILED (30) -- the trust pass's own mean curves do not
+    reproduce the diagnostic's `curves.reference_position` and
+    `curves.persistence_position` within `mbfps.eval.reproduction`'s bound
+    (64 ULPs of the stored value at the disagreeing step; exactly 0.0 until
+    macOS 27.0 moved the MPS kernels 6 ULPs under the study -- spec 2.4), or
+    its windows are not the diagnostic's.
     Same windows, same rollout, same refit probe, or this is not measuring
     what the ladder measured -- and the cell's record is NOT written, and the
     run stops: the pooling after the loop reads only the records this run
@@ -281,7 +283,10 @@ def trustworthy(check) -> bool:
     a reader may trust: `ok`, both curves inside the bound their own recorded
     magnitudes give, both window flags. The bound is RECOMPUTED here rather
     than taken on trust -- a record whose `ok` says True over a delta its own
-    magnitude cannot justify is a record that was edited, and is refused. A
+    magnitude cannot justify is a record that was edited, and is refused. It
+    cannot catch an edited MAGNITUDE, which is the record's own data with no
+    second copy to check it against; the guard is against a careless edit, not
+    against an adversary. A
     record from M3d-M3g carries no magnitude and a delta of exactly 0.0; the
     missing key reads as a magnitude of 0.0, whose bound is 0.0, so those
     records stay trusted and a nonzero delta without its scale does not."""

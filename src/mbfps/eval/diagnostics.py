@@ -893,7 +893,10 @@ class Trajectories:
     `reference.persistence_position` -- `np.stack(rows).mean(axis=0)` over
     the per-window rows, the same reduction the diagnostic records were
     written with -- so a consumer that recomputes them from the rows and
-    compares against the stored diagnostic can demand max |delta| == 0.0.
+    compares against the stored diagnostic can demand a reproduction of it --
+    exactly 0.0 until macOS 27.0 moved the MPS kernels, and within
+    `mbfps.eval.reproduction`'s bound since (spec 2.4). The reduction being
+    the same is what makes either rule meaningful; the platform decides which.
     """
 
     positions: np.ndarray

@@ -504,7 +504,12 @@ def sweep_inputs(records: dict, *, arms, seeds, h: int, taus) -> SweepInputs:
 
 def load_sweep(args, cells) -> tuple[int, dict]:
     """Every requested sweep record, keyed by `(arm, seed)`; 11 names the
-    first missing, 30 the first whose reference self-check is not exact."""
+    first missing, 30 the first whose reference self-check does not reproduce
+    the diagnostic within `mbfps.eval.reproduction`'s bound (spec 2.4).
+
+    Only the prose moved here: the identity check below still demands an
+    EXACT retrain, because training does not reproduce across a platform
+    change at all -- that refusal is the right answer, not a bound to widen."""
     records: dict[tuple[str, int], dict] = {}
     for arm, seed in cells:
         path = sweep_record_path(args.sweep_out, arm, seed)

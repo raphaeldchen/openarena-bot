@@ -57,12 +57,14 @@ def test_a_non_finite_delta_never_reproduces():
     """`_max_delta` returns inf for a shape mismatch and `anchor_delta` for a
     NaN; both must stay refusals rather than unorderable comparisons.
 
-    `-inf` is the case that needs the explicit guard, and is why the guard is
-    not redundant: `inf <= bound` and `nan <= bound` are already False under
-    IEEE comparison, but `-inf <= bound` is True. No caller can produce a
-    negative delta -- both helpers return a max of absolute values -- so this
-    pins the predicate's contract for its future callers, sign and all.
+    A NEGATIVE delta is the case that needs the explicit guard: `inf <= bound`
+    and `nan <= bound` are already False under IEEE comparison, but `-inf <=
+    bound` and `-5.0 <= bound` are both True. No caller can produce one --
+    both helpers return a max of absolute values -- so this pins the
+    predicate's contract for its future callers, sign and all.
     """
     assert not reproduces(float("inf"), 200.0)
     assert not reproduces(float("nan"), 200.0)
     assert not reproduces(float("-inf"), 200.0)
+    assert not reproduces(-5.0, 200.0), "a finite negative distance is no more a delta than -inf"
+    assert not reproduces(-5.0, 0.0)

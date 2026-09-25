@@ -7,7 +7,7 @@ loads its script. Unlike that file, nothing here stubs the model: the cell
 under test is the same tiny cell `test_aggregate.py` trains --
 `run_job(..., steps=5, seq_len=4, context=2, horizon=3, device="cpu")` on the
 shared `small_buffer` -- and `diagnose_dynamics.main` writes the diagnostic
-for it, so the self-check's `max |delta| == 0.0` is asserted against a
+for it, so the self-check's reproduction bound (spec 2.4) is asserted against a
 diagnostic the ladder really wrote on the same machine, and every refusal is
 produced by doctoring ONE file the way a real drift would.
 
@@ -322,11 +322,17 @@ def test_self_check_reads_zero_when_the_trajectories_reproduce_the_diagnostic():
 
 
 def test_self_check_names_the_curve_and_the_step_of_the_largest_delta():
-    """The rule is `max |delta| == 0.0`, the ladder's `record_reproduction`
-    rule: a delta of 2^-40 (exactly representable beside 10.5, so the
-    difference is exactly 2^-40) fails it. Each curve is judged on its own:
-    the persistence curve doctored alone fails too, and the step named is
-    the 1-based horizon step of the largest delta."""
+    """The rule is the reproduction bound (spec 2.4): a delta of 2^-40 beside
+    10.5 is 512 ULPs of it, eight times the 64 the bound allows, so it fails.
+    Each curve is judged on its own: the persistence curve doctored alone
+    fails too, and the step named is the 1-based horizon step of the largest
+    delta.
+
+    The magnitude assertions carry three rules the zero-delta cells cannot:
+    that the scale comes from the STORED curve and not from the fresh pass
+    (which differ here by exactly `tiny`), that each curve is scaled by its
+    OWN step (they are 2 and 1 here, not both 1), and therefore that a
+    drifting run cannot widen the bound it is judged by."""
     traj, diagnostic = _fabricated()
     tiny = 2.0 ** -40
     reference_only = script.self_check(
@@ -335,6 +341,9 @@ def test_self_check_names_the_curve_and_the_step_of_the_largest_delta():
     assert reference_only.ok is False
     assert reference_only.reference_position_max_delta == tiny
     assert reference_only.reference_position_step == 2
+    # The STORED 10.5 + tiny at step 2, not the fresh pass's 10.5, and not
+    # the persistence curve's value at either step.
+    assert reference_only.reference_position_magnitude == 10.5 + tiny
     assert reference_only.persistence_position_max_delta == 0.0
     assert reference_only.record()["ok"] is False
     (message,) = reference_only.failures()
@@ -347,6 +356,9 @@ def test_self_check_names_the_curve_and_the_step_of_the_largest_delta():
     assert persistence_only.reference_position_max_delta == 0.0
     assert persistence_only.persistence_position_max_delta == 0.5
     assert persistence_only.persistence_position_step == 1
+    # The STORED 10.0 at ITS OWN step 1 -- the reference curve's largest delta
+    # is at step 2, and borrowing that step would scale this bound by 31.0.
+    assert persistence_only.persistence_position_magnitude == 10.0
     (message,) = persistence_only.failures()
     assert "persistence_position" in message and "step 1" in message
 
@@ -696,6 +708,38 @@ def test_a_study_record_the_rollout_no_longer_reproduces_is_exit_14(cell, capsys
     assert "RECORD MISMATCH for random_vit seed 1" in out
     assert "device=cpu" in out
     assert not (cell.out / TRUST).exists()
+
+
+def test_a_study_record_the_rollout_reproduces_within_the_bound_is_exit_0(cell, capsys):
+    """The other side of exit 14, and the reason the bound exists: a stored
+    curve moved by 6 ULPs of its own value -- the worst case measured across
+    the nine M3c cells when macOS 27.0 changed the MPS kernels (spec 2.4) --
+    is a reproduction, and the cell's trust record IS written.
+
+    The exact rule this replaced would refuse it, which is how a real sweep
+    was blocked. Doctoring at the LAST index keeps the delta the maximum
+    `_max_delta` finds while leaving the curve's shape alone.
+    """
+    _doctor(
+        cell.out / RECORD,
+        lambda r: r["curves"]["rssm_position"].__setitem__(
+            -1, r["curves"]["rssm_position"][-1] + 6 * math.ulp(abs(r["curves"]["rssm_position"][-1]))
+        ),
+    )
+    assert script.main(_argv(cell)) == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert "RECORD MISMATCH" not in out
+    assert (cell.out / TRUST).exists(), "a reproduction inside the bound writes its record"
+
+
+def test_the_exit_14_message_names_the_bound_and_the_magnitude_that_set_it(cell, capsys):
+    """A reader has to be able to see what was demanded, not only what was
+    measured -- otherwise a refusal at 1e-13 and one at 12 map units read the
+    same."""
+    FAULTS["record"](cell)
+    assert script.main(_argv(cell)) == script.EXIT_RECORD_MISMATCH
+    out = capsys.readouterr().out
+    assert "outside the" in out and "allows" in out
 
 
 def test_prepare_cell_is_the_check_and_refit_block_and_run_cell_uses_it(cell, monkeypatch):
