@@ -18,6 +18,7 @@
 - **The M3 gate is reported, never decided on**, in both phases.
 - **Exit codes:** 0 / 11 / 12 / 14 / 30 imported from `trust_horizon`; **35 `EXIT_NOT_NOISE_LIMITED`**, **36 `EXIT_TEMPERATURE_MISMATCH`**, **37 `EXIT_IDENTITY_CHECK_FAILED`** new; argparse 2 for `--out` equal to `--reference` or `--sweep-out`.
 - **The retrain is gated in code**, not by a person: `train` reads the sweep record and refuses (35) unless it says `NOISE_LIMITED`, taking τ* from it.
+- **The reproduction rule (amended 2026-09-24, spec §2.4).** A fresh pass reproduces a **stored** artefact when `max |delta| <= 64 * ulp(m)`, `m` the stored value's magnitude at the disagreeing step (`mbfps.eval.reproduction`); measured worst case on macOS 27.0 is 6 ULPs and a wrong device is still 6–12 map units. Comparisons **inside one run** keep exactly 0.0, and so does every **training** comparison — `checkpoint_ladder`'s anchor and `sharper_latent`'s identity check — because a retrain diverges from a record written on another OS by far more than any ULP band.
 - Nothing under `runs/` is removed; no shipped checkpoint is altered; the M3 gate, `aggregate.py`, `report_study.py` and every M3b–M3g verdict and record stand. Results live in this plan's `## Task 10 results`; earlier plans are closed. Never `git stash`. Do not commit while a run is in progress.
 - **Style:** match the neighbouring docstring register (the *why*); tests carry hand-typed expected values, one rule mutated per test; every commit ends with `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`.
 - Run from the worktree root with `.venv/bin/python -m pytest ...`; `runs/` and `data/` are symlinks to the main checkout.
@@ -3405,6 +3406,482 @@ Expected: exit **0** in about ten minutes (five passes of ~1 min plus the probe 
 - [ ] **Step 6: Read the smoke's `sweep.txt` for format**
 
 Check, and fix in the script with a test where wrong: every table's header columns align with its rows (M3f shipped a missing space between two header columns — look for it); the gate table's `GATE PASSES` flags read correctly; the noise table's medians fall with τ and reach 0.0 at τ = 0; `NOTE:` appears only if the horizon clamps (it should not, at horizon 45). Commit any fix, then re-run the whole suite if the script changed.
+
+---
+
+### Task 11: The reproduction rule (inserted 2026-09-24; **runs before Task 10**)
+
+Forced by the environment, not by the design: macOS 27.0 was installed on this box at 15:00:46 on 2026-09-24 and booted at 16:39:50, between the smoke run that reproduced bitwise at 03:01 and the sweep launched at 19:54, which refused at its first cell with exit 14. Spec §2.4 records the measurements. In one line: a forward pass now reproduces the shipped curve to at most **6 ULPs** of float64, the code is proven bit-identical to `ca3e140`'s, and a wrong device — the thing the gate exists to refuse — is still **6–12 map units** away.
+
+This task replaces the exact rule with a scale-aware one **for stored artefacts only**. In-run comparisons and every training comparison keep exactly 0.0.
+
+**Files:**
+- Create: `src/mbfps/eval/reproduction.py`
+- Create: `tests/eval/test_reproduction.py`
+- Modify: `scripts/trust_horizon.py` (`_magnitude_at`, `SelfCheck`, `_curve_failure`, `trustworthy`, `prepare_cell`)
+- Modify: `tests/eval/test_trust_horizon_script.py`
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks.
+- Produces: `REPRODUCTION_ULPS: int`, `reproduction_bound(magnitude, *, ulps=REPRODUCTION_ULPS) -> float`, `reproduces(delta, magnitude, *, ulps=REPRODUCTION_ULPS) -> bool` from `mbfps.eval.reproduction`; `trust_horizon._magnitude_at(theirs, step) -> float`; `SelfCheck` gains `reference_position_magnitude` and `persistence_position_magnitude`, and `SelfCheck.record()` writes both keys.
+
+**Out of scope, deliberately.** `scripts/diagnose_dynamics.py`'s own `cell["record"]` gate and `scripts/checkpoint_ladder.py`'s hard anchor are NOT changed. Neither is traversed by `sharper_latent.py`. The anchor compares *training*, where the exact rule is now the correct answer (spec §2.4), and `diagnose_dynamics`' gate is a real follow-up for whenever M3c's diagnostic is next re-run, recorded as such rather than bundled here.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/eval/test_reproduction.py`:
+
+```python
+"""The reproduction rule: the bound, its edges, and the calibration it claims."""
+import math
+
+import pytest
+
+from mbfps.eval.reproduction import REPRODUCTION_ULPS, reproduces, reproduction_bound
+
+
+def test_the_bound_is_sixty_four_ulps_of_the_stored_magnitude():
+    assert REPRODUCTION_ULPS == 64
+    assert reproduction_bound(200.0) == 1.8189894035458565e-12
+    assert reproduction_bound(1.0) == 1.4210854715202004e-14
+    assert reproduction_bound(0.5) == 7.105427357601002e-15
+
+
+def test_the_bound_scales_with_the_magnitude_not_with_the_delta():
+    """Doubling the stored value doubles the bound: one absolute tolerance
+    cannot serve a position curve near 200 and a loss near 0.4."""
+    assert reproduction_bound(512.0) == 2 * reproduction_bound(256.0)
+
+
+def test_the_measured_worst_case_reproduces_and_leaves_headroom():
+    """1.705303e-13 at magnitude 231.9665544559 is frozen_ssl/s1, the worst of
+    the nine M3c cells on macOS 27.0: 6.000002 ULPs against a bound of 64."""
+    magnitude = 231.9665544559
+    assert 1.705303e-13 / math.ulp(magnitude) == pytest.approx(6.0, abs=1e-5)
+    assert reproduces(1.705303e-13, magnitude)
+
+
+def test_a_wrong_device_does_not_reproduce():
+    """The discrepancy the gate exists to refuse: 6-12 map units."""
+    assert not reproduces(6.0, 231.9665544559)
+    assert not reproduces(12.4, 214.9230630703)
+
+
+def test_exactly_zero_always_reproduces():
+    assert reproduces(0.0, 200.0)
+    assert reproduces(0.0, 0.0)
+
+
+def test_a_magnitude_with_no_scale_demands_the_exact_rule():
+    """Nothing is granted a tolerance around zero or a non-finite magnitude:
+    the bound is 0.0, so only an exact delta passes."""
+    assert reproduction_bound(0.0) == 0.0
+    assert reproduction_bound(float("nan")) == 0.0
+    assert reproduction_bound(float("inf")) == 0.0
+    assert not reproduces(1e-300, 0.0)
+
+
+def test_ulps_zero_is_how_a_caller_asks_for_the_exact_rule():
+    assert reproduction_bound(200.0, ulps=0) == 0.0
+    assert not reproduces(1e-13, 200.0, ulps=0)
+    assert reproduces(0.0, 200.0, ulps=0)
+
+
+def test_a_non_finite_delta_never_reproduces():
+    """`_max_delta` returns inf for a shape mismatch and `anchor_delta` for a
+    NaN; both must stay refusals rather than unorderable comparisons."""
+    assert not reproduces(float("inf"), 200.0)
+    assert not reproduces(float("nan"), 200.0)
+```
+
+- [ ] **Step 2: Run it to watch it fail**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_reproduction.py -q`
+Expected: collection error, `ModuleNotFoundError: No module named 'mbfps.eval.reproduction'`.
+
+- [ ] **Step 3: Write the module**
+
+Create `src/mbfps/eval/reproduction.py`:
+
+```python
+"""The study's reproduction rule: when a fresh pass reproduces a STORED artefact.
+
+Through M3g every such comparison demanded `max |delta| == 0.0` and passed,
+because every run had happened on one macOS build. The macOS 27.0 upgrade of
+2026-09-24 changed the MPS kernels' reduction order. Measured over the nine
+M3c cells, same checkpoints, same code (spec 2.4):
+
+- the shipped `rssm_position` reproduces to at most 1.705303e-13 -- 6 ULPs of
+  float64, largest relative 7.656e-16 -- and two of nine cells still exactly;
+- no reported digit moves: every cell's endpoint is identical to ten decimals;
+- the computation is bitwise deterministic WITHIN the new build;
+- `ca3e140`, the commit the records were written at, and this branch compute
+  bit-identical curves here, so no code changed the computation.
+
+A wrong DEVICE -- the thing this gate exists to refuse -- misses by 6-12 MAP
+UNITS, about thirteen orders of magnitude above the platform band. That ratio
+is what makes a bound possible without blunting the gate.
+
+`REPRODUCTION_ULPS` is calibrated, not theoretical: 64 is about ten times the
+measured worst case, and far tighter than the ~N*ulp a reduction over hundreds
+of windows could produce. A delta above it means re-characterise the platform,
+not raise the bound.
+
+Two things this rule is NOT. It is not for comparisons inside ONE run --
+`diagnose_dynamics`'s `open_loop` and `stream` keep exactly 0.0, because
+determinism within a build is measured, so nothing need be granted. And it is
+not a rule about TRAINING: a retrain's per-step losses diverge from the
+record's by far more than any ULP band, because the straight-through
+categorical sampler makes training a discrete system where a last-bit change
+flips a sampled class and the trajectory jumps. `checkpoint_ladder`'s anchor
+and `sharper_latent`'s identity check therefore keep the exact rule and
+refuse across a platform change, which is the right answer rather than a
+tolerance to widen.
+"""
+
+from __future__ import annotations
+
+import math
+
+# Ten times the worst case measured across the nine M3c cells on macOS 27.0
+# (6.000002 ULPs, frozen_ssl/s1), and thirteen orders below a wrong device.
+REPRODUCTION_ULPS: int = 64
+
+
+def reproduction_bound(magnitude, *, ulps: int = REPRODUCTION_ULPS) -> float:
+    """The largest `max |delta|` that counts as reproducing a stored value of
+    this magnitude.
+
+    `0.0` for a zero or non-finite magnitude, and for `ulps <= 0`: nothing is
+    granted a tolerance around a number that has no scale, and `ulps=0` is how
+    a caller asks for the exact rule in so many words.
+    """
+    magnitude = abs(float(magnitude))
+    if int(ulps) <= 0 or not math.isfinite(magnitude) or magnitude == 0.0:
+        return 0.0
+    return int(ulps) * math.ulp(magnitude)
+
+
+def reproduces(delta, magnitude, *, ulps: int = REPRODUCTION_ULPS) -> bool:
+    """Is `delta` within the bound for a stored value of `magnitude`.
+
+    A non-finite delta never reproduces: `trust_horizon._max_delta` returns
+    `inf` for a shape mismatch and `ladder.anchor_delta` for a NaN, and both
+    must stay refusals rather than becoming unorderable comparisons.
+    """
+    delta = float(delta)
+    if not math.isfinite(delta):
+        return False
+    return delta <= reproduction_bound(magnitude, ulps=ulps)
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_reproduction.py -q`
+Expected: `9 passed`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/mbfps/eval/reproduction.py tests/eval/test_reproduction.py
+git commit -m "feat: the reproduction rule -- a stored artefact reproduces within 64 ULPs of its own magnitude, measured at 6 on macOS 27.0 and 1e13 below a wrong device
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 6: Write the failing tests for `trust_horizon`'s three gates**
+
+Append to `tests/eval/test_trust_horizon_script.py`. `_th` is the module fixture the file already uses — follow the file's existing spelling for it rather than inventing one.
+
+```python
+def test_magnitude_at_reads_the_stored_value_the_delta_was_measured_against():
+    """The bound's scale comes from the STORED curve at the 1-based step
+    `_max_delta` reports, not from the fresh pass."""
+    assert _th._magnitude_at([1.0, -200.0, 3.0], 2) == 200.0
+    assert _th._magnitude_at([1.0, -200.0, 3.0], 1) == 1.0
+
+
+def test_magnitude_at_is_zero_where_there_is_no_step():
+    """`_max_delta` returns step 0 on a shape mismatch, with an infinite
+    delta: the magnitude must be 0.0 so the bound is 0.0 and inf stays a
+    refusal."""
+    assert _th._magnitude_at([1.0, 2.0], 0) == 0.0
+    assert _th._magnitude_at([1.0, 2.0], 7) == 0.0
+
+
+def test_a_six_ulp_curve_difference_is_a_reproduction():
+    """The macOS 27.0 band: frozen_ssl/s1's worst step, 6 ULPs at ~232."""
+    check = _th.SelfCheck(
+        reference_position_max_delta=1.705303e-13,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=231.9665544559,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    assert check.failures() == []
+    assert check.ok is True
+
+
+def test_a_map_unit_curve_difference_is_not_a_reproduction():
+    """A wrong device. The message must carry the bound, so a reader can see
+    what was demanded and not only what was measured."""
+    check = _th.SelfCheck(
+        reference_position_max_delta=12.4,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=231.9665544559,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    failures = check.failures()
+    assert len(failures) == 1
+    assert "reference_position" in failures[0]
+    assert "1.819e-12" in failures[0]
+
+
+def test_the_recorded_self_check_carries_both_magnitudes():
+    check = _th.SelfCheck(
+        reference_position_max_delta=1.705303e-13,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=190.4674100809,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    record = check.record()
+    assert record["reference_position_magnitude"] == 231.9665544559
+    assert record["persistence_position_magnitude"] == 190.4674100809
+    assert record["ok"] is True
+
+
+def test_trustworthy_accepts_a_recorded_delta_inside_its_own_recomputed_bound():
+    assert _th.trustworthy({
+        "ok": True,
+        "reference_position_max_delta": 1.705303e-13,
+        "reference_position_magnitude": 231.9665544559,
+        "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": 231.9665544559,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }) is True
+
+
+def test_trustworthy_refuses_a_recorded_delta_outside_it():
+    assert _th.trustworthy({
+        "ok": True,
+        "reference_position_max_delta": 12.4,
+        "reference_position_magnitude": 231.9665544559,
+        "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": 231.9665544559,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }) is False
+
+
+def test_trustworthy_demands_the_exact_rule_of_a_record_with_no_magnitude():
+    """Every M3d-M3g record predates the magnitude keys and carries 0.0, so it
+    stays trusted; a record that claims a nonzero delta without the magnitude
+    that scales it is refused rather than granted a default bound."""
+    old = {
+        "ok": True,
+        "reference_position_max_delta": 0.0,
+        "persistence_position_max_delta": 0.0,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }
+    assert _th.trustworthy(old) is True
+    assert _th.trustworthy({**old, "reference_position_max_delta": 1.7e-13}) is False
+```
+
+- [ ] **Step 7: Run them to watch them fail**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_trust_horizon_script.py -q -k "magnitude or ulp or map_unit or trustworthy"`
+Expected: `TypeError: ... unexpected keyword argument 'reference_position_magnitude'` and `AttributeError: ... '_magnitude_at'`.
+
+- [ ] **Step 8: Change the three gates**
+
+In `scripts/trust_horizon.py`, add the import beside the other `mbfps.eval` imports:
+
+```python
+from mbfps.eval.reproduction import reproduces, reproduction_bound
+```
+
+Add `_magnitude_at` directly below `_max_delta`:
+
+```python
+def _magnitude_at(theirs, step: int) -> float:
+    """The STORED value's magnitude at the 1-based `step` a delta was measured
+    at, which is the scale the reproduction bound is built from. `0.0` where
+    there is no such step -- `_max_delta` reports step 0 on a shape mismatch,
+    and a zero magnitude makes the bound zero, so its `inf` stays a refusal."""
+    if int(step) < 1:
+        return 0.0
+    flat = np.asarray(theirs, dtype=float).reshape(-1)
+    if int(step) > flat.size:
+        return 0.0
+    return abs(float(flat[int(step) - 1]))
+```
+
+Give `SelfCheck` the two magnitudes (keep the field order: each curve's delta, step, magnitude together), rewrite its docstring's rule, and judge with `reproduces`:
+
+```python
+@dataclass(frozen=True)
+class SelfCheck:
+    """Does the trust pass reproduce the diagnostic it is about to be read
+    beside. Two curve reproductions and two window identities.
+
+    The curve rule is `mbfps.eval.reproduction`'s, not exact equality: on
+    macOS 27.0 the same code on the same checkpoint misses the shipped curve
+    by up to 6 ULPs where it used to miss by nothing (spec 2.4). The magnitude
+    each delta is scaled against is recorded beside it, so `trustworthy`
+    recomputes the bound rather than trusting a recorded verdict."""
+
+    reference_position_max_delta: float
+    reference_position_step: int
+    reference_position_magnitude: float
+    persistence_position_max_delta: float
+    persistence_position_step: int
+    persistence_position_magnitude: float
+    windows_total_match: bool
+    windows_episode_match: bool
+
+    def failures(self) -> list[str]:
+        out = []
+        if not reproduces(self.reference_position_max_delta, self.reference_position_magnitude):
+            out.append(_curve_failure(
+                "reference_position", self.reference_position_max_delta,
+                self.reference_position_step, self.reference_position_magnitude,
+            ))
+        if not reproduces(self.persistence_position_max_delta, self.persistence_position_magnitude):
+            out.append(_curve_failure(
+                "persistence_position", self.persistence_position_max_delta,
+                self.persistence_position_step, self.persistence_position_magnitude,
+            ))
+        if not self.windows_total_match:
+            out.append("windows.total is not the diagnostic's")
+        if not self.windows_episode_match:
+            out.append("windows.episode is not the diagnostic's")
+        return out
+
+    @property
+    def ok(self) -> bool:
+        return not self.failures()
+
+    def record(self) -> dict:
+        return {
+            "reference_position_max_delta": self.reference_position_max_delta,
+            "reference_position_magnitude": self.reference_position_magnitude,
+            "persistence_position_max_delta": self.persistence_position_max_delta,
+            "persistence_position_magnitude": self.persistence_position_magnitude,
+            "windows_total_match": self.windows_total_match,
+            "windows_episode_match": self.windows_episode_match,
+            "ok": self.ok,
+        }
+```
+
+Rewrite `trustworthy` and `_curve_failure`:
+
+```python
+def trustworthy(check) -> bool:
+    """Is a RECORDED self-check (`SelfCheck.record()` read back from disk) one
+    a reader may trust: `ok`, both curves inside the bound their own recorded
+    magnitudes give, both window flags. The bound is RECOMPUTED here rather
+    than taken on trust -- a record whose `ok` says True over a delta its own
+    magnitude cannot justify is a record that was edited, and is refused. A
+    record from M3d-M3g carries no magnitude and a delta of exactly 0.0; the
+    missing key reads as a magnitude of 0.0, whose bound is 0.0, so those
+    records stay trusted and a nonzero delta without its scale does not."""
+    return bool(check) and (
+        check.get("ok") is True
+        and reproduces(
+            check.get("reference_position_max_delta", float("inf")),
+            check.get("reference_position_magnitude", 0.0),
+        )
+        and reproduces(
+            check.get("persistence_position_max_delta", float("inf")),
+            check.get("persistence_position_magnitude", 0.0),
+        )
+        and bool(check.get("windows_total_match"))
+        and bool(check.get("windows_episode_match"))
+    )
+
+
+def _curve_failure(name: str, delta: float, step: int, magnitude: float) -> str:
+    if step == 0:
+        return f"{name} has a different length from the diagnostic's"
+    return (
+        f"{name} differs from the diagnostic's by max |delta| {delta:.3e} at step "
+        f"{step}, outside the {reproduction_bound(magnitude):.3e} the stored "
+        f"{magnitude:.6f} there allows"
+    )
+```
+
+In `self_check`, pass the magnitudes through — the two `_max_delta` calls already give the step:
+
+```python
+    reference, reference_step = _max_delta(
+        reference_rows.mean(axis=0), curves["reference_position"]
+    )
+    persistence, persistence_step = _max_delta(
+        persistence_rows.mean(axis=0), curves["persistence_position"]
+    )
+```
+
+becomes those two calls followed by
+
+```python
+    reference_magnitude = _magnitude_at(curves["reference_position"], reference_step)
+    persistence_magnitude = _magnitude_at(curves["persistence_position"], persistence_step)
+```
+
+and the `SelfCheck(...)` construction gains `reference_position_magnitude=reference_magnitude` and `persistence_position_magnitude=persistence_magnitude`.
+
+In `prepare_cell`, the exit-14 reproduction gate becomes:
+
+```python
+    reference = evaluate_rollout(model, val, embedding_probe, **common)
+    reproduction, step = _max_delta(
+        reference.rssm_position, cell.record["curves"]["rssm_position"]
+    )
+    magnitude = _magnitude_at(cell.record["curves"]["rssm_position"], step)
+    if not reproduces(reproduction, magnitude):
+        print(
+            f"\nRECORD MISMATCH for {arm} seed {seed}: evaluate_rollout no longer "
+            f"reproduces the study record's curves.rssm_position (max abs "
+            f"{reproduction:.3e} at step {step}, outside the "
+            f"{reproduction_bound(magnitude):.3e} the stored {magnitude:.6f} there "
+            f"allows). Measured, the records reproduce on mps to within 6 ULPs and "
+            f"miss on cpu by an arm-dependent 6-12 map units. This run used "
+            f"device={device} torch={torch.__version__}."
+        )
+        return EXIT_RECORD_MISMATCH, None
+```
+
+- [ ] **Step 9: Run the tests to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_trust_horizon_script.py tests/eval/test_reproduction.py -q`
+Expected: all pass. Every pre-existing test in the file must pass **untouched except for the `SelfCheck(...)` constructions**, which need the two new keyword arguments; if a pre-existing assertion about a `record()` key set or a failure message needs changing, change it and say so in the report.
+
+- [ ] **Step 10: Run every consumer of the changed names**
+
+Run: `.venv/bin/python -m pytest tests/eval/test_trust_horizon_script.py tests/eval/test_reproduction.py tests/eval/test_sharper_latent_script.py tests/eval/test_stage_decomposition_script.py tests/eval/test_split_gap_script.py tests/eval/test_diagnose_dynamics_script.py -q`
+Expected: all pass. `trustworthy` and `SelfCheck` are shared with M3g's `stage_decomposition.py` and M3h's `sharper_latent.py`; a break there is this task's to fix.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add scripts/trust_horizon.py tests/eval/test_trust_horizon_script.py
+git commit -m "fix: the stored-artefact gates judge by the reproduction bound, not by exact equality -- macOS 27.0 moved the MPS kernels 6 ULPs and the self-check records the magnitude that scales its own delta
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
 
 ---
 
