@@ -211,11 +211,21 @@ def reading_noise(inputs: SweepInputs) -> SweepReading:
 
 
 def format_reading_noise(reading: SweepReading, inputs: SweepInputs) -> str:
-    """The contrast table over the grid and the verdict, in `ladder.txt`'s style."""
+    """The contrast table over the grid and the verdict, in `ladder.txt`'s style.
+
+    BOTH seed tallies are printed. Under SHARPER_WORSE the verdict sentence is
+    a statement about the DOWN tally ("tau=0.3 clears -3.06 in 3 of 3 arms"),
+    and a table carrying only the up tally made every row of that verdict read
+    `0/3 ... no` -- which a reader naturally takes as "the clear did not
+    replicate in any seed", the exact opposite of what decided it. `counts up`
+    keeps its meaning: the up conjunction `clears_up and seeds_up >= 2`, which
+    is the tally `tau_star` is chosen on.
+    """
     lines = [
         f"--- Reading N: is the rollout noise-limited at h={reading.h} (S_free(h) at tau minus "
         f"at tau={REFERENCE_TAU}, paired on the val windows); z_fam = {reading.z_fam:.2f} ---",
-        f"  {'arm':<12}{'tau':>5}{'estimate':>11}{'se':>9}{'z':>8}{'seeds':>7}  clears  counts",
+        f"  {'arm':<12}{'tau':>5}{'estimate':>11}{'se':>9}{'z':>8}"
+        f"{'seeds up':>10}{'seeds dn':>10}  clears  counts up",
     ]
     for arm, sweep_arm in inputs.arms.items():
         for tau in TAU_GRID:
@@ -228,7 +238,8 @@ def format_reading_noise(reading: SweepReading, inputs: SweepInputs) -> str:
             lines.append(
                 f"  {arm:<12}{tau:>5.1f}{fmt_z(contrast.estimate, '+.4f'):>11}"
                 f"{fmt_z(contrast.se, '.4f'):>9}{fmt_z(contrast.z):>8}"
-                f"{f'{cell.seeds_up}/{cell.seeds_total}':>7}  {direction:<6}  "
+                f"{f'{cell.seeds_up}/{cell.seeds_total}':>10}"
+                f"{f'{cell.seeds_down}/{cell.seeds_total}':>10}  {direction:<6}  "
                 f"{'yes' if cell.counts else 'no'}{endpoint}"
             )
     lines.append(

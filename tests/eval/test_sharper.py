@@ -9,7 +9,6 @@ contrast Readings G, T and S are decided on.
 """
 
 import numpy as np
-import pytest
 
 from mbfps.eval.split_gap import StratumContrast
 from mbfps.eval.sharper import (
@@ -175,6 +174,51 @@ def test_format_reading_noise_prints_every_cell_and_the_verdict():
         assert f"{tau:.1f}" in text
     assert "verdict: NOISE LIMITED" in text and "tau=0.5" in text
     assert text.endswith("\n")
+
+
+def test_the_table_carries_the_down_tally_the_sharper_worse_verdict_is_read_from():
+    """Under SHARPER_WORSE the verdict sentence is a statement about the DOWN
+    seeds ("tau=0.3 clears -3.06 in 3 of 3 arms"), so the table has to print
+    that tally. Carrying only the up one made every row of that verdict read
+    `0/3 ... no`, which reads as "it replicated in no seed" -- the opposite.
+
+    The shape here is M3h's own reading: all three arms clear downward at
+    tau = 0.3, replicated in 2 of 3 seeds for pixel_ae and 3 of 3 elsewhere.
+    """
+    inputs = SweepInputs(
+        arms={
+            "pixel_ae": arm(t03=tau_inputs(-5.0, seeds=(-5.0, -5.0, 1.0))),
+            "frozen_ssl": arm(t03=-5.0),
+            "random_vit": arm(t03=-5.0),
+        },
+        z_fam=Z_FAM, h=15,
+    )
+    reading = reading_noise(inputs)
+    assert reading.status is SweepStatus.SHARPER_WORSE
+    assert "in 3 of 3 arms" in reading.rule
+    text = format_reading_noise(reading, inputs)
+
+    header = text.splitlines()[1]
+    assert header.split() == [
+        "arm", "tau", "estimate", "se", "z", "seeds", "up", "seeds", "dn", "clears", "counts", "up"
+    ]
+    rows = {
+        (parts[0], parts[1]): parts
+        for parts in (line.split() for line in text.splitlines()[2:])
+        if len(parts) >= 9 and parts[0] in inputs.arms
+    }
+    # arm, tau, estimate, se, z, seeds up, seeds dn, clears, counts up
+    assert rows[("pixel_ae", "0.3")][:9] == [
+        "pixel_ae", "0.3", "-0.0500", "0.0100", "-5.00", "0/3", "2/3", "down", "no"
+    ]
+    assert rows[("frozen_ssl", "0.3")][5:9] == ["0/3", "3/3", "down", "no"]
+    assert rows[("random_vit", "0.3")][5:9] == ["0/3", "3/3", "down", "no"]
+    # A temperature that moved neither way carries both tallies at zero.
+    assert rows[("pixel_ae", "0.7")][5:9] == ["0/3", "0/3", "no", "no"]
+    # The down tally the verdict counted is the one the table prints: three
+    # arms with at least SEEDS_REQUIRED down seeds.
+    down = sum(1 for a in inputs.arms if int(rows[(a, "0.3")][6].split("/")[0]) >= SEEDS_REQUIRED)
+    assert down == 3 and reading.arms_against[0.3] == ("pixel_ae", "frozen_ssl", "random_vit")
 
 
 # ---------------------------------------------------------------------------
