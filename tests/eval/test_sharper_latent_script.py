@@ -166,8 +166,13 @@ def test_the_sweep_writes_one_record_per_cell_holding_every_temperature(swept):
         assert set(entry["gate"]) == {"gap_final", "degenerate"}
         assert set(entry["summary"]) >= {"windows", "curves", "band", "crossing", "margin", "survival", "counts"}
         assert set(entry["probe"]) == {"selection_r2", "measurable"}
-        assert np.asarray(entry["noise"]["curve"]).shape == (HORIZON,)
-        assert np.asarray(entry["displacement"]["curve"]).shape == (HORIZON,)
+        # Both reductions over windows on both series: `curve` is the median,
+        # which the table prints under a caption that says so, and
+        # `curve_mean` is recorded beside it.
+        assert set(entry["noise"]) == set(entry["displacement"]) == {"curve", "curve_mean", "median"}
+        for series in ("noise", "displacement"):
+            assert np.asarray(entry[series]["curve"]).shape == (HORIZON,)
+            assert np.asarray(entry[series]["curve_mean"]).shape == (HORIZON,)
         crossing = np.asarray(entry["summary"]["crossing"]["free"], dtype=float)
         assert crossing.shape == (WINDOWS,)
 
@@ -537,6 +542,208 @@ def swept_read(swept, capsys):
     assert _run(swept, "--phase", "read") == script.EXIT_OK
     text = capsys.readouterr().out
     return types.SimpleNamespace(ref=swept, text=text, path=swept.sweep / "sweep.txt")
+
+
+# The VALUES in the two tables, not just their banners. Both are fabricated:
+# every printed number is derived here from hand-typed windows, so a table
+# that reads the wrong index or the wrong reduction prints a number no
+# assertion below recognises.
+
+
+def _fabricated(entries_by_cell: dict, *, decision_h: int = 3) -> dict:
+    """Records shaped only as the read tables read them."""
+    return {
+        cell: {"decision_h": int(decision_h), "entries": entries}
+        for cell, entries in entries_by_cell.items()
+    }
+
+
+def _survival_entries(curves_by_tau: dict) -> dict:
+    return {
+        script.tau_key(tau): {
+            "summary": {"survival": {"free": [float(v) for v in curve]}},
+            "gate": {"gap_final": float(tau), "degenerate": 0},
+        }
+        for tau, curve in curves_by_tau.items()
+    }
+
+
+def test_the_survival_table_prints_s_of_h_at_index_h():
+    """`trust.survival` returns `(horizon + 1,)` with index h = S(h), so the
+    column captioned `S(1)` is `s[1]`. Indexing `h - 1` shifts every row one
+    step early and prints S(0) -- 1.000 by definition -- under `S(1)`.
+
+    Two seeds so the printed number is the stack's mean and not one curve:
+    seed 0's crossings are 1, 2, 3, 4 and seed 1's are all 4, both at
+    horizon 3, which makes the stacked curve [1.0, 0.875, 0.75, 0.625].
+    """
+    from mbfps.eval.trust import survival
+
+    spread = survival(np.array([1.0, 2.0, 3.0, 4.0]), 3)
+    late = survival(np.array([4.0, 4.0, 4.0, 4.0]), 3)
+    np.testing.assert_allclose(spread, [1.0, 0.75, 0.5, 0.25])
+    np.testing.assert_allclose(late, [1.0, 1.0, 1.0, 1.0])
+
+    records = _fabricated({
+        ("pixel_ae", 0): _survival_entries({1.0: spread}),
+        ("pixel_ae", 1): _survival_entries({1.0: late}),
+    })
+    table = script._survival_table(records, [1.0], horizon=3)
+    header, row = table.rstrip("\n").splitlines()[1:3]
+    assert header.split()[2:] == ["S(1)", "S(2)", "S(3)"]
+    assert row.split() == ["pixel_ae", "1.0", "0.875", "0.750", "0.625"]
+    # The tell the shipped table carried: S(1) can only be 1.000 when the
+    # column printed is S(0), since every finite crossing is >= 1.
+    assert "1.000" not in row
+
+
+def test_the_survival_panel_of_the_figure_reads_the_same_index_as_the_table(tmp_path, monkeypatch):
+    """The figure's S(h) panel is the table's row drawn, so it indexes `[h]`
+    too. Pinned by watching what is handed to `Axes.plot`: the first plot call
+    of the two-panel figure is the survival panel's."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.axes
+
+    plotted = []
+    real_plot = matplotlib.axes.Axes.plot
+
+    def spy(self, *args, **kwargs):
+        plotted.append(args)
+        return real_plot(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "plot", spy)
+
+    # decision_h = 3, so the panel must draw index 3 -- 0.25 at tau 1.0 and
+    # 0.50 at tau 0.0 -- and never index 2 (0.50 and 0.75).
+    records = _fabricated({("pixel_ae", 0): _survival_entries({
+        1.0: [1.0, 0.75, 0.50, 0.25],
+        0.0: [1.0, 0.90, 0.75, 0.50],
+    })}, decision_h=3)
+    figure = tmp_path / "curves.png"
+    line = script.write_curves(records, [1.0, 0.0], figure)
+    assert line == f"figure={figure}" and figure.exists()
+    assert plotted, "the survival panel was never drawn"
+    assert list(plotted[0][1]) == [0.25, 0.50]
+
+
+def _noise_entries(noise_windows: np.ndarray, moved_windows: np.ndarray, taus) -> dict:
+    """One entry per temperature carrying BOTH reductions of the same
+    windows, as `sweep_cell` records them."""
+    return {
+        script.tau_key(tau): {
+            "noise": {
+                "curve": np.median(noise_windows, axis=0).tolist(),
+                "curve_mean": noise_windows.mean(axis=0).tolist(),
+                "median": float(np.median(noise_windows)),
+            },
+            "displacement": {
+                "curve": np.median(moved_windows, axis=0).tolist(),
+                "curve_mean": moved_windows.mean(axis=0).tolist(),
+                "median": float(np.median(moved_windows)),
+            },
+        }
+        for tau in taus
+    }
+
+
+def test_the_noise_tables_columns_are_the_quantity_its_caption_and_header_name():
+    """The caption says "medians over windows" and the headers say `noise(h)`
+    and `moved(h)`; this pins that each column IS that quantity.
+
+    The windows are right-skewed exactly as embedding distances are -- three
+    rows at `base` and one at `7 * base` -- so the median (`base`) and the
+    mean (`2.5 * base`) are different numbers and a column that printed the
+    other reduction, or another step, prints a number checked against here.
+    """
+    base = np.arange(1.0, 16.0)
+    noise_windows = np.array([base, base, base, 7.0 * base])
+    moved_windows = np.array([100.0 * base, 100.0 * base, 100.0 * base, 700.0 * base])
+    records = _fabricated({("pixel_ae", 0): _noise_entries(noise_windows, moved_windows, [1.0])})
+
+    table = script._noise_table(records, [1.0], horizon=15)
+    caption, header, row = table.rstrip("\n").splitlines()
+    assert "medians over windows" in caption
+    names = header.split()[2:]
+    assert names == ["noise(1)", "moved(1)", "noise(5)", "moved(5)", "noise(15)", "moved(15)"]
+    values = row.split()[3:]  # the arm field is "pixel_ae s0", then tau.
+    assert len(values) == len(names)
+    for name, printed in zip(names, values):
+        kind, step = name.rstrip(")").split("(")
+        windows = noise_windows if kind == "noise" else moved_windows
+        expected = float(np.median(windows, axis=0)[int(step) - 1])
+        assert printed == f"{expected:.3f}", (name, printed, expected)
+    # Hand-typed, so the medians above cannot agree with the code by echoing it.
+    assert values == ["1.000", "100.000", "5.000", "500.000", "15.000", "1500.000"]
+    # The means of the same windows, which the caption does NOT name.
+    for mean in ("2.500", "250.000", "12.500", "37.500"):
+        assert mean not in row
+
+
+def test_the_noise_tables_arm_field_fits_the_longest_cell_name():
+    """`frozen_ssl s1` is 13 characters; in a 12-wide field it pushed its own
+    row's numbers one column right of `pixel_ae`'s. Every row's tau must start
+    where the header's does."""
+    base = np.arange(1.0, 16.0)
+    windows = np.array([base, 2.0 * base])
+    cells = [("pixel_ae", 0), ("frozen_ssl", 1), ("random_vit", 2)]
+    records = _fabricated({cell: _noise_entries(windows, windows, [1.0]) for cell in cells})
+
+    lines = script._noise_table(records, [1.0], horizon=15).rstrip("\n").splitlines()
+    header, rows = lines[1], lines[2:]
+    assert len(rows) == 3
+    tau_column = header.index("tau") + len("tau") - len(f"{1.0:>5.1f}")
+    for (arm, seed), row in zip(cells, rows):
+        assert row[2:tau_column].rstrip() == f"{arm} s{seed}"
+        assert row[tau_column:tau_column + 5] == f"{1.0:>5.1f}", row
+    assert len({len(row) for row in rows}) == 1
+
+
+def test_the_sweep_records_the_median_it_prints_and_the_mean_beside_it(
+    reference, monkeypatch, capsys
+):
+    """C2: the printed `curve` is the MEDIAN over windows on BOTH series, and
+    the mean is recorded beside it as `curve_mean`.
+
+    Checked against the pass's own windows, captured on the way through, so
+    this is the reduction and not a re-statement of it. The two reductions
+    must differ at tau = 1.0: embedding distances are right-skewed, which is
+    why printing one under the other's caption was not like for like.
+    """
+    seen = {}
+    real = script.reference_trajectories
+
+    def recording(*args, **kwargs):
+        traj = real(*args, **kwargs)
+        seen[float(kwargs["rollout_temperature"])] = traj
+        return traj
+
+    monkeypatch.setattr(script, "reference_trajectories", recording)
+    assert _run(reference, "--phase", "sweep") == script.EXIT_OK
+    capsys.readouterr()
+
+    record = load_record(reference.sweep / SWEEP)
+    assert set(seen) == {float(t) for t in SWEEP_TAUS}
+    for tau in SWEEP_TAUS:
+        entry = record["entries"][script.tau_key(tau)]
+        traj = seen[float(tau)]
+        for name, windows in (("noise", np.asarray(traj.noise_embedding, dtype=float)),
+                              ("displacement", np.asarray(traj.embedding_displacement, dtype=float))):
+            assert windows.shape == (WINDOWS, HORIZON), (name, windows.shape)
+            np.testing.assert_array_equal(
+                np.asarray(entry[name]["curve"], dtype=float),
+                np.median(windows, axis=0), err_msg=f"{name}/curve at tau={tau}",
+            )
+            np.testing.assert_array_equal(
+                np.asarray(entry[name]["curve_mean"], dtype=float),
+                windows.mean(axis=0), err_msg=f"{name}/curve_mean at tau={tau}",
+            )
+    warm = record["entries"][script.tau_key(REFERENCE_TAU)]
+    for name in ("noise", "displacement"):
+        assert not np.allclose(warm[name]["curve"], warm[name]["curve_mean"]), (
+            f"{name}: the two reductions coincide, so this cell cannot tell them apart"
+        )
 
 
 def test_read_without_a_sweep_record_is_exit_11(reference, capsys):

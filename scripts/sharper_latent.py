@@ -295,8 +295,8 @@ def tau_entry(traj, record: dict, horizon: int) -> dict:
                 widest_se=0.0,
             )),
         },
-        "noise": {"curve": None, "median": None},
-        "displacement": {"curve": None, "median": None},
+        "noise": {"curve": None, "curve_mean": None, "median": None},
+        "displacement": {"curve": None, "curve_mean": None, "median": None},
         "summary": summary,
     }
 
@@ -349,15 +349,26 @@ def sweep_cell(args, cell: Cell, device, train, val, taus) -> tuple[int, dict | 
         entry = tau_entry(traj, cell.record, prepared.horizon)
         noise = np.asarray(traj.noise_embedding, dtype=float)
         entry["tau"] = float(tau)
+        # BOTH reductions over windows, on both series, because the two are
+        # different numbers: embedding distances are right-skewed, so a mean
+        # sits above the median by 1.01-1.72x across these cells. `curve` is
+        # the MEDIAN on both, and `curve` is what the table prints, so the
+        # noise column and the displacement column beside it are like for
+        # like and the caption over them ("medians over windows") is true of
+        # what is underneath it. `curve_mean` is recorded so a reader who
+        # wants the other reduction has it without re-running the sweep.
         entry["noise"] = {
-            "curve": noise.mean(axis=0),
+            "curve": np.median(noise, axis=0),
+            "curve_mean": noise.mean(axis=0),
             "median": float(np.median(noise)),
         }
         # The statistic the study turns on, beside the noise it is compared
         # with: how far the imagination moved in embedding space,
         # ||e_hat(h) - e_hat(0)||, per horizon step, median over windows.
+        displacement = np.asarray(traj.embedding_displacement, dtype=float)
         entry["displacement"] = {
-            "curve": np.median(np.asarray(traj.embedding_displacement, dtype=float), axis=0),
+            "curve": np.median(displacement, axis=0),
+            "curve_mean": displacement.mean(axis=0),
             "median": float(np.median(traj.embedding_displacement)),
         }
         entries[tau_key(tau)] = entry
@@ -856,13 +867,19 @@ def _gate_table(records: dict, taus) -> str:
 
 def _noise_table(records: dict, taus, horizon: int) -> str:
     """The statistic that motivated the study: two draws of the same model
-    against that model's own imagined displacement, at every temperature."""
+    against that model's own imagined displacement, at every temperature.
+
+    Both columns print `curve`, which `sweep_cell` reduces the same way on
+    both series -- the median over windows -- so the comparison is like for
+    like and the caption below says what is printed. The arm field is 14
+    wide because `'frozen_ssl s1'` is 13 characters and a narrower field
+    would push those rows' numbers out of line with `pixel_ae`'s."""
     hs = [h for h in (1, 5, 15, 45) if h <= horizon]
     lines = [
         "--- the noise reference against the imagined displacement (medians over windows, "
         "embedding units through the same head): two draws of one model, then how far that "
         "model imagined it moved ---",
-        f"  {'arm':<12}{'tau':>5}" + "".join(f"{f'noise({h})':>12}{f'moved({h})':>12}" for h in hs),
+        f"  {'arm':<14}{'tau':>5}" + "".join(f"{f'noise({h})':>12}{f'moved({h})':>12}" for h in hs),
     ]
     for arm, seed in _cells_in_order(records):
         r = records[(arm, seed)]
@@ -873,11 +890,17 @@ def _noise_table(records: dict, taus, horizon: int) -> str:
             cells = "".join(
                 f"{_num(noise[h - 1]):>12}{_num(moved[h - 1]):>12}" for h in hs
             )
-            lines.append(f"  {arm + ' s' + str(seed):<12}{float(tau):>5.1f}{cells}")
+            lines.append(f"  {arm + ' s' + str(seed):<14}{float(tau):>5.1f}{cells}")
     return "\n".join(lines) + "\n"
 
 
 def _survival_table(records: dict, taus, horizon: int) -> str:
+    """`trust.survival` returns a `(horizon + 1,)` array whose index IS h --
+    `s[0] = S(0) = 1` by definition, since every finite crossing is >= 1 --
+    so the column captioned `S(h)` is `s[h]`, as `split_gap._survival_table`
+    reads it. Indexing `h - 1` here printed each row one step early, which is
+    invisible at the right-hand end of the table and unmistakable at the left,
+    where every row read `S(1) = 1.000`."""
     hs = [h for h in (1, 2, 3, 5, 10, 15, 30, 45) if h <= horizon]
     lines = [
         "--- survival by temperature: S(h) = fraction of moved draws with h_x > h, free channel, "
@@ -894,7 +917,7 @@ def _survival_table(records: dict, taus, horizon: int) -> str:
             ])
             lines.append(
                 f"  {arm:<12}{float(tau):>5.1f}"
-                + "".join(f"{_num(stacked[:, h - 1].mean()):>8}" for h in hs)
+                + "".join(f"{_num(stacked[:, h].mean()):>8}" for h in hs)
             )
     return "\n".join(lines) + "\n"
 
@@ -902,7 +925,10 @@ def _survival_table(records: dict, taus, horizon: int) -> str:
 def write_curves(records: dict, taus, figure: Path) -> str:
     """Two panels against the temperature: S(15) on the free channel and the
     gate's own metric, arms coloured, seeds thin. A missing or broken
-    matplotlib, or an unwritable path, costs the FIGURE and nothing else."""
+    matplotlib, or an unwritable path, costs the FIGURE and nothing else.
+
+    The survival panel indexes `[h]`, not `[h - 1]`, for `_survival_table`'s
+    reason: `trust.survival`'s index is h itself."""
     try:
         import matplotlib
 
@@ -920,7 +946,7 @@ def write_curves(records: dict, taus, figure: Path) -> str:
         for (arm, seed), record in records.items():
             colour = colours.get(arm, "black")
             survival.plot(
-                x, [float(np.asarray(_entry(record, t)["summary"]["survival"]["free"])[h - 1]) for t in order],
+                x, [float(np.asarray(_entry(record, t)["summary"]["survival"]["free"])[h]) for t in order],
                 marker="o", markersize=3, linewidth=0.9, color=colour, label=f"{arm} s{seed}",
             )
             gate.plot(
