@@ -304,10 +304,17 @@ def test_self_check_reads_zero_when_the_trajectories_reproduce_the_diagnostic():
     assert check.failures() == []
     assert check.reference_position_max_delta == 0.0
     assert check.persistence_position_max_delta == 0.0
+    # The step of an exact (all-zero-delta) match is `argmax`'s tie-break,
+    # step 1 -- so the magnitude scaling the bound is each curve's own first
+    # value: reference_position[0] = 2.0, persistence_position[0] = 9.5.
+    assert check.reference_position_magnitude == 2.0
+    assert check.persistence_position_magnitude == 9.5
     assert check.windows_total_match is True and check.windows_episode_match is True
     assert check.record() == {
         "reference_position_max_delta": 0.0,
+        "reference_position_magnitude": 2.0,
         "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": 9.5,
         "windows_total_match": True,
         "windows_episode_match": True,
         "ok": True,
@@ -447,7 +454,8 @@ def test_trust_record_wires_every_channel_the_way_the_spec_names_it():
         "windows": {"total": 2, "episode": [0, 1]},
         "probe": {"selection_r2": 0.31, "measurable": True},
         "self_check": {
-            "reference_position_max_delta": 0.0, "persistence_position_max_delta": 0.0,
+            "reference_position_max_delta": 0.0, "reference_position_magnitude": 2.0,
+            "persistence_position_max_delta": 0.0, "persistence_position_magnitude": 9.5,
             "windows_total_match": True, "windows_episode_match": True, "ok": True,
         },
     }.items():
@@ -587,10 +595,16 @@ def test_the_self_check_reads_zero_the_single_episode_is_disclosed_and_h1_never_
     assert script.main(_argv(cell)) == script.EXIT_OK
     out = capsys.readouterr().out
     record = load_record(cell.out / TRUST)
+    diagnostic = load_record(cell.out / DIAGNOSTIC)
 
+    # An exact (all-zero-delta) match's step is `argmax`'s tie-break, step 1,
+    # so the magnitude scaling the bound is each stored curve's own first
+    # value -- read off the diagnostic this run reproduced, not hand-typed.
     assert record["self_check"] == {
         "reference_position_max_delta": 0.0,
+        "reference_position_magnitude": abs(diagnostic["curves"]["reference_position"][0]),
         "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": abs(diagnostic["curves"]["persistence_position"][0]),
         "windows_total_match": True,
         "windows_episode_match": True,
         "ok": True,
@@ -1576,3 +1590,109 @@ def test_prepare_cell_builds_its_config_at_the_temperature_its_args_name(cell):
     # raises is trust_horizon's, and a caller catching any other misses it.
     with pytest.raises(script.TemperatureMismatch, match="0.5"):
         script.prepare_cell(sharp, loaded, device, train, val)
+
+
+def test_magnitude_at_reads_the_stored_value_the_delta_was_measured_against():
+    """The bound's scale comes from the STORED curve at the 1-based step
+    `_max_delta` reports, not from the fresh pass."""
+    assert script._magnitude_at([1.0, -200.0, 3.0], 2) == 200.0
+    assert script._magnitude_at([1.0, -200.0, 3.0], 1) == 1.0
+
+
+def test_magnitude_at_is_zero_where_there_is_no_step():
+    """`_max_delta` returns step 0 on a shape mismatch, with an infinite
+    delta: the magnitude must be 0.0 so the bound is 0.0 and inf stays a
+    refusal."""
+    assert script._magnitude_at([1.0, 2.0], 0) == 0.0
+    assert script._magnitude_at([1.0, 2.0], 7) == 0.0
+
+
+def test_a_six_ulp_curve_difference_is_a_reproduction():
+    """The macOS 27.0 band: frozen_ssl/s1's worst step, 6 ULPs at ~232."""
+    check = script.SelfCheck(
+        reference_position_max_delta=1.705303e-13,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=231.9665544559,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    assert check.failures() == []
+    assert check.ok is True
+
+
+def test_a_map_unit_curve_difference_is_not_a_reproduction():
+    """A wrong device. The message must carry the bound, so a reader can see
+    what was demanded and not only what was measured."""
+    check = script.SelfCheck(
+        reference_position_max_delta=12.4,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=231.9665544559,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    failures = check.failures()
+    assert len(failures) == 1
+    assert "reference_position" in failures[0]
+    assert "1.819e-12" in failures[0]
+
+
+def test_the_recorded_self_check_carries_both_magnitudes():
+    check = script.SelfCheck(
+        reference_position_max_delta=1.705303e-13,
+        reference_position_step=35,
+        reference_position_magnitude=231.9665544559,
+        persistence_position_max_delta=0.0,
+        persistence_position_step=1,
+        persistence_position_magnitude=190.4674100809,
+        windows_total_match=True,
+        windows_episode_match=True,
+    )
+    record = check.record()
+    assert record["reference_position_magnitude"] == 231.9665544559
+    assert record["persistence_position_magnitude"] == 190.4674100809
+    assert record["ok"] is True
+
+
+def test_trustworthy_accepts_a_recorded_delta_inside_its_own_recomputed_bound():
+    assert script.trustworthy({
+        "ok": True,
+        "reference_position_max_delta": 1.705303e-13,
+        "reference_position_magnitude": 231.9665544559,
+        "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": 231.9665544559,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }) is True
+
+
+def test_trustworthy_refuses_a_recorded_delta_outside_it():
+    assert script.trustworthy({
+        "ok": True,
+        "reference_position_max_delta": 12.4,
+        "reference_position_magnitude": 231.9665544559,
+        "persistence_position_max_delta": 0.0,
+        "persistence_position_magnitude": 231.9665544559,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }) is False
+
+
+def test_trustworthy_demands_the_exact_rule_of_a_record_with_no_magnitude():
+    """Every M3d-M3g record predates the magnitude keys and carries 0.0, so it
+    stays trusted; a record that claims a nonzero delta without the magnitude
+    that scales it is refused rather than granted a default bound."""
+    old = {
+        "ok": True,
+        "reference_position_max_delta": 0.0,
+        "persistence_position_max_delta": 0.0,
+        "windows_total_match": True,
+        "windows_episode_match": True,
+    }
+    assert script.trustworthy(old) is True
+    assert script.trustworthy({**old, "reference_position_max_delta": 1.7e-13}) is False

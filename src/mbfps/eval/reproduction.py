@@ -61,7 +61,10 @@ def reproduces(delta, magnitude, *, ulps: int = REPRODUCTION_ULPS) -> bool:
 
     A non-finite delta never reproduces: `trust_horizon._max_delta` returns
     `inf` for a shape mismatch and `ladder.anchor_delta` for a NaN, and both
-    must stay refusals rather than becoming unorderable comparisons.
+    must stay refusals rather than becoming unorderable comparisons. The
+    comparison below would refuse those two on its own; the guard is what also
+    refuses `-inf`, which no caller can produce -- both helpers return a max of
+    absolute values -- but which the predicate should not silently accept.
     """
     delta = float(delta)
     if not math.isfinite(delta):

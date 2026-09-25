@@ -3578,7 +3578,7 @@ def reproduces(delta, magnitude, *, ulps: int = REPRODUCTION_ULPS) -> bool:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/eval/test_reproduction.py -q`
-Expected: `9 passed`.
+Expected: `8 passed`.
 
 - [ ] **Step 5: Commit**
 
