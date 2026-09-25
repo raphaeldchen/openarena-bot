@@ -809,7 +809,7 @@ def _cells_in_order(records: dict) -> list[tuple[str, int]]:
 
 def _self_check_table(records: dict) -> str:
     lines = [
-        "--- self-check per cell: the tau=1.0 pass against the cell's own diagnostic (exact) ---",
+        "--- self-check per cell: the tau=1.0 pass against the cell's own diagnostic (within the reproduction bound, 64 ULPs of the stored value -- spec 2.4) ---",
         f"  {'arm':<12}{'seed':>5}{'step':>7}{'ref max|d|':>12}{'pers max|d|':>13}{'windows':>9}{'clusters':>10}",
     ]
     for arm, seed in _cells_in_order(records):
