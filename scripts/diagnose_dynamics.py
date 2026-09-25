@@ -109,10 +109,14 @@ actions:
     rollout's. The rungs did not share a sampling stream with it, so every
     measured delta is noise. Also a code defect, and a different one.
   EXIT_RECORD_MISMATCH -- `evaluate_rollout` itself no longer reproduces the
-    shipped record's curve. Measured, the records reproduce BITWISE on mps under
-    torch 2.13.0 and miss on cpu, with an identical probe and split, by an
-    ARM-DEPENDENT amount: ~6.5 map units (2.96% relative) on cnn/seed0 and ~12.4
-    on frozen_ssl/seed0. So this status most likely means the ENVIRONMENT
+    shipped record's curve. THIS GATE IS STILL EXACT -- deliberately, and unlike
+    the stored-artefact gates of spec 2.4, which now judge by a 64-ULP bound.
+    Measured, the records reproduced BITWISE on mps under torch 2.13.0 on the
+    macOS build they were written on; macOS 27.0 changed the MPS reduction order
+    and they now come back within 6 ULPs there instead (at most 1.705303e-13),
+    so an exact gate reports a platform difference here. They miss on cpu, with
+    an identical probe and split, by an ARM-DEPENDENT amount: ~6.5 map units
+    (2.96% relative) on cnn/seed0 and ~12.4 on frozen_ssl/seed0. So this status most likely means the ENVIRONMENT
     differs from the study's, not that the diagnostic is wrong -- and collapsing
     it into EXIT_PROTOCOL_DIVERGED would make a machine difference read as a
     code defect. Neither the checkpoints (which carry only arm and seed) nor the
@@ -1524,8 +1528,10 @@ def build_record(cell: dict, args, device, *, family: int) -> dict:
     """The cell's numbers, plus the environment they are only reproducible in.
 
     The DEVICE and the torch version are recorded because the record
-    reproduction is locked to them -- bitwise on mps under torch 2.13.0, and off
-    on cpu by an arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map
+    reproduction is locked to them -- on mps under torch 2.13.0 within a few
+    ULPs of the stored value (bitwise on the macOS build the records were
+    written on; at most 1.705303e-13 on macOS 27.0, spec 2.4), and off on cpu
+    by an arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map
     units -- and nothing else in the study carries that. Without it a future
     reader cannot tell a sound diagnostic run on another machine from a broken
     one, and the shuffled delta itself moves with the device by more than its
@@ -1832,9 +1838,13 @@ def main(argv=None) -> int:
                 f"evaluate_rollout no longer reproduces the shipped curve "
                 f"(max abs {cell['record']:.3e}). The protocol checks above "
                 f"PASSED, so this points at the environment -- measured, the "
-                f"records reproduce bitwise on mps and miss on cpu by an "
+                f"records reproduce on mps within a few ULPs of the stored "
+                f"value (bitwise on the macOS build they were written on, at "
+                f"most 1.705303e-13 on macOS 27.0) and miss on cpu by an "
                 f"arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map "
-                f"units. This run used device={device} torch={torch.__version__}."
+                f"units. This gate stays EXACT, so a delta in the ULP band is a "
+                f"platform difference, not a wrong device. "
+                f"This run used device={device} torch={torch.__version__}."
             )
             return EXIT_RECORD_MISMATCH
     return EXIT_OK

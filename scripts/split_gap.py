@@ -43,8 +43,9 @@ THE CHECKS RUN IN A FIXED ORDER and each has its own status:
                                     (an ENVIRONMENT difference: cpu misses by
                                     6-12 map units), or --context/--horizon
                                     disagree with the diagnostic's protocol.
-  EXIT_SELF_CHECK_FAILED (30)       the val stratum's mean curves are not
-                                    bitwise the diagnostic's, or its windows
+  EXIT_SELF_CHECK_FAILED (30)       the val stratum's mean curves do not
+                                    reproduce the diagnostic's within the
+                                    bound of spec 2.4, or its windows
                                     are not the diagnostic's. Same windows,
                                     same rollout, same refit probe -- or the
                                     train strata are not read against the

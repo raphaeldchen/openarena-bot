@@ -15,8 +15,9 @@ exactly known:
   evaluate  per cell: `prepare_cell` on the reference study (12, 14), the
             trust pass with `keep_latents` -- the rollout the gate scored,
             plus the posterior over the window, the teacher-forced and the
-            open-loop prior -- the bitwise self-check against the cell's
-            diagnostic (30), the step-1 identity (30), the statistics of
+            open-loop prior -- the self-check against the cell's diagnostic
+            within the reproduction bound of spec 2.4 (30), 64 ULPs of the
+            stored value -- the step-1 identity (30), the statistics of
             spec 2.3, one stages_<arm>_seed<n>.json. Then the CONTROL cells
             -- known-blind rung-4000 checkpoints from the M3f ladder, loaded
             as rung cells -- through the same pass, into
@@ -39,8 +40,9 @@ THE CHECKS, BY PHASE, each with its own status:
             EXIT_RECORD_MISMATCH (14)     --context/--horizon disagree with the
                                           protocol, or evaluate_rollout no longer
                                           reproduces the record's curve.
-            EXIT_SELF_CHECK_FAILED (30)   a cell's trust pass is not bitwise its
-                                          diagnostic, or (cell or control) the
+            EXIT_SELF_CHECK_FAILED (30)   a cell's trust pass does not reproduce
+                                          its diagnostic within the bound of
+                                          spec 2.4, or (cell or control) the
                                           open-loop prior at step 1 is not the
                                           teacher-forced prior at step 1.
   read:     EXIT_NO_CHECKPOINTS (11)     a requested record is missing.

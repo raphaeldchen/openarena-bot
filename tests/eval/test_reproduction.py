@@ -20,9 +20,12 @@ def test_the_bound_scales_with_the_magnitude_not_with_the_delta():
 
 
 def test_the_measured_worst_case_reproduces_and_leaves_headroom():
-    """1.705303e-13 at magnitude 231.9665544559 is frozen_ssl/s1, the worst of
-    the nine M3c cells on macOS 27.0: 6.000002 ULPs against a bound of 64."""
-    magnitude = 231.9665544559
+    """1.705303e-13 at magnitude 222.77787658642973 is frozen_ssl/s1, the worst
+    of the nine M3c cells on macOS 27.0: the stored `rssm_position` at the step
+    where the fresh pass disagreed (index 34, NOT the curve's endpoint), which
+    is the magnitude the self-check recorded to scale its own delta. 6.000002
+    ULPs against a bound of 64 (spec 2.4, plan results 4)."""
+    magnitude = 222.77787658642973
     assert 1.705303e-13 / math.ulp(magnitude) == pytest.approx(6.0, abs=1e-5)
     assert reproduces(1.705303e-13, magnitude)
 

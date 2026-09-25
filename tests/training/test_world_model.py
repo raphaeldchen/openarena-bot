@@ -745,7 +745,7 @@ def test_history_records_every_step(buffer):
 
 def test_checkpoint_steps_default_leaves_the_final_save_and_the_history_as_they_were(buffer, tmp_path):
     """The M3c study and every reader of its checkpoints must not notice this
-    change: no rung directories, the same three payload keys, and the history
+    change: no rung directories, the same four payload keys, and the history
     gains only an empty `checkpoint_seconds`."""
     out = tmp_path / "ckpt"
     history = train_world_model(tiny(seed=3), buffer, out_dir=out)

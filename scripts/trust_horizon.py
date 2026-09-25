@@ -1225,7 +1225,7 @@ def _parser() -> argparse.ArgumentParser:
 class Prepared:
     """One cell past its checks: the loaded model, the refit probe, the
     protocol kwargs every pass takes, the resolved protocol, and the val
-    rollout that reproduced the record bitwise."""
+    rollout that reproduced the record within the bound of spec 2.4."""
 
     model: object
     embedding_probe: dict
