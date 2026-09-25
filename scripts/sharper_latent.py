@@ -12,7 +12,8 @@ state separate by more than that model's entire imagined displacement. So:
   sweep     re-run the canonical pass on each shipped cell at every rollout
             temperature of TAU_GRID, sharpening the prior inside `imagine`
             and nothing else. tau = 1.0 runs first and must reproduce the
-            cell's diagnostic bitwise, or nothing below it is read.
+            cell's diagnostic within the reproduction bound (spec 2.4), or
+            nothing below it is read.
   train     read the sweep's records, decide Reading N, refuse (35) unless it
             says NOISE_LIMITED, check the tau = 1.0 identity (37), then
             retrain nine cells at tau*.
@@ -37,9 +38,10 @@ THE CHECKS, BY PHASE, each with its own status:
             EXIT_RECORD_MISMATCH (14)     --context/--horizon disagree with the
                                           protocol, or evaluate_rollout no longer
                                           reproduces the record's curve.
-            EXIT_SELF_CHECK_FAILED (30)   the tau = 1.0 pass is not bitwise the
-                                          cell's diagnostic -- judged BEFORE any
-                                          other temperature of that cell runs.
+            EXIT_SELF_CHECK_FAILED (30)   the tau = 1.0 pass does not reproduce
+                                          the cell's diagnostic within the bound
+                                          -- judged BEFORE any other temperature
+                                          of that cell runs.
   train:    EXIT_NO_CHECKPOINTS (11)     a sweep record is missing.
             EXIT_NOT_NOISE_LIMITED (35)   NEW. Reading N does not say the rollout
                                           is noise-limited: the retrain is gated
@@ -126,7 +128,7 @@ ONE CORRECTION TO THE M3H TASK-8 BRIEF, found running its own tests:
 
     The control is now ALWAYS `_reference_trust`, built from the sweep's own
     REFERENCE_TAU entry. It is also the better control of the two:
-    `load_sweep` has proven that entry bitwise identical to the M3c
+    `load_sweep` has proven that entry a reproduction of the M3c
     diagnostic in THIS run (exit 30 otherwise), and it scores the same
     windows at the same protocol as the retrain it is compared against,
     rather than being a file another milestone happened to leave behind. No
@@ -764,8 +766,8 @@ def evaluate_cell(args, buffer, arm: str, seed: int, device, train, val) -> tupl
     # `curves.floor_position` / `probe.embedding_selection_r2`, which self_check
     # never compares, come from the study record `evaluate_job` just wrote.
     # The meaningful check for a retrained cell is the temperature the payload
-    # carries (already refused above, 36), not a bitwise reproduction with
-    # nothing earlier to reproduce.
+    # carries (already refused above, 36), not a reproduction with nothing
+    # earlier to reproduce.
     diagnostic = {
         "curves": {
             "reference_position": _trust._distance(
@@ -786,7 +788,7 @@ def evaluate_cell(args, buffer, arm: str, seed: int, device, train, val) -> tupl
     )
     # The self-check that `trust_record` just computed compared this pass with
     # itself, so it reads 0.0 by construction. A sweep record's 0.0 means the
-    # pass reproduced the shipped diagnostic bitwise; this one would mean
+    # pass reproduced the shipped diagnostic; this one would mean
     # nothing, and the two are indistinguishable once written. So the record
     # says there was nothing to reproduce, and the check that DOES bind a
     # retrained cell -- the temperature its payload carries -- has already
@@ -1068,7 +1070,7 @@ def _reference_trust(records: dict, cells) -> dict:
     so preferring them would have meant the real run reading a file and every
     test reading this -- two paths, and the untested one shipping. Beyond
     that, this entry is the better control: `load_sweep` has already proven
-    it bitwise identical to the M3c diagnostic in THIS run (exit 30
+    it a reproduction of the M3c diagnostic in THIS run (exit 30
     otherwise), it scores the same windows at the same protocol as the
     retrain it is compared against, and it carries `crossing`/`windows` in
     the shape a trust record does, for both channels."""
@@ -1111,7 +1113,7 @@ def read_phase(args, cells) -> int:
 
     `old_trust`, Reading M's control arm, is ALWAYS `_reference_trust` -- the
     sweep's own REFERENCE_TAU entry, which `load_sweep` has already proven
-    bitwise identical to the M3c diagnostic in this run. It is never a
+    a reproduction of the M3c diagnostic in this run. It is never a
     `trust_<arm>_seed<n>.json` that happens to sit under `--reference`: the
     shipped M3c directory carries M3d's, so preferring those would mean the
     real run reading files and every test reading the derived path."""

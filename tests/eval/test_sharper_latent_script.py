@@ -227,9 +227,15 @@ def test_the_reference_temperature_is_scored_first_whatever_order_the_grid_gives
     assert seen[0] == REFERENCE_TAU, seen
 
 
-def test_the_reference_temperature_reproduces_the_cells_diagnostic_bitwise(swept):
+def test_the_reference_temperature_reproduces_the_cells_diagnostic(swept):
     """THE anchor: at tau = 1.0 the pass must be the one the gate scored, or
-    no temperature below it means anything. Exact, not close."""
+    no temperature below it means anything.
+
+    Asserted EXACTLY here, which is stronger than the shipping rule needs.
+    The shipping rule is the reproduction bound (spec 2.4) and it exists for
+    one reason: on mps, macOS 27.0 moved the kernels up to 6 ULPs. This
+    fixture is cpu, one process, one seed, so exact still holds and a
+    regression that moved the pass at all would still be caught."""
     record = load_record(swept.sweep / SWEEP)
     assert record["self_check"]["ok"] is True
     assert record["self_check"]["reference_position_max_delta"] == 0.0
@@ -493,7 +499,7 @@ def test_evaluate_scores_the_retrained_cell_at_its_own_temperature(trained, caps
     assert np.asarray(trust_record["crossing"]["free"], dtype=float).shape == (WINDOWS,)
     # A retrained cell has no earlier pass to reproduce, so its record must not
     # carry a self-check at all: a 0.0 computed against itself is
-    # indistinguishable from a sweep record's 0.0, which means a real bitwise
+    # indistinguishable from a sweep record's 0.0, which means a real
     # reproduction of the pass the gate scored.
     assert trust_record["self_check"] is None
 
