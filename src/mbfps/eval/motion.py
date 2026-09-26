@@ -1,0 +1,93 @@
+"""M3i: does the posterior latent encode MOTION, or only absolute position?
+
+M3g measured that the frame injects 0.290-0.489 nats beyond what the
+teacher-forced prior already predicted, summed over all 32 groups, and that
+copying the previous latent predicts the next one BETTER than the model's own
+prior does (persist 0.824-0.866 against teacher 0.796-0.845). M3h then ruled
+out the prior's sampling temperature. Between them they leave the three
+remaining prior-side levers pulling on a stage with about four tenths of a nat
+of headroom.
+
+So this module asks a different question. The latent demonstrably carries
+absolute position -- `latent_selection_r2` 0.18-0.34 across the M3c records --
+and a latent that encodes "which corridor am I in" can score well on a
+position probe while carrying nothing about step-to-step DISPLACEMENT. The M3
+gate scores the imagined trajectory against PERSISTENCE, staying put, so a
+latent without displacement cannot beat it whatever the prior does.
+
+Everything here is pure: arrays in, arrays and readings out. No torch, no I/O,
+no record schema. `scripts/latent_motion.py` owns all three.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from mbfps.eval.pooling import cluster_threshold
+
+# Pre-registered (spec 3.1, 3.2). Three arms, each contrast within a cell
+# against that cell's own persistence baseline -- no arm is ranked against
+# another, so the family is the arms and not their pairs.
+MOTION_FAMILY: int = 3
+SEEDS_REQUIRED: int = 2
+ARMS_REQUIRED: int = 2
+
+# Reported at every one of these; DECIDED only at `split_gap.DECISION_H`, the
+# horizon every milestone since M3e has decided at.
+K_REPORTED: tuple[int, ...] = (1, 5, 15, 30, 45)
+
+# The permutation control's seed. Fixed so the control is reproducible: a
+# control that draws a fresh permutation each run is a control whose refusal
+# cannot be repeated.
+CONTROL_SEED: int = 0
+
+
+def motion_threshold(clusters: int) -> float:
+    """The z Reading D must clear: the project's cluster-robust Bonferroni
+    bar over `MOTION_FAMILY`, read against t(G-1) for G episode clusters.
+    2.582 on the shipped 24-episode split."""
+    return cluster_threshold(MOTION_FAMILY, clusters)
+
+
+def displacement(positions, k: int) -> np.ndarray:
+    """`p(t+k) - p(t)` per window, as a VECTOR in map units. `(n, 2)`.
+
+    Taken from the window's first scored step, so every window contributes
+    exactly one displacement at each k and the rows stay alignable with the
+    per-window masks the pooling clusters on. A window shorter than `k + 1`
+    steps is refused rather than truncated: a short window silently scored at
+    a smaller k would be a different horizon pooled as if it were this one.
+    """
+    positions = np.asarray(positions, dtype=float)
+    if positions.ndim != 3 or positions.shape[-1] != 2:
+        raise ValueError(f"positions must be (n, steps, 2), got {positions.shape}")
+    k = int(k)
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if positions.shape[1] < k + 1:
+        raise ValueError(
+            f"k={k} needs {k + 1} steps per window, got {positions.shape[1]}"
+        )
+    return positions[:, k, :] - positions[:, 0, :]
+
+
+def contrast_series(predicted, true) -> np.ndarray:
+    """Per window, `||true|| - ||predicted - true||`: how much closer the
+    probe's displacement is than predicting no displacement at all. `(n,)`.
+
+    Positive means the latent beat staying put. The persistence baseline is
+    the ZERO prediction, so its error is `||true||` exactly -- which makes a
+    probe that outputs zeros score exactly 0.0, the fixed point the reading is
+    read against. Deliberately the same shape as `gap_closed`: a paired,
+    per-window, model-against-persistence contrast, so `pooling.paired_contrast`
+    reads it unchanged and clusters it on the same episodes.
+    """
+    predicted = np.asarray(predicted, dtype=float)
+    true = np.asarray(true, dtype=float)
+    if predicted.shape != true.shape:
+        raise ValueError(
+            f"predicted {predicted.shape} and true {true.shape} must be the same shape"
+        )
+    error_persist = np.linalg.norm(true, axis=-1)
+    error_model = np.linalg.norm(predicted - true, axis=-1)
+    return error_persist - error_model
