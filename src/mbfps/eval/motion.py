@@ -21,6 +21,8 @@ no record schema. `scripts/latent_motion.py` owns all three.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from mbfps.eval.pooling import cluster_threshold
@@ -91,3 +93,112 @@ def contrast_series(predicted, true) -> np.ndarray:
     error_persist = np.linalg.norm(true, axis=-1)
     error_model = np.linalg.norm(predicted - true, axis=-1)
     return error_persist - error_model
+
+
+@dataclass(frozen=True)
+class MotionArm:
+    """One arm's pooled contrast at one k, with the seed tallies BOTH ways.
+
+    `seeds_down` is carried beside `seeds_up` because M3h shipped a Reading N
+    table that printed only the up tally while its verdict was read from the
+    down one: every row said `0/3` under a verdict asserting "3 of 3 arms",
+    and the natural misreading was the opposite of the truth.
+    """
+
+    estimate: float
+    se: float
+    z: float
+    seeds_up: int
+    seeds_down: int
+    seeds_total: int
+
+    def clears_up(self, z_fam: float) -> bool:
+        return self.z >= z_fam and self.seeds_up >= SEEDS_REQUIRED
+
+    def clears_down(self, z_fam: float) -> bool:
+        return self.z <= -z_fam and self.seeds_down >= SEEDS_REQUIRED
+
+    def leaks(self, z_fam: float) -> bool:
+        """For a CONTROL arm: cleared the bar in either direction. Two-sided
+        on purpose -- a permuted pairing that is reliably worse than chance is
+        as much a broken instrument as one that is better, and only the seed
+        tallies are ignored here because a control has no result to replicate.
+        """
+        return abs(self.z) >= z_fam
+
+
+@dataclass(frozen=True)
+class MotionInputs:
+    """Everything Reading D is decided on: the real arms, the permuted
+    control, the bar, the horizon and the cluster count."""
+
+    arms: dict[str, MotionArm]
+    control: dict[str, MotionArm]
+    z_fam: float
+    k: int
+    clusters: int
+
+
+@dataclass(frozen=True)
+class MotionStatus:
+    status: str
+    rule: str
+    arms_up: tuple[str, ...]
+    arms_down: tuple[str, ...]
+    leaked: tuple[str, ...]
+
+
+def reading_displacement(inputs: MotionInputs) -> MotionStatus:
+    """Does the posterior latent encode displacement (spec 3.2)?
+
+    Precedence, and it is the point: UNRESOLVED_CONTROL outranks every
+    result. The control's pairing was permuted, so it cannot carry signal; a
+    control that clears means the instrument is reading structure that does
+    not exist, and the reading it would otherwise have printed is precisely
+    the one not to trust. A suppressed reading reports no arms at all rather
+    than reporting them beside a warning nobody reads.
+    """
+    z_fam = float(inputs.z_fam)
+    leaked = tuple(sorted(a for a, arm in inputs.control.items() if arm.leaks(z_fam)))
+    if leaked:
+        return MotionStatus(
+            status="UNRESOLVED_CONTROL",
+            rule=(
+                f"the permuted control cleared +/-{z_fam:.2f} in {', '.join(leaked)} at "
+                f"k = {inputs.k}; the pairing it scores cannot carry signal, so the "
+                f"instrument is reading structure that is not there and no reading is taken"
+            ),
+            arms_up=(), arms_down=(), leaked=leaked,
+        )
+
+    up = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_up(z_fam)))
+    down = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_down(z_fam)))
+
+    if len(up) >= ARMS_REQUIRED:
+        return MotionStatus(
+            status="MOTION_ENCODED",
+            rule=(
+                f"the latent beats staying put by more than +{z_fam:.2f} in "
+                f"{len(up)} of {len(inputs.arms)} arms ({', '.join(up)}) at k = {inputs.k}, "
+                f"each in at least {SEEDS_REQUIRED} of its seeds"
+            ),
+            arms_up=up, arms_down=down, leaked=(),
+        )
+    if not up and len(down) >= ARMS_REQUIRED:
+        return MotionStatus(
+            status="NO_MOTION",
+            rule=(
+                f"no arm beats staying put at k = {inputs.k}, and the latent is WORSE than "
+                f"staying put by more than -{z_fam:.2f} in {len(down)} of {len(inputs.arms)} "
+                f"arms ({', '.join(down)})"
+            ),
+            arms_up=(), arms_down=down, leaked=(),
+        )
+    return MotionStatus(
+        status="NO_DIFFERENCE",
+        rule=(
+            f"no {ARMS_REQUIRED} arms clear +/-{z_fam:.2f} at k = {inputs.k} in at least "
+            f"{SEEDS_REQUIRED} seeds each; the latent is indistinguishable from staying put"
+        ),
+        arms_up=up, arms_down=down, leaked=(),
+    )

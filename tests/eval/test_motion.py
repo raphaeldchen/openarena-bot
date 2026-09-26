@@ -70,3 +70,98 @@ def test_a_model_that_predicts_nothing_scores_exactly_zero():
 def test_contrast_refuses_mismatched_shapes():
     with pytest.raises(ValueError, match="same shape"):
         contrast_series(np.zeros((3, 2)), np.zeros((4, 2)))
+
+
+from mbfps.eval.motion import (
+    MotionArm,
+    MotionInputs,
+    reading_displacement,
+)
+
+Z = 2.5820
+
+
+def _arm(z, up=3, down=0, total=3):
+    """An arm whose estimate carries the sign of its z, so a test that flips a
+    z does not leave an estimate contradicting it."""
+    return MotionArm(estimate=0.1 * z, se=0.1, z=z, seeds_up=up, seeds_down=down, seeds_total=total)
+
+
+def _inputs(arms, control=None, k=15):
+    clean = {a: _arm(0.4, up=0, down=0) for a in arms}
+    return MotionInputs(
+        arms=arms, control=control if control is not None else clean,
+        z_fam=Z, k=k, clusters=24,
+    )
+
+
+def test_two_arms_clearing_up_in_two_seeds_is_motion_encoded():
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(3.0, up=2), "frozen_ssl": _arm(4.1, up=3), "random_vit": _arm(1.0, up=1),
+    }))
+    assert reading.status == "MOTION_ENCODED"
+    assert reading.arms_up == ("frozen_ssl", "pixel_ae")
+    assert "2 of 3 arms" in reading.rule
+
+
+def test_one_arm_clearing_up_is_not_enough():
+    """ARMS_REQUIRED = 2. A single arm clearing is one cell's worth of
+    evidence wearing a family-corrected bar."""
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(5.0, up=3), "frozen_ssl": _arm(0.2), "random_vit": _arm(0.1),
+    }))
+    assert reading.status == "NO_DIFFERENCE"
+
+
+def test_an_arm_clearing_up_on_one_seed_does_not_count():
+    """SEEDS_REQUIRED = 2, so a pooled clear carried by a single seed is not
+    an arm that cleared."""
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(4.0, up=1), "frozen_ssl": _arm(4.0, up=1), "random_vit": _arm(0.1),
+    }))
+    assert reading.status == "NO_DIFFERENCE"
+
+
+def test_no_arm_up_and_some_arm_down_is_no_motion():
+    """The latent is measurably WORSE than staying put -- the result that
+    retires M3h section 8's three prior-side levers."""
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(-3.3, up=0, down=2), "frozen_ssl": _arm(-4.0, up=0, down=3),
+        "random_vit": _arm(-0.5, up=0, down=0),
+    }))
+    assert reading.status == "NO_MOTION"
+    assert reading.arms_down == ("frozen_ssl", "pixel_ae")
+
+
+def test_nothing_clearing_either_way_is_no_difference():
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(1.0), "frozen_ssl": _arm(-1.2), "random_vit": _arm(0.3),
+    }))
+    assert reading.status == "NO_DIFFERENCE"
+
+
+def test_a_leaking_control_suppresses_a_result_that_would_otherwise_pass():
+    """Precedence: UNRESOLVED_CONTROL outranks every result. The permuted
+    pairing cannot carry signal, so a control that clears means the instrument
+    is reading structure that does not exist -- and the reading it would
+    otherwise have printed is exactly the one not to trust."""
+    arms = {"pixel_ae": _arm(3.0, up=2), "frozen_ssl": _arm(4.1, up=3), "random_vit": _arm(1.0)}
+    control = {"pixel_ae": _arm(0.1, up=0), "frozen_ssl": _arm(3.9, up=0), "random_vit": _arm(0.2)}
+    reading = reading_displacement(_inputs(arms, control=control))
+    assert reading.status == "UNRESOLVED_CONTROL"
+    assert reading.leaked == ("frozen_ssl",)
+    assert reading.arms_up == (), "a suppressed reading reports no result"
+
+
+def test_the_control_leaks_on_a_NEGATIVE_clear_too():
+    """The control is two-sided: a permuted pairing that is reliably WORSE
+    than chance is as much a broken instrument as one that is better."""
+    arms = {"pixel_ae": _arm(0.2), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.3)}
+    control = {"pixel_ae": _arm(-4.5), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.2)}
+    assert reading_displacement(_inputs(arms, control=control)).status == "UNRESOLVED_CONTROL"
+
+
+def test_the_rule_sentence_names_the_horizon_it_was_decided_at():
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(0.1), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.1)}, k=15))
+    assert "k = 15" in reading.rule
