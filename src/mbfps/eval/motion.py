@@ -211,6 +211,14 @@ READING_COLUMNS: tuple[str, ...] = (
     "arm", "estimate", "se", "z", "up", "dn", "clears",
 )
 
+# Field widths for READING_COLUMNS, in the same order. Kept beside the names
+# so the header and the rows -- two separate f-strings -- cannot drift apart,
+# and sized so a realistic value cannot equal or exceed its width and glue
+# onto the previous column with no separator (the arm-name-overflow defect
+# this project already shipped once, relocated to a numeric column: e.g. a
+# 7-char "120/120" seed tally in what was a 6-wide field).
+READING_WIDTHS: tuple[int, ...] = (12, 13, 8, 8, 8, 8, 8)
+
 
 def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> str:
     """Reading D as it is printed and written to `motion.txt`, byte for byte.
@@ -225,10 +233,11 @@ def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> 
         f"z_fam = {inputs.z_fam:.2f} over {inputs.clusters} clusters ---",
         "  " + "".join(
             f"{name:>{width}}" for name, width in zip(
-                READING_COLUMNS, (12, 11, 8, 8, 6, 6, 8), strict=True,
+                READING_COLUMNS, READING_WIDTHS, strict=True,
             )
         ),
     ]
+    w_arm, w_est, w_se, w_z, w_up, w_dn, w_clears = READING_WIDTHS
     for arm in sorted(inputs.arms):
         cell = inputs.arms[arm]
         if cell.clears_up(inputs.z_fam):
@@ -238,9 +247,10 @@ def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> 
         else:
             clears = "no"
         lines.append(
-            f"  {arm:>12}{cell.estimate:>11.4f}{cell.se:>8.4f}{cell.z:>8.2f}"
-            f"{f'{cell.seeds_up}/{cell.seeds_total}':>6}"
-            f"{f'{cell.seeds_down}/{cell.seeds_total}':>6}{clears:>8}"
+            f"  {arm:>{w_arm}}{cell.estimate:>{w_est}.4f}{cell.se:>{w_se}.4f}"
+            f"{cell.z:>{w_z}.2f}"
+            f"{f'{cell.seeds_up}/{cell.seeds_total}':>{w_up}}"
+            f"{f'{cell.seeds_down}/{cell.seeds_total}':>{w_dn}}{clears:>{w_clears}}"
         )
     lines.append(
         "  control (permuted pairing, cannot carry signal): "

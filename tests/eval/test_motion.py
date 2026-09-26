@@ -199,23 +199,75 @@ def test_every_column_header_is_printed_in_the_declared_order():
 def test_each_arms_row_carries_its_own_numbers_under_those_headers():
     """A swapped column is the defect this pins: the seed tallies differ
     between the arms here, so up/down transposed or an arm's row taking its
-    neighbour's numbers both fail."""
+    neighbour's numbers both fail.
+
+    `estimate` and `se` are given distinct, non-uniform values per arm (the
+    shared `_arm` helper fixes `se=0.1` for every arm, which would make an
+    `estimate`/`se` swap invisible) so a swap between those two columns, or
+    between two arms' rows, changes what a hand-typed assertion sees. The
+    `clears` column is pinned for three arms so "up"/"down" transposed in
+    that branch -- as opposed to merely omitted -- also fails.
+    """
     arms = {
-        "pixel_ae": _arm(3.0, up=2, down=0),
-        "frozen_ssl": _arm(-4.1, up=0, down=3),
-        "random_vit": _arm(1.0, up=1, down=0),
+        "pixel_ae": MotionArm(
+            estimate=0.3000, se=0.1000, z=3.0, seeds_up=2, seeds_down=0, seeds_total=3,
+        ),
+        "frozen_ssl": MotionArm(
+            estimate=-0.4100, se=0.2500, z=-4.1, seeds_up=0, seeds_down=3, seeds_total=3,
+        ),
+        "random_vit": MotionArm(
+            estimate=0.0700, se=0.0400, z=1.0, seeds_up=1, seeds_down=0, seeds_total=3,
+        ),
     }
     inputs = _inputs(arms)
     text = format_reading_displacement(reading_displacement(inputs), inputs)
     rows = {line.split()[0]: line.split() for line in text.splitlines()
             if line.strip().startswith(("pixel_ae", "frozen_ssl", "random_vit"))}
     cols = list(READING_COLUMNS)
+    assert rows["pixel_ae"][cols.index("estimate")] == "0.3000"
+    assert rows["pixel_ae"][cols.index("se")] == "0.1000"
     assert rows["pixel_ae"][cols.index("z")] == "3.00"
     assert rows["pixel_ae"][cols.index("up")] == "2/3"
     assert rows["pixel_ae"][cols.index("dn")] == "0/3"
+    assert rows["pixel_ae"][cols.index("clears")] == "up"
+    assert rows["frozen_ssl"][cols.index("estimate")] == "-0.4100"
+    assert rows["frozen_ssl"][cols.index("se")] == "0.2500"
     assert rows["frozen_ssl"][cols.index("z")] == "-4.10"
     assert rows["frozen_ssl"][cols.index("up")] == "0/3"
     assert rows["frozen_ssl"][cols.index("dn")] == "3/3"
+    assert rows["frozen_ssl"][cols.index("clears")] == "down"
+    assert rows["random_vit"][cols.index("estimate")] == "0.0700"
+    assert rows["random_vit"][cols.index("se")] == "0.0400"
+    assert rows["random_vit"][cols.index("clears")] == "no"
+
+
+def test_extreme_values_do_not_glue_onto_the_previous_column():
+    """A value that meets or exceeds its own field's width is printed with no
+    separating space, so it runs into whatever the previous column printed --
+    the arm-name-overflow defect this project already shipped once,
+    relocated to a numeric column (e.g. a three-digit seed total's `120/120`
+    is 7 characters, which used to overflow a 6-wide field).
+
+    Deliberately generic: rather than re-checking only the specific fields
+    someone hand-picked, this asserts every arm row splits into exactly
+    `len(READING_COLUMNS)` whitespace-separated tokens -- which fails if ANY
+    column glues onto its neighbour, including a column added later.
+    """
+    arms = {
+        "pixel_ae": MotionArm(
+            estimate=-123456.7890, se=0.1000, z=-100.00,
+            seeds_up=0, seeds_down=120, seeds_total=120,
+        ),
+        "frozen_ssl": _arm(0.4),
+        "random_vit": _arm(0.4),
+    }
+    inputs = _inputs(arms)
+    text = format_reading_displacement(reading_displacement(inputs), inputs)
+    rows = [line for line in text.splitlines()
+            if line.strip().startswith(("pixel_ae", "frozen_ssl", "random_vit"))]
+    assert len(rows) == 3
+    for row in rows:
+        assert len(row.split()) == len(READING_COLUMNS), row
 
 
 def test_the_table_prints_the_status_and_its_rule():
@@ -230,10 +282,20 @@ def test_the_table_prints_the_status_and_its_rule():
 
 def test_a_suppressed_reading_prints_the_control_and_no_verdict_row():
     """UNRESOLVED_CONTROL must not print a table a reader could mistake for a
-    result."""
+    result -- but suppression is a file-write decision owned by the script
+    that later writes `motion.txt`, not a formatting one: an operator
+    debugging a leaking control needs to see the per-arm rows on the console,
+    so this formatter prints them unconditionally. Pinned here so a future
+    change that wrongly hides the rows on this path fails: the constraint's
+    own wording ("must not print a table a reader could mistake for a
+    result") makes hiding them an easy, plausible-sounding mistake.
+    """
     arms = {"pixel_ae": _arm(3.0, up=2), "frozen_ssl": _arm(4.1, up=3), "random_vit": _arm(1.0)}
     control = {"pixel_ae": _arm(0.1), "frozen_ssl": _arm(3.9), "random_vit": _arm(0.2)}
     inputs = _inputs(arms, control=control)
     text = format_reading_displacement(reading_displacement(inputs), inputs)
     assert "UNRESOLVED CONTROL" in text
     assert "MOTION ENCODED" not in text
+    row_starts = [line.strip().split()[0] for line in text.splitlines() if line.strip()]
+    for arm in ("pixel_ae", "frozen_ssl", "random_vit"):
+        assert arm in row_starts, f"the {arm} row must still print under UNRESOLVED_CONTROL"
