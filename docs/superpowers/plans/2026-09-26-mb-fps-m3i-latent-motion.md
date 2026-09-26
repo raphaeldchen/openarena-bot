@@ -930,7 +930,7 @@ def _top1_mass(logits: np.ndarray) -> float:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/eval/test_motion.py -q`
-Expected: `24 passed`.
+Expected: `26 passed`.
 
 - [ ] **Step 5: Commit**
 

@@ -321,6 +321,20 @@ def test_live_groups_counts_the_groups_whose_argmax_ever_changes():
     assert latent_description(post, post)["live_groups"] == pytest.approx(1.0)
 
 
+def test_live_groups_counts_a_group_that_changes_and_reverts():
+    """The case that separates "changed at ANY step" from "differs between the
+    first and last step" -- and the only kind of input where the two diverge.
+
+    Group 0 goes 0 -> 2 -> 0: it moved, and a latent that moved is live
+    however it ended up. Comparing only the endpoints would call it dead and
+    understate how much of the code is doing anything, which is the whole
+    quantity this statistic exists to report. Without this case both
+    semantics pass every other live-groups test in this file.
+    """
+    post = _logits([[0, 1], [2, 1], [0, 1]])
+    assert latent_description(post, post)["live_groups"] == pytest.approx(1.0)
+
+
 def test_live_groups_is_zero_for_a_latent_that_never_moves():
     post = _logits([[3, 3], [3, 3]])
     assert latent_description(post, post)["live_groups"] == pytest.approx(0.0)
