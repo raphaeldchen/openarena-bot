@@ -130,6 +130,26 @@ def test_no_arm_up_and_some_arm_down_is_no_motion():
     assert reading.arms_down == ("frozen_ssl", "pixel_ae")
 
 
+def test_one_arm_up_and_two_down_is_not_NO_MOTION():
+    """NO_MOTION requires that NO arm cleared positively -- not merely that
+    enough arms cleared negatively.
+
+    The distinction matters because NO_MOTION is the status that retires three
+    training levers. An arm that beat staying put, sitting beside arms that
+    lost to it, is a split result and must read as NO_DIFFERENCE; calling it
+    NO_MOTION would retire those levers on evidence that contradicts itself.
+    The guard is `not up`, and a later `len(up) < ARMS_REQUIRED` would pass
+    every other test in this file.
+    """
+    reading = reading_displacement(_inputs({
+        "pixel_ae": _arm(4.0, up=3), "frozen_ssl": _arm(-4.0, up=0, down=3),
+        "random_vit": _arm(-3.5, up=0, down=2),
+    }))
+    assert reading.status == "NO_DIFFERENCE"
+    assert reading.arms_up == ("pixel_ae",)
+    assert reading.arms_down == ("frozen_ssl", "random_vit")
+
+
 def test_nothing_clearing_either_way_is_no_difference():
     reading = reading_displacement(_inputs({
         "pixel_ae": _arm(1.0), "frozen_ssl": _arm(-1.2), "random_vit": _arm(0.3),
