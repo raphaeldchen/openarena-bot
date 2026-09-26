@@ -962,14 +962,15 @@ def test_gather_probe_data_windows_an_episode_exactly_as_the_rollout_does(tmp_pa
     np.testing.assert_array_equal(data["latent"][:, 0], expected)
 
 
-def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
+def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     tmp_path,
 ):
     """Two consumers read this dict by key and pair their arrays at the SAME
     timestep, so misaligned rows would compare two different frames and no
     shape check would notice.
 
-    There are FOUR keys, and the two embeddings are not interchangeable:
+    There are SIX keys -- four payload arrays and M3i's two row indices --
+    and the two embeddings are not interchangeable:
     `"embedding"` is the head's PREDICTED embedding (the space the rollout band
     is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
     RAW encoder output for the same frame (the reference the filtering gate
