@@ -654,7 +654,7 @@ Three defects of exactly one class have shipped on this project: `f24c2f3` (a no
 
 **Interfaces:**
 - Consumes: `MotionInputs`, `MotionStatus` from Task 3.
-- Produces: `NOISE_FREE_COLUMNS: tuple[str, ...]` — the reading table's column headers in printed order; `format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> str`, ending in a newline.
+- Produces: `READING_COLUMNS: tuple[str, ...]` — the reading table's column headers in printed order; `format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> str`, ending in a newline.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -778,7 +778,7 @@ def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/eval/test_motion.py -q`
-Expected: `19 passed`.
+Expected: `20 passed`.
 
 - [ ] **Step 5: Mutation-check the caption test**
 
