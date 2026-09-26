@@ -27,3 +27,19 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = ["slow: downloads model weights or runs a long benchmark"]
+# This suite's fixtures write real checkpoints and episode data: measured,
+# individual tests leave 269-413 MB in their `tmp_path` and one whole-suite run
+# leaves ~20-24 GB. pytest's defaults (keep the last THREE session roots, and
+# keep them whatever the outcome) therefore cost ~60 GB, and on 2026-09-26 that
+# filled a 228 GB disk and killed three consecutive suite runs partway through
+# -- as `OSError: <n> requested and 0 written` inside a fixture, after which
+# pytest crashes in its own report formatter and prints no summary at all, so
+# the runs looked like an unexplained wall of errors.
+#
+# `failed` deletes a passing test's directory as soon as it passes, which is
+# where nearly all of the volume is, and keeps every failing test's directory
+# -- the only ones worth opening. `1` keeps a single session root rather than
+# three. Together they take a whole-suite run from ~24 GB resident to the
+# failures alone.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
