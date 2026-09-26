@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from mbfps.eval.pooling import cluster_threshold
+from mbfps.eval.stages import entropy_by_group
 
 # Pre-registered (spec 3.1, 3.2). Three arms, each contrast within a cell
 # against that cell's own persistence baseline -- no arm is ranked against
@@ -260,3 +261,44 @@ def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> 
     )
     lines.append(f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}")
     return "\n".join(lines) + "\n"
+
+
+def latent_description(post_logits, prior_logits) -> dict:
+    """The descriptive block (spec 2.3): what the latent looks like, with no
+    threshold attached to any of it.
+
+    Reported beside Reading D and deciding nothing. Every one of these is
+    written into the record so the next milestone quotes an artefact rather
+    than a scratch measurement -- which is exactly how M3h came to ship a
+    premise that was never measured as stated.
+
+    `live_groups` is the mean over windows of how many groups change argmax at
+    least once within the window: a latent whose groups are mostly constant is
+    far smaller than G x C in effect, however much capacity it nominally has.
+    """
+    post = np.asarray(post_logits, dtype=float)
+    prior = np.asarray(prior_logits, dtype=float)
+    if post.ndim != 4 or prior.ndim != 4:
+        raise ValueError(
+            f"expected (n, steps, groups, classes); got post {post.shape}, prior {prior.shape}"
+        )
+    entropy = entropy_by_group(post)
+    modes = post.argmax(axis=-1)                       # (n, steps, groups)
+    changes = (modes[:, 1:, :] != modes[:, :-1, :]).any(axis=1)   # (n, groups)
+    return {
+        "entropy_by_group": [float(x) for x in entropy],
+        "entropy_mean": float(np.mean(entropy)),
+        "entropy_max": float(np.log(post.shape[-1])),
+        "live_groups": float(changes.sum(axis=-1).mean()),
+        "top1_posterior": float(_top1_mass(post)),
+        "top1_prior": float(_top1_mass(prior)),
+    }
+
+
+def _top1_mass(logits: np.ndarray) -> float:
+    """Mean probability the most likely class in each group carries. 1/C for a
+    uniform group, 1.0 for a sharp one."""
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    probs = np.exp(shifted)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return float(probs.max(axis=-1).mean())

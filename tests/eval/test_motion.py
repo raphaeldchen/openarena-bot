@@ -16,6 +16,7 @@ from mbfps.eval.motion import (
     contrast_series,
     displacement,
     format_reading_displacement,
+    latent_description,
     motion_threshold,
     reading_displacement,
 )
@@ -278,6 +279,61 @@ def test_the_table_prints_the_status_and_its_rule():
     assert "NO MOTION" in text
     assert "decided by:" in text
     assert text.endswith("\n")
+
+
+def _logits(rows):
+    """`(1, T, G, C)` from a list of per-step, per-group class indices, with a
+    sharp one-hot at each. Sharp on purpose: a hand-typed entropy of 0 and a
+    top-1 mass of 1 are values a reader can check without running anything."""
+    rows = np.asarray(rows)
+    t, g = rows.shape
+    out = np.full((1, t, g, 4), -20.0)
+    for i in range(t):
+        for j in range(g):
+            out[0, i, j, rows[i, j]] = 20.0
+    return out
+
+
+def test_a_sharp_latent_has_zero_entropy_and_full_top1_mass():
+    post = _logits([[0, 1], [0, 1]])
+    d = latent_description(post, post)
+    assert d["entropy_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert d["top1_posterior"] == pytest.approx(1.0, abs=1e-6)
+    assert d["top1_prior"] == pytest.approx(1.0, abs=1e-6)
+    assert len(d["entropy_by_group"]) == 2
+
+
+def test_a_uniform_latent_has_log_C_entropy():
+    """Four classes, so the ceiling is log 4 = 1.386 nats -- the number a
+    reader compares the real cells against."""
+    post = np.zeros((1, 2, 3, 4))
+    d = latent_description(post, post)
+    assert d["entropy_mean"] == pytest.approx(np.log(4.0), abs=1e-6)
+    assert d["entropy_max"] == pytest.approx(np.log(4.0), abs=1e-6)
+    assert d["top1_posterior"] == pytest.approx(0.25, abs=1e-6)
+
+
+def test_live_groups_counts_the_groups_whose_argmax_ever_changes():
+    """Group 0 changes class between steps, group 1 never does. A latent whose
+    groups are mostly constant is far smaller than G x C in effect, which is
+    the whole reason this statistic is recorded."""
+    post = _logits([[0, 1], [2, 1], [2, 1]])
+    assert latent_description(post, post)["live_groups"] == pytest.approx(1.0)
+
+
+def test_live_groups_is_zero_for_a_latent_that_never_moves():
+    post = _logits([[3, 3], [3, 3]])
+    assert latent_description(post, post)["live_groups"] == pytest.approx(0.0)
+
+
+def test_the_description_reads_the_prior_separately_from_the_posterior():
+    """A swapped argument is the defect this catches: the two are different
+    distributions here, so transposing them changes both top-1 masses."""
+    post = _logits([[0, 0]])
+    prior = np.zeros((1, 1, 2, 4))
+    d = latent_description(post, prior)
+    assert d["top1_posterior"] == pytest.approx(1.0, abs=1e-6)
+    assert d["top1_prior"] == pytest.approx(0.25, abs=1e-6)
 
 
 def test_a_suppressed_reading_prints_the_control_and_no_verdict_row():
