@@ -1118,6 +1118,61 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
+---
+
+### Task 6 amendments (2026-09-26, found while implementing)
+
+*Five defects in Task 6 as written above. Three of them would have moved a number M3i is decided
+on, and one would have produced M3i's own hypothesis through the instrument rather than the data.
+Recorded here rather than silently corrected, because the plan is what survives.*
+
+1. **`fit_displacement_probe` must select its ridge — the briefed version decides the milestone.**
+   The code above calls `fit_probe` with no selection data, which takes its documented fallback
+   `ridge=1e3`, chosen for `(N, 4)` POSITION targets of std ~240 map units. Displacement over k
+   steps is one to two orders smaller. Measured on this plan's own known-answer case — latents
+   encoding the displacement exactly, signal magnitude ~3 — the fallback reads it back with max
+   error **5.55**, larger than the signal; the selected `1e-1` reads it back to **0.009**, and no
+   ridge in `RIDGES = (1e-1, 1e1, 1e3, 1e5, 1e7)` reaches the `< 1e-6` this plan asserted, so that
+   tolerance was unreachable rather than merely missed. Taking the fallback would have underfit
+   every displacement probe and biased the reading toward `NO_MOTION` — the hypothesis under test —
+   **through the probe rather than through the latent.** `measure_cell` therefore always passes
+   `select`, gathered from held-out TRAINING episodes at episode granularity, as `fit_probes` does.
+
+2. **`permute_pairing` as written does not always derange, and this plan's test could not catch
+   it.** The neighbour-swap repair wraps the last fixed point onto index 0 and can return row 0 to
+   itself; measured, **1370 of 76,000** `(n, seed)` cases over `n ∈ [2, 40)`, `seed ∈ [0, 2000)`
+   keep a fixed point, and the identity at `n = 2` swaps to `[1, 0]` and straight back. Worse, the
+   test above uses `n = 200, seed = CONTROL_SEED`, where `default_rng(0).permutation(200)` happens
+   to have **zero** fixed points — so deleting the repair entirely left the test passing. Replaced
+   with rejection sampling, and the test now sweeps the `(n, seed)` cases where a plain shuffle
+   does leak.
+
+3. **The validation gather must pass `limit=len(val)`.** "The same way" above takes
+   `gather_probe_data`'s default `PROBE_EPISODE_LIMIT = 20`, which is the probe's *fit* rule. The
+   shipped validation split is 24 episodes / 229 windows, so the default would score the first 20
+   and **drop 40 windows** — and the six-episode fixture could never reveal it.
+
+4. **`tests/eval/conftest.py`'s `wide_buffer` cannot exercise the control.** Its positions are
+   linear in the frame index, so `p(t+k) − p(t)` is the same vector in every window and the
+   permuted control is **bitwise** the treatment. A `curved_buffer` was added beside it (the
+   straight path left bitwise unchanged). **Task 7 must use it**: that task's
+   `assert inputs.arms[arm].z != inputs.control[arm].z` cannot pass on `wide_buffer`.
+
+5. Smaller: `self_check` is not a field of `trust_horizon.Prepared`, and `windows` is not on the
+   study *result* record at all — it is on the *diagnostic*. `K_REPORTED` reaches 45, so `main`
+   takes `ks` as a parameter, following `sharper_latent.py`'s `taus` idiom.
+
+**Window-order alignment was verified, not assumed.** `require_aligned_windows` does not count
+rows: it reconstructs what the gather's rows must be from the canonical pass's own
+`true_at_context` and `true_positions` and compares frame for frame, refusing a wrong count
+(naming both numbers) or a wrong order without truncating, padding or reordering. One real shipped
+cell was measured end to end (`pixel_ae`/s0 on `mps`, evaluation-only into a scratch directory):
+229 windows over 24 clusters, `self_check.ok` True, every k series exactly 229 rows, `nonfinite {}`
+— and its `information` block matches M3g's own `stages_pixel_ae_seed0.json` **bitwise** (mean
+0.40118678781765876), which is independent confirmation that the same 229 windows are being read.
+
+---
+
 ### Task 7: `scripts/latent_motion.py` — the read phase, exit 38, and the registry
 
 **Files:**
