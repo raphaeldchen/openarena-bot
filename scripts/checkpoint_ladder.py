@@ -12,7 +12,8 @@ its own loss minimum rolls out better (spec 2026-09-18 M3f):
             anchor the retrain to the reference run: its per-step losses
             against the reference record's history.loss, exact.
   evaluate  per cell: the REFERENCE first (prepare_cell on --reference, the
-            bitwise self-check against its diagnostic, the trust pass, the
+            self-check against its diagnostic within the reproduction bound
+            of spec 2.4 -- 64 ULPs of the stored value -- the trust pass, the
             validation objective), then every rung: the study's own
             evaluation half (`evaluate_job`) writes step{N}/result_*.json,
             prepare_cell reads it back, the trust pass, the objective. One
@@ -42,8 +43,9 @@ THE CHECKS, BY PHASE, each with its own status:
             EXIT_RECORD_MISMATCH (14)     --context/--horizon disagree with the
                                           protocol, or evaluate_rollout no longer
                                           reproduces the record's curve.
-            EXIT_SELF_CHECK_FAILED (30)   the reference's trust pass is not
-                                          bitwise its diagnostic -- judged BEFORE
+            EXIT_SELF_CHECK_FAILED (30)   the reference's trust pass does not
+                                          reproduce its diagnostic within the
+                                          bound of spec 2.4 -- judged BEFORE
                                           any rung of the cell is evaluated.
             EXIT_RUNG_MISLABELLED (33)    NEW. a rung checkpoint's arm, seed or
                                           step is not the rung's.
@@ -343,7 +345,8 @@ def rung_entry(step: int, record: dict, traj, prepared, objective: dict, train_p
 
 def evaluate_reference(args, reference: Cell, device, train, val, buffer) -> tuple[int, dict | None, tuple]:
     """Rung 20000: `prepare_cell` on `--reference` (12, 14), the trust pass,
-    the bitwise self-check against the diagnostic (30), the objective.
+    the self-check against the diagnostic within the reproduction bound (30),
+    the objective.
     Returns the entry and the resolved `(context, horizon)` every rung is
     evaluated at."""
     status, prepared = prepare_cell(_cell_args(args, args.reference), reference, device, train, val)

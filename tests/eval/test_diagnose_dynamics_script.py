@@ -540,7 +540,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(ladder.values()) - set(reused_by_ladder.values()) - {0}
     assert own == {32, 33}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "stage_decomposition"):
+                  "stage_decomposition", "sharper_latent"):
         clash = own & set(statuses(other).values())
         assert not clash, f"checkpoint_ladder collides with {other} on {clash}"
 
@@ -559,9 +559,30 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(stages.values()) - set(reused_by_stages.values()) - {0}
     assert own == {34}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "checkpoint_ladder"):
+                  "checkpoint_ladder", "sharper_latent"):
         clash = own & set(statuses(other).values())
         assert not clash, f"stage_decomposition collides with {other} on {clash}"
+
+    sharper = statuses("sharper_latent")
+    reused_by_sharper = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in sharper.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_sharper, (
+        f"sharper_latent shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_sharper} is shared on purpose"
+    )
+    assert len(set(sharper.values())) == len(sharper), sharper
+    assert 1 not in sharper.values() and 2 not in sharper.values()
+    assert sharper["EXIT_NOT_NOISE_LIMITED"] == 35
+    assert sharper["EXIT_TEMPERATURE_MISMATCH"] == 36
+    assert sharper["EXIT_IDENTITY_CHECK_FAILED"] == 37
+    own = set(sharper.values()) - set(reused_by_sharper.values()) - {0}
+    assert own == {35, 36, 37}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"sharper_latent collides with {other} on {clash}"
 
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
@@ -2805,3 +2826,34 @@ def test_a_record_this_script_writes_is_readable_by_the_pooling_reader(monkeypat
     assert script.main(_argv(tmp_path)) == script.EXIT_OK
     with pytest.raises(pooling.StaleRecord, match="episode"):
         pooling.read_series(load_record(script.diagnostic_record_path(tmp_path, "pixel_ae", 0)), "shuffled")
+
+
+def test_the_loader_applies_the_payloads_temperature_and_refuses_a_mismatch(tmp_path):
+    """The loader builds the model it is asked for and then checks that the
+    weights it is about to load were produced by a model that samples the same
+    way. A shipped checkpoint (no key) reads as 1.0, so every M3b-M3g artefact
+    loads unchanged; a sharper checkpoint asked for at 1.0 is refused by name
+    rather than evaluated as something it is not."""
+    import torch
+
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    cfg = get_config("random_vit", seed=1, device="cpu")
+    model = WorldModel(cfg)
+    path = tmp_path / "world_model_random_vit_seed1.pt"
+
+    torch.save({"arm": "random_vit", "seed": 1, "state_dict": model.state_dict()}, path)
+    loaded = script.load_checkpoint_model(tmp_path, "random_vit", 1, cfg, torch.device("cpu"))
+    assert loaded.rssm.cfg.sample_temperature == 1.0
+
+    torch.save(
+        {"arm": "random_vit", "seed": 1, "state_dict": model.state_dict(), "sample_temperature": 0.5},
+        path,
+    )
+    with pytest.raises(script.TemperatureMismatch, match="0.5"):
+        script.load_checkpoint_model(tmp_path, "random_vit", 1, cfg, torch.device("cpu"))
+    sharp = get_config("random_vit", seed=1, device="cpu", sample_temperature=0.5)
+    loaded = script.load_checkpoint_model(tmp_path, "random_vit", 1, sharp, torch.device("cpu"))
+    assert loaded.rssm.cfg.sample_temperature == 0.5
+    assert issubclass(script.TemperatureMismatch, ValueError)

@@ -745,13 +745,13 @@ def test_history_records_every_step(buffer):
 
 def test_checkpoint_steps_default_leaves_the_final_save_and_the_history_as_they_were(buffer, tmp_path):
     """The M3c study and every reader of its checkpoints must not notice this
-    change: no rung directories, the same three payload keys, and the history
+    change: no rung directories, the same four payload keys, and the history
     gains only an empty `checkpoint_seconds`."""
     out = tmp_path / "ckpt"
     history = train_world_model(tiny(seed=3), buffer, out_dir=out)
     assert sorted(p.name for p in out.iterdir()) == ["world_model_cnn_seed3.pt"]
     payload = torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)
-    assert set(payload) == {"arm", "seed", "state_dict"}
+    assert set(payload) == {"arm", "seed", "state_dict", "sample_temperature"}
     assert history["checkpoint_seconds"] == {}
 
 
@@ -765,12 +765,15 @@ def test_checkpoint_steps_write_labelled_rungs_in_the_studys_layout(buffer, tmp_
     )
     for step in (2, 4):
         payload = torch.load(out / f"step{step}" / "world_model_cnn_seed3.pt", weights_only=True)
+        assert set(payload) == {"arm", "seed", "step", "state_dict", "sample_temperature"}
         assert (payload["arm"], payload["seed"], payload["step"]) == ("cnn", 3, step)
         assert any(k.startswith("rssm.") for k in payload["state_dict"])
     assert sorted(history["checkpoint_seconds"]) == [2, 4]
     assert 0.0 < history["checkpoint_seconds"][2] <= history["checkpoint_seconds"][4] <= history["seconds"]
     # The final save is still written beside the rungs, unchanged.
-    assert set(torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)) == {"arm", "seed", "state_dict"}
+    assert set(torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)) == {
+        "arm", "seed", "state_dict", "sample_temperature"
+    }
 
 
 def test_the_last_rung_holds_the_same_weights_as_the_final_checkpoint(buffer, tmp_path):
@@ -1096,3 +1099,24 @@ def test_model_parameters_land_on_the_configured_device(buffer, monkeypatch):
     assert device_seen.type == "cpu", (
         f"model parameters landed on {device_seen.type!r}, not the configured 'cpu'"
     )
+
+
+def test_the_payload_carries_the_temperature_the_model_was_trained_at(tmp_path, buffer):
+    """A checkpoint trained sharper and loaded into a default configuration
+    would be evaluated at 1.0 in silence -- the model would sample differently
+    from the one whose weights are being read, and nothing would say so. The
+    temperature travels in the payload so the loader can refuse."""
+    from mbfps.training.world_model import train_world_model
+    from mbfps.utils.config import get_config
+
+    out = tmp_path / "sharp"
+    cfg = get_config("cnn", steps=2, seq_len=4, seed=3, device="cpu", sample_temperature=0.5)
+    train_world_model(cfg, buffer, out_dir=out)
+    payload = torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)
+    assert payload["sample_temperature"] == 0.5
+
+    warm = tmp_path / "warm"
+    train_world_model(
+        get_config("cnn", steps=2, seq_len=4, seed=3, device="cpu"), buffer, out_dir=warm
+    )
+    assert torch.load(warm / "world_model_cnn_seed3.pt", weights_only=True)["sample_temperature"] == 1.0

@@ -160,3 +160,15 @@ def test_encoder_config_keeps_the_shared_bottleneck_fields():
     assert c.bottleneck_dim == 32
     assert c.cnn_depth == 32
     assert c.standardise_features is True
+
+
+def test_the_sample_temperature_is_a_train_config_field_at_the_shipped_default():
+    """`get_config(arm, sample_temperature=tau)` is how M3h reaches the model:
+    the override path every script already uses, so no script needs a new
+    argument to build a sharper model."""
+    from mbfps.models.rssm import SAMPLE_TEMPERATURE
+    from mbfps.utils.config import TrainConfig, get_config
+
+    assert TrainConfig().sample_temperature == SAMPLE_TEMPERATURE == 1.0
+    assert get_config("pixel_ae").train.sample_temperature == 1.0
+    assert get_config("pixel_ae", sample_temperature=0.5).train.sample_temperature == 0.5

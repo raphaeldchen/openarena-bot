@@ -38,6 +38,7 @@ from mbfps.eval.probe import filtering_gain, filtering_report, fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.summary import METRICS, metric_summary
 from mbfps.models.encoders import encoder_backbone
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
 from mbfps.training.world_model import WorldModel, train_world_model
 from mbfps.utils.config import get_config
 from mbfps.utils.device import get_device
@@ -512,6 +513,7 @@ def evaluate_job(
     horizon: int = 45,
     device: str = "mps",
     started: float | None = None,
+    sample_temperature: float = SAMPLE_TEMPERATURE,
 ) -> dict:
     """The evaluation half of `run_job` (M3f): load the checkpoint `out_dir`
     holds for `job`, fit the probes, score the rollout and the filtering, and
@@ -524,11 +526,17 @@ def evaluate_job(
     `started` is the `perf_counter` the record's `seconds` is measured from;
     None measures the evaluation alone, which is what a rung's record means
     by it (its training time is `history["seconds"]`, as `steps_per_second`
-    reads it).
+    reads it). `sample_temperature` (M3h) is the rollout's sampling
+    temperature -- the one the checkpoint being scored was TRAINED at, so the
+    model built here samples the way its weights learned to. Defaulting to
+    the shipped `SAMPLE_TEMPERATURE` leaves every existing caller unchanged.
     """
     out_dir = Path(out_dir)                                       # M3f
     started = time.perf_counter() if started is None else started  # M3f
-    cfg = get_config(job.arm, steps=steps, seq_len=seq_len, seed=job.seed, device=device)  # M3f
+    cfg = get_config(
+        job.arm, steps=steps, seq_len=seq_len, seed=job.seed, device=device,
+        sample_temperature=sample_temperature,
+    )  # M3f
     torch_device = get_device(prefer=device)                      # M3f
     train_paths, val_paths = episode_split(
         buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED

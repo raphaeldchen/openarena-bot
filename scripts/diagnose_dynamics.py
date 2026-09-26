@@ -109,10 +109,14 @@ actions:
     rollout's. The rungs did not share a sampling stream with it, so every
     measured delta is noise. Also a code defect, and a different one.
   EXIT_RECORD_MISMATCH -- `evaluate_rollout` itself no longer reproduces the
-    shipped record's curve. Measured, the records reproduce BITWISE on mps under
-    torch 2.13.0 and miss on cpu, with an identical probe and split, by an
-    ARM-DEPENDENT amount: ~6.5 map units (2.96% relative) on cnn/seed0 and ~12.4
-    on frozen_ssl/seed0. So this status most likely means the ENVIRONMENT
+    shipped record's curve. THIS GATE IS STILL EXACT -- deliberately, and unlike
+    the stored-artefact gates of spec 2.4, which now judge by a 64-ULP bound.
+    Measured, the records reproduced BITWISE on mps under torch 2.13.0 on the
+    macOS build they were written on; macOS 27.0 changed the MPS reduction order
+    and they now come back within 6 ULPs there instead (at most 1.705303e-13),
+    so an exact gate reports a platform difference here. They miss on cpu, with
+    an identical probe and split, by an ARM-DEPENDENT amount: ~6.5 map units
+    (2.96% relative) on cnn/seed0 and ~12.4 on frozen_ssl/seed0. So this status most likely means the ENVIRONMENT
     differs from the study's, not that the diagnostic is wrong -- and collapsing
     it into EXIT_PROTOCOL_DIVERGED would make a machine difference read as a
     code defect. Neither the checkpoints (which carry only arm and seed) nor the
@@ -170,6 +174,7 @@ from mbfps.eval.probe import fit_probes
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, StudyJob, job_record_path, load_record, write_record
 from mbfps.models.encoders import encoder_backbone
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
 from mbfps.training.world_model import WorldModel
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
@@ -207,6 +212,30 @@ class MislabelledCheckpoint(ValueError):
     """
 
 
+class TemperatureMismatch(ValueError):
+    """The checkpoint was trained at a sampling temperature other than the one
+    this configuration builds. Loading it anyway would evaluate weights with a
+    sampler their training never saw -- silently, since nothing about the
+    state_dict says how it was drawn from. Absent from the payload means 1.0,
+    which is every M3b-M3g artefact."""
+
+
+def configured_temperature(cfg) -> float:
+    """The sampling temperature `cfg` would build its model at.
+
+    Absent, it is the shipped `SAMPLE_TEMPERATURE` -- the same 1.0 a payload
+    without the key reads as, so a pre-M3h checkpoint and a pre-M3h
+    configuration agree by default rather than by coincidence.
+
+    Tolerant of a configuration object with no `train` block on purpose: this
+    script's own tests patch `get_config` with a bare namespace for the ~30
+    cases that never reach a model, and a checkpoint's temperature must not
+    become the reason those refuse.
+    """
+    train = getattr(cfg, "train", None)
+    return float(getattr(train, "sample_temperature", SAMPLE_TEMPERATURE))
+
+
 def checkpoint_path(out_dir: Path, arm: str, seed: int) -> Path:
     """BOTH the arm and the seed are in the name.
 
@@ -233,6 +262,13 @@ def load_checkpoint_model(out_dir: Path, arm: str, seed: int, cfg, device):
             f"checkpoint in {out_dir} is arm={checkpoint.get('arm')!r} "
             f"seed={checkpoint.get('seed')!r}, not this cell's arm={arm!r} "
             f"seed={seed!r}"
+        )
+    trained_at = float(checkpoint.get("sample_temperature", SAMPLE_TEMPERATURE))
+    asked_for = configured_temperature(cfg)
+    if trained_at != asked_for:
+        raise TemperatureMismatch(
+            f"checkpoint in {out_dir} was trained at sample_temperature={trained_at}, "
+            f"but this configuration samples at {asked_for}"
         )
     model = WorldModel(cfg).to(device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -1492,8 +1528,10 @@ def build_record(cell: dict, args, device, *, family: int) -> dict:
     """The cell's numbers, plus the environment they are only reproducible in.
 
     The DEVICE and the torch version are recorded because the record
-    reproduction is locked to them -- bitwise on mps under torch 2.13.0, and off
-    on cpu by an arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map
+    reproduction is locked to them -- on mps under torch 2.13.0 within a few
+    ULPs of the stored value (bitwise on the macOS build the records were
+    written on; at most 1.705303e-13 on macOS 27.0, spec 2.4), and off on cpu
+    by an arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map
     units -- and nothing else in the study carries that. Without it a future
     reader cannot tell a sound diagnostic run on another machine from a broken
     one, and the shuffled delta itself moves with the device by more than its
@@ -1800,9 +1838,13 @@ def main(argv=None) -> int:
                 f"evaluate_rollout no longer reproduces the shipped curve "
                 f"(max abs {cell['record']:.3e}). The protocol checks above "
                 f"PASSED, so this points at the environment -- measured, the "
-                f"records reproduce bitwise on mps and miss on cpu by an "
+                f"records reproduce on mps within a few ULPs of the stored "
+                f"value (bitwise on the macOS build they were written on, at "
+                f"most 1.705303e-13 on macOS 27.0) and miss on cpu by an "
                 f"arm-dependent ~6.5 (cnn/seed0) to ~12.4 (frozen_ssl/seed0) map "
-                f"units. This run used device={device} torch={torch.__version__}."
+                f"units. This gate stays EXACT, so a delta in the ULP band is a "
+                f"platform difference, not a wrong device. "
+                f"This run used device={device} torch={torch.__version__}."
             )
             return EXIT_RECORD_MISMATCH
     return EXIT_OK

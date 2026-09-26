@@ -44,10 +44,12 @@ and each has its own status:
     refused under this status too, UP FRONT: a rollout at another protocol
     cannot reproduce the record, which is how `diagnose_dynamics.py` surfaces
     the same mismatch -- after its refit, twenty seconds later.
-  EXIT_SELF_CHECK_FAILED (30) -- the trust pass's own mean curves are not
-    bitwise the diagnostic's `curves.reference_position` and
-    `curves.persistence_position` (`max |delta| == 0.0`, the ladder's own
-    `record_reproduction` rule), or its windows are not the diagnostic's.
+  EXIT_SELF_CHECK_FAILED (30) -- the trust pass's own mean curves do not
+    reproduce the diagnostic's `curves.reference_position` and
+    `curves.persistence_position` within `mbfps.eval.reproduction`'s bound
+    (64 ULPs of the stored value at the disagreeing step; exactly 0.0 until
+    macOS 27.0 moved the MPS kernels 6 ULPs under the study -- spec 2.4), or
+    its windows are not the diagnostic's.
     Same windows, same rollout, same refit probe, or this is not measuring
     what the ladder measured -- and the cell's record is NOT written, and the
     run stops: the pooling after the loop reads only the records this run
@@ -77,6 +79,7 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import Trajectories, reference_trajectories
 from mbfps.eval.probe import fit_probes
+from mbfps.eval.reproduction import reproduces, reproduction_bound
 from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.study import (
     SPLIT_SEED,
@@ -111,6 +114,7 @@ from mbfps.eval.trust_readings import (
     reading_two,
 )
 from mbfps.models.encoders import encoder_backbone
+from mbfps.models.rssm import SAMPLE_TEMPERATURE
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.device import get_device
 
@@ -132,6 +136,11 @@ def _sibling(name: str):
 _diagnose_dynamics = _sibling("diagnose_dynamics")
 checkpoint_path = _diagnose_dynamics.checkpoint_path
 load_checkpoint_model = _diagnose_dynamics.load_checkpoint_model
+TemperatureMismatch = _diagnose_dynamics.TemperatureMismatch
+"""Re-exported because `_sibling` executes `diagnose_dynamics.py` afresh for
+every importer, so each one holds its OWN class object: a caller that catches
+its own copy's `TemperatureMismatch` would not catch the one `prepare_cell`
+raises. Catch THIS name (M3h)."""
 diagnostic_record_path = _diagnose_dynamics.diagnostic_record_path
 probe_is_measurable = _diagnose_dynamics.probe_is_measurable
 
@@ -202,28 +211,50 @@ def _max_delta(ours, theirs) -> tuple[float, int]:
     return float(delta.max()), int(delta.argmax()) + 1
 
 
+def _magnitude_at(theirs, step: int) -> float:
+    """The STORED value's magnitude at the 1-based `step` a delta was measured
+    at, which is the scale the reproduction bound is built from. `0.0` where
+    there is no such step -- `_max_delta` reports step 0 on a shape mismatch,
+    and a zero magnitude makes the bound zero, so its `inf` stays a refusal."""
+    if int(step) < 1:
+        return 0.0
+    flat = np.asarray(theirs, dtype=float).reshape(-1)
+    if int(step) > flat.size:
+        return 0.0
+    return abs(float(flat[int(step) - 1]))
+
+
 @dataclass(frozen=True)
 class SelfCheck:
     """Does the trust pass reproduce the diagnostic it is about to be read
-    beside. Two exact curve equalities (the ladder's `record_reproduction`
-    rule, `max |delta| == 0.0`) and two window identities."""
+    beside. Two curve reproductions and two window identities.
+
+    The curve rule is `mbfps.eval.reproduction`'s, not exact equality: on
+    macOS 27.0 the same code on the same checkpoint misses the shipped curve
+    by up to 6 ULPs where it used to miss by nothing (spec 2.4). The magnitude
+    each delta is scaled against is recorded beside it, so `trustworthy`
+    recomputes the bound rather than trusting a recorded verdict."""
 
     reference_position_max_delta: float
     reference_position_step: int
+    reference_position_magnitude: float
     persistence_position_max_delta: float
     persistence_position_step: int
+    persistence_position_magnitude: float
     windows_total_match: bool
     windows_episode_match: bool
 
     def failures(self) -> list[str]:
         out = []
-        if self.reference_position_max_delta != 0.0:
+        if not reproduces(self.reference_position_max_delta, self.reference_position_magnitude):
             out.append(_curve_failure(
-                "reference_position", self.reference_position_max_delta, self.reference_position_step
+                "reference_position", self.reference_position_max_delta,
+                self.reference_position_step, self.reference_position_magnitude,
             ))
-        if self.persistence_position_max_delta != 0.0:
+        if not reproduces(self.persistence_position_max_delta, self.persistence_position_magnitude):
             out.append(_curve_failure(
-                "persistence_position", self.persistence_position_max_delta, self.persistence_position_step
+                "persistence_position", self.persistence_position_max_delta,
+                self.persistence_position_step, self.persistence_position_magnitude,
             ))
         if not self.windows_total_match:
             out.append("windows.total is not the diagnostic's")
@@ -238,7 +269,9 @@ class SelfCheck:
     def record(self) -> dict:
         return {
             "reference_position_max_delta": self.reference_position_max_delta,
+            "reference_position_magnitude": self.reference_position_magnitude,
             "persistence_position_max_delta": self.persistence_position_max_delta,
+            "persistence_position_magnitude": self.persistence_position_magnitude,
             "windows_total_match": self.windows_total_match,
             "windows_episode_match": self.windows_episode_match,
             "ok": self.ok,
@@ -247,22 +280,39 @@ class SelfCheck:
 
 def trustworthy(check) -> bool:
     """Is a RECORDED self-check (`SelfCheck.record()` read back from disk) one
-    a reader may trust: `ok`, both curves at exactly 0.0, both window flags.
-    The deltas are checked beside `ok` on purpose -- a record whose `ok` says
-    True over a nonzero delta is a record that was edited, and is refused."""
+    a reader may trust: `ok`, both curves inside the bound their own recorded
+    magnitudes give, both window flags. The bound is RECOMPUTED here rather
+    than taken on trust -- a record whose `ok` says True over a delta its own
+    magnitude cannot justify is a record that was edited, and is refused. It
+    cannot catch an edited MAGNITUDE, which is the record's own data with no
+    second copy to check it against; the guard is against a careless edit, not
+    against an adversary. A
+    record from M3d-M3g carries no magnitude and a delta of exactly 0.0; the
+    missing key reads as a magnitude of 0.0, whose bound is 0.0, so those
+    records stay trusted and a nonzero delta without its scale does not."""
     return bool(check) and (
         check.get("ok") is True
-        and check.get("reference_position_max_delta") == 0.0
-        and check.get("persistence_position_max_delta") == 0.0
+        and reproduces(
+            check.get("reference_position_max_delta", float("inf")),
+            check.get("reference_position_magnitude", 0.0),
+        )
+        and reproduces(
+            check.get("persistence_position_max_delta", float("inf")),
+            check.get("persistence_position_magnitude", 0.0),
+        )
         and bool(check.get("windows_total_match"))
         and bool(check.get("windows_episode_match"))
     )
 
 
-def _curve_failure(name: str, delta: float, step: int) -> str:
+def _curve_failure(name: str, delta: float, step: int, magnitude: float) -> str:
     if step == 0:
         return f"{name} has a different length from the diagnostic's"
-    return f"{name} differs from the diagnostic's by max |delta| {delta:.3e} at step {step}"
+    return (
+        f"{name} differs from the diagnostic's by max |delta| {delta:.3e} at step "
+        f"{step}, outside the {reproduction_bound(magnitude):.3e} the stored "
+        f"{magnitude:.6f} there allows"
+    )
 
 
 def self_check(traj: Trajectories, diagnostic: dict) -> SelfCheck:
@@ -282,6 +332,8 @@ def self_check(traj: Trajectories, diagnostic: dict) -> SelfCheck:
     persistence, persistence_step = _max_delta(
         persistence_rows.mean(axis=0), curves["persistence_position"]
     )
+    reference_magnitude = _magnitude_at(curves["reference_position"], reference_step)
+    persistence_magnitude = _magnitude_at(curves["persistence_position"], persistence_step)
     windows = diagnostic["windows"]
     # `null` when the ladder carried no clustering: a trust record cannot be
     # clustered on nothing, so that is a mismatch, never `range(n)`.
@@ -289,8 +341,10 @@ def self_check(traj: Trajectories, diagnostic: dict) -> SelfCheck:
     return SelfCheck(
         reference_position_max_delta=reference,
         reference_position_step=reference_step,
+        reference_position_magnitude=reference_magnitude,
         persistence_position_max_delta=persistence,
         persistence_position_step=persistence_step,
+        persistence_position_magnitude=persistence_magnitude,
         windows_total_match=int(traj.windows_total) == int(windows["total"]),
         windows_episode_match=(
             episode is not None
@@ -1171,7 +1225,7 @@ def _parser() -> argparse.ArgumentParser:
 class Prepared:
     """One cell past its checks: the loaded model, the refit probe, the
     protocol kwargs every pass takes, the resolved protocol, and the val
-    rollout that reproduced the record bitwise."""
+    rollout that reproduced the record within the bound of spec 2.4."""
 
     model: object
     embedding_probe: dict
@@ -1208,7 +1262,13 @@ def prepare_cell(args, cell: Cell, device, train, val) -> tuple[int, Prepared | 
     context = int(cell.diagnostic["context"]) if args.context is None else args.context
     horizon = int(cell.diagnostic["horizon"]) if args.horizon is None else args.horizon
 
-    cfg = get_config(arm, seed=seed, device=args.device)
+    # Every existing caller sets no temperature and gets the shipped 1.0, which
+    # is what every cell they read was trained at; M3h's script sets it, so the
+    # model returned here samples the way its checkpoint was trained to.
+    cfg = get_config(
+        arm, seed=seed, device=args.device,
+        sample_temperature=getattr(args, "sample_temperature", SAMPLE_TEMPERATURE),
+    )
     model = load_checkpoint_model(args.out, arm, seed, cfg, device)
     backbone = encoder_backbone(cfg.encoder)
     # The probe is REFIT at the rollout's own context/horizon and at the
@@ -1224,13 +1284,16 @@ def prepare_cell(args, cell: Cell, device, train, val) -> tuple[int, Prepared | 
     reproduction, step = _max_delta(
         reference.rssm_position, cell.record["curves"]["rssm_position"]
     )
-    if reproduction != 0.0:
+    magnitude = _magnitude_at(cell.record["curves"]["rssm_position"], step)
+    if not reproduces(reproduction, magnitude):
         print(
             f"\nRECORD MISMATCH for {arm} seed {seed}: evaluate_rollout no longer "
             f"reproduces the study record's curves.rssm_position (max abs "
-            f"{reproduction:.3e} at step {step}). Measured, the records reproduce "
-            f"bitwise on mps and miss on cpu by an arm-dependent 6-12 map units. "
-            f"This run used device={device} torch={torch.__version__}."
+            f"{reproduction:.3e} at step {step}, outside the "
+            f"{reproduction_bound(magnitude):.3e} the stored {magnitude:.6f} there "
+            f"allows). Measured, the records reproduce on mps to within 6 ULPs and "
+            f"miss on cpu by an arm-dependent 6-12 map units. This run used "
+            f"device={device} torch={torch.__version__}."
         )
         return EXIT_RECORD_MISMATCH, None
     return EXIT_OK, Prepared(
