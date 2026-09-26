@@ -4017,47 +4017,66 @@ help the rollout at any temperature in the grid; it hurts, monotonically, in all
 all three seeds. The entropy hypothesis is refuted on the shipped models at this grid, and §2.1's
 gate closed the door on the fifteen-hour retrain in code, not by a person.
 
+*These results were rewritten after the final whole-branch review, which found two Critical
+defects in the reporting layer — an off-by-one in the survival table and a mean printed under a
+caption promising medians. Neither touched Reading N, whose verdict the reviewer reproduced
+independently, but both changed numbers quoted below and one falsified this milestone's stated
+premise (§8). Phase 1 was re-run on the corrected code; the first run's `sweep.txt` is kept beside
+the new one as `sweep-preC1C2.txt`.*
+
 ### 1. Provenance
 
 | | |
 |---|---|
-| `git_sha` (all nine records) | `3f6660eca3e802382d50f61223a017acf91d18bb` |
+| `git_sha` (all nine records) | `42c92f2` (the corrected re-run) |
 | device / torch | `mps` / 2.13.0 |
 | reference cells | `runs/m3_study_v2`, `record_git_sha` `ca3e140`, step 20000 |
 | protocol | context 5, horizon 45, `split_seed` 0, 24 val episodes, `decision_h` 15 |
-| `sweep.started` → `sweep.finished` | 2026-09-25T21:47:30Z → 2026-09-25T22:20:55Z (**33 m 25 s**) |
+| `sweep.started` → `sweep.finished` | 2026-09-25T23:44:43Z → 2026-09-26T00:25:00Z (**40 m 17 s**) |
 | `sweep.exit` | **0** |
-| artefacts | nine `sweep_<arm>_seed<n>.json`, `sweep.txt`, `sweep_curves.png`, 41 MB |
-| `nonfinite` | `{}` on every cell |
+| artefacts | nine `sweep_<arm>_seed<n>.json`, `sweep.txt`, `sweep_curves.png` |
+| `nonfinite` | `{}` on eight cells; `frozen_ssl`/s1 carries five entries |
 
-`sweep.txt` is byte-identical to what `--phase read` prints. One disclosure: after the run,
-`06249d8` corrected the self-check table's caption, which said "(exact)" above deltas of up to
-1.7e-13 — a caption/column contradiction of the same class as `f24c2f3`'s, found the same way, by
-reading the run's own output. `sweep.txt` was regenerated from the same nine records at that
-commit; only the caption line differs, and no number in this section moved. The records
-themselves carry `3f6660e` and were not rewritten.
+`sweep.txt` is byte-identical to what `--phase read` prints.
 
-*Platform note.* This run is the first in the project made under macOS 27.0 (installed 2026-09-24
-15:00:46, booted 16:39:50). The first attempt, at `f24c2f3` on 2026-09-24 19:54, refused at its
-first cell with exit 14 and `max abs 8.526513e-14` — the upgrade had changed the MPS kernels'
-reduction order under a gate that demanded exact reproduction. Spec §2.4 and Task 11 record the
-measurement and the fix; §4 of this section reads the outcome.
+**The `nonfinite` row, stated properly.** `frozen_ssl`/s1 records
+`entries.tau{100,70,50,30,0}.summary.band.angle.gap_final: "nan"` — its *angle* band is degenerate
+at every temperature. The decision is taken on `position`, `degen(max)` is 0 in every cell, and no
+reading consumes the angle band, so nothing downstream moves. It is recorded because "`{}` on
+every cell" — what the first draft of this section said — reads as a clean-run certificate, and
+this cell is not clean.
+
+**An earlier run of the same phase** at `3f6660e` (2026-09-25T21:47:30Z → 22:20:55Z, 33 m 25 s,
+exit 0) produced the same nine records and the same verdict. It is superseded by the re-run, not
+contradicted: the gate table and the self-check table are byte-identical between the two, the
+Reading N estimates are identical to four decimals, and only the survival and noise tables — the
+two the review corrected — differ.
+
+*Platform note.* This is the first study in the project run under macOS 27.0 (installed
+2026-09-24 15:00:46, booted 16:39:50). The first attempt, at `f24c2f3` on 2026-09-24 19:54,
+refused at its first cell with exit 14 and `max abs 8.526513e-14` — the upgrade had changed the
+MPS kernels' reduction order under a gate demanding exact reproduction. Spec §2.4 and Task 11
+record the measurement and the fix; §4 below reads the outcome. That refused run's log is kept at
+`runs/m3h_sweep/sweep-refused-1954.log`.
 
 ### 2. Suite
 
 `1732 passed in 1448.58s (0:24:08)` at `3f6660e`, 0 skipped, 0 warnings, 0 failures — 1714 before
-Task 11 plus its 18 new tests. Run under `caffeinate -dimsu`. *An earlier attempt at the same
-commit, launched without `caffeinate` while the machine sat on battery at 34%, ran clean to ~70%
-and then produced ~450 consecutive fixture errors and a pytest teardown crash;
-`tests/eval/test_study.py`, where the cascade begins, passes alone in 51 s. No sleep transition is
-logged in that window, so the power explanation is the best-supported one rather than a proven
-one. Every long run in this project is `caffeinate`d; that suite was the only one that was not.*
+Task 11 plus its 18 new tests. Run under `caffeinate -dimsu`. The suite at the final HEAD is
+reported in the branch's completion, after the review fixes.
+
+*An earlier attempt at `3f6660e`, launched without `caffeinate` while the machine sat on battery
+at 34 %, ran clean to ~70 % and then produced ~450 consecutive fixture errors and a pytest
+teardown crash; `tests/eval/test_study.py`, where the cascade begins, passes alone in 51 s. No
+sleep transition is logged in that window, so the power explanation is the best-supported one
+rather than a proven one. Every long run in this project is `caffeinate`d; that suite was the only
+one that was not.*
 
 ### 3. Acceptance
 
 Nine records, one `git_sha` equal to `sweep.head`, all on `mps`, `self_check.ok` on 9/9, exactly
 229 windows over 24 clusters at every one of the five temperatures of every cell, `taus` =
-(1.0, 0.7, 0.5, 0.3, 0.0), `decision_h` 15, `step` 20000. Passed.
+(1.0, 0.7, 0.5, 0.3, 0.0), `decision_h` 15, `step` 20000. Passed, on both runs.
 
 ### 4. The self-check at τ = 1.0 — the reproduction bound, exercised
 
@@ -4074,30 +4093,37 @@ Nine records, one `git_sha` equal to `sweep.head`, all on `mps`, `self_check.ok`
   random_vit      2  20000     1.4e-13      1.1e-13      229        24
 ```
 
-§2.4's acceptance was "within the bound on 9/9", and that is what happened. The worst delta is
-`1.705303e-13` on `frozen_ssl`/s1 at a stored magnitude of 222.77787658642973 — **6.0 ULPs**
-against a bound of 64, so the run used about a tenth of its allowance. Two cells reproduced
-**exactly**, as the pre-run characterisation predicted. Nothing came within an order of magnitude
-of the bound, and a wrong device would still have been 6–12 map units away. The bound changed
-whether the gate fires, not what the gate measures: every number below is the number the exact
-rule would have produced, had it been able to run at all.
+§2.4's acceptance was "within the bound on 9/9", and that is what happened, identically on both
+runs. The worst delta is `1.705303e-13` on `frozen_ssl`/s1 at a stored magnitude of
+222.77787658642973 — **6.0 ULPs** against a bound of 64, so the run used about a tenth of its
+allowance. Two cells reproduced **exactly**.
+
+Two things the final review established that are stronger than anything §2.4 claimed, and that
+belong here. First, the bound is judged at the argmax step, which in principle could differ from
+the per-step maximum; measured across all 18 curve comparisons (9 cells × reference/persistence),
+**the recorded ULP count equals the per-step maximum in 18 of 18**, because these curves live in
+one or two binades (magnitudes 134–281). Second, and more to the point: comparing the per-window
+**crossing steps** — the discrete statistic every reading is actually built on — between M3d's
+trust records written under macOS 26.x and this run's τ = 1.0 pass, they are **identical in
+229/229 windows in all nine cells**. The platform moved the arithmetic in the last bits and moved
+no decision quantity at all.
 
 ### 5. Reading N
 
 ```
-  arm           tau   estimate       se       z  seeds  clears  counts
-  pixel_ae      0.7    -0.0277   0.0144   -1.92    0/3  no      no
-  pixel_ae      0.5    -0.0422   0.0167   -2.52    0/3  no      no
-  pixel_ae      0.3    -0.0509   0.0157   -3.25    0/3  down    no
-  pixel_ae      0.0    -0.1121   0.0191   -5.88    0/3  down    no  (endpoint, never a candidate)
-  frozen_ssl    0.7    -0.0189   0.0093   -2.03    0/3  no      no
-  frozen_ssl    0.5    -0.0393   0.0129   -3.04    0/3  no      no
-  frozen_ssl    0.3    -0.0830   0.0101   -8.20    0/3  down    no
-  frozen_ssl    0.0    -0.0946   0.0112   -8.44    0/3  down    no  (endpoint, never a candidate)
-  random_vit    0.7    -0.0364   0.0117   -3.10    0/3  down    no
-  random_vit    0.5    -0.0844   0.0117   -7.20    0/3  down    no
-  random_vit    0.3    -0.1106   0.0132   -8.38    0/3  down    no
-  random_vit    0.0    -0.1310   0.0139   -9.43    0/3  down    no  (endpoint, never a candidate)
+  arm           tau   estimate       se       z  seeds up  seeds dn  clears  counts up
+  pixel_ae      0.7    -0.0277   0.0144   -1.92       0/3       0/3  no      no
+  pixel_ae      0.5    -0.0422   0.0167   -2.52       0/3       0/3  no      no
+  pixel_ae      0.3    -0.0509   0.0157   -3.25       0/3       2/3  down    no
+  pixel_ae      0.0    -0.1121   0.0191   -5.88       0/3       2/3  down    no  (endpoint, never a candidate)
+  frozen_ssl    0.7    -0.0189   0.0093   -2.03       0/3       0/3  no      no
+  frozen_ssl    0.5    -0.0393   0.0129   -3.04       0/3       0/3  no      no
+  frozen_ssl    0.3    -0.0830   0.0101   -8.20       0/3       3/3  down    no
+  frozen_ssl    0.0    -0.0946   0.0112   -8.44       0/3       3/3  down    no  (endpoint, never a candidate)
+  random_vit    0.7    -0.0364   0.0117   -3.10       0/3       1/3  down    no
+  random_vit    0.5    -0.0844   0.0117   -7.20       0/3       2/3  down    no
+  random_vit    0.3    -0.1106   0.0132   -8.38       0/3       3/3  down    no
+  random_vit    0.0    -0.1310   0.0139   -9.43       0/3       3/3  down    no  (endpoint, never a candidate)
   verdict: SHARPER WORSE -- decided by: no candidate temperature clears +3.06 in 2 arms, and
            tau=0.3 clears -3.06 in 3 of 3 arms (pixel_ae, frozen_ssl, random_vit)
 ```
@@ -4105,22 +4131,27 @@ rule would have produced, had it been able to run at all.
 `z_fam = cluster_threshold(9, 24) = 3.06`. Every contrast is a cell at a temperature against the
 **same cell at τ = 1.0 on the same val windows**, so no arm is ranked against another.
 
+The `seeds dn` column exists because of the review (finding I3): the table previously printed only
+the *up* tally, so every row read `0/3` while the verdict asserted "3 of 3 arms" — the natural
+misreading being that the negative clear replicated in no seed, the opposite of the truth. The
+tally the verdict is read from is now visible: at τ = 0.3 it is 2/3, 3/3, 3/3.
+
 There is no τ\*: the status is `SHARPER_WORSE`, which §3.2 defines as no candidate clearing
-positively in two arms while some candidate clears negatively in two or more. Here the negative
-side is unanimous — τ = 0.3 clears −3.06 in **3 of 3** arms, and **all twelve** (arm, τ) estimates
-are negative with `0/3` seeds clearing positively anywhere in the table. The effect is monotone in
-τ within every arm. `random_vit` is the most temperature-sensitive (−0.036 at τ = 0.7 already
-clears) and `frozen_ssl` the least at the top of the grid (−0.019, z −2.03).
+positively in two arms while some candidate clears negatively in two or more. The negative side is
+unanimous — τ = 0.3 clears −3.06 in **3 of 3** arms — and **all twelve** (arm, τ) estimates are
+negative with `0/3` seeds clearing positively anywhere. The effect is monotone in τ within every
+arm. `random_vit` is the most temperature-sensitive (−0.036 at τ = 0.7 already clears) and
+`frozen_ssl` the least at the top of the grid (−0.019, z −2.03).
 
 **The endpoint row.** τ = 0 is reported and is never a candidate (§3.2). It is the largest effect
-in every arm — −0.112, −0.095, −0.131 — which is the ordering §3.2 anticipated from M3a and is
-why it was excluded in advance rather than after seeing it.
+in every arm — −0.112, −0.095, −0.131 — which is the ordering §3.2 anticipated from M3a and is why
+it was excluded in advance rather than after seeing it.
 
-### 6. The gate, the noise, the survival
+### 6. The gate, the survival, the noise
 
 **The M3 gate at every temperature** (`gap_closed` at h = 15 on position, per seed; reported,
-never decided on — §2 of the Global Constraints). It passes nowhere, at any temperature, as it
-did not in M3c; and it degrades monotonically as τ falls in 8 of 9 cells:
+never decided on). Byte-identical across both runs. It passes nowhere, at any temperature, as it
+did not in M3c, and it degrades monotonically as τ falls in 8 of 9 cells:
 
 ```
   arm           tau        s0        s1        s2   passes  degen(max)
@@ -4142,46 +4173,65 @@ did not in M3c; and it degrades monotonically as τ falls in 8 of 9 cells:
 ```
 
 The one non-monotone cell is `pixel_ae`/s2, which turns back from −2.0559 at τ = 0.3 to −1.5129 at
-τ = 0. It is the only such reversal in the 36 (cell, temperature-step) transitions and it sits at the endpoint that
-is not a candidate, so it changes nothing; it is recorded because it is there.
+τ = 0. It is the only such reversal in the 36 (cell, temperature-step) transitions and it sits at
+the endpoint that is not a candidate, so it changes nothing; it is recorded because it is there.
 
-**Survival, `S_free(h)`, seeds stacked** — the statistic Reading N is built on. At h = 10 and
-beyond it falls monotonically with τ in all three arms, and at the decision horizon h = 15 it falls
-in every arm without exception. Nearer the context it is not monotone: `frozen_ssl` rises slightly
-as τ falls at h = 2 (0.802 → 0.808 by τ = 0.5), h = 3 (0.640 → 0.662) and h = 5 (0.457 → 0.466 at
-τ = 0.7) before turning down. The reading is taken at h = 15, where no such reversal occurs.
+**Survival, `S_free(h)`, seeds stacked.** *Corrected: the first draft of this table was
+`S(h − 1)`, because `survival()` returns `S(h)` at index `h` and the table read index `h − 1`
+(review finding C1). The tell was an `S(1)` column reading 1.000 in all fifteen rows — that is
+`S(0)`, which is 1.0 by definition. Reading N never used this table; it reads `crossing > 15`
+directly, which is why the verdict is unaffected.*
 
 ```
   arm           tau    S(1)    S(2)    S(3)    S(5)   S(10)   S(15)   S(30)   S(45)
-  pixel_ae      1.0   1.000   0.815   0.639   0.461   0.259   0.182   0.068   0.042
-  pixel_ae      0.0   1.000   0.770   0.571   0.336   0.122   0.064   0.012   0.004
-  frozen_ssl    1.0   1.000   0.802   0.640   0.457   0.239   0.154   0.045   0.017
-  frozen_ssl    0.0   1.000   0.786   0.553   0.277   0.089   0.052   0.001   0.000
-  random_vit    1.0   1.000   0.808   0.643   0.440   0.247   0.183   0.079   0.051
-  random_vit    0.0   1.000   0.758   0.509   0.247   0.084   0.057   0.012   0.009
+  pixel_ae      1.0   0.815   0.639   0.537   0.405   0.246   0.169   0.068   0.042
+  pixel_ae      0.7   0.805   0.620   0.525   0.394   0.224   0.141   0.060   0.039
+  pixel_ae      0.5   0.798   0.611   0.509   0.367   0.192   0.127   0.055   0.025
+  pixel_ae      0.3   0.786   0.590   0.461   0.320   0.167   0.118   0.023   0.012
+  pixel_ae      0.0   0.770   0.571   0.412   0.269   0.105   0.057   0.010   0.004
+  frozen_ssl    1.0   0.802   0.640   0.533   0.386   0.221   0.141   0.042   0.017
+  frozen_ssl    0.7   0.806   0.652   0.540   0.397   0.205   0.122   0.039   0.020
+  frozen_ssl    0.5   0.808   0.662   0.521   0.367   0.185   0.102   0.019   0.007
+  frozen_ssl    0.3   0.803   0.616   0.469   0.294   0.114   0.058   0.003   0.001
+  frozen_ssl    0.0   0.786   0.553   0.355   0.217   0.077   0.047   0.001   0.000
+  random_vit    1.0   0.808   0.643   0.531   0.392   0.236   0.179   0.076   0.049
+  random_vit    0.7   0.790   0.627   0.511   0.368   0.214   0.143   0.060   0.041
+  random_vit    0.5   0.780   0.600   0.464   0.320   0.140   0.095   0.033   0.020
+  random_vit    0.3   0.773   0.559   0.396   0.247   0.103   0.068   0.015   0.007
+  random_vit    0.0   0.758   0.509   0.322   0.182   0.079   0.048   0.012   0.009
 ```
 
-(The full five-temperature table is in `sweep.txt`; the τ = 1.0 and τ = 0 rows bound it.)
+**At the decision horizon h = 15 survival falls with τ in every arm without exception**, which is
+the statement Reading N rests on. Between h = 10 and h = 30 it is monotone in every arm. It is
+*not* monotone everywhere else, and the first draft of this section claimed it was: `frozen_ssl`
+rises as τ falls at h = 1 (0.802 → 0.808 by τ = 0.5), h = 2 (0.640 → 0.662), h = 3 (0.533 → 0.540)
+and h = 5 (0.386 → 0.397), and at h = 45 both `frozen_ssl` (0.017 → 0.020) and `random_vit`
+(0.007 → 0.009) tick up. The reading is taken at h = 15, where no reversal occurs.
 
-**The noise reference against the imagined displacement** — the table that carries the study's
-central surprise. At τ = 0 the two-draw noise is exactly `0.000`, by construction: with the argmax
-taken, two draws of one model are the same draw. The imagined displacement does not shrink with
-it. It **grows**, in every cell:
+**The noise reference against the imagined displacement**, medians over windows, both columns.
+*Corrected: the noise column was previously a mean while the displacement column was a median,
+under a caption reading "medians over windows" (review finding C2). Embedding distances are
+strongly right-skewed, so the old table systematically inflated the noise side. Both reductions
+are now recorded in every entry (`curve`, `curve_mean`); the table prints the medians its caption
+promises.*
 
 ```
-  arm           tau    noise(1)    moved(1)    noise(5)    moved(5)   noise(15)   moved(15)   noise(45)   moved(45)
-  pixel_ae s0   1.0       1.482       1.773       4.096       3.873       6.625       4.974       8.789       6.950
-  pixel_ae s0   0.0       0.000       3.286       0.000      10.415       0.000      13.411       0.000      13.338
-  frozen_ssl s0 1.0       2.106       2.395       5.862       5.185       9.036       7.327      12.501      10.940
-  frozen_ssl s0 0.0       0.000       3.969       0.000      15.525       0.000      25.776       0.000      30.286
-  random_vit s0 1.0       1.661       1.657       4.256       2.956       4.659       3.705       5.439       3.839
-  random_vit s0 0.0       0.000       2.977       0.000      15.974       0.000      39.185       0.000      42.314
+  arm             tau    noise(1)    moved(1)    noise(5)    moved(5)   noise(15)   moved(15)   noise(45)   moved(45)
+  pixel_ae s0     1.0       1.375       1.773       3.582       3.873       5.700       4.974       7.201       6.950
+  pixel_ae s0     0.0       0.000       3.286       0.000      10.415       0.000      13.411       0.000      13.338
+  frozen_ssl s0   1.0       1.923       2.395       4.988       5.185       7.734       7.327      12.215      10.940
+  frozen_ssl s0   0.0       0.000       3.969       0.000      15.525       0.000      25.776       0.000      30.286
+  random_vit s0   1.0       1.253       1.657       2.841       2.956       2.392       3.705       2.394       3.839
+  random_vit s0   0.0       0.000       2.977       0.000      15.974       0.000      39.185       0.000      42.314
 ```
 
-`random_vit`/s0 imagines **eleven times** the displacement at τ = 0 that it does at τ = 1.0
-(42.314 against 3.839 at h = 45) with the sampling noise entirely removed. Over the same
-temperature drop the `random_vit` arm's stacked survival at h = 15 falls from 0.183 to 0.057. The
-rollout moves more and tracks worse.
+At τ = 0 the two-draw noise is exactly `0.000`, by construction: with the argmax taken, two draws
+of one model are the same draw. The imagined displacement does not shrink with it — it **grows**,
+in every cell. `random_vit`/s0 imagines **eleven times** the displacement at τ = 0 that it does at
+τ = 1.0 (42.314 against 3.839 at h = 45) with the sampling noise entirely removed. Over the same
+temperature drop the `random_vit` arm's stacked survival at h = 15 falls from 0.179 to 0.048. The
+rollout moves more and tracks worse. That comparison is displacement against displacement across
+temperatures, so it is unaffected by C2.
 
 ### 7. Phase 2
 
@@ -4189,23 +4239,34 @@ Not run, and correctly not run. §2.1's gate lives in the `train` phase, which r
 record and refuses with exit 35 unless it says `NOISE_LIMITED`. `runs/m3h_sharper/` does not
 exist; no checkpoint was written, altered or retrained; the fifteen and a half hours were not
 spent. The identity check (37) and the τ\* payload check (36) were therefore never reached — they
-remain written, tested and unexercised on real data, which the next milestone to open that gate
-should know.
+remain written, tested and unexercised on real data.
 
-A second reason Phase 2 must not have run on this machine, independent of Reading N and recorded
-in §2.4: the shipped M3c cells can no longer serve as its control arm here. Training is bitwise
-reproducible **within** macOS 27.0 (two 500-step runs of `random_vit`/s0 agree at exactly 0.0) and
-not at all **across** the upgrade (up to 6.833319e-01 in the per-step loss, first differing at step
-3), because the straight-through categorical sampler turns a last-bit change into a flipped class.
-Had Reading N opened the gate, Phase 2 would have needed nine control retrains of its own, ~31 h
-rather than ~15 h 30 m. It did not open, so the question is retired rather than answered.
+**Two traps for whoever opens that gate**, both found by the final review and both left in place
+deliberately rather than fixed speculatively:
+
+1. **`train` as shipped terminates at exit 37 on this platform, before any cell trains.**
+   `train_phase` calls `identity_check` unconditionally, and that check keeps the exact rule — by
+   design, because §2.4 measured a retrain diverging from a record written on the previous macOS
+   build by up to 6.833319e-01 in the per-step loss, first differing at step 3, the
+   straight-through categorical sampler turning a last-bit change into a flipped class. Training
+   *is* bitwise reproducible **within** macOS 27.0 (two 500-step runs of `random_vit`/s0 agree at
+   exactly 0.0), so Phase 2 remains possible — but only by retraining the τ = 1.0 control arm on
+   this build too, nine more cells, ~31 h rather than ~15 h 30 m. **There is no code path for that
+   yet**: `train_cell` takes one τ for all nine cells and there is no `--control` flag. A milestone
+   that opens this gate must write that first, and should not discover it by burning a launch.
+2. **`--phase all`, the default, cannot produce a reading on a `SHARPER_WORSE` sweep.** `main`
+   returns on the first non-zero status, so `train_phase`'s exit 35 aborts before `read_phase`:
+   running the script with no arguments against `runs/m3h_sweep` exits 35 having written no
+   `sweep.txt`. Every reading in this section was produced with an explicit `--phase read`. Either
+   `all` should treat 35 as terminal-but-report, or the default should become `sweep`.
 
 ### 8. Read against §4 — what this does and does not claim
 
-**Per arm.** `pixel_ae`: no candidate clears positively; τ = 0.3 clears negatively (z −3.25).
-`frozen_ssl`: none positive; τ = 0.3 negative (z −8.20). `random_vit`: none positive; all three
-candidates negative (z −3.10, −7.20, −8.38). §3.2 said `SHARPER_WORSE` follows when no candidate
-clears positively in two arms and some clears negatively in two or more; three of three did.
+**Per arm.** `pixel_ae`: no candidate clears positively; τ = 0.3 clears negatively (z −3.25, 2/3
+seeds). `frozen_ssl`: none positive; τ = 0.3 negative (z −8.20, 3/3). `random_vit`: none positive;
+all three candidates negative (z −3.10, −7.20, −8.38; 1/3, 2/3, 3/3). §3.2 said `SHARPER_WORSE`
+follows when no candidate clears positively in two arms and some clears negatively in two or more;
+three of three did.
 
 **The non-claims, restated as measured.** No arm was ranked against another — every contrast is
 within a cell, against its own τ = 1.0 pass on the same windows. No checkpoint was altered and no
@@ -4214,29 +4275,38 @@ cell retrained; Phase 1 is evaluation only, and the nine `world_model_*.pt` unde
 verdict stand; the gate is printed above and decided nothing. There is no τ\*, so the "best of a
 three-value grid" caveat does not arise. The KL regime was not moved, because nothing was trained.
 
-**What `SHARPER_WORSE` refutes, precisely.** It says that on these nine checkpoints, at
-`my_way_home`'s 24 validation episodes, context 5 / horizon 45, read at h = 15 on the free
-channel, sampling the prior more sharply at rollout time makes the rollout keep ahead of
-embedding-space persistence on **fewer** moved draws — monotonically in τ, in every arm and seed.
+**What `SHARPER_WORSE` refutes, precisely.** On these nine checkpoints, at `my_way_home`'s 24
+validation episodes, context 5 / horizon 45, read at h = 15 on the free channel, sampling the prior
+more sharply at rollout time makes the rollout keep ahead of embedding-space persistence on
+**fewer** moved draws — monotonically in τ, in every arm and seed.
 
-It does not say why, and §4 is explicit that it does not distinguish "the noise was doing work"
-from "this model, sampled at this temperature, is worse for another reason". The noise table
-argues for the first reading and is the most useful thing this milestone produced: removing the
-stochasticity entirely does not quiet the rollout, it lets it run away — displacement up to
-eleven-fold with the noise at exactly zero and survival roughly a third of what it was. So the
-premise M3h was built on — M3g's finding that two draws of one model separate by more than that
-model's whole imagined displacement from h = 5 — did not license the inference that the dynamics
-signal is *swamped* by sampling entropy. The entropy was a symptom of a diffuse prior, not the
-thing standing between the posterior and the prior, and a diffuse prior sampled sharply commits
-harder to a step it had no business being confident about.
+**The premise this milestone was built on was weaker than it was stated to be.** Spec §1 claimed
+that from h = 5 onward the model's own resampling noise exceeds its entire imagined motion, in
+every one of the nine cells. That comparison was a mean against a median. Like-for-like at h = 15,
+τ = 1.0: **median against median the noise exceeds the displacement in 4 of 9 cells; mean against
+mean, in 6 of 9.** Never nine, and `random_vit`/s0 reverses outright (2.392 against 3.705). The
+claim that survives is the weaker one — the two-draw noise is *comparable in size to* the whole
+imagined displacement — which is still a striking property for a dynamics model at h = 15, and
+still a reasonable thing to have investigated. Spec §1 now carries this correction inline. The
+attribution also needs fixing: the first draft of this section called it "M3g's finding", but §1
+is explicit that those figures were scratch measurements taken while designing M3h. M3g's finding
+was the stage decomposition — that the **predict** stage, the prior, is where the rollout fails.
 
-Finally, none of this is a statement that a model **trained** sharper would fail. §4 said
-`NOT_NOISE_LIMITED` would mean only that the evidence does not justify fifteen hours of training
-on that premise, and `SHARPER_WORSE` is the stronger form of the same: the evidence points the
-other way. M3g's stage decomposition already located the failure in the **predict** stage — the
-prior — and M3h has now ruled out its sampling temperature as the lever. The remaining M3g-shaped
-candidates are the ones that change what the prior *learns* rather than how it is *drawn from*:
-the dyn-KL weight, the free-bits floor's batch-and-time-mean clamp — `KL_FREE_BITS = 0.20` is
-applied to the mean over batch AND time rather than per element, so groups can sit below the floor
-while the mean clears it, and these nine cells run with 74.6–97.6 % of steps above it
-(`kl_rate_above_free_bits`, M3c records) — and action conditioning.
+**Why the result is still informative, and the direction it points.** §4 says the reading does not
+distinguish "the noise was doing work" from "this model, sampled at this temperature, is worse for
+another reason", and that remains true. But the τ = 0 endpoint argues for the first reading and is
+the most useful thing this milestone produced: removing the stochasticity entirely does not quiet
+the rollout, it lets it run away — displacement up to eleven-fold with the noise at exactly zero,
+survival at h = 15 roughly a quarter of what it was. So sampling entropy was not the thing standing
+between the posterior and the prior. It was a symptom of a **diffuse** prior, and a diffuse prior
+sampled sharply commits harder to a step it had no business being confident about.
+
+None of this says a model **trained** sharper would fail. §4 said `NOT_NOISE_LIMITED` would mean
+only that the evidence does not justify fifteen hours of training on that premise, and
+`SHARPER_WORSE` is the stronger form of the same: the evidence points the other way. M3g located
+the failure in the prior and M3h has now ruled out its sampling temperature as the lever. The
+remaining candidates are the ones that change what the prior *learns* rather than how it is *drawn
+from*: the dyn-KL weight; the free-bits floor's clamp — `KL_FREE_BITS = 0.20` is applied to the
+mean over batch AND time rather than per element, so groups can sit below the floor while the mean
+clears it, and these nine cells run with 74.6–97.6 % of steps above it (`kl_rate_above_free_bits`,
+M3c records); and action conditioning.

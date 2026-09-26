@@ -25,6 +25,12 @@ But M3g's own disclosure, and the measurements made designing this study, say th
 
 So the dynamics signal is not missing, it is swamped. M3h asks whether the rollout is noise-limited, and if it is, trains the latent sharper.
 
+> ***Corrected after the run (2026-09-26). The bolded claim above, and "every one of the nine cells has this shape", are not supported and were never measured the way they are stated.*** *The figures came from scratch measurements made while designing M3h, in which the noise column was a **mean** over windows and the imagined column a **median**. Embedding distances are strongly right-skewed, so that comparison is not like-for-like and it inflates the noise side. The shipped code carried the same mismatch under a caption reading "medians over windows" until `a80e0ed` (final review, finding C2); both reductions are now recorded for both quantities.*
+>
+> *Measured like-for-like at h = 15, τ = 1.0, over the nine cells: **median against median, the noise exceeds the imagined displacement in 4 of 9 cells; mean against mean, in 6 of 9.** Never nine. `random_vit`/s0 reverses hardest — 2.392 against 3.705, the displacement half again larger than the noise. The claim that survives, and the one that motivated the study fairly, is the weaker one: the two-draw noise is **comparable in size to** the whole imagined displacement, which is still a striking thing to be true of a dynamics model at h = 15.*
+>
+> *This does not rescue the hypothesis, and the correction cuts against the study rather than for it: M3h's result is `SHARPER_WORSE`, so a premise that was weaker than stated was pointing at a lever that does not work anyway. See `## Task 10 results` §8 in the plan.*
+
 ## 2. What it does
 
 ### 2.1 Phase 1 — the sweep (evaluation only)
