@@ -10,9 +10,12 @@ from mbfps.eval.motion import (
     K_REPORTED,
     MOTION_FAMILY,
     SEEDS_REQUIRED,
+    MotionArm,
+    MotionInputs,
     contrast_series,
     displacement,
     motion_threshold,
+    reading_displacement,
 )
 from mbfps.eval.split_gap import DECISION_H
 
@@ -71,12 +74,6 @@ def test_contrast_refuses_mismatched_shapes():
     with pytest.raises(ValueError, match="same shape"):
         contrast_series(np.zeros((3, 2)), np.zeros((4, 2)))
 
-
-from mbfps.eval.motion import (
-    MotionArm,
-    MotionInputs,
-    reading_displacement,
-)
 
 Z = 2.5820
 
