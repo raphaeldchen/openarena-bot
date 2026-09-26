@@ -282,6 +282,14 @@ def latent_description(post_logits, prior_logits) -> dict:
         raise ValueError(
             f"expected (n, steps, groups, classes); got post {post.shape}, prior {prior.shape}"
         )
+    # The two describe the SAME windows, so a shape disagreement is a wiring
+    # bug upstream, not an input this should average over. Task 6 builds these
+    # from one `observe` pass; if they ever differ, the pass was mis-sliced and
+    # every recorded number below would describe two different things.
+    if post.shape != prior.shape:
+        raise ValueError(
+            f"post {post.shape} and prior {prior.shape} must describe the same windows"
+        )
     entropy = entropy_by_group(post)
     modes = post.argmax(axis=-1)                       # (n, steps, groups)
     changes = (modes[:, 1:, :] != modes[:, :-1, :]).any(axis=1)   # (n, groups)

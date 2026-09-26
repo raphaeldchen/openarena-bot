@@ -340,6 +340,16 @@ def test_live_groups_is_zero_for_a_latent_that_never_moves():
     assert latent_description(post, post)["live_groups"] == pytest.approx(0.0)
 
 
+def test_the_description_refuses_a_posterior_and_prior_of_different_shapes():
+    """They describe the same windows, so a disagreement is a wiring bug in
+    the pass that produced them -- and averaging over it anyway would report
+    two different things under one cell's name."""
+    post = _logits([[0, 1]])
+    prior = np.zeros((1, 1, 3, 4))
+    with pytest.raises(ValueError, match="same windows"):
+        latent_description(post, prior)
+
+
 def test_the_description_reads_the_prior_separately_from_the_posterior():
     """A swapped argument is the defect this catches: the two are different
     distributions here, so transposing them changes both top-1 masses."""
