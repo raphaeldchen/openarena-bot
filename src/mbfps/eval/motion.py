@@ -202,3 +202,51 @@ def reading_displacement(inputs: MotionInputs) -> MotionStatus:
         ),
         arms_up=up, arms_down=down, leaked=(),
     )
+
+
+# The reading table's columns, in printed order. Declared once so a test can
+# assert the header against THIS and the rows against the same index -- the
+# caption-column pairing that three shipped defects on this project all broke.
+READING_COLUMNS: tuple[str, ...] = (
+    "arm", "estimate", "se", "z", "up", "dn", "clears",
+)
+
+
+def format_reading_displacement(reading: MotionStatus, inputs: MotionInputs) -> str:
+    """Reading D as it is printed and written to `motion.txt`, byte for byte.
+
+    The caption names the reduction and the horizon, because a table whose
+    header does not say what its columns hold is how this project has shipped
+    a wrong number three times.
+    """
+    lines = [
+        f"--- Reading D: does the latent encode displacement at k = {inputs.k} "
+        f"(per-window ||true|| - ||predicted - true||, map units, against staying put); "
+        f"z_fam = {inputs.z_fam:.2f} over {inputs.clusters} clusters ---",
+        "  " + "".join(
+            f"{name:>{width}}" for name, width in zip(
+                READING_COLUMNS, (12, 11, 8, 8, 6, 6, 8), strict=True,
+            )
+        ),
+    ]
+    for arm in sorted(inputs.arms):
+        cell = inputs.arms[arm]
+        if cell.clears_up(inputs.z_fam):
+            clears = "up"
+        elif cell.clears_down(inputs.z_fam):
+            clears = "down"
+        else:
+            clears = "no"
+        lines.append(
+            f"  {arm:>12}{cell.estimate:>11.4f}{cell.se:>8.4f}{cell.z:>8.2f}"
+            f"{f'{cell.seeds_up}/{cell.seeds_total}':>6}"
+            f"{f'{cell.seeds_down}/{cell.seeds_total}':>6}{clears:>8}"
+        )
+    lines.append(
+        "  control (permuted pairing, cannot carry signal): "
+        + ", ".join(
+            f"{arm} z={inputs.control[arm].z:+.2f}" for arm in sorted(inputs.control)
+        )
+    )
+    lines.append(f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}")
+    return "\n".join(lines) + "\n"

@@ -9,11 +9,13 @@ from mbfps.eval.motion import (
     CONTROL_SEED,
     K_REPORTED,
     MOTION_FAMILY,
+    READING_COLUMNS,
     SEEDS_REQUIRED,
     MotionArm,
     MotionInputs,
     contrast_series,
     displacement,
+    format_reading_displacement,
     motion_threshold,
     reading_displacement,
 )
@@ -182,3 +184,56 @@ def test_the_rule_sentence_names_the_horizon_it_was_decided_at():
     reading = reading_displacement(_inputs({
         "pixel_ae": _arm(0.1), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.1)}, k=15))
     assert "k = 15" in reading.rule
+
+
+def test_every_column_header_is_printed_in_the_declared_order():
+    """The caption-column pairing, pinned. Three defects of this exact class
+    have shipped on this project and every one was caught by a person reading
+    output rather than by a test."""
+    arms = {"pixel_ae": _arm(3.0, up=2), "frozen_ssl": _arm(4.1, up=3), "random_vit": _arm(1.0)}
+    text = format_reading_displacement(reading_displacement(_inputs(arms)), _inputs(arms))
+    header = next(line for line in text.splitlines() if "estimate" in line)
+    assert header.split() == list(READING_COLUMNS)
+
+
+def test_each_arms_row_carries_its_own_numbers_under_those_headers():
+    """A swapped column is the defect this pins: the seed tallies differ
+    between the arms here, so up/down transposed or an arm's row taking its
+    neighbour's numbers both fail."""
+    arms = {
+        "pixel_ae": _arm(3.0, up=2, down=0),
+        "frozen_ssl": _arm(-4.1, up=0, down=3),
+        "random_vit": _arm(1.0, up=1, down=0),
+    }
+    inputs = _inputs(arms)
+    text = format_reading_displacement(reading_displacement(inputs), inputs)
+    rows = {line.split()[0]: line.split() for line in text.splitlines()
+            if line.strip().startswith(("pixel_ae", "frozen_ssl", "random_vit"))}
+    cols = list(READING_COLUMNS)
+    assert rows["pixel_ae"][cols.index("z")] == "3.00"
+    assert rows["pixel_ae"][cols.index("up")] == "2/3"
+    assert rows["pixel_ae"][cols.index("dn")] == "0/3"
+    assert rows["frozen_ssl"][cols.index("z")] == "-4.10"
+    assert rows["frozen_ssl"][cols.index("up")] == "0/3"
+    assert rows["frozen_ssl"][cols.index("dn")] == "3/3"
+
+
+def test_the_table_prints_the_status_and_its_rule():
+    arms = {"pixel_ae": _arm(-3.3, up=0, down=2), "frozen_ssl": _arm(-4.0, up=0, down=3),
+            "random_vit": _arm(-0.5)}
+    inputs = _inputs(arms)
+    text = format_reading_displacement(reading_displacement(inputs), inputs)
+    assert "NO MOTION" in text
+    assert "decided by:" in text
+    assert text.endswith("\n")
+
+
+def test_a_suppressed_reading_prints_the_control_and_no_verdict_row():
+    """UNRESOLVED_CONTROL must not print a table a reader could mistake for a
+    result."""
+    arms = {"pixel_ae": _arm(3.0, up=2), "frozen_ssl": _arm(4.1, up=3), "random_vit": _arm(1.0)}
+    control = {"pixel_ae": _arm(0.1), "frozen_ssl": _arm(3.9), "random_vit": _arm(0.2)}
+    inputs = _inputs(arms, control=control)
+    text = format_reading_displacement(reading_displacement(inputs), inputs)
+    assert "UNRESOLVED CONTROL" in text
+    assert "MOTION ENCODED" not in text
