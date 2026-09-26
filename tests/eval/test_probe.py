@@ -979,7 +979,9 @@ def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
     paths = _write_episodes(tmp_path, [20])
     data = _gather(paths, head_width=7, context=2, horizon=3)
 
-    assert set(data) == {"latent", "embedding", "encoder_embedding", "targets"}
+    assert set(data) == {
+        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+    }
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
     assert data["encoder_embedding"].shape == (20, 1), (
@@ -995,6 +997,39 @@ def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
                                atol=1e-4)
     np.testing.assert_allclose(data["targets"][:, 0],
                                DX * data["encoder_embedding"][:, 0], atol=1e-4)
+
+
+def test_gather_probe_data_labels_every_row_with_its_window_and_step(tmp_path):
+    """M3i reconstructs per-window trajectories from these rows, which needs
+    the window each row came from and its order inside that window. Without
+    them a caller has to reshape on an undocumented regularity."""
+    paths = _write_episodes(tmp_path, [20, 20])
+    data = _gather(paths, context=2, horizon=3)
+    n = data["latent"].shape[0]
+    window, step = data["window"], data["step"]
+
+    assert window.shape == (n,) and step.shape == (n,)
+    assert window.dtype.kind == "i" and step.dtype.kind == "i"
+    # Every window contributes exactly context + horizon rows, in order.
+    assert set(np.unique(step).tolist()) == set(range(2 + 3))
+    for w in np.unique(window):
+        rows = step[window == w]
+        assert rows.tolist() == list(range(2 + 3)), f"window {w} is not in step order"
+    # The indices are row-aligned with the payload, not a separate ordering.
+    assert data["targets"].shape[0] == n and data["encoder_embedding"].shape[0] == n
+
+
+def test_gather_probe_data_leaves_the_four_original_arrays_unchanged(tmp_path):
+    """The indices are ADDITIVE. `fit_probes` and every existing caller read
+    the four original keys and must see byte-identical arrays."""
+    paths = _write_episodes(tmp_path, [20, 20])
+    first = _gather(paths, context=2, horizon=3)
+    second = _gather(paths, context=2, horizon=3)
+    for key in ("latent", "embedding", "encoder_embedding", "targets"):
+        np.testing.assert_array_equal(first[key], second[key], err_msg=key)
+    assert set(first) == {
+        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+    }
 
 
 def test_gather_probe_data_skips_episodes_too_short_for_one_window(tmp_path):

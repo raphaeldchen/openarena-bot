@@ -192,7 +192,7 @@ def gather_probe_data(
     prevent. What is matched here is the filtering DEPTH, which is what the
     three references actually share.
 
-    Returns four row-aligned arrays:
+    Returns six row-aligned arrays:
 
     - `"latent"` `(N, LATENT)` -- the posterior latent.
     - `"embedding"` `(N, EMBED)` -- the model's PREDICTED embedding, i.e.
@@ -200,6 +200,12 @@ def gather_probe_data(
     - `"encoder_embedding"` `(N, ENC)` -- the RAW encoder output for the same
       frames, before the RSSM and before the head.
     - `"targets"` `(N, 4)`.
+    - `"window"` `(N,)` int -- a 0-based index identifying which window each
+      row came from.
+    - `"step"` `(N,)` int -- the 0-based position of the row within its
+      window, `0 .. context + horizon - 1`. M3i reconstructs per-window
+      trajectories from these two so it can compute displacement WITHIN a
+      window; every earlier caller ignores them.
 
     THE TWO EMBEDDINGS ARE NOT REDUNDANT AND MUST NOT BE COLLAPSED INTO ONE.
     They answer different questions, and each is the wrong array for the
@@ -234,6 +240,9 @@ def gather_probe_data(
     torch.manual_seed(seed)
     need = context + horizon
     latents, embeddings, encoder_embeddings, targets = [], [], [], []
+    windows: list[np.ndarray] = []
+    steps: list[np.ndarray] = []
+    window_index = 0
 
     for path in list(paths)[:limit]:
         episode = load_episode(path)
@@ -280,6 +289,10 @@ def gather_probe_data(
                     episode.privileged_keys,
                 )
             )
+            rows = int(latent.shape[1])
+            windows.append(np.full(rows, window_index, dtype=np.int64))
+            steps.append(np.arange(rows, dtype=np.int64))
+            window_index += 1
 
     if not latents:
         raise ValueError(
@@ -291,6 +304,11 @@ def gather_probe_data(
         "embedding": np.concatenate(embeddings),
         "encoder_embedding": np.concatenate(encoder_embeddings),
         "targets": np.concatenate(targets),
+        # Row-aligned with the four arrays above: which window each row came
+        # from and its order within that window. M3i reconstructs per-window
+        # trajectories from these; every earlier caller ignores them.
+        "window": np.concatenate(windows),
+        "step": np.concatenate(steps),
     }
 
 
