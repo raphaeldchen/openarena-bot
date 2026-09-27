@@ -21,8 +21,9 @@ displacement cannot beat it whatever the prior does.
             against the persistence baseline (`contrast_series`); and score
             the same probe again with the latent->displacement pairing
             PERMUTED. One record per cell.
-  read      (Task 7) pool the records, decide Reading D at `DECISION_H`, print
-            the tables and write motion.txt.
+  read      pool those records per arm -- treatment and control by the SAME
+            route -- decide Reading D at `DECISION_H`, print the self-check,
+            descriptive and per-k tables beside it, and write motion.txt.
 
 Evaluation only: no training, no checkpoint written or altered.
 
@@ -43,8 +44,14 @@ THE CHECKS, BY PHASE, each with its own status:
                                           reproduces the record's curve.
             EXIT_SELF_CHECK_FAILED (30)   the pass does not reproduce the cell's
                                           diagnostic within the bound.
-  read:     EXIT_CONTROL_LEAKED (38)      NEW. the permuted control cleared the
-                                          bar, so no reading is taken (Task 7).
+  read:     EXIT_NO_CHECKPOINTS (11)      a requested cell has no motion record,
+                                          named before any number is pooled.
+            EXIT_CONTROL_LEAKED (38)      NEW. the permuted control cleared the
+                                          bar, so no reading is taken -- and NO
+                                          motion.txt is written, because a
+                                          suppressed reading must not leave an
+                                          artefact a later reader mistakes for
+                                          a result.
 
 0 / 11 / 12 / 14 / 30 carry `trust_horizon.py`'s meanings on purpose; 38 is in
 no other tool's range (run_study 1/3-6/23, report_study 7-10, spike 10,
@@ -124,6 +131,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import mbfps.eval.pooling as pooling
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
@@ -131,9 +139,17 @@ from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.motion import (
     CONTROL_SEED,
     K_REPORTED,
+    MOTION_FAMILY,
+    SEEDS_REQUIRED,
+    MotionArm,
+    MotionInputs,
+    MotionStatus,
     contrast_series,
     displacement,
+    format_reading_displacement,
     latent_description,
+    motion_threshold,
+    reading_displacement,
 )
 from mbfps.eval.probe import (
     PROBE_EPISODE_LIMIT,
@@ -142,8 +158,9 @@ from mbfps.eval.probe import (
     gather_probe_data,
     probe_episodes,
 )
+from mbfps.eval.split_gap import DECISION_H, fmt_z
 from mbfps.eval.stages import information
-from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.utils.config import ARMS
 from mbfps.utils.device import get_device
 
@@ -175,7 +192,7 @@ EXIT_CONTROL_LEAKED = 38
 signal, so a control that clears means the instrument is reading structure
 that is not there -- and no reading is taken."""
 
-PHASES: tuple[str, ...] = ("measure",)
+PHASES: tuple[str, ...] = ("measure", "read", "all")
 
 SELECT_EPISODES: int = 4
 """How many of `PROBE_EPISODE_LIMIT`'s training episodes are held back to
@@ -625,6 +642,331 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
 
 
 # ---------------------------------------------------------------------------
+# read: the records pooled into Reading D.
+# ---------------------------------------------------------------------------
+
+
+def load_motion(out_dir: Path, arms, seeds) -> dict:
+    """Every planned cell's record, keyed by `(arm, seed)` -- or `CellMissing`
+    naming the first that is not on disk.
+
+    Named, never skipped: a pool over the cells that happen to be present,
+    printed under the nine cells' names, is exactly the failure
+    `pooling.MissingCell` exists for. A record whose own `arm`/`seed` disagree
+    with the file it was read under is refused too -- a swapped pair of files
+    pools one cell under another's name with every count still right.
+    """
+    records: dict[tuple[str, int], dict] = {}
+    for arm in arms:
+        for seed in seeds:
+            path = motion_record_path(out_dir, arm, int(seed))
+            if not path.exists():
+                raise CellMissing(
+                    f"{arm} seed {int(seed)}: no motion record at {path}; "
+                    "run --phase measure first"
+                )
+            record = load_record(path)
+            if record.get("arm") != arm or int(record.get("seed", -1)) != int(seed):
+                raise ValueError(
+                    f"{path.name} was read for {arm} seed {int(seed)} but its record says "
+                    f"arm={record.get('arm')!r} seed={record.get('seed')!r}"
+                )
+            records[(arm, int(seed))] = record
+    return records
+
+
+def require_one_protocol(records: dict) -> None:
+    """Every record reports the same horizons on the same windows, or the two
+    that disagree are named with the field.
+
+    `pooling.require_compatible` runs inside `pool_arm` and already refuses a
+    pool over cells of ONE arm that did not score the same windows. It never
+    sees two arms together here, because the arms are pooled separately and
+    only their z's meet in the reading -- so the CROSS-ARM identity has no
+    other backstop, and `clusters` (the one number `z_fam` is read against)
+    would silently become whichever arm was pooled last. The `ks` grid is
+    checked with it: a record measured at another grid either has no entry at
+    the horizon this decides on, or has one at a k the others never reported.
+    """
+    items = sorted(records.items())
+    if not items:
+        raise ValueError("no motion record to read")
+    (first_cell, first) = items[0]
+    for cell, record in items[1:]:
+        for field, pick in (
+            ("ks", lambda r: list(r["ks"])),
+            ("windows.episode", lambda r: list(r["windows"]["episode"])),
+            ("episodes.val", lambda r: list(r["episodes"]["val"])),
+            ("context", lambda r: int(r["context"])),
+            ("horizon", lambda r: int(r["horizon"])),
+            ("device", lambda r: str(r["device"])),
+            ("torch_version", lambda r: str(r["torch_version"])),
+        ):
+            mine, theirs = pick(record), pick(first)
+            if mine != theirs:
+                shown = (
+                    f" ({len(mine)} vs {len(theirs)} windows)" if field == "windows.episode"
+                    else f": {mine!r} vs {theirs!r}"
+                )
+                raise ValueError(
+                    f"{cell[0]} seed {cell[1]} and {first_cell[0]} seed {first_cell[1]} "
+                    f"disagree on {field}{shown}; they are not one measurement and their "
+                    "arms cannot be read against one bar"
+                )
+
+
+def _arm_from_pool(pooled: pooling.PooledMean, cells) -> MotionArm:
+    """One arm's `MotionArm`: the pooled estimate with its episode-clustered
+    standard error, and the seed tallies counted PER SEED.
+
+    `seeds_up` / `seeds_down` are the number of this arm's cells whose OWN
+    per-seed z clears `+-z_fam` -- each cell pooled alone, that seed's windows
+    clustered by episode, which is `trust_horizon`'s `per_seed` idiom and
+    `_pooled_mean`'s shape. Reading them off the POOLED z instead would make
+    every arm read 0/3 or 3/3 by construction, and `MotionArm.clears_up`'s
+    replication clause -- the requirement that an arm hold in at least
+    `SEEDS_REQUIRED` of its seeds -- would stop binding on anything.
+
+    The bar is recomputed here from `pooled.clusters` rather than passed in,
+    so an arm's tallies are read against the same threshold its row is: every
+    cell scores the same windows (`require_one_protocol`) and every window
+    counts, so this is the one cluster count in the file.
+    """
+    z_fam = motion_threshold(int(pooled.clusters))
+    per_seed = [pooling.pool_arm([cell]).z for cell in cells]
+    return MotionArm(
+        estimate=float(pooled.mean),
+        se=float(pooled.se),
+        z=float(pooled.z),
+        seeds_up=int(sum(z >= z_fam for z in per_seed)),
+        seeds_down=int(sum(z <= -z_fam for z in per_seed)),
+        seeds_total=len(cells),
+    )
+
+
+def motion_inputs(records: dict, k: int) -> MotionInputs:
+    """The per-cell records reduced to what Reading D is decided on at `k`.
+
+    TREATMENT AND CONTROL ARE BUILT THE SAME WAY -- both through `cell_series`
+    onto the record's own `windows.episode`, then `pool_arm`, then
+    `_arm_from_pool` -- differing only in which of the record's two per-window
+    series goes in. That is what makes the control a control, rather than a
+    differently-computed number that happens to be called one: anything that
+    moves the treatment's number by a route other than the data moves the
+    control's identically, and the comparison survives it.
+    """
+    key = k_key(k)
+    arms: dict[str, MotionArm] = {}
+    control: dict[str, MotionArm] = {}
+    clusters = 0
+    for arm in sorted({a for a, _ in records}):
+        treat_cells, ctrl_cells = [], []
+        for (a, seed), record in sorted(records.items()):
+            if a != arm:
+                continue
+            if key not in record["k"]:
+                raise KeyError(
+                    f"{arm} seed {seed}: no {key!r} entry; the record was measured at "
+                    f"ks={list(record['ks'])}"
+                )
+            entry = record["k"][key]
+            # EVERY VALIDATION WINDOW COUNTS, which is why the mask is all
+            # ones rather than an oversight. `changed` exists in the trust and
+            # ladder readings to drop windows an intervention left untouched,
+            # where the recorded delta is an exact zero that is no
+            # measurement. There is no such category here: the contrast is
+            # `||true|| - ||predicted - true||`, defined at every window,
+            # including one whose true displacement is the zero vector -- and
+            # there it reads `-||predicted||`, a real penalty on the probe for
+            # claiming motion that did not happen. Masking those out would
+            # drop precisely the windows the persistence baseline is hardest
+            # to beat on and read the latent against an easier question. The
+            # series is also paired POSITIONALLY with `windows.episode`
+            # (`cell_series`' contract), so the rows must stay the record's
+            # own, in the record's own order, neither filtered nor reordered.
+            changed = np.ones(len(entry["contrast"]), dtype=bool)
+            treat_cells.append(cell_series(
+                arm, seed, "displacement",
+                np.asarray(entry["contrast"], dtype=float), changed, record,
+            ))
+            ctrl_cells.append(cell_series(
+                arm, seed, "displacement",
+                np.asarray(entry["control"], dtype=float), changed, record,
+            ))
+        treat, ctrl = pooling.pool_arm(treat_cells), pooling.pool_arm(ctrl_cells)
+        clusters = int(treat.clusters)
+        arms[arm] = _arm_from_pool(treat, treat_cells)
+        control[arm] = _arm_from_pool(ctrl, ctrl_cells)
+    return MotionInputs(
+        arms=arms,
+        control=control,
+        z_fam=motion_threshold(clusters),
+        k=int(k),
+        clusters=clusters,
+    )
+
+
+# ---------------------------------------------------------------------------
+# read: the tables.
+# ---------------------------------------------------------------------------
+
+
+def _self_check_table(records: dict) -> str:
+    """What this script's own pass reproduced, per cell. A reading is only as
+    good as the pass under it, so the operator sees the deltas rather than a
+    boolean that was decided somewhere out of sight."""
+    lines = [
+        "--- self-check per record: this script's pass against the cell's diagnostic "
+        "(mbfps.eval.reproduction's bound, spec 2.4), and the windows it was scored on ---",
+        f"  {'arm':<12}{'seed':>5}{'step':>8}{'ref max|d|':>12}{'pers max|d|':>13}"
+        f"{'windows':>9}{'clusters':>10}  ok",
+    ]
+    for (arm, seed), record in sorted(records.items()):
+        check = record["self_check"]
+        lines.append(
+            f"  {arm:<12}{int(seed):>5}{int(record['step']):>8}"
+            f"{fmt_z(float(check['reference_position_max_delta']), '.1e'):>12}"
+            f"{fmt_z(float(check['persistence_position_max_delta']), '.1e'):>13}"
+            f"{int(record['windows']['total']):>9}"
+            f"{len(set(record['windows']['episode'])):>10}"
+            f"  {'yes' if check['ok'] else 'NO'}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _description_table(records: dict) -> str:
+    """Spec 2.3's descriptive block, reported and deciding nothing. `live` is
+    the MEDIAN over windows of how many groups change argmax within a window
+    -- the spec's reduction, named in the caption because a mean printed under
+    a caption that says median is how M3h shipped a premise it never
+    measured."""
+    lines = [
+        "--- the latent, described (spec 2.3; reported, deciding nothing): mean posterior "
+        "entropy per group against its own ln(classes) ceiling; `live` = the MEDIAN over "
+        "windows of how many of `groups` change argmax within the window; top-1 mass for the "
+        "posterior and the teacher-forced prior; KL(post || teacher prior) per window, nats ---",
+        f"  {'arm':<12}{'seed':>5}{'entropy':>9}{'ln(C)':>8}{'live':>7}{'groups':>8}"
+        f"{'top1 post':>11}{'top1 prior':>12}{'KL mean':>9}{'KL med':>9}",
+    ]
+    for (arm, seed), record in sorted(records.items()):
+        d, info = record["description"], record["information"]
+        lines.append(
+            f"  {arm:<12}{int(seed):>5}"
+            f"{fmt_z(float(d['entropy_mean']), '.3f'):>9}"
+            f"{fmt_z(float(d['entropy_max']), '.3f'):>8}"
+            f"{fmt_z(float(d['live_groups']), '.1f'):>7}"
+            f"{len(d['entropy_by_group']):>8}"
+            f"{fmt_z(float(d['top1_posterior']), '.3f'):>11}"
+            f"{fmt_z(float(d['top1_prior']), '.3f'):>12}"
+            f"{fmt_z(float(info['mean']), '.3f'):>9}"
+            f"{fmt_z(float(info['median']), '.3f'):>9}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _per_k_table(per_k: dict, decision_h: int) -> str:
+    """Every reported horizon, with the one that decides marked as such.
+
+    The `decides` column is the whole point of printing the others: M3i is
+    read at `DECISION_H` alone, exactly as the M3 gate is, and a table of five
+    horizons with no column saying which one was decided on is a table whose
+    reader picks the horizon that suits them.
+    """
+    lines = [
+        "--- the displacement contrast per reported horizon (per-window ||true|| - "
+        "||predicted - true||, map units, against staying put; seeds averaged per window, "
+        f"episode-clustered); `ctl z` is the permuted pairing's; k = {int(decision_h)} DECIDES "
+        "and every other k is reported and decides nothing ---",
+        f"  {'k':<6}{'arm':<12}{'estimate':>12}{'se':>9}{'z':>8}{'up':>7}{'dn':>7}"
+        f"{'ctl z':>9}{'decides':>9}",
+    ]
+    for k, inputs in sorted(per_k.items()):
+        for arm in sorted(inputs.arms):
+            a, c = inputs.arms[arm], inputs.control[arm]
+            lines.append(
+                f"  {f'k={int(k)}':<6}{arm:<12}"
+                f"{fmt_z(a.estimate, '+.4f'):>12}{fmt_z(a.se, '.4f'):>9}{fmt_z(a.z):>8}"
+                f"{f'{a.seeds_up}/{a.seeds_total}':>7}{f'{a.seeds_down}/{a.seeds_total}':>7}"
+                f"{fmt_z(c.z):>9}"
+                f"{('yes' if int(k) == int(decision_h) else 'no'):>9}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _pooling_caption(inputs: MotionInputs) -> str:
+    return (
+        f"  pooling: z_fam = cluster_threshold({MOTION_FAMILY}, {inputs.clusters}) = "
+        f"{inputs.z_fam:.2f}; each arm's contrast is a per-window series pooled over its seeds "
+        "(seeds averaged per window, episode-clustered), and an arm clears pooled AND in at "
+        f"least {SEEDS_REQUIRED} of its own seeds. EVERY validation window counts -- unlike "
+        "the trust readings there is no 'moved' mask, because the contrast is a measurement "
+        "at every window, including one whose true displacement is zero. The control is the "
+        "SAME predictions read against another window's displacement, pooled by the same "
+        "route, and it decides nothing except whether a reading is taken at all.\n"
+    )
+
+
+def motion_text(records: dict, per_k: dict, inputs: MotionInputs, reading: MotionStatus) -> str:
+    """Everything `read` prints, in `stages.txt`'s style; written to
+    `motion.txt` byte-identical -- see `read_phase` for the one case in which
+    it is not written at all."""
+    return "".join([
+        _self_check_table(records),
+        _description_table(records),
+        _per_k_table(per_k, inputs.k),
+        _pooling_caption(inputs),
+        format_reading_displacement(reading, inputs),
+    ])
+
+
+def write_text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def read_phase(args) -> int:
+    """Pool every requested cell (11 names the first missing), decide Reading
+    D at `DECISION_H`, print the tables -- and write `motion.txt` only if the
+    control did not leak.
+
+    THE FORMATTER STILL PRINTS THE PER-ARM ROWS ON A LEAK, and that is
+    deliberate: an operator debugging a control that cleared needs to see the
+    numbers it cleared beside. The suppression is purely the file: exit 38
+    leaves no `motion.txt` for a later reader -- or a later milestone's quote
+    -- to mistake for a result.
+    """
+    try:
+        records = load_motion(args.out, args.arms, [int(s) for s in args.seeds])
+    except CellMissing as error:
+        print(f"NO CELL: {error}")
+        return EXIT_NO_CHECKPOINTS
+    require_one_protocol(records)
+    ks = [int(k) for k in next(iter(records.values()))["ks"]]
+    if DECISION_H not in ks:
+        raise ValueError(
+            f"these records were measured at ks={ks}, which does not include the "
+            f"pre-registered DECISION_H = {DECISION_H}. Reading D is decided there and "
+            "nowhere else, so it is refused rather than taken at a neighbouring horizon "
+            "that would then be read as this one."
+        )
+    per_k = {k: motion_inputs(records, k) for k in ks}
+    inputs = per_k[DECISION_H]
+    reading = reading_displacement(inputs)
+    text = motion_text(records, per_k, inputs, reading)
+    print(text, end="")
+    if reading.status == "UNRESOLVED_CONTROL":
+        print(
+            f"\nCONTROL LEAKED at k = {inputs.k}: {reading.rule}. No reading is taken and no "
+            f"{args.out / 'motion.txt'} is written -- a suppressed reading must not leave an "
+            "artefact a later reader mistakes for a result."
+        )
+        return EXIT_CONTROL_LEAKED
+    write_text(args.out / "motion.txt", text)
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -655,6 +997,10 @@ def main(argv: list[str] | None = None, *, ks=K_REPORTED) -> int:
         buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
         train, val = episode_split(buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED)
         status = measure_phase(args, cells, device, train, val, ks=ks)
+        if status != EXIT_OK:
+            return status
+    if args.phase in ("read", "all"):
+        status = read_phase(args)
         if status != EXIT_OK:
             return status
     return EXIT_OK

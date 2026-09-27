@@ -27,9 +27,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import mbfps.eval.pooling as pooling
 from mbfps.eval.motion import K_REPORTED, contrast_series, displacement
 from mbfps.eval.probe import fit_probes
-from mbfps.eval.study import StudyJob, load_record, run_job
+from mbfps.eval.study import StudyJob, load_record, run_job, write_record
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
@@ -676,3 +677,216 @@ def test_the_record_path_names_both_the_arm_and_the_seed(tmp_path):
     }
     assert len(paths) == len(script.ARMS) * len(script.SEEDS)
     assert script.motion_record_path(tmp_path, "pixel_ae", 0).name == "motion_pixel_ae_seed0.json"
+
+
+# ---------------------------------------------------------------------------
+# read: pooling the records into Reading D (Task 7).
+# ---------------------------------------------------------------------------
+#
+# THREE OF THE BRIEF'S READ-PHASE ASSERTIONS DO NOT DESCRIBE THIS FIXTURE, and
+# are written here against what it actually holds:
+#
+#   * the records are under `--out` (`ref.motion`), never under `ref.out`,
+#     which is the M3c STUDY directory the checkpoints are read from. The
+#     brief's `measured.out` would look for `motion_*.json` beside the
+#     checkpoints and find none.
+#   * the fixture measures ONE cell (`--arms random_vit --seeds 1`), so
+#     `load_motion(..., ARMS, SEEDS)` would refuse eight cells that were never
+#     measured, and `set(inputs.arms) == set(ARMS)` cannot hold.
+#   * the fixture's grid is `KS = (1, 5, 15)`, the largest its horizon of 15
+#     can carry, so k = 30 and k = 45 are not in these records and no honest
+#     table can print them. The "reported, deciding nothing" horizons here are
+#     1 and 5.
+#
+# And the brief's orientation assertion -- `arms[a].z != control[a].z` -- is
+# kept but is NOT the test of the orientation: swapping `arms=` and `control=`
+# leaves two unequal numbers unequal. The orientation is pinned BY VALUE below.
+
+
+def _series(record, key, k=15):
+    return np.asarray(record["k"][f"k{k}"][key], dtype=float)
+
+
+def _rewrite(path, record):
+    """A doctored record back to disk. `load_record` restores the `nonfinite`
+    map it read, and `write_record` refuses a record that already carries one
+    under the name it writes it under -- so it is dropped here and rebuilt."""
+    record.pop("nonfinite", None)
+    write_record(path, record)
+
+
+def _pooled_z(record, key, arm=JOB.arm, seed=JOB.seed, k=15):
+    """The pooled z of one of the record's own per-window series, recomputed
+    in the test by the route the script is supposed to take: `cell_series`
+    onto `windows.episode`, then `pool_arm`. Independent of which slot the
+    script put it in, which is what makes it a check of the orientation."""
+    values = _series(record, key, k)
+    cell = trust.cell_series(
+        arm, seed, key, values, np.ones(values.size, dtype=bool), record,
+    )
+    return pooling.pool_arm([cell]).z
+
+
+def test_the_reading_is_built_from_the_records_treatment_and_control(measured):
+    """The orientation, pinned by value. A swapped treatment and control would
+    invert the verdict, and no shape check would notice -- nor would an
+    inequality between the two, since both stay unequal after a swap."""
+    records = script.load_motion(measured.motion, [JOB.arm], [JOB.seed])
+    inputs = script.motion_inputs(records, k=15)
+    assert set(inputs.arms) == {JOB.arm}
+    assert set(inputs.control) == {JOB.arm}
+    assert inputs.k == 15
+    assert inputs.clusters == CLUSTERS
+    assert inputs.z_fam == pytest.approx(script.motion_threshold(inputs.clusters))
+
+    record = records[(JOB.arm, JOB.seed)]
+    # One seed and every window kept, so the pooled estimate IS the mean of
+    # the record's own series -- the plainest statement of which series went
+    # into which slot.
+    assert inputs.arms[JOB.arm].estimate == pytest.approx(_series(record, "contrast").mean())
+    assert inputs.control[JOB.arm].estimate == pytest.approx(_series(record, "control").mean())
+    assert inputs.arms[JOB.arm].z == pytest.approx(_pooled_z(record, "contrast"))
+    assert inputs.control[JOB.arm].z == pytest.approx(_pooled_z(record, "control"))
+    # The control is the PERMUTED series, so it must differ from the treatment
+    # (it is bitwise equal on a straight path -- hence `curved_buffer`).
+    for arm in inputs.arms:
+        assert inputs.arms[arm].z != inputs.control[arm].z
+
+
+def test_the_treatment_and_the_control_are_pooled_by_the_same_route(measured):
+    """A control computed differently from the treatment is not a control: it
+    is a differently-computed number that happens to be called one. So the two
+    slots must agree with the SAME recomputation, differing only in which of
+    the record's series went in."""
+    records = script.load_motion(measured.motion, [JOB.arm], [JOB.seed])
+    inputs = script.motion_inputs(records, k=15)
+    record = records[(JOB.arm, JOB.seed)]
+    for slot, key in ((inputs.arms, "contrast"), (inputs.control, "control")):
+        values = _series(record, key)
+        cell = trust.cell_series(
+            JOB.arm, JOB.seed, key, values, np.ones(values.size, dtype=bool), record,
+        )
+        pooled = pooling.pool_arm([cell])
+        assert slot[JOB.arm].estimate == pytest.approx(pooled.mean)
+        assert slot[JOB.arm].se == pytest.approx(pooled.se)
+        assert slot[JOB.arm].z == pytest.approx(pooled.z)
+        assert slot[JOB.arm].seeds_total == 1
+
+
+def test_the_seed_tallies_are_counted_per_seed_and_not_off_the_pooled_z(measured):
+    """`seeds_up` / `seeds_down` are the arm's cells whose OWN per-seed z
+    clears the bar. Read off the pooled z instead, every arm would read 0/n or
+    n/n and `MotionArm.clears_up`'s replication clause would stop binding.
+
+    One cell here, so the per-seed z IS the pooled one -- which is exactly why
+    the tally is asserted against the per-seed rule and against the bar, not
+    against the pooled number it happens to equal.
+    """
+    records = script.load_motion(measured.motion, [JOB.arm], [JOB.seed])
+    inputs = script.motion_inputs(records, k=15)
+    arm = inputs.arms[JOB.arm]
+    own = _pooled_z(records[(JOB.arm, JOB.seed)], "contrast")
+    assert arm.seeds_total == 1
+    assert arm.seeds_up == int(own >= inputs.z_fam)
+    assert arm.seeds_down == int(own <= -inputs.z_fam)
+    assert arm.seeds_up + arm.seeds_down <= 1
+
+
+def test_a_leaking_control_is_exit_38_and_writes_no_reading(measured, capsys):
+    """The gate, in code. Doctoring the control to clear the bar must refuse
+    before any verdict is printed."""
+    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
+    record = load_record(path)
+    entry = record["k"]["k15"]
+    entry["control"] = [x + 500.0 for x in entry["contrast"]]
+    _rewrite(path, record)
+    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_CONTROL_LEAKED
+    out = capsys.readouterr().out
+    assert "UNRESOLVED CONTROL" in out
+    assert "MOTION ENCODED" not in out and "NO MOTION" not in out
+    assert not (measured.motion / "motion.txt").exists()
+
+
+def test_read_writes_motion_txt_byte_identical_to_what_it_printed(measured, capsys):
+    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+    printed = capsys.readouterr().out
+    written = (measured.motion / "motion.txt").read_text()
+    assert written == printed, "motion.txt must be what the reader saw"
+
+
+def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(measured, capsys):
+    """Only k = 15 decides. The other horizons are printed and decide nothing,
+    exactly as the M3 gate is.
+
+    The binding half is the SECOND run: a control doctored to leak at k = 1 --
+    a reported horizon -- must change no verdict and cost no exit code, while
+    the same doctoring at k = 15 is exit 38 above. A read that pooled every k
+    into the decision would return 38 here.
+    """
+    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Reading D: does the latent encode displacement at k = 15" in out
+    assert script.DECISION_H == 15
+    # Every reported horizon has its own row in the per-k table, and no k the
+    # records do not carry is printed as if it had been measured.
+    rows = [line for line in out.splitlines() if line.startswith("  k=")]
+    assert {line.split()[0] for line in rows} == {f"k={k}" for k in KS}
+    assert sum(line.split()[-1] == "yes" for line in rows) == 1, (
+        "exactly one horizon decides, and it is DECISION_H"
+    )
+    assert [line.split()[0] for line in rows if line.split()[-1] == "yes"] == ["k=15"]
+
+    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
+    record = load_record(path)
+    record["k"]["k1"]["control"] = [x + 500.0 for x in record["k"]["k1"]["contrast"]]
+    _rewrite(path, record)
+    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+    assert "UNRESOLVED CONTROL" not in capsys.readouterr().out
+
+
+def test_read_names_a_missing_record_and_is_exit_11(reference, capsys):
+    """Nothing measured, so the first cell has no record: named, never pooled
+    over what happens to be on disk."""
+    assert script.main(_argv(reference, "--phase", "read")) == script.EXIT_NO_CHECKPOINTS
+    out = capsys.readouterr().out
+    assert "NO CELL" in out and JOB.arm in out
+    assert not (reference.motion / "motion.txt").exists()
+
+
+def test_a_grid_without_DECISION_H_is_refused_rather_than_read_at_a_neighbour(
+    measured, capsys,
+):
+    """Reading D is decided at k = 15 and nowhere else. A record measured at a
+    grid that does not carry it has no reading to take, and taking the nearest
+    horizon instead would print a number under 15's caption."""
+    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
+    record = load_record(path)
+    record["ks"] = [1, 5]
+    del record["k"]["k15"]
+    _rewrite(path, record)
+    with pytest.raises(ValueError, match=r"does not include the pre-registered DECISION_H"):
+        script.main(_argv(measured, "--phase", "read"))
+    assert not (measured.motion / "motion.txt").exists()
+
+
+def test_two_records_that_did_not_score_the_same_windows_cannot_share_one_bar():
+    """`pool_arm`'s own compatibility check only ever sees ONE arm here, since
+    the arms are pooled separately and only their z's meet in the reading. So
+    the cross-arm identity has no other backstop, and `clusters` -- the single
+    number `z_fam` is read against -- would silently become whichever arm was
+    pooled last."""
+    base = {
+        "ks": [1, 15], "windows": {"total": 2, "episode": [0, 1]},
+        "episodes": {"val": ["a.npz", "b.npz"]}, "context": 5, "horizon": 15,
+        "device": "cpu", "torch_version": "2.0.0",
+    }
+    script.require_one_protocol({("pixel_ae", 0): base, ("random_vit", 0): dict(base)})
+    for field, value in (
+        ("ks", [1, 5, 15]),
+        ("windows", {"total": 2, "episode": [0, 0]}),
+        ("horizon", 45),
+        ("device", "mps"),
+    ):
+        other = {**base, field: value}
+        with pytest.raises(ValueError, match="cannot be read against one bar"):
+            script.require_one_protocol({("pixel_ae", 0): base, ("random_vit", 0): other})

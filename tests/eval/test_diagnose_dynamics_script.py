@@ -540,7 +540,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(ladder.values()) - set(reused_by_ladder.values()) - {0}
     assert own == {32, 33}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "stage_decomposition", "sharper_latent"):
+                  "stage_decomposition", "sharper_latent", "latent_motion"):
         clash = own & set(statuses(other).values())
         assert not clash, f"checkpoint_ladder collides with {other} on {clash}"
 
@@ -559,7 +559,7 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(stages.values()) - set(reused_by_stages.values()) - {0}
     assert own == {34}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "checkpoint_ladder", "sharper_latent"):
+                  "checkpoint_ladder", "sharper_latent", "latent_motion"):
         clash = own & set(statuses(other).values())
         assert not clash, f"stage_decomposition collides with {other} on {clash}"
 
@@ -580,9 +580,28 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
     own = set(sharper.values()) - set(reused_by_sharper.values()) - {0}
     assert own == {35, 36, 37}
     for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
-                  "checkpoint_ladder", "stage_decomposition"):
+                  "checkpoint_ladder", "stage_decomposition", "latent_motion"):
         clash = own & set(statuses(other).values())
         assert not clash, f"sharper_latent collides with {other} on {clash}"
+
+    motion = statuses("latent_motion")
+    reused_by_motion = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in motion.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_motion, (
+        f"latent_motion shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_motion} is shared on purpose"
+    )
+    assert len(set(motion.values())) == len(motion), motion
+    assert 1 not in motion.values() and 2 not in motion.values()
+    assert motion["EXIT_CONTROL_LEAKED"] == 38
+    own = set(motion.values()) - set(reused_by_motion.values()) - {0}
+    assert own == {38}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"latent_motion collides with {other} on {clash}"
 
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
