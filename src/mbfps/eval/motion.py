@@ -55,11 +55,19 @@ def motion_threshold(clusters: int) -> float:
 def displacement(positions, k: int) -> np.ndarray:
     """`p(t+k) - p(t)` per window, as a VECTOR in map units. `(n, 2)`.
 
-    Taken from the window's first scored step, so every window contributes
-    exactly one displacement at each k and the rows stay alignable with the
-    per-window masks the pooling clusters on. A window shorter than `k + 1`
-    steps is refused rather than truncated: a short window silently scored at
-    a smaller k would be a different horizon pooled as if it were this one.
+    ANCHORED AT ROW 0 OF WHATEVER IS PASSED IN. This function does not know
+    where a window's context ends, so the anchor is the caller's choice and
+    row 0 is whatever it sliced to: `scripts/latent_motion.py` passes
+    `positions[:, context - 1:]`, whose row 0 is the rollout's own t0 -- the
+    frame the M3 gate's persistence baseline freezes at -- rather than the
+    window's first gathered row, which is the posterior after ONE real frame
+    and cannot carry a velocity even in principle.
+
+    Either way every window contributes exactly one displacement at each k and
+    the rows stay alignable with the per-window masks the pooling clusters on.
+    A window shorter than `k + 1` steps is refused rather than truncated: a
+    short window silently scored at a smaller k would be a different horizon
+    pooled as if it were this one.
     """
     positions = np.asarray(positions, dtype=float)
     if positions.ndim != 3 or positions.shape[-1] != 2:
@@ -272,9 +280,13 @@ def latent_description(post_logits, prior_logits) -> dict:
     than a scratch measurement -- which is exactly how M3h came to ship a
     premise that was never measured as stated.
 
-    `live_groups` is the mean over windows of how many groups change argmax at
-    least once within the window: a latent whose groups are mostly constant is
-    far smaller than G x C in effect, however much capacity it nominally has.
+    `live_groups` is the MEDIAN over windows of how many groups change argmax
+    at least once within the window: a latent whose groups are mostly constant
+    is far smaller than G x C in effect, however much capacity it nominally
+    has. The median is the spec's reduction (section 2.3) and not a detail --
+    per-window counts on this project are right-skewed, and a mean printed
+    under a caption that says median is exactly how M3h shipped a premise it
+    never measured as stated.
     """
     post = np.asarray(post_logits, dtype=float)
     prior = np.asarray(prior_logits, dtype=float)
@@ -297,7 +309,7 @@ def latent_description(post_logits, prior_logits) -> dict:
         "entropy_by_group": [float(x) for x in entropy],
         "entropy_mean": float(np.mean(entropy)),
         "entropy_max": float(np.log(post.shape[-1])),
-        "live_groups": float(changes.sum(axis=-1).mean()),
+        "live_groups": float(np.median(changes.sum(axis=-1))),
         "top1_posterior": float(_top1_mass(post)),
         "top1_prior": float(_top1_mass(prior)),
     }

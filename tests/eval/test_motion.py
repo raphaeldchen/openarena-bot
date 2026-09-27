@@ -340,6 +340,29 @@ def test_live_groups_is_zero_for_a_latent_that_never_moves():
     assert latent_description(post, post)["live_groups"] == pytest.approx(0.0)
 
 
+def test_live_groups_is_the_MEDIAN_over_windows_and_not_the_mean():
+    """Spec 2.3 says median over windows, and this record is what the final
+    results quote -- so the reduction is pinned, not just the per-window count.
+
+    Every other live-groups test in this file has ONE window, where the mean
+    and the median are the same number and neither can distinguish the other.
+    Three windows here, hand-typed: with two steps each and three groups,
+    window 0 changes no group, window 1 changes group 0 only, and window 2
+    changes all three. The per-window counts are therefore 0, 1, 3 -- median
+    1.0, mean 4/3 -- and the two are far enough apart that `pytest.approx`
+    cannot confuse them.
+    """
+    post = np.concatenate([
+        _logits([[0, 0, 0], [0, 0, 0]]),
+        _logits([[0, 0, 0], [1, 0, 0]]),
+        _logits([[0, 0, 0], [1, 2, 3]]),
+    ], axis=0)
+    assert post.shape == (3, 2, 3, 4)
+    description = latent_description(post, post)
+    assert description["live_groups"] == pytest.approx(1.0)
+    assert description["live_groups"] != pytest.approx(4.0 / 3.0), "the mean, not the median"
+
+
 def test_the_description_refuses_a_posterior_and_prior_of_different_shapes():
     """They describe the same windows, so a disagreement is a wiring bug in
     the pass that produced them -- and averaging over it anyway would report

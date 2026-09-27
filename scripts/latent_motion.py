@@ -15,10 +15,11 @@ probe while carrying nothing about DISPLACEMENT. The M3 gate scores the
 imagined trajectory against PERSISTENCE -- staying put -- so a latent without
 displacement cannot beat it whatever the prior does.
 
-  measure   per shipped cell: fit a ridge probe from the posterior latent to
-            `p(t+k) - p(t)` on TRAINING episodes, score it per VALIDATION
-            window against the persistence baseline (`contrast_series`), and
-            score the same probe again with the latent->displacement pairing
+  measure   per shipped cell: fit a ridge probe from the posterior latent AT
+            THE ROLLOUT'S OWN t0 to `p(t+k) - p(t)` measured from that same
+            frame, on TRAINING episodes; score it per VALIDATION window
+            against the persistence baseline (`contrast_series`); and score
+            the same probe again with the latent->displacement pairing
             PERMUTED. One record per cell.
   read      (Task 7) pool the records, decide Reading D at `DECISION_H`, print
             the tables and write motion.txt.
@@ -78,12 +79,26 @@ milestone is decided on:
     on. The val gather therefore passes `limit=len(val)` explicitly, and
     `require_aligned_windows` below refuses any count or order that is not the
     cell's own rather than truncating, padding or reordering to fit.
-  * `K_REPORTED` REACHES 45, which needs 46 rows in a window. A test fixture
-    at a shorter horizon cannot carry it, so `main` takes `ks` as a parameter
-    with `K_REPORTED` as its default -- the sharper_latent `taus` idiom -- and
-    a grid a cell's protocol cannot carry is refused for every cell BEFORE any
-    pass runs, rather than being silently scored at a smaller k that would
-    then pool as if it were this one.
+  * `K_REPORTED` REACHES 45, which needs 46 rows measured from t0. The
+    shipped protocol's horizon is 45, so it leaves exactly 46 and every
+    reported k fits with none to spare; a test fixture at a shorter horizon
+    cannot carry it, so `main` takes `ks` as a parameter with `K_REPORTED` as
+    its default -- the sharper_latent `taus` idiom -- and a grid a cell's
+    protocol cannot carry is refused for every cell BEFORE any pass runs,
+    rather than being silently scored at a smaller k that would then pool as
+    if it were this one.
+
+THE PROBE'S ANCHOR IS THE ROLLOUT'S t0, NOT THE WINDOW'S FIRST GATHERED ROW.
+`gather_probe_data`'s row 0 is the posterior after ONE real frame out of a
+zero RSSM state; displacement is a two-frame quantity, so a latent there
+cannot encode velocity even in principle and its only route to a positive
+contrast would be a correlation between absolute position and displacement --
+biasing this milestone toward NO_MOTION, its own hypothesis, through the
+read-out point rather than through the latent. Both the fit and the scoring
+read row `context - 1`, the frame the M3 gate's persistence baseline freezes
+at and the frame `require_aligned_windows` already checks the gather against.
+`anchor_at_t0` does the slicing, so `displacement` still anchors at ITS own
+row 0 and its shipped contract is untouched.
 
 Two smaller ones, recorded where they bit: `self_check` is NOT on
 `trust_horizon.Prepared` (the record's comes from `self_check(traj,
@@ -355,17 +370,24 @@ def require_aligned_windows(
 def require_reportable_ks(ks, *, context: int, horizon: int, arm: str, seed: int) -> None:
     """Refuse a grid this cell's protocol cannot carry, BEFORE any pass runs.
 
-    `displacement` needs `k + 1` rows in a window and a window holds
-    `context + horizon`. A window silently scored at a smaller k would be a
-    different horizon pooled as if it were this one, so the whole grid is
-    refused rather than any part of it truncated.
+    `displacement` needs `k + 1` rows, and it is handed `positions[:, context
+    - 1:]` -- the rows from the rollout's own t0 onward, of which there are
+    `horizon + 1`, the `context - 1` rows before t0 having been consumed by
+    the anchor. So the grid fits exactly when `k <= horizon`. The shipped
+    protocol's horizon is 45 and `K_REPORTED` tops out at 45, so every
+    reported k fits, with none to spare.
+
+    A window silently scored at a smaller k would be a different horizon
+    pooled as if it were this one, so the whole grid is refused rather than
+    any part of it truncated.
     """
-    steps = int(context) + int(horizon)
+    rows = int(horizon) + 1
     for k in ks:
-        if int(k) + 1 > steps:
+        if int(k) + 1 > rows:
             raise ValueError(
-                f"{arm} seed {seed}: k={int(k)} needs {int(k) + 1} steps per window, but the "
-                f"protocol (context {int(context)} + horizon {int(horizon)}) gives {steps}"
+                f"{arm} seed {seed}: k={int(k)} needs {int(k) + 1} rows from the rollout's t0, "
+                f"but this protocol (context {int(context)}, horizon {int(horizon)}) leaves "
+                f"{rows} -- the probe anchors at t0, so the context steps before it are gone"
             )
 
 
@@ -383,7 +405,40 @@ def _cell_args(args, source: Path) -> types.SimpleNamespace:
     )
 
 
-def _k_entry(train_rows: dict, select_rows: dict | None, val_rows: dict, k: int) -> dict:
+def anchor_at_t0(rows: dict, context: int) -> tuple[np.ndarray, np.ndarray]:
+    """The probe's read-out point and the positions measured from it.
+
+    Returns `(latent, positions)`: the posterior latent at window row
+    `context - 1`, `(n, LATENT)`, and `positions[:, context - 1:]`,
+    `(n, horizon + 1, 2)` whose row 0 IS that same frame.
+
+    WHY `context - 1` AND NOT 0. `gather_probe_data`'s row `j` is frame
+    `start + 1 + j`, so row 0 is the posterior after observing ONE real frame
+    out of a zero RSSM state. Displacement is a two-frame quantity, so a
+    latent with one frame of history cannot encode velocity even in
+    principle -- its only route to a positive contrast is a correlation
+    between absolute position and displacement, which would bias M3i toward
+    NO_MOTION, the hypothesis under test, through the read-out point rather
+    than through the latent.
+
+    Row `context - 1` is frame `start + context`: the rollout's own t0, the
+    frame the M3 gate's persistence baseline freezes at and the frame
+    `require_aligned_windows` already compares the gather against
+    (`traj.true_at_context`). The latent there has the full context of real
+    frames the rollout itself starts from.
+
+    `displacement`'s contract is untouched -- it still anchors at ITS row 0 --
+    because the slice happens here, before the call.
+    """
+    row = int(context) - 1
+    if row < 0:
+        raise ValueError(f"context must be at least 1 real frame, got {context}")
+    return rows["latent"][:, row, :], rows["positions"][:, row:, :]
+
+
+def _k_entry(
+    train_rows: dict, select_rows: dict | None, val_rows: dict, k: int, context: int
+) -> dict:
     """One reported horizon: the probe fit on TRAINING windows with its ridge
     selected on held-out TRAINING windows, scored per VALIDATION window
     against staying put, and scored again with the pairing permuted.
@@ -392,27 +447,34 @@ def _k_entry(train_rows: dict, select_rows: dict | None, val_rows: dict, k: int)
     `fit_probes`' docstring warns that passing validation paths TO THE FIT
     would leak, and these rows are gathered to SCORE.
 
-    THE PROBE READS THE LATENT AT THE WINDOW'S FIRST SCORED STEP, row 0, which
-    is the step `displacement` measures `p(t+k) - p(t)` from. One row per
+    THE PROBE READS THE LATENT AT THE ROLLOUT'S OWN t0 -- window row
+    `context - 1` -- and `displacement` measures `p(t+k) - p(t)` from that
+    same frame, because `anchor_at_t0` slices the positions to start there.
+    The fit and the scoring take the SAME row: a probe fit at one read-out
+    point and applied at another is not the probe anyone reported. One row per
     window at every k, so the series stays alignable with the per-window
-    episode index the pooling clusters on -- `displacement`'s own docstring
-    states that rule and this is the call site that has to honour it.
+    episode index the pooling clusters on.
 
     The control permutes which window's TRUE displacement each prediction is
     read against. Both marginals are untouched -- the same predictions, the
     same displacements -- and only the pairing is destroyed, which is what
     makes a control that clears a broken instrument rather than a result.
     """
-    train_true = displacement(train_rows["positions"], k)
-    val_true = displacement(val_rows["positions"], k)
-    select = None if select_rows is None else {
-        "latent": select_rows["latent"][:, 0, :],
-        "displacement": displacement(select_rows["positions"], k),
-    }
+    train_latent, train_positions = anchor_at_t0(train_rows, context)
+    val_latent, val_positions = anchor_at_t0(val_rows, context)
+    train_true = displacement(train_positions, k)
+    val_true = displacement(val_positions, k)
+    select = None
+    if select_rows is not None:
+        select_latent, select_positions = anchor_at_t0(select_rows, context)
+        select = {
+            "latent": select_latent,
+            "displacement": displacement(select_positions, k),
+        }
     probe = fit_displacement_probe(
-        {"latent": train_rows["latent"][:, 0, :], "displacement": train_true}, k, select,
+        {"latent": train_latent, "displacement": train_true}, k, select,
     )
-    predicted = apply_displacement_probe(probe, val_rows["latent"][:, 0, :])
+    predicted = apply_displacement_probe(probe, val_latent)
     order = permute_pairing(val_true.shape[0], CONTROL_SEED)
     return {
         "k": int(k),
@@ -504,7 +566,9 @@ def measure_cell(args, cell: Cell, device, train, val, ks=K_REPORTED) -> tuple[i
             "episode": [int(e) for e in cell.diagnostic["windows"]["episode"]],
         },
         "self_check": check.record(),
-        "k": {k_key(k): _k_entry(train_rows, select_rows, val_rows, k) for k in ks},
+        "k": {
+            k_key(k): _k_entry(train_rows, select_rows, val_rows, k, context) for k in ks
+        },
         # The posterior over the HORIZON steps against the teacher-forced
         # prior, which exists only there -- `stage_decomposition` reads the
         # same slice, and `latent_description` refuses two shapes that do not

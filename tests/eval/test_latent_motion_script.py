@@ -9,10 +9,14 @@ as the sharper-latent, ladder and stage tests build theirs.
 
 THE FIXTURE'S FACTS: six validation episodes; `window_starts(40, 5, 15)` cuts
 TWO windows per episode (`range(0, 40 - 20 + 1, 20)`), so 12 val windows over 6
-clusters, and each window is 20 rows long. `K_REPORTED` reaches 45, which a
-20-row window cannot carry, so the measure phase takes `ks` as a parameter with
-`K_REPORTED` as its default -- a test never patches the pre-registration -- and
-the fixture runs `(1, 5, 15)`, which includes the horizon M3i decides at.
+clusters, and each window is 20 rows long. The probe anchors at the rollout's
+own t0 -- window row `context - 1` -- so `displacement` is handed the
+`horizon + 1 = 16` rows from t0 onward and a k fits exactly when `k <= horizon`.
+`K_REPORTED` reaches 45, which this fixture's horizon of 15 cannot carry, so the
+measure phase takes `ks` as a parameter with `K_REPORTED` as its default -- a
+test never patches the pre-registration -- and the fixture runs `(1, 5, 15)`,
+which includes the horizon M3i decides at and sits exactly on the boundary the
+shipped protocol's k=45 sits on.
 """
 
 import importlib.util
@@ -23,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from mbfps.eval.motion import K_REPORTED, contrast_series
+from mbfps.eval.motion import K_REPORTED, contrast_series, displacement
 from mbfps.eval.probe import fit_probes
 from mbfps.eval.study import StudyJob, load_record, run_job
 
@@ -288,6 +292,35 @@ def test_window_rows_refuses_windows_of_unequal_length():
         script.window_rows(data)
 
 
+def test_window_rows_anchors_the_probe_at_the_rollouts_own_t0():
+    """`anchor_at_t0` reads window row `context - 1`, never row 0.
+
+    `gather_probe_data`'s row `j` is frame `start + 1 + j`, so row 0 is the
+    posterior after ONE real frame out of a zero RSSM state -- a latent that
+    cannot encode a two-frame quantity even in principle, whose only route to
+    a positive contrast is a correlation between absolute position and
+    displacement. Row `context - 1` is frame `start + context`: the rollout's
+    own t0, the frame the persistence baseline freezes at.
+
+    Hand-typed on four rows at context 3: the anchor is row 2, and the
+    positions handed to `displacement` start there, so there are
+    `horizon + 1 = 2` of them.
+    """
+    rows = {
+        "latent": np.arange(4 * 2, dtype=float).reshape(1, 4, 2),
+        "positions": np.arange(4 * 2, dtype=float).reshape(1, 4, 2) + 100.0,
+    }
+    latent, positions = script.anchor_at_t0(rows, context=3)
+    np.testing.assert_array_equal(latent, [[4.0, 5.0]])
+    np.testing.assert_array_equal(positions, [[[104.0, 105.0], [106.0, 107.0]]])
+    # and the displacement is measured from t0, not from the window's first row
+    np.testing.assert_array_equal(displacement(positions, 1), [[2.0, 2.0]])
+    # a context of zero has no t0 to anchor at; `row = -1` would silently take
+    # the window's LAST step, which is a different horizon entirely.
+    with pytest.raises(ValueError, match="at least 1 real frame"):
+        script.anchor_at_t0(rows, context=0)
+
+
 def _aligned(n: int = 3, horizon: int = 2, context: int = 1):
     """Three windows whose gathered rows ARE the pass's own: row `context - 1`
     is the frame at t0, and the rows after it are the horizon's truth."""
@@ -327,6 +360,96 @@ def test_a_val_gather_in_a_different_ORDER_is_refused():
             positions[::-1].copy(), at_context, true_positions,
             context=context, total=3, arm="a", seed=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# One reported horizon: the values, and which way round they are recorded.
+# ---------------------------------------------------------------------------
+
+
+def _anchored_rows(n: int, steps: int, context: int, seed: int) -> dict:
+    """`window_rows`' output, built so ONLY the latent at the anchor can
+    predict the displacement.
+
+    Each window travels in a straight line whose velocity vector is that
+    window's own latent at row `context - 1`, scaled; every other row of the
+    latent is independent noise, and each window's starting point is its own.
+    So a probe that reads the anchor recovers the displacement nearly exactly,
+    a probe that reads any other row recovers nothing, and pairing a
+    prediction with another window's displacement is plainly worse than
+    pairing it with its own -- which is what makes the three numbers below
+    move when the read-out point, the sign or the pairing does.
+    """
+    rng = np.random.default_rng(seed)
+    latent = rng.normal(size=(n, steps, 6))
+    velocity = latent[:, context - 1, :2] * 5.0
+    offset = (np.arange(steps, dtype=float) - (context - 1))[None, :, None]
+    positions = rng.normal(size=(n, 1, 2)) * 50.0 + offset * velocity[:, None, :]
+    return {"latent": latent, "positions": positions, "windows": n, "steps": steps}
+
+
+def test_the_k_entry_records_the_real_pairing_as_contrast_and_the_permuted_one_as_control():
+    """The record's per-window series, pinned BY VALUE and BY ORIENTATION.
+
+    Three separate mutations to this function left every other test in this
+    file green, because the only record-level assertions were shapes and
+    `contrast != control`: negating the recorded contrast, SWAPPING the
+    `contrast` and `control` keys -- which would hand the next task the
+    permuted pairing as the result and the real pairing as the control -- and
+    reading the validation latents at a row other than the one the probe was
+    fit at.
+
+    Hand-typed from the fixture above: window 0's contrast is +19.0998, the
+    probe reading its displacement back almost exactly; its control is
+    -12.3473, the same prediction read against another window's displacement;
+    and anchoring at row 0 instead of `context - 1` would make the first
+    contrast -1.82. No two of those can be confused.
+    """
+    context, steps, k, n_val = 5, 20, 3, 9
+    train = _anchored_rows(40, steps, context, 0)
+    select = _anchored_rows(12, steps, context, 1)
+    val = _anchored_rows(n_val, steps, context, 2)
+    entry = script._k_entry(train, select, val, k, context)
+
+    assert entry["k"] == k and entry["train_windows"] == 40
+    assert entry["contrast"][0] == pytest.approx(19.09979931796889, rel=1e-6)
+    assert entry["control"][0] == pytest.approx(-12.347330772303156, rel=1e-6)
+
+    # And the whole control series is the treatment's own predictions read
+    # against `permute_pairing(n, CONTROL_SEED)`'s displacements -- nothing
+    # refit, nothing resampled, only the pairing destroyed.
+    row = context - 1
+    probe = script.fit_displacement_probe(
+        {"latent": train["latent"][:, row, :],
+         "displacement": displacement(train["positions"][:, row:], k)},
+        k,
+        select={"latent": select["latent"][:, row, :],
+                "displacement": displacement(select["positions"][:, row:], k)},
+    )
+    predicted = script.apply_displacement_probe(probe, val["latent"][:, row, :])
+    true = displacement(val["positions"][:, row:], k)
+    order = script.permute_pairing(n_val, script.CONTROL_SEED)
+    np.testing.assert_allclose(entry["contrast"], contrast_series(predicted, true), rtol=1e-9)
+    np.testing.assert_allclose(
+        entry["control"], contrast_series(predicted, true[order]), rtol=1e-9
+    )
+
+
+def test_the_k_grid_fits_exactly_when_k_is_at_most_the_horizon():
+    """The anchor is t0, so `displacement` is handed `horizon + 1` rows and
+    not `context + horizon`: the grid fits exactly when `k <= horizon`.
+
+    Pinned on the SHIPPED protocol -- context 5, horizon 45 -- where
+    `K_REPORTED`'s largest k is 45 and consumes all 46 rows with none to
+    spare, and pinned at the boundary in both directions. The `context=1`
+    case is the one that fails if the old `context + horizon` arithmetic ever
+    comes back: the context steps sit BEFORE the anchor and are gone.
+    """
+    assert max(K_REPORTED) == 45, "a k above the shipped horizon could not be reported"
+    script.require_reportable_ks(K_REPORTED, context=5, horizon=45, arm="a", seed=0)
+    script.require_reportable_ks((45,), context=1, horizon=45, arm="a", seed=0)
+    with pytest.raises(ValueError, match=r"k=46 needs 47 rows from the rollout's t0"):
+        script.require_reportable_ks((46,), context=5, horizon=45, arm="a", seed=0)
 
 
 # ---------------------------------------------------------------------------
@@ -380,24 +503,85 @@ def test_the_record_is_what_cell_series_can_cluster(measured):
     assert np.unique(series.episode).size == CLUSTERS
 
 
+def _reverse_window_blocks(data: dict) -> dict:
+    """The same gather with its WINDOWS in reverse order and the `window` /
+    `step` index left ascending -- the exact shape of corruption that survives
+    every downstream shape check, because the counts and the dtypes are all
+    still right and only the pairing is wrong."""
+    steps = int(np.asarray(data["step"]).max()) + 1
+    n = int(np.asarray(data["window"]).size) // steps
+    index = np.concatenate(
+        [np.arange(w * steps, (w + 1) * steps) for w in reversed(range(n))]
+    )
+    out = dict(data)
+    for key in ("latent", "embedding", "encoder_embedding", "targets"):
+        out[key] = np.asarray(data[key])[index]
+    return out
+
+
+def test_measure_refuses_a_val_gather_whose_windows_are_in_another_order(
+    reference, monkeypatch,
+):
+    """The alignment guard's WIRING, which its own unit tests cannot cover.
+
+    Replacing the `require_aligned_windows(...)` call in `measure_cell` with
+    `pass` left every other test in this file green. A count mismatch would
+    still be caught downstream by `cell_series`' shape check; an ORDER
+    mismatch has no other backstop at all, and every per-window series would
+    be clustered onto the wrong episodes with nothing raising.
+
+    So the val gather -- the third of the three -- comes back with its window
+    blocks reversed while `window` and `step` stay ascending, and
+    `measure_cell` must refuse it and write nothing.
+    """
+    real = script.gather_probe_data
+    calls = []
+
+    def spy(model, paths, backbone, device, **kwargs):
+        data = real(model, paths, backbone, device, **kwargs)
+        calls.append(1)
+        return _reverse_window_blocks(data) if len(calls) == 3 else data
+
+    monkeypatch.setattr(script, "gather_probe_data", spy)
+    with pytest.raises(ValueError, match="not the windows the record was scored on"):
+        _run(reference, "--phase", "measure")
+    assert len(calls) == 3, "the fit, selection and val gathers, in that order"
+    assert not (reference.motion / MOTION).exists(), "no record for a refused gather"
+
+
 def test_the_val_gather_is_not_capped_at_the_probes_twenty_episodes(measured, monkeypatch):
     """`gather_probe_data`'s default `limit=20` is the PROBE's fit rule. The
     shipped val split is 24 episodes, so scoring it at that default would drop
     four episodes -- 189 of the record's 229 windows -- and the fixture's six
-    val episodes would never reveal it."""
+    val episodes would never reveal it.
+
+    The three blocks are pinned BY NAME as well as by count, because the
+    counts alone cannot see a validation leak: taking the ridge-selection
+    episodes straight out of the val split -- selecting the probe on the exact
+    windows its contrast is then read from, which would inflate every contrast
+    and manufacture MOTION_ENCODED -- leaves `n_fit + n_select == 20` and
+    `n_select == SELECT_EPISODES` both true.
+    """
     calls = []
     real = script.gather_probe_data
 
     def spy(model, paths, backbone, device, **kwargs):
-        calls.append((len(list(paths)), kwargs.get("limit")))
+        paths = list(paths)
+        calls.append(({Path(p).name for p in paths}, kwargs.get("limit")))
         return real(model, paths, backbone, device, **kwargs)
 
     monkeypatch.setattr(script, "gather_probe_data", spy)
     assert _run(measured, "--phase", "measure") == script.EXIT_OK
     assert len(calls) == 3, "fit block, ridge-selection block, val"
-    (n_fit, _), (n_select, _), (n_val, val_limit) = calls
+    (fit, _), (select, _), (val, val_limit) = calls
+    n_fit, n_select, n_val = len(fit), len(select), len(val)
     assert n_fit + n_select == 20, "PROBE_EPISODE_LIMIT training episodes, split for selection"
     assert n_select == script.SELECT_EPISODES
+    assert fit.isdisjoint(val), f"the probe is FIT on episodes it is scored on: {fit & val}"
+    assert select.isdisjoint(val), (
+        f"the ridge is SELECTED on episodes the probe is scored on: {select & val}"
+    )
+    assert fit.isdisjoint(select), "the selection block is not held out of the fit"
     assert val_limit is not None and val_limit >= n_val, (
         f"the val gather asked for limit={val_limit} over {n_val} episodes; every val "
         "window the record was scored on must be gathered"
@@ -427,18 +611,21 @@ def test_the_description_is_the_posterior_against_the_teacher_forced_prior(measu
 def test_a_k_longer_than_the_window_is_refused_before_anything_is_gathered(
     reference, monkeypatch,
 ):
-    """`K_REPORTED` reaches 45; a 20-row window cannot carry it. Scoring a
-    short window at a smaller k would pool a different horizon as if it were
-    this one, so the grid is refused rather than truncated.
+    """`K_REPORTED` reaches 45; this fixture's horizon of 15 leaves 16 rows
+    from t0 and cannot carry it. Scoring a short window at a smaller k would
+    pool a different horizon as if it were this one, so the grid is refused
+    rather than truncated.
 
     The match is on `require_reportable_ks`' OWN sentence, not on the shared
-    prefix: `displacement` raises `k=45 needs 46 steps per window, got 20`
+    prefix: `displacement` raises `k=45 needs 46 steps per window, got 16`
     too, so a looser pattern would pass with this guard deleted -- after a
     full rollout and three gathers per cell had already run. `prepare_cell` is
     replaced by a raiser to prove the refusal comes first.
     """
     monkeypatch.setattr(script, "prepare_cell", _never_pass)
-    with pytest.raises(ValueError, match=r"k=45 needs 46 steps per window, but the protocol"):
+    with pytest.raises(
+        ValueError, match=r"k=45 needs 46 rows from the rollout's t0, but this protocol"
+    ):
         script.main(_argv(reference, "--phase", "measure"), ks=(1, 45))
     assert not reference.motion.exists(), "nothing is written for a grid that was refused"
 
