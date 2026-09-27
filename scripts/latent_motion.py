@@ -58,6 +58,13 @@ no other tool's range (run_study 1/3-6/23, report_study 7-10, spike 10,
 diagnose 11-17, pool 18-22, trust 30, split_gap 31, ladder 32-33, stages 34,
 sharper_latent 35-37, argparse 2, a traceback 1).
 
+A `read` whose PLAN cannot reach the verdict is refused before a record is
+opened, and it RAISES rather than carrying a status of its own -- see
+`require_readable_plan`. That is the class `read_phase` already refuses by
+raising (a grid with no `DECISION_H`, records that disagree on the protocol):
+the operator asked for something no data can answer, as against a condition
+discovered in the data, which is what the numbered statuses report.
+
 FIVE CORRECTIONS TO THE M3I TASK-6 BRIEF, each found by running its own tests
 or by measuring the real protocol. Three of them would have moved a number the
 milestone is decided on:
@@ -137,6 +144,7 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.motion import (
+    ARMS_REQUIRED,
     CONTROL_SEED,
     K_REPORTED,
     MOTION_FAMILY,
@@ -646,6 +654,50 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
 # ---------------------------------------------------------------------------
 
 
+def require_readable_plan(arms, seeds) -> None:
+    """Refuse a `--arms` / `--seeds` plan Reading D cannot be taken on, before
+    a single record is opened.
+
+    `reading_displacement` decides MOTION_ENCODED on `ARMS_REQUIRED` arms
+    clearing the bar, each in at least `SEEDS_REQUIRED` of its OWN seeds. A
+    read narrowed below either -- `--arms random_vit`, or `--seeds 0` -- pools
+    perfectly cleanly and then prints a verdict decided by the plan rather
+    than by the data: measured on a real cell, `--arms random_vit` prints the
+    row `estimate +2.9967, z +996.13, 3/3 up, clears = up` and, directly under
+    it, `NO DIFFERENCE -- the latent is indistinguishable from staying put`,
+    and returns 0 with a `motion.txt` saying both. `--seeds 0` has the same
+    shape from the other side: every tally is `1/1`, so `clears_up`'s
+    replication clause can never be satisfied whatever the z is.
+
+    That is exactly the failure `MotionArm`'s docstring records from M3h --
+    a table whose rows and whose verdict say opposite things -- so the plan is
+    refused by name, in `trust_horizon._inputs`' register: what was asked for,
+    what the pre-registered rule needs, and why the two cannot meet.
+
+    It RAISES rather than returning a status. The numbered exits report what
+    was found in the DATA (a record missing, a control that leaked); this is
+    the operator asking for a reading that does not exist, which is the class
+    `read_phase` already refuses by raising -- a grid without `DECISION_H`,
+    records that disagree on the protocol.
+    """
+    arms = [str(a) for a in arms]
+    seeds = [int(s) for s in seeds]
+    short = []
+    if len(arms) < ARMS_REQUIRED:
+        short.append(f"{len(arms)} arm(s) {arms} where the rule needs {ARMS_REQUIRED}")
+    if len(seeds) < SEEDS_REQUIRED:
+        short.append(f"{len(seeds)} seed(s) {seeds} where the rule needs {SEEDS_REQUIRED}")
+    if not short:
+        return
+    raise ValueError(
+        "this read asks for " + " and ".join(short) + ": Reading D is decided by "
+        f"{ARMS_REQUIRED} of the {len(ARMS)} arms clearing +/-z_fam at k = {DECISION_H}, each "
+        f"in at least {SEEDS_REQUIRED} of its own seeds, so a plan this narrow CANNOT REACH "
+        "THE VERDICT -- every arm would be printed with its own z beside a NO DIFFERENCE that "
+        "the plan decided and the data did not. Refused rather than read."
+    )
+
+
 def load_motion(out_dir: Path, arms, seeds) -> dict:
     """Every planned cell's record, keyed by `(arm, seed)` -- or `CellMissing`
     naming the first that is not on disk.
@@ -811,6 +863,44 @@ def motion_inputs(records: dict, k: int) -> MotionInputs:
 # ---------------------------------------------------------------------------
 
 
+def _table_line(values, widths) -> str:
+    """One line of a table -- its header or one of its rows -- laid out at the
+    DECLARED field specs.
+
+    Header and rows both come through here, from one column tuple, so a
+    caption and the values printed under it cannot drift apart: on this
+    project they have drifted three times, always because the two were
+    separate f-strings carrying their own copies of the widths. `strict=True`
+    refuses a line carrying a different number of values than the table
+    declares columns, which is the same drift one step earlier.
+    """
+    return "  " + "".join(
+        f"{value!s:{spec}}" for value, spec in zip(values, widths, strict=True)
+    )
+
+
+# Each table's columns in printed order, with their field specs (alignment
+# and width) beside them. Declared ONCE per table -- `READING_COLUMNS` /
+# `READING_WIDTHS`' discipline in `mbfps.eval.motion`, which exists so a test
+# can assert the header against THIS and each row's values by the same index.
+#
+# `ref max|d|` and `pers max|d|` are letter for letter the names split_gap,
+# checkpoint_ladder, sharper_latent and stage_decomposition already print
+# their self-checks under: one reader reads all five tables.
+SELF_CHECK_COLUMNS: tuple[str, ...] = (
+    "arm", "seed", "step", "ref max|d|", "pers max|d|", "windows", "clusters", "ok",
+)
+SELF_CHECK_WIDTHS: tuple[str, ...] = ("<12", ">5", ">8", ">12", ">13", ">9", ">10", ">5")
+
+DESCRIPTION_COLUMNS: tuple[str, ...] = (
+    "arm", "seed", "entropy", "ln(C)", "live", "groups",
+    "top1 post", "top1 prior", "KL mean", "KL med",
+)
+DESCRIPTION_WIDTHS: tuple[str, ...] = (
+    "<12", ">5", ">9", ">8", ">7", ">8", ">11", ">12", ">9", ">9",
+)
+
+
 def _self_check_table(records: dict) -> str:
     """What this script's own pass reproduced, per cell. A reading is only as
     good as the pass under it, so the operator sees the deltas rather than a
@@ -818,19 +908,20 @@ def _self_check_table(records: dict) -> str:
     lines = [
         "--- self-check per record: this script's pass against the cell's diagnostic "
         "(mbfps.eval.reproduction's bound, spec 2.4), and the windows it was scored on ---",
-        f"  {'arm':<12}{'seed':>5}{'step':>8}{'ref max|d|':>12}{'pers max|d|':>13}"
-        f"{'windows':>9}{'clusters':>10}  ok",
+        _table_line(SELF_CHECK_COLUMNS, SELF_CHECK_WIDTHS),
     ]
     for (arm, seed), record in sorted(records.items()):
         check = record["self_check"]
-        lines.append(
-            f"  {arm:<12}{int(seed):>5}{int(record['step']):>8}"
-            f"{fmt_z(float(check['reference_position_max_delta']), '.1e'):>12}"
-            f"{fmt_z(float(check['persistence_position_max_delta']), '.1e'):>13}"
-            f"{int(record['windows']['total']):>9}"
-            f"{len(set(record['windows']['episode'])):>10}"
-            f"  {'yes' if check['ok'] else 'NO'}"
-        )
+        lines.append(_table_line((
+            arm,
+            int(seed),
+            int(record["step"]),
+            fmt_z(float(check["reference_position_max_delta"]), ".1e"),
+            fmt_z(float(check["persistence_position_max_delta"]), ".1e"),
+            int(record["windows"]["total"]),
+            len(set(record["windows"]["episode"])),
+            "yes" if check["ok"] else "NO",
+        ), SELF_CHECK_WIDTHS))
     return "\n".join(lines) + "\n"
 
 
@@ -845,23 +936,42 @@ def _description_table(records: dict) -> str:
         "entropy per group against its own ln(classes) ceiling; `live` = the MEDIAN over "
         "windows of how many of `groups` change argmax within the window; top-1 mass for the "
         "posterior and the teacher-forced prior; KL(post || teacher prior) per window, nats ---",
-        f"  {'arm':<12}{'seed':>5}{'entropy':>9}{'ln(C)':>8}{'live':>7}{'groups':>8}"
-        f"{'top1 post':>11}{'top1 prior':>12}{'KL mean':>9}{'KL med':>9}",
+        _table_line(DESCRIPTION_COLUMNS, DESCRIPTION_WIDTHS),
     ]
     for (arm, seed), record in sorted(records.items()):
         d, info = record["description"], record["information"]
-        lines.append(
-            f"  {arm:<12}{int(seed):>5}"
-            f"{fmt_z(float(d['entropy_mean']), '.3f'):>9}"
-            f"{fmt_z(float(d['entropy_max']), '.3f'):>8}"
-            f"{fmt_z(float(d['live_groups']), '.1f'):>7}"
-            f"{len(d['entropy_by_group']):>8}"
-            f"{fmt_z(float(d['top1_posterior']), '.3f'):>11}"
-            f"{fmt_z(float(d['top1_prior']), '.3f'):>12}"
-            f"{fmt_z(float(info['mean']), '.3f'):>9}"
-            f"{fmt_z(float(info['median']), '.3f'):>9}"
-        )
+        lines.append(_table_line((
+            arm,
+            int(seed),
+            fmt_z(float(d["entropy_mean"]), ".3f"),
+            fmt_z(float(d["entropy_max"]), ".3f"),
+            fmt_z(float(d["live_groups"]), ".1f"),
+            len(d["entropy_by_group"]),
+            fmt_z(float(d["top1_posterior"]), ".3f"),
+            fmt_z(float(d["top1_prior"]), ".3f"),
+            fmt_z(float(info["mean"]), ".3f"),
+            fmt_z(float(info["median"]), ".3f"),
+        ), DESCRIPTION_WIDTHS))
     return "\n".join(lines) + "\n"
+
+
+PER_K_COLUMNS: tuple[str, ...] = (
+    "k", "arm", "estimate", "se", "z", "up", "dn", "ctl z", "decides",
+)
+
+# WIDER THAN THE FIELDS THESE VALUES USED TO BE PRINTED IN, and that is the
+# whole change: a value that MEETS its own width is printed with no separating
+# space and runs into the column before it. `z` at `+.2f` reaches 8 characters
+# at |z| = 1000 (`+1000.00`) in a field that was 8 wide; `ctl z` reaches 9 at
+# |ctl z| = 10000 in a field that was 9, which printed a real doctored
+# control's row as `0/3+717489.65`. `READING_WIDTHS` states this discipline
+# for the reading table -- sized so a REALISTIC value cannot reach its width
+# -- and these follow it: z legible to |z| = 999,999.99 and a control z to
+# |z| = 99,999,999.99, far past anything a working instrument prints and
+# exactly the range a broken one does.
+PER_K_WIDTHS: tuple[str, ...] = (
+    "<7", "<13", ">14", ">11", ">11", ">9", ">9", ">13", ">9",
+)
 
 
 def _per_k_table(per_k: dict, decision_h: int) -> str:
@@ -877,19 +987,22 @@ def _per_k_table(per_k: dict, decision_h: int) -> str:
         "||predicted - true||, map units, against staying put; seeds averaged per window, "
         f"episode-clustered); `ctl z` is the permuted pairing's; k = {int(decision_h)} DECIDES "
         "and every other k is reported and decides nothing ---",
-        f"  {'k':<6}{'arm':<12}{'estimate':>12}{'se':>9}{'z':>8}{'up':>7}{'dn':>7}"
-        f"{'ctl z':>9}{'decides':>9}",
+        _table_line(PER_K_COLUMNS, PER_K_WIDTHS),
     ]
     for k, inputs in sorted(per_k.items()):
         for arm in sorted(inputs.arms):
             a, c = inputs.arms[arm], inputs.control[arm]
-            lines.append(
-                f"  {f'k={int(k)}':<6}{arm:<12}"
-                f"{fmt_z(a.estimate, '+.4f'):>12}{fmt_z(a.se, '.4f'):>9}{fmt_z(a.z):>8}"
-                f"{f'{a.seeds_up}/{a.seeds_total}':>7}{f'{a.seeds_down}/{a.seeds_total}':>7}"
-                f"{fmt_z(c.z):>9}"
-                f"{('yes' if int(k) == int(decision_h) else 'no'):>9}"
-            )
+            lines.append(_table_line((
+                f"k={int(k)}",
+                arm,
+                fmt_z(a.estimate, "+.4f"),
+                fmt_z(a.se, ".4f"),
+                fmt_z(a.z),
+                f"{a.seeds_up}/{a.seeds_total}",
+                f"{a.seeds_down}/{a.seeds_total}",
+                fmt_z(c.z),
+                "yes" if int(k) == int(decision_h) else "no",
+            ), PER_K_WIDTHS))
     return "\n".join(lines) + "\n"
 
 
@@ -926,16 +1039,20 @@ def write_text(path: Path, text: str) -> Path:
 
 
 def read_phase(args) -> int:
-    """Pool every requested cell (11 names the first missing), decide Reading
-    D at `DECISION_H`, print the tables -- and write `motion.txt` only if the
-    control did not leak.
+    """Refuse a plan that cannot reach the verdict, pool every requested cell
+    (11 names the first missing), decide Reading D at `DECISION_H`, print the
+    tables -- and write `motion.txt` only if the control did not leak.
 
     THE FORMATTER STILL PRINTS THE PER-ARM ROWS ON A LEAK, and that is
     deliberate: an operator debugging a control that cleared needs to see the
     numbers it cleared beside. The suppression is purely the file: exit 38
     leaves no `motion.txt` for a later reader -- or a later milestone's quote
-    -- to mistake for a result.
+    -- to mistake for a result. A `motion.txt` an EARLIER, clean run wrote is
+    REMOVED on a leak rather than left byte-unchanged beside a suppressed
+    reading: a stale artefact under the same name is exactly the thing that
+    sentence promises is not there.
     """
+    require_readable_plan(args.arms, args.seeds)
     try:
         records = load_motion(args.out, args.arms, [int(s) for s in args.seeds])
     except CellMissing as error:
@@ -955,14 +1072,19 @@ def read_phase(args) -> int:
     reading = reading_displacement(inputs)
     text = motion_text(records, per_k, inputs, reading)
     print(text, end="")
+    path = args.out / "motion.txt"
     if reading.status == "UNRESOLVED_CONTROL":
+        # Removed, not merely not written: an earlier clean run's file would
+        # otherwise sit there byte-unchanged under the name this sentence
+        # promises holds no result.
+        path.unlink(missing_ok=True)
         print(
-            f"\nCONTROL LEAKED at k = {inputs.k}: {reading.rule}. No reading is taken and no "
-            f"{args.out / 'motion.txt'} is written -- a suppressed reading must not leave an "
-            "artefact a later reader mistakes for a result."
+            f"\nCONTROL LEAKED at k = {inputs.k}: {reading.rule}. No reading is taken, no "
+            f"{path} is written, and any earlier one is removed -- a suppressed reading must "
+            "not leave an artefact a later reader mistakes for a result."
         )
         return EXIT_CONTROL_LEAKED
-    write_text(args.out / "motion.txt", text)
+    write_text(path, text)
     return EXIT_OK
 
 

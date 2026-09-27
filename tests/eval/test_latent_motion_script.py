@@ -715,6 +715,66 @@ def _rewrite(path, record):
     write_record(path, record)
 
 
+PLAN = ("--arms", *script.ARMS, "--seeds", *(str(seed) for seed in script.SEEDS))
+"""The full pre-registered plan on the command line. `_argv` names one arm and
+one seed -- the cell this fixture really measures -- and argparse takes the
+LAST `--arms` / `--seeds` it is given, so appending this widens the read."""
+
+
+@pytest.fixture
+def planned(measured):
+    """The pre-registered plan on disk: the one cell this fixture measures,
+    copied under every other `(arm, seed)` name with the record's own
+    `arm` / `seed` rewritten to match the file it will be read under.
+
+    `read_phase` now refuses a plan that cannot reach the verdict -- Reading D
+    needs `ARMS_REQUIRED` arms each clearing in `SEEDS_REQUIRED` of its own
+    seeds -- so a read over the one measured cell is refused, correctly, and
+    every read test needs a plan that can be decided. Measuring nine real
+    cells here would be nine real rollouts for tests about POOLING, the tables
+    and the gate; the numbers under those are one real cell's, repeated, which
+    every arm and seed shares by construction and `require_one_protocol`
+    therefore accepts.
+    """
+    source = load_record(script.motion_record_path(measured.motion, JOB.arm, JOB.seed))
+    for arm in script.ARMS:
+        for seed in script.SEEDS:
+            _rewrite(
+                script.motion_record_path(measured.motion, arm, int(seed)),
+                {**source, "arm": arm, "seed": int(seed)},
+            )
+    return measured
+
+
+def _read(ref, *extra: str) -> int:
+    """`--phase read` over the full plan."""
+    return script.main(_argv(ref, "--phase", "read", *PLAN, *extra), ks=KS)
+
+
+def _doctor(ref, change) -> None:
+    """`change(record)` applied to EVERY record of the plan, back to disk.
+
+    Every one, because `require_one_protocol` refuses a pool whose cells
+    disagree on their grid or their windows: doctoring one of nine would be
+    refused, but for the wrong reason and in another rule's words.
+    """
+    for arm in script.ARMS:
+        for seed in script.SEEDS:
+            path = script.motion_record_path(ref.motion, arm, int(seed))
+            record = load_record(path)
+            change(record)
+            _rewrite(path, record)
+
+
+def _leak_at(k):
+    """A control doctored 500 map units above its own treatment: a permuted
+    pairing that cannot carry signal, reading as though it carried all of it."""
+    def change(record):
+        entry = record["k"][f"k{int(k)}"]
+        entry["control"] = [x + 500.0 for x in entry["contrast"]]
+    return change
+
+
 def _pooled_z(record, key, arm=JOB.arm, seed=JOB.seed, k=15):
     """The pooled z of one of the record's own per-window series, recomputed
     in the test by the route the script is supposed to take: `cell_series`
@@ -778,9 +838,14 @@ def test_the_seed_tallies_are_counted_per_seed_and_not_off_the_pooled_z(measured
     clears the bar. Read off the pooled z instead, every arm would read 0/n or
     n/n and `MotionArm.clears_up`'s replication clause would stop binding.
 
-    One cell here, so the per-seed z IS the pooled one -- which is exactly why
-    the tally is asserted against the per-seed rule and against the bar, not
-    against the pooled number it happens to equal.
+    One cell here, so the per-seed z IS the pooled one. This test therefore
+    pins the tally against the per-seed RULE and against the bar -- but it
+    cannot tell the two routes apart, and a reader should not think it does:
+    under `seeds_up = len(cells) if pooled.z >= z_fam else 0` every assertion
+    below still holds. The test that separates them is
+    `test_a_result_carried_by_one_seed_of_three_does_not_clear`, which needs
+    three seeds that disagree and so is built from records rather than
+    measured.
     """
     records = script.load_motion(measured.motion, [JOB.arm], [JOB.seed])
     inputs = script.motion_inputs(records, k=15)
@@ -792,29 +857,127 @@ def test_the_seed_tallies_are_counted_per_seed_and_not_off_the_pooled_z(measured
     assert arm.seeds_up + arm.seeds_down <= 1
 
 
-def test_a_leaking_control_is_exit_38_and_writes_no_reading(measured, capsys):
+# Twelve windows over six episodes -- the fixture's own shape -- so the bar is
+# `cluster_threshold(3, 6) = 3.53`. `STRONG` is a result one seed carries on
+# its own; `NOISE` and its negation are two seeds that carry nothing, and they
+# are each other's negation so the three seeds' per-window mean is exactly
+# `STRONG / 3`: a pooled estimate that clears the bar by two orders of
+# magnitude while two of its three seeds sit at z = 0.00.
+MOTION_EPISODES = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+STRONG = {
+    "frozen_ssl": [2.00, 2.02, 1.98, 2.01, 1.99, 2.03, 1.97, 2.00, 2.02, 1.98, 2.01, 1.99],
+    "pixel_ae": [3.00, 3.03, 2.97, 3.01, 2.99, 3.04, 2.96, 3.00, 3.02, 2.98, 3.01, 2.99],
+}
+# Mean exactly zero, but no EPISODE's mean is zero, so the clustered standard
+# error is positive and the seed's own z is 0.00 rather than a NaN that would
+# fail to clear for the wrong reason.
+NOISE = [0.05, -0.04, 0.03, -0.06, 0.02, -0.01, 0.04, -0.05, 0.01, -0.02, 0.03, 0.00]
+QUIET_CONTROL = [0.02, -0.03, 0.01, 0.04, -0.02, -0.01, 0.03, -0.04, 0.02, -0.01, -0.01, 0.00]
+
+
+def _motion_record(arm, seed, contrast):
+    """One cell's record in the shape `motion_inputs` reads -- the plain-dict
+    route `test_two_records_that_did_not_score_the_same_windows_cannot_share_
+    one_bar` takes, since this case needs three seeds that DISAGREE and the
+    fixture measures one real cell."""
+    return {
+        "arm": arm, "seed": int(seed), "ks": [15], "context": CONTEXT, "horizon": HORIZON,
+        "device": "cpu", "torch_version": "2.0.0",
+        "windows": {"total": 12, "episode": list(MOTION_EPISODES)},
+        "episodes": {"val": [f"e{i}.npz" for i in range(6)]},
+        "k": {"k15": {"contrast": list(contrast), "control": list(QUIET_CONTROL)}},
+    }
+
+
+def test_a_result_carried_by_one_seed_of_three_does_not_clear():
+    """THE REPLICATION CLAUSE, where it binds. Both arms here pool to a z of
+    over 500 -- far past the 3.53 bar -- and in both it is seed 0 alone that
+    carries it: seeds 1 and 2 are zero-mean noise reading z = 0.00 each. So
+    `seeds_up` is 1 of 3, `clears_up` is False for both arms, and the verdict
+    is NO DIFFERENCE.
+
+    Read the tally off the POOLED z instead -- `seeds_up = len(cells) if
+    pooled.z >= z_fam else 0`, the mutation `_arm_from_pool`'s docstring warns
+    about -- and both arms read 3/3, both clear, and the same records print
+    MOTION ENCODED: a result one seed carries, printed as replicated across
+    three, with every count in the table still internally consistent.
+    """
+    records = {
+        (arm, seed): _motion_record(arm, seed, series)
+        for arm in ("frozen_ssl", "pixel_ae")
+        for seed, series in ((0, STRONG[arm]), (1, NOISE), (2, [-x for x in NOISE]))
+    }
+    inputs = script.motion_inputs(records, k=15)
+
+    assert inputs.clusters == 6
+    assert inputs.z_fam == pytest.approx(3.5341, abs=5e-5)
+    # The pooled number clears by a wide margin in BOTH arms: nothing about
+    # the estimate or its z is what refuses this reading.
+    assert inputs.arms["frozen_ssl"].estimate == pytest.approx(0.666667, abs=5e-7)
+    assert inputs.arms["frozen_ssl"].z == pytest.approx(516.3978, abs=5e-5)
+    assert inputs.arms["pixel_ae"].estimate == pytest.approx(1.000000, abs=5e-7)
+    assert inputs.arms["pixel_ae"].z == pytest.approx(533.1140, abs=5e-5)
+    for arm in ("frozen_ssl", "pixel_ae"):
+        assert inputs.arms[arm].z > inputs.z_fam
+        assert inputs.control[arm].z == pytest.approx(0.0, abs=5e-9)
+        # One seed of three, counted per seed -- and that is what refuses it.
+        assert inputs.arms[arm].seeds_up == 1
+        assert inputs.arms[arm].seeds_down == 0
+        assert inputs.arms[arm].seeds_total == 3
+        assert not inputs.arms[arm].clears_up(inputs.z_fam)
+
+    for seed, expected in ((0, 516.3978), (1, 0.0), (2, 0.0)):
+        own = _pooled_z(records[("frozen_ssl", seed)], "contrast", "frozen_ssl", seed)
+        assert own == pytest.approx(expected, abs=5e-5)
+
+    reading = script.reading_displacement(inputs)
+    assert reading.status == "NO_DIFFERENCE"
+    assert reading.arms_up == () and reading.leaked == ()
+
+
+def test_a_leaking_control_is_exit_38_and_writes_no_reading(planned, capsys):
     """The gate, in code. Doctoring the control to clear the bar must refuse
     before any verdict is printed."""
-    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
-    record = load_record(path)
-    entry = record["k"]["k15"]
-    entry["control"] = [x + 500.0 for x in entry["contrast"]]
-    _rewrite(path, record)
-    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_CONTROL_LEAKED
+    _doctor(planned, _leak_at(15))
+    assert _read(planned) == script.EXIT_CONTROL_LEAKED
     out = capsys.readouterr().out
     assert "UNRESOLVED CONTROL" in out
     assert "MOTION ENCODED" not in out and "NO MOTION" not in out
-    assert not (measured.motion / "motion.txt").exists()
+    assert not (planned.motion / "motion.txt").exists()
 
 
-def test_read_writes_motion_txt_byte_identical_to_what_it_printed(measured, capsys):
-    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+def test_a_leak_removes_the_motion_txt_an_earlier_clean_run_left(planned, capsys):
+    """Exit 38 leaves NO motion.txt -- and "no motion.txt" has to mean the
+    same thing on the second run as on the first.
+
+    A clean read writes the file; a later read of records whose control now
+    leaks used to return 38 and leave that file byte-unchanged on disk, under
+    the name `read_phase`'s own docstring promises holds no suppressed
+    reading. The next milestone quotes `motion.txt`; a stale one is the
+    artefact the gate exists to keep it from quoting.
+    """
+    assert _read(planned) == script.EXIT_OK
+    path = planned.motion / "motion.txt"
+    stale = path.read_text()
+    assert "Reading D" in stale, "the clean run must have written a reading to shadow"
+
+    _doctor(planned, _leak_at(15))
+    assert _read(planned) == script.EXIT_CONTROL_LEAKED
+    out = capsys.readouterr().out
+    assert "UNRESOLVED CONTROL" in out
+    assert not path.exists(), (
+        "a suppressed reading must not leave the earlier run's motion.txt behind"
+    )
+
+
+def test_read_writes_motion_txt_byte_identical_to_what_it_printed(planned, capsys):
+    assert _read(planned) == script.EXIT_OK
     printed = capsys.readouterr().out
-    written = (measured.motion / "motion.txt").read_text()
+    written = (planned.motion / "motion.txt").read_text()
     assert written == printed, "motion.txt must be what the reader saw"
 
 
-def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(measured, capsys):
+def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(planned, capsys):
     """Only k = 15 decides. The other horizons are printed and decide nothing,
     exactly as the M3 gate is.
 
@@ -823,7 +986,7 @@ def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(measured, c
     the same doctoring at k = 15 is exit 38 above. A read that pooled every k
     into the decision would return 38 here.
     """
-    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+    assert _read(planned) == script.EXIT_OK
     out = capsys.readouterr().out
     assert "Reading D: does the latent encode displacement at k = 15" in out
     assert script.DECISION_H == 15
@@ -831,42 +994,101 @@ def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(measured, c
     # records do not carry is printed as if it had been measured.
     rows = [line for line in out.splitlines() if line.startswith("  k=")]
     assert {line.split()[0] for line in rows} == {f"k={k}" for k in KS}
-    assert sum(line.split()[-1] == "yes" for line in rows) == 1, (
-        "exactly one horizon decides, and it is DECISION_H"
-    )
-    assert [line.split()[0] for line in rows if line.split()[-1] == "yes"] == ["k=15"]
+    # One row per arm per horizon, so the tally is over HORIZONS: `decides`
+    # is yes on every row of k = 15 and on no row of any other k.
+    for line in rows:
+        fields = line.split()
+        assert fields[-1] == ("yes" if fields[0] == "k=15" else "no"), line
+    assert {line.split()[0] for line in rows if line.split()[-1] == "yes"} == {"k=15"}
 
-    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
-    record = load_record(path)
-    record["k"]["k1"]["control"] = [x + 500.0 for x in record["k"]["k1"]["contrast"]]
-    _rewrite(path, record)
-    assert script.main(_argv(measured, "--phase", "read")) == script.EXIT_OK
+    _doctor(planned, _leak_at(1))
+    assert _read(planned) == script.EXIT_OK
     assert "UNRESOLVED CONTROL" not in capsys.readouterr().out
 
 
+def test_a_read_narrowed_to_one_arm_is_refused_before_a_record_is_opened(
+    reference, monkeypatch,
+):
+    """`--arms random_vit` pools cleanly and then prints a verdict its plan
+    decided: on a real cell the arm's own row reads `estimate +2.9967, z
+    +996.13, 3/3 up, clears = up` and the line under it reads NO DIFFERENCE,
+    because MOTION_ENCODED needs `ARMS_REQUIRED = 2` arms and there is only
+    one. The row and the verdict say opposite things -- `MotionArm`'s
+    docstring records that exact shipped failure -- so the plan is refused.
+
+    `load_motion` is replaced by a raiser: the refusal must come before any
+    record is opened, not after nine are pooled.
+    """
+    monkeypatch.setattr(script, "load_motion", _never_pass)
+    every_seed = [str(seed) for seed in script.SEEDS]
+    with pytest.raises(ValueError, match=r"CANNOT REACH THE VERDICT") as raised:
+        script.main(_argv(
+            reference, "--phase", "read", "--arms", JOB.arm, "--seeds", *every_seed,
+        ), ks=KS)
+    message = str(raised.value)
+    assert "1 arm(s)" in message and f"needs {script.ARMS_REQUIRED}" in message
+    assert "seed(s)" not in message, "three seeds is what the rule asks for; do not name them"
+    assert not (reference.motion / "motion.txt").exists()
+
+
+def test_a_read_narrowed_to_one_seed_is_refused_before_a_record_is_opened(
+    reference, monkeypatch,
+):
+    """`--seeds 0` has the same shape from the other side: every arm's tally
+    is `1/1`, so `clears_up`'s replication clause -- at least
+    `SEEDS_REQUIRED = 2` of the arm's own seeds -- cannot be satisfied whatever
+    the z is, and the verdict is NO DIFFERENCE by construction."""
+    monkeypatch.setattr(script, "load_motion", _never_pass)
+    with pytest.raises(ValueError, match=r"CANNOT REACH THE VERDICT") as raised:
+        script.main(_argv(
+            reference, "--phase", "read", "--arms", *script.ARMS, "--seeds", "0",
+        ), ks=KS)
+    message = str(raised.value)
+    assert "1 seed(s) [0]" in message and f"needs {script.SEEDS_REQUIRED}" in message
+    assert "arm(s)" not in message, "three arms is what the rule asks for; do not name them"
+    assert not (reference.motion / "motion.txt").exists()
+
+
+def test_the_pre_registered_plan_is_readable_and_names_both_shortfalls():
+    """The guard must not refuse the plan the milestone actually runs, and it
+    must name BOTH counts when both are short -- `--arms random_vit --seeds 1`
+    is the narrowing this fixture would otherwise have read under."""
+    assert script.ARMS_REQUIRED == 2 and script.SEEDS_REQUIRED == 2
+    assert len(script.ARMS) >= script.ARMS_REQUIRED
+    assert len(script.SEEDS) >= script.SEEDS_REQUIRED
+    assert script.require_readable_plan(script.ARMS, script.SEEDS) is None
+    # Exactly at the bar: two arms and two seeds is a readable plan.
+    assert script.require_readable_plan(script.ARMS[:2], script.SEEDS[:2]) is None
+    with pytest.raises(ValueError) as raised:
+        script.require_readable_plan([JOB.arm], [JOB.seed])
+    message = str(raised.value)
+    assert "1 arm(s) ['random_vit']" in message and "1 seed(s) [1]" in message
+    assert "k = 15" in message
+
+
 def test_read_names_a_missing_record_and_is_exit_11(reference, capsys):
-    """Nothing measured, so the first cell has no record: named, never pooled
-    over what happens to be on disk."""
-    assert script.main(_argv(reference, "--phase", "read")) == script.EXIT_NO_CHECKPOINTS
+    """Nothing measured, so the first cell of the plan has no record: named,
+    never pooled over what happens to be on disk."""
+    assert _read(reference) == script.EXIT_NO_CHECKPOINTS
     out = capsys.readouterr().out
-    assert "NO CELL" in out and JOB.arm in out
+    assert "NO CELL" in out and f"{script.ARMS[0]} seed {script.SEEDS[0]}" in out
     assert not (reference.motion / "motion.txt").exists()
 
 
 def test_a_grid_without_DECISION_H_is_refused_rather_than_read_at_a_neighbour(
-    measured, capsys,
+    planned, capsys,
 ):
     """Reading D is decided at k = 15 and nowhere else. A record measured at a
     grid that does not carry it has no reading to take, and taking the nearest
     horizon instead would print a number under 15's caption."""
-    path = script.motion_record_path(measured.motion, JOB.arm, JOB.seed)
-    record = load_record(path)
-    record["ks"] = [1, 5]
-    del record["k"]["k15"]
-    _rewrite(path, record)
+    def drop_the_decision(record):
+        record["ks"] = [1, 5]
+        del record["k"]["k15"]
+
+    _doctor(planned, drop_the_decision)
     with pytest.raises(ValueError, match=r"does not include the pre-registered DECISION_H"):
-        script.main(_argv(measured, "--phase", "read"))
-    assert not (measured.motion / "motion.txt").exists()
+        _read(planned)
+    assert not (planned.motion / "motion.txt").exists()
 
 
 def test_two_records_that_did_not_score_the_same_windows_cannot_share_one_bar():
@@ -890,3 +1112,209 @@ def test_two_records_that_did_not_score_the_same_windows_cannot_share_one_bar():
         other = {**base, field: value}
         with pytest.raises(ValueError, match="cannot be read against one bar"):
             script.require_one_protocol({("pixel_ae", 0): base, ("random_vit", 0): other})
+
+
+# ---------------------------------------------------------------------------
+# read: the tables, and the caption each number is printed under.
+# ---------------------------------------------------------------------------
+#
+# `mbfps.eval.motion` declares `READING_COLUMNS` / `READING_WIDTHS` once and
+# builds the reading table's header and its rows from them, so a test can
+# assert the header against the DECLARATION and each row's values by the same
+# index. The three tables this script owns are pinned the same way here. Every
+# value below is distinct from every other in its row, so a swap between any
+# two columns -- `KL mean` carrying the median, `top1 post` carrying the prior
+# -- moves a hand-typed string and fails.
+
+
+def _table_record(
+    *, step, ref, pers, ok, windows, episodes, entropy, live, groups,
+    top1_post, top1_prior, kl_mean, kl_median,
+):
+    """One record in the shape the two per-record tables read. Keyword-only:
+    a positional call could pass the prior where the posterior goes, which is
+    one of the two swaps this section exists to catch."""
+    return {
+        "step": step,
+        "self_check": {
+            "reference_position_max_delta": ref,
+            "persistence_position_max_delta": pers,
+            "ok": ok,
+        },
+        "windows": {"total": windows, "episode": list(episodes)},
+        "description": {
+            "entropy_mean": entropy, "entropy_max": 3.466, "live_groups": live,
+            "entropy_by_group": [0.1] * groups,
+            "top1_posterior": top1_post, "top1_prior": top1_prior,
+        },
+        "information": {"mean": kl_mean, "median": kl_median},
+    }
+
+
+TABLE_RECORDS = {
+    ("pixel_ae", 1): _table_record(
+        step=20000, ref=4.2e-07, pers=1.3e-06, ok=True, windows=229, episodes=(0, 1, 2),
+        entropy=0.812, live=7.0, groups=32, top1_post=0.641, top1_prior=0.238,
+        kl_mean=0.489, kl_median=0.317,
+    ),
+    ("random_vit", 0): _table_record(
+        step=15000, ref=0.0, pers=5.5e-05, ok=False, windows=187, episodes=(3, 4, 5, 6),
+        entropy=1.204, live=11.0, groups=24, top1_post=0.573, top1_prior=0.194,
+        kl_mean=0.290, kl_median=0.206,
+    ),
+}
+
+
+def _rows(text, columns):
+    """Each table row keyed by its arm, split into one token per column.
+
+    Every value these tables print is a single token, so a row splits into
+    exactly `len(columns)` of them -- and if a value reached its field's width
+    it would glue onto its neighbour and this would find one fewer.
+    """
+    rows = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] in {arm for arm, _ in TABLE_RECORDS}:
+            assert len(fields) == len(columns), line
+            rows[fields[0]] = fields
+    return rows
+
+
+def test_the_self_check_table_prints_the_declared_header():
+    """Hand-typed, so the declaration cannot drift and take the assertion with
+    it. `ref max|d|` and `pers max|d|` are letter for letter split_gap's,
+    checkpoint_ladder's, sharper_latent's and stage_decomposition's."""
+    header = script._self_check_table(TABLE_RECORDS).splitlines()[1]
+    assert header == (
+        "  arm          seed    step  ref max|d|  pers max|d|  windows  clusters   ok"
+    )
+    assert list(script.SELF_CHECK_COLUMNS) == [
+        "arm", "seed", "step", "ref max|d|", "pers max|d|", "windows", "clusters", "ok",
+    ]
+
+
+def test_each_self_check_row_carries_its_own_numbers_under_those_headers():
+    """`clusters` is the DISTINCT episode count and `windows` the total, which
+    a swap between the two would report as 229 clusters over 3 windows."""
+    columns = list(script.SELF_CHECK_COLUMNS)
+    rows = _rows(script._self_check_table(TABLE_RECORDS), columns)
+    assert set(rows) == {"pixel_ae", "random_vit"}
+    row = rows["pixel_ae"]
+    assert row[columns.index("seed")] == "1"
+    assert row[columns.index("step")] == "20000"
+    assert row[columns.index("ref max|d|")] == "4.2e-07"
+    assert row[columns.index("pers max|d|")] == "1.3e-06"
+    assert row[columns.index("windows")] == "229"
+    assert row[columns.index("clusters")] == "3"
+    assert row[columns.index("ok")] == "yes"
+    row = rows["random_vit"]
+    assert row[columns.index("seed")] == "0"
+    assert row[columns.index("step")] == "15000"
+    assert row[columns.index("ref max|d|")] == "0.0e+00"
+    assert row[columns.index("pers max|d|")] == "5.5e-05"
+    assert row[columns.index("windows")] == "187"
+    assert row[columns.index("clusters")] == "4"
+    assert row[columns.index("ok")] == "NO"
+
+
+def test_the_description_table_prints_the_declared_header():
+    header = script._description_table(TABLE_RECORDS).splitlines()[1]
+    assert header == (
+        "  arm          seed  entropy   ln(C)   live  groups  top1 post  top1 prior"
+        "  KL mean   KL med"
+    )
+    assert list(script.DESCRIPTION_COLUMNS) == [
+        "arm", "seed", "entropy", "ln(C)", "live", "groups",
+        "top1 post", "top1 prior", "KL mean", "KL med",
+    ]
+
+
+def test_each_description_row_carries_its_own_numbers_under_those_headers():
+    """The two swaps this pins by name: `KL mean` must carry
+    `information["mean"]` and not `["median"]` -- `_information_block`'s
+    docstring says this milestone's headline KL number is read off this row --
+    and `top1 post` must carry the posterior and not the prior. Byte-identity
+    between print and file cannot tell either swap from the truth, and both
+    are how M3h shipped a premise it never measured as stated.
+    """
+    columns = list(script.DESCRIPTION_COLUMNS)
+    rows = _rows(script._description_table(TABLE_RECORDS), columns)
+    row = rows["pixel_ae"]
+    assert row[columns.index("seed")] == "1"
+    assert row[columns.index("entropy")] == "0.812"
+    assert row[columns.index("ln(C)")] == "3.466"
+    assert row[columns.index("live")] == "7.0"
+    assert row[columns.index("groups")] == "32"
+    assert row[columns.index("top1 post")] == "0.641"
+    assert row[columns.index("top1 prior")] == "0.238"
+    assert row[columns.index("KL mean")] == "0.489"
+    assert row[columns.index("KL med")] == "0.317"
+    row = rows["random_vit"]
+    assert row[columns.index("entropy")] == "1.204"
+    assert row[columns.index("live")] == "11.0"
+    assert row[columns.index("groups")] == "24"
+    assert row[columns.index("top1 post")] == "0.573"
+    assert row[columns.index("top1 prior")] == "0.194"
+    assert row[columns.index("KL mean")] == "0.290"
+    assert row[columns.index("KL med")] == "0.206"
+
+
+def _extreme_inputs(k=15):
+    """A reading no working instrument prints and a broken one does: the
+    control z here is the one a doctored control actually read (+717489.65),
+    which used to print as `0/3+717489.65`."""
+    arm = script.MotionArm(
+        estimate=717489.65, se=12345.6789, z=717489.65,
+        seeds_up=120, seeds_down=0, seeds_total=120,
+    )
+    control = script.MotionArm(
+        estimate=-717489.65, se=0.0001, z=-717489.65,
+        seeds_up=0, seeds_down=120, seeds_total=120,
+    )
+    return script.MotionInputs(
+        arms={"pixel_ae": arm, "random_vit": arm},
+        control={"pixel_ae": control, "random_vit": control},
+        z_fam=2.58, k=k, clusters=24,
+    )
+
+
+def test_the_per_k_table_prints_the_declared_header():
+    header = script._per_k_table({15: _extreme_inputs()}, 15).splitlines()[1]
+    assert header == (
+        "  k      arm                estimate         se          z       up       dn"
+        "        ctl z  decides"
+    )
+    assert list(script.PER_K_COLUMNS) == [
+        "k", "arm", "estimate", "se", "z", "up", "dn", "ctl z", "decides",
+    ]
+
+
+def test_per_k_columns_do_not_glue_onto_their_neighbours_at_an_extreme_reading():
+    """A value that meets or exceeds its own field's width prints with no
+    separating space and runs into the column before it: `z` at `+.2f` is 8
+    characters from |z| = 1000 in a field of 8, and `ctl z` was 10 in a field
+    of 9, which printed `0/3+717489.65`. `READING_WIDTHS` states this
+    discipline for the reading table and these fields did not follow it.
+
+    Deliberately generic, as `test_extreme_values_do_not_glue_onto_the_
+    previous_column` is: every row must split into exactly
+    `len(PER_K_COLUMNS)` whitespace-separated tokens, which fails if ANY
+    column glues onto its neighbour, including one added later.
+    """
+    text = script._per_k_table({1: _extreme_inputs(1), 15: _extreme_inputs()}, 15)
+    rows = [line for line in text.splitlines() if line.strip().startswith("k=")]
+    assert len(rows) == 4, "two horizons, two arms each"
+    for row in rows:
+        assert len(row.split()) == len(script.PER_K_COLUMNS), row
+    fields = rows[0].split()
+    columns = list(script.PER_K_COLUMNS)
+    assert fields[columns.index("k")] == "k=1"
+    assert fields[columns.index("estimate")] == "+717489.6500"
+    assert fields[columns.index("se")] == "12345.6789"
+    assert fields[columns.index("z")] == "+717489.65"
+    assert fields[columns.index("up")] == "120/120"
+    assert fields[columns.index("dn")] == "0/120"
+    assert fields[columns.index("ctl z")] == "-717489.65"
+    assert fields[columns.index("decides")] == "no"
+    assert rows[-1].split()[columns.index("decides")] == "yes"
