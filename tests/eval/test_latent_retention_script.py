@@ -743,6 +743,22 @@ def test_retention_inputs_reads_the_base_control_against_the_floor():
         "would reproduce the same numbers"
     )
 
+    # WITHIN-arm too, not only across arms. The cross-arm check above cannot
+    # see a base-control loop that read records[(arm, 0)] for all three seed
+    # slots: the arms still differ from each other, so the distinctness
+    # assertion holds while every arm silently reports seed 0 three times. The
+    # base control is a GATE, so a seed-collapse here suppresses or licenses a
+    # reading without changing anything a reader would notice. Recomputed from
+    # the fixture rather than hardcoded, so it tracks _cell_offset.
+    raw = _records(base_r2=BASE_R2_FLOOR + 0.05)
+    for arm in ("frozen_ssl", "pixel_ae", "random_vit"):
+        seeds = [raw[(arm, seed)]["base_control"]["r2"] for seed in (0, 1, 2)]
+        assert len(set(seeds)) == 3, f"{arm}: the fixture must vary r2 by seed"
+        assert holding.base[arm].r2 == pytest.approx(sum(seeds) / 3), (
+            f"{arm}: base r2 is not the mean of ITS OWN three seeds; the read "
+            "collapsed the seeds or gathered them from another arm"
+        )
+
     failing = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR - 0.05))
     assert not any(c.clears() for c in failing.base.values())
 
