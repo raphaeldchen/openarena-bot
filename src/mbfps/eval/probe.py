@@ -741,10 +741,11 @@ def gain_from_blocks(
         base_probe = fit_probe(base_fit, target_fit)
     else:
         select.rows()
-        joint_probe = fit_probe(joint_fit, target_fit, select.joint(), select.target)
+        select_target = np.asarray(select.target, dtype=np.float64)
+        joint_probe = fit_probe(joint_fit, target_fit, select.joint(), select_target)
         base_probe = fit_probe(
             base_fit, target_fit,
-            np.asarray(select.base, dtype=np.float64), select.target,
+            np.asarray(select.base, dtype=np.float64), select_target,
         )
 
     joint_predicted = apply_probe(joint_probe, joint_score)

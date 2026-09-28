@@ -1738,29 +1738,72 @@ def test_gain_from_blocks_counts_groups_not_rows_over_a_window():
     assert out["n_scored_windows"] == 2
 
 
+def _base_carries_target_case(n: int, seed: int):
+    """`base` predicts the target almost perfectly; `block` is pure noise.
+
+    The arrangement `_history_case` deliberately does NOT provide: there, the
+    encoder embedding carries no information about the target, so a probe on
+    the joint arm and a probe on the base arm both saturate the ridge grid and
+    score the same. That makes `_history_case` right for testing what the
+    deterministic block adds, and useless for testing that the base is in both
+    arms -- removing it from either arm changes nothing measurable.
+
+    Here the base explains the target, so the two one-sided mutations separate:
+    dropping the base from the JOINT arm collapses `joint_r2` while `base_r2`
+    stays high (gain goes strongly negative), and dropping it from the BASE arm
+    leaves `joint_r2` high while `base_r2` collapses (gain goes strongly
+    positive). A correct implementation sits at gain ~= 0, because a pure-noise
+    block can neither help nor hurt.
+    """
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=n)
+    base = signal[:, None] * np.ones((1, 3)) + 0.01 * rng.normal(size=(n, 3))
+    block = rng.normal(size=(n, 2))
+    targets = np.column_stack([signal] * 4) * 3.0 + 0.05 * rng.normal(size=(n, 4))
+    return base, block, targets
+
+
 def test_gain_from_blocks_puts_the_base_in_both_arms():
     """The cancellation the whole statistic rests on. If the base appeared only
     in one arm, the gain would measure the two feature sets' widths as much as
     the block's contribution -- and neither the bottleneck nor the
-    position-constrains-motion confound would cancel."""
-    latent, embedding, targets = _history_case(600, seed=5)
+    position-constrains-motion confound would cancel.
+
+    Two mutations expose the defect:
+    - Dropping the base from the JOINT arm collapses joint_r2 while base_r2
+      stays high: the gain goes strongly negative, caught by `gain > -0.05`.
+    - Dropping the base from the BASE arm leaves joint_r2 high while base_r2
+      collapses: the gain goes strongly positive, caught by `ci_low <= 0.0`.
+    """
+    base, block, targets = _base_carries_target_case(600, seed=11)
     rows = np.arange(600)
-    # A block of pure noise must not show a gain: the base is identical in both
-    # arms, so there is nothing for extra width alone to buy.
-    noise = np.random.default_rng(9).normal(size=(600, 2))
+    splits = (slice(0, 200), slice(200, 400), slice(400, 600))
     def split(sl):
-        return GainSplit(base=embedding[sl], block=noise[sl], target=targets[sl])
+        return GainSplit(base=base[sl], block=block[sl], target=targets[sl])
+
     out = gain_from_blocks(
         split(rows[:200]), split(rows[200:400]), split(rows[400:600]),
         groups=np.arange(200) // 5, resamples=200, confidence=0.9, seed=6,
     )
-    assert out["ci_low"] <= 0.0, (
-        f"a noise block cleared zero (ci_low={out['ci_low']}); the base is not "
-        "in both arms, or the selection is being taken on the scored rows"
+
+    # Verify the fixture's premise: the base explains the target almost perfectly
+    assert out["embedding_r2"] > 0.9, (
+        f"the base does not carry target signal (embedding_r2={out['embedding_r2']:.4f}); "
+        "the fixture assumption is wrong"
     )
+
+    # A pure-noise block must not show a gain: if this fails, the base is missing
+    # from the JOINT arm and the two arms are not nested.
+    assert out["ci_low"] <= 0.0, (
+        f"a noise block cleared zero (ci_low={out['ci_low']}); the base is missing "
+        "from the JOINT arm or selection is being taken on the scored rows"
+    )
+
+    # If this fails, the base is missing from the BASE arm and adding the block
+    # collapses the joint arm's score.
     assert out["gain"] > -0.05, (
         f"a noise block cost {out['gain']:.4f} of R^2; the base is missing from the "
-        "JOINT arm, so the two arms are not nested"
+        "BASE arm, so the two arms are not nested"
     )
 
 
