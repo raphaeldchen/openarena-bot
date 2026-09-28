@@ -104,7 +104,7 @@ That cell's recorded `latent_selection_r2` is **−0.008**: its latent predicts 
 
 - It does not change the M3 gate, `aggregate.py`, `report_study.py`, any shipped checkpoint, or any verdict M3b–M3h recorded.
 - It does not rank arms. Every contrast is within a cell, against that cell's own persistence baseline on the same windows.
-- A linear ridge probe is a **lower bound** on the information present: `NO_MOTION` says no *linear* read-out of the posterior latent beats staying put, not that the information is absent under every decoder. The claim it licenses is about what the rollout's own linear machinery can exploit — which is the machinery the M3 gate uses.
+- A linear ridge probe is a **lower bound** on the information present: `NO_MOTION` says no *linear* read-out of the posterior latent beats staying put, not that the information is absent under every decoder. The claim it licenses is about what the rollout's own linear machinery can exploit — which is the machinery the gate's band is *scored through*. *Corrected after the run: it is not the gate's rollout, which steps a nonlinear RSSM given the real future actions while this probe is linear and action-blind. Adding the action sequence to the probe was measured and is not result-moving (k = 15 contrast −0.6550 → −0.6551); see `## Task 8 results` §11.*
 - `MOTION_ENCODED` does not say the prior can learn the displacement, only that it is there to be learned.
 - It says nothing about a model trained differently. It reads the nine cells that exist.
 - A reading at `k = 15` on `my_way_home`'s 24 validation episodes at context 5 / horizon 45, at 20,000 steps, is not a statement that the world model works.

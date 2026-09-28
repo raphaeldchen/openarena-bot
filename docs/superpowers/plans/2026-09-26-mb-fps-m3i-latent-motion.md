@@ -1131,7 +1131,7 @@ Recorded here rather than silently corrected, because the plan is what survives.
    `ridge=1e3`, chosen for `(N, 4)` POSITION targets of std ~240 map units. Displacement over k
    steps is one to two orders smaller. Measured on this plan's own known-answer case — latents
    encoding the displacement exactly, signal magnitude ~3 — the fallback reads it back with max
-   error **5.55**, larger than the signal; the selected `1e-1` reads it back to **0.009**, and no
+   error **5.874**, larger than the signal; the selected `1e-1` reads it back to **0.0169**, and no
    ridge in `RIDGES = (1e-1, 1e1, 1e3, 1e5, 1e7)` reaches the `< 1e-6` this plan asserted, so that
    tolerance was unreachable rather than merely missed. Taking the fallback would have underfit
    every displacement probe and biased the reading toward `NO_MOTION` — the hypothesis under test —
@@ -1445,14 +1445,22 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ## Task 8 results
 
 **Reading D is `NO MOTION`.** At the decision horizon the posterior latent is measurably **worse**
-than predicting no displacement at all, in all three arms. All three of M3h §8's remaining
+than predicting no displacement at all, in all three arms. *One caveat belongs with that sentence
+rather than buried: at the selected ridge the probe emits a near-constant ≈6 map-unit displacement,
+and a nonzero constant must lose to the zero prediction, so the −0.63 to −0.68 is the cost of that
+offset rather than a property of the representation. The `down` rather than `NO_DIFFERENCE` clearing
+is a fact about an unregularised intercept. §3.3 treats the two statuses identically, so nothing
+downstream turns on it — but "the latent is worse than standing still" is the sentence that will be
+quoted, and it overstates what was measured.* All three of M3h §8's remaining
 prior-side levers are refuted in advance by §3.3, and the project's next lever is upstream: the
 encoder and the representation loss.
 
-The sharper finding is the post-hoc companion in §9: the probe does **exactly as well on a random
-window's displacement as on its own** — paired z of 0.13, −0.12 and 0.08 at k = 15. The latent
-carries no window-specific displacement information at all, which is a stronger statement than
-losing to persistence and does not depend on persistence being a fair baseline.
+The evidence that makes this a statement about the **latent** rather than about the probe is in
+§9's positive controls: from the identical 132 fit rows the same instrument recovers absolute
+position at r² 0.291 and 0.165, selecting a mild ridge — so it is not sample-starved — while
+recovering none of the displacement the latent has **already observed** (backward displacement r²
+−0.010 and −0.021). The information is absent from the representation, not merely unavailable ahead
+of time.
 
 ### 1. Provenance
 
@@ -1534,6 +1542,15 @@ Sweeping an uninformative prediction of growing size against 2000 real displacem
 controls of 0.0000, −0.0383, −0.1509, −0.4626 and −2.4594 — monotone in the prediction's magnitude
 and exactly 0 only when the probe emits nothing. So the gate should have been **one-sided**: only a
 control clearing **positive** means signal where none can exist.
+
+**And it reaches one step further than the paragraph above admits.** Because
+`contrast − control` is identically zero for a constant predictor (§9), and the k = 15 probe is
+nearly constant, the control at the decision horizon had almost no power to fire — the measured
+`|mean(contrast) − mean(control)|` is 0.0001–0.0027 in the five cells at ridge 1e7. So its silence
+at k = 15 is not evidence the instrument is sound, and the reading rests on the ridge selection and
+§9's positive controls instead. Worse for the rule as written: the horizons it *does* suppress are
+the ones with the most signal — at k = 1 the latent's z is −5.67 / −6.55 / −2.78, the strongest in
+the run — while the one it licenses is where the control is degenerate.
 
 What this does and does not change. It does **not** change the verdict: the gate did not fire at
 k = 15, the reading was taken under the rule as written, and a one-sided gate is strictly more
@@ -1619,16 +1636,18 @@ than a scratch measurement:
 - **The prior already knows nearly everything the posterior knows**, confirmed on this milestone's
   own pass: KL(posterior ‖ teacher-forced prior) is **0.203–0.602 nats** summed over 32 groups.
   Averaged within each arm these reproduce M3g's recorded figures **to three decimals** —
-  `pixel_ae` 0.2897 against 0.290, `frozen_ssl` 0.4673 against 0.467, `random_vit` 0.4897
-  against 0.489 — an independent cross-milestone confirmation that both passes read the same
+  `pixel_ae` 0.289910 against 0.290, `frozen_ssl` 0.467248 against 0.467, `random_vit`
+  0.489497 against 0.489 — an independent cross-milestone confirmation that both passes read the same
   229 windows, and the number §1 of the spec opened on, closed here.
 
-### 9. The mechanism — a post-hoc companion, deciding nothing
+### 9. Why the fit found nothing — and the positive controls that make that a statement about the latent
 
-Reading D says the latent loses to staying put. That leaves open *why*, and the permutation already
-in the record answers it. Pooling `contrast − control` per window — the same predictions on their
-own window versus on a random one, which isolates whatever window-**specific** information the
-probe carries:
+*Rewritten after the final whole-branch review, which showed the original §9 claimed more than its
+statistic can carry. The correction is recorded rather than quietly applied, because the original
+called this section load-bearing and it is not.*
+
+**What the permutation actually shows.** Pooling `contrast − control` per window — the same
+predictions on their own window versus on a random one:
 
 | k | `frozen_ssl` | `pixel_ae` | `random_vit` |
 |---|---|---|---|
@@ -1638,20 +1657,53 @@ probe carries:
 | 30 | +0.152 (0.30) | +0.336 (0.43) | +0.249 (0.44) |
 | 45 | +0.074 (0.12) | +0.768 (1.16) | +1.251 (1.49) |
 
-**Indistinguishable from zero everywhere**, and at the decision horizon |z| ≤ 0.13 in all three
-arms. The probe's predictions are statistically independent of which window they are applied to.
+Indistinguishable from zero everywhere, |z| ≤ 0.13 at the decision horizon.
 
-This is the load-bearing observation, and it is stronger than the headline for two reasons. It does
-not depend on persistence being a fair baseline — it is a paired comparison of the probe against
-itself. And it explains the headline's sign without appealing to anti-correlation: both the
-treatment and the control are negative because any nonzero prediction beats nothing only when it
-points the right way, and these point nowhere in particular. The selected ridge agrees — **1e5 or
-1e7 in all nine cells, the top of `RIDGES`**, which is the fit shrinking almost to the training
-mean because there was nothing else to find.
+**But this is close to arithmetic, not evidence.** For a **constant** prediction `c`, the statistic
+is *identically* zero, because the control permutes the same displacement set:
+`(1/n)Σ‖c − d_σ(i)‖ = (1/n)Σ‖c − d_i‖`. Verified: 0.000e+00 and −5.6e−17 for three different
+constants. And at k = 15 the shipped probe **is** nearly constant — five of the nine cells selected
+ridge 1e7, where the prediction's spread is 3.84 map units against a mean ‖Δ‖ of 49.47. So this
+table largely restates "the ridge selection shrank the fit to the training mean", which is honest
+but **not independent of the headline, and not stronger than it.** The original §9 claimed both.
 
-This statistic is **not** pre-registered and decides nothing. It is reported because it was
-computable from the records the pre-registered rule already required.
+**The same reasoning limits what §5's control licenses.** Since `contrast − control` vanishes for a
+constant predictor, the control at k = 15 had almost no power to fire: in the five cells at ridge
+1e7 the measured `|mean(contrast) − mean(control)|` is 0.0001–0.0027. Its silence there is not
+evidence that the instrument is sound.
 
+**So the real support is the positive controls.** `NO_MOTION` is a statement about the latent only
+if the instrument can read *something* from the same rows. The shipped fit is 132 rows against 1536
+features — one row per window at t0 — a regime where "it found nothing because n ≪ p" is a live
+alternative. Measured on the shipped code path, same 132 fit rows, same latent anchor, same
+`fit_probe` / `RIDGES` selection on the same held-out training episodes:
+
+| target | `pixel_ae`/s0 | `frozen_ssl`/s0 |
+|---|---|---|
+| displacement k = 15 (what Reading D scores) | r² **−0.015**, ridge 1e7, pred std 3.84 | −0.015, 1e7, 3.84 |
+| **absolute position at t0** | r² **+0.291**, ridge **1e3**, pred std 384.8 | **+0.165**, **1e3**, 377.2 |
+| **backward displacement, 1 step** | r² **−0.010**, ridge 1e7 | −0.010, 1e7 |
+| **backward displacement, 4 steps** | r² **−0.021**, ridge 1e7 | −0.020, 1e5 |
+
+Two things follow, and they are what the milestone's conclusion rests on.
+
+**The instrument is not sample-starved.** From the *identical* 132 rows it recovers absolute
+position at r² 0.291 and 0.165 — at or near the `latent_selection_r2` 0.18–0.34 the spec quotes
+from M3c's own probe, which was fit on ~50× more rows — and it selects a mild 1e3 rather than
+saturating the grid. The displacement failure is **target-specific**, not a property of the fit.
+
+**The latent cannot read motion it has already seen.** Backward displacement over 1 and 4 steps is
+entirely inside the frames the posterior observed, and the latent recovers none of it (r² −0.010,
+−0.021). That closes the obvious alternative reading — "the latent knows its own motion but cannot
+predict the future" — and it is a sharper statement than anything in Reading D: the information is
+absent from the representation, not merely unavailable ahead of time.
+
+*Provenance: these four rows were measured during the final whole-branch review, on the shipped
+code path, and independently re-measured by the controller before being recorded here. They are
+**not** produced by `scripts/latent_motion.py` and are not in the records. A milestone reusing this
+instrument should build them into the measure phase — they cost one extra `fit_probe` per cell on
+rows the pass already gathers, and they are the difference between a null result and a null result
+that means something.*
 ### 10. `pixel_ae`/s1
 
 Spec §3.4 kept the cell whose recorded `latent_selection_r2` is −0.008 in the nine, and said the
@@ -1673,7 +1725,9 @@ negatively; three of three did.
 batch-and-time-mean clamp, and action conditioning — are **refuted**, because they are prior-side
 and the prior has ~0.4 nats of headroom over a latent that carries no displacement. §8 above
 confirms both halves of that premise on this milestone's own pass: the KL is 0.203–0.602 nats, and
-§9 shows the displacement information is absent rather than merely unexploited. The next lever is
+§9's positive controls show the displacement information is absent from the representation rather
+than merely unexploited — the latent cannot read even the motion it observed, while reading position
+from the same rows. The next lever is
 upstream — the encoder and the representation loss, where `rep_scale = 0.1` sits five times below
 `dyn_scale`. That is applied here as the rule said, not renegotiated now that the number is known.
 
@@ -1685,9 +1739,13 @@ untouched. The M3 gate, `aggregate.py`, `report_study.py` and every M3b–M3h ve
 **The limit §4 stated, and it binds.** Reading D uses a **linear** ridge probe, so `NO_MOTION` says
 no *linear* read-out of the posterior latent beats staying put — not that the information is absent
 under every decoder. The claim is scoped to what the rollout's own linear machinery can exploit,
-which is the machinery the M3 gate uses. §9 strengthens it in one direction only: the probe's
-output is independent of the window, so there is nothing for a *linear* read-out to find. A
-nonlinear decoder is not excluded by this evidence.
+which is the machinery the gate's band is *scored through*. It is **not** the gate's rollout:
+`evaluate_rollout` steps a nonlinear RSSM handed the real future action sequence, while this probe
+is linear and action-blind. The obvious objection — that the missing information is the actions —
+was tested and is not result-moving: adding the 15×6 one-hot action sequence to the probe moves the
+k = 15 contrast from −0.6550 to −0.6551, and actions alone reach select r² −0.008. §9's positive
+controls bound the claim from the other side: a linear read-out recovers position and not
+displacement from the same rows. **A nonlinear decoder is not excluded by any of this evidence.**
 
 **What the anchor decision changed, disclosed.** The probe reads the latent at window row
 `context − 1`, the rollout's own t0. The plan originally read row 0 — the posterior after **one**
