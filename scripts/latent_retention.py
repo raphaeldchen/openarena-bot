@@ -203,6 +203,16 @@ def gather_three_splits(prepared, train, val, *, seed: int):
     neither the weights nor the selection ever saw. Seeds are `seed`, `seed + 2`
     and `seed + 1` in that order, matching `filtering_gain` exactly so the two
     diagnostics describe the same rows.
+
+    THE SCORED SPLIT TAKES EVERY VALIDATION EPISODE, WHICH IS WHERE THIS
+    DEPARTS FROM `filtering_gain`. That function's `limit` caps the fit split
+    AND the scored split at the same number -- its docstring says so
+    ("episodes for the fit split, and for the scored split") -- so mirroring it
+    literally would have scored 20 of the 24 validation episodes and silently
+    thrown away four. The smoke run caught it: 20 clusters and 9,261 rows at
+    k = 1 against the 24 and 11,221 spec sections 3.4 and 6 state and accept on.
+    The protocol every milestone since M3d reads is 229 windows over 24
+    validation episodes, and that is what the reading must be taken on.
     """
     used = list(train)
     fit_paths = used[:FIT_EPISODES]
@@ -221,7 +231,7 @@ def gather_three_splits(prepared, train, val, *, seed: int):
     return (
         gather(fit_paths, seed),
         gather(select_paths, seed + 2) if select_paths else None,
-        gather(val, seed + 1, limit=FIT_EPISODES),
+        gather(val, seed + 1),
     )
 
 

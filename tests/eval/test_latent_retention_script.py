@@ -325,10 +325,17 @@ def test_gather_three_splits_takes_the_filtering_gain_draws(monkeypatch):
     """The three gathers must carry the exact `(paths, seed)` pairs
     `probe.filtering_gain` uses: fit on `train[:FIT_EPISODES]` at `seed`,
     select on the NEXT `SELECT_EPISODES` episodes at `seed + 2`, and score on
-    `val` at `seed + 1` with `limit=FIT_EPISODES` -- NOT `len(val)`, which is
-    `gather_probe_data`'s fit-episode rule and is what keeps this diagnostic
-    describing the same rows `filtering_gain` does. No model needed:
-    `gather_probe_data` itself is replaced with a recorder."""
+    `val` at `seed + 1`.
+
+    The scored split takes EVERY validation episode, which is the one place
+    this departs from `filtering_gain`: that function's `limit` caps the fit
+    split and the scored split at the same number, so mirroring it literally
+    scored 20 of the 24 validation episodes and silently discarded four. The
+    smoke run caught it -- 20 clusters and 9,261 rows at k = 1 against the 24
+    and 11,221 the spec accepts on. The protocol every milestone since M3d
+    reads is 229 windows over 24 validation episodes.
+
+    No model needed: `gather_probe_data` itself is replaced with a recorder."""
     calls = []
 
     def recorder(model, paths, backbone, device, *, context, horizon, limit, seed):
@@ -356,7 +363,14 @@ def test_gather_three_splits_takes_the_filtering_gain_draws(monkeypatch):
     assert select_call["seed"] == 9
     assert score_call["paths"] == val
     assert score_call["seed"] == 8
-    assert score_call["limit"] == script.FIT_EPISODES
+    assert score_call["limit"] == len(val), (
+        f"the scored split was capped at {score_call['limit']} of {len(val)} "
+        "validation episodes; the reading must be taken on all of them"
+    )
+    assert score_call["limit"] != script.FIT_EPISODES, (
+        "the fixture must make the two numbers differ, or this cannot catch "
+        "a regression back to filtering_gain's shared cap"
+    )
 
 
 def test_measure_cell_refuses_a_failed_self_check_and_records_steps(monkeypatch):
