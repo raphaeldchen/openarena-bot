@@ -662,3 +662,130 @@ def test_reading_retention_refuses_a_base_with_too_few_arms():
     del inputs.base["pixel_ae"]
     with pytest.raises(ValueError, match="arm"):
         reading_retention(inputs)
+
+
+# --- the printed tables: captions pinned to their columns -------------------
+
+
+from mbfps.eval.retention import (  # noqa: E402
+    LADDER_COLUMNS,
+    LADDER_WIDTHS,
+    READING_COLUMNS,
+    READING_WIDTHS,
+    format_ladder,
+    format_reading_retention,
+)
+
+
+def test_reading_columns_and_widths_stay_the_same_length():
+    """Header and rows are two separate f-strings built from these tuples. A
+    length mismatch means one column's caption sits over another's values --
+    the defect class this project has shipped three times."""
+    assert len(READING_COLUMNS) == len(READING_WIDTHS)
+    assert len(LADDER_COLUMNS) == len(LADDER_WIDTHS)
+
+
+def test_every_reading_width_admits_its_widest_realistic_value():
+    """A value as wide as its field glues onto the previous column with no
+    separator. `seeds` holds "3/3" (3 chars), `clears` holds "yes"/"no", `arm`
+    holds "frozen_ssl" (10) and "random_vit" (10), and a gain prints as
+    "+0.1234" or "-12.3456" (8). Every width must EXCEED, not equal."""
+    widest = {
+        "rung": len("deterministic"), "arm": len("frozen_ssl"),
+        "gain": len("-12.3456"), "ci_low": len("-12.3456"),
+        "ci_high": len("-12.3456"), "seeds": len("3/3"), "clears": len("yes"),
+    }
+    for name, width in zip(READING_COLUMNS, READING_WIDTHS, strict=True):
+        assert width > widest[name], (
+            f"column {name!r} is {width} wide but holds up to {widest[name]} "
+            "characters; a full-width value glues onto its left neighbour"
+        )
+
+
+def test_reading_header_captions_the_columns_it_prints():
+    """The header and the rows must agree COLUMN BY COLUMN, sliced at the same
+    offsets. Asserting the two strings look plausible is what let three wrong
+    captions ship."""
+    inputs = _inputs({("translation", DECISION_K, "full"): 0.2})
+    text = format_reading_retention(reading_retention(inputs), inputs)
+    lines = [line for line in text.splitlines() if line.startswith("  ")]
+    header, first = lines[0], lines[1]
+    offset = 2
+    for name, width in zip(READING_COLUMNS, READING_WIDTHS, strict=True):
+        assert header[offset:offset + width].strip() == name, (
+            f"header column at offset {offset} is not {name!r}"
+        )
+        assert first[offset:offset + width].strip() != "", (
+            f"the first row has nothing under the {name!r} caption"
+        )
+        offset += width
+
+
+def test_reading_names_the_target_the_horizon_and_the_clusters_in_its_caption():
+    """A table whose caption does not say what its numbers are is how this
+    project shipped a wrong number three times. The caption has to name the
+    statistic (a gain over enc(t), not a level), the target, the horizon, the
+    one-sided rule and the cluster count."""
+    inputs = _inputs({})
+    caption = format_reading_retention(reading_retention(inputs), inputs).splitlines()[0]
+    assert "gain over enc(t)" in caption
+    assert "translation" in caption
+    assert f"k = {DECISION_K}" in caption
+    assert "ci_low > 0" in caption
+    assert "24 clusters" in caption
+
+
+def test_reading_prints_the_verdict_and_its_rule():
+    inputs = _inputs({("translation", 4, "deterministic"): 0.2})
+    text = format_reading_retention(reading_retention(inputs), inputs)
+    assert "verdict: BOTTLENECK LOSS" in text
+    assert "decided by:" in text
+
+
+def test_reading_prints_the_base_control_beside_the_verdict():
+    """The control is a gate, so its numbers belong next to the reading it
+    licensed rather than in a companion nobody reads."""
+    inputs = _inputs({})
+    text = format_reading_retention(reading_retention(inputs), inputs)
+    assert "base control (enc(t) -> absolute position" in text
+    assert "frozen_ssl r2=+0.300" in text
+
+
+def test_reading_prints_the_rotation_control_beside_the_verdict():
+    """Reading rotation but not translation is a DIFFERENT lever from reading
+    neither, so which rungs read rotation has to be on the face of the verdict."""
+    inputs = _inputs({("rotation", 4, "two_frame"): 0.5})
+    text = format_reading_retention(reading_retention(inputs), inputs)
+    assert "rotation control" in text
+    assert "two_frame" in text.split("rotation control")[1].splitlines()[0]
+
+
+def test_ladder_prints_every_rung_at_every_horizon_for_both_targets():
+    """`K_REPORTED` x `RUNGS` x `TARGETS` rows, all of them, because the rule is
+    a disjunction over k and a reader has to be able to check it."""
+    inputs = _inputs({("translation", 15, "full"): 0.3})
+    rows = [
+        line for line in format_ladder(inputs).splitlines()
+        if line.startswith("  ") and "target" not in line
+    ]
+    assert len(rows) == len(TARGETS) * len(RUNGS) * len(K_REPORTED)
+
+
+def test_ladder_header_captions_the_columns_it_prints():
+    inputs = _inputs({})
+    lines = [line for line in format_ladder(inputs).splitlines() if line.startswith("  ")]
+    header, first = lines[0], lines[1]
+    offset = 2
+    for name, width in zip(LADDER_COLUMNS, LADDER_WIDTHS, strict=True):
+        assert header[offset:offset + width].strip() == name
+        assert first[offset:offset + width].strip() != ""
+        offset += width
+
+
+def test_ladder_says_it_decides_nothing_on_its_own():
+    """Every horizon contributes to the disjunction, so no row "decides" alone.
+    M3i printed `decides: no` beside every companion row for the opposite reason
+    -- one horizon decided and the rest did not -- and a reader carrying that
+    habit across would misread this table without the caption."""
+    caption = format_ladder(_inputs({})).splitlines()[0]
+    assert "any horizon counts" in caption

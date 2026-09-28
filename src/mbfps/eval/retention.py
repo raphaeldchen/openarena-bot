@@ -529,3 +529,118 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
         ),
         surviving=None, translation_rungs=(), rotation_rungs=(), base_failed=base_failed,
     )
+
+
+# The reading table's columns, in printed order. Declared once so a test can
+# assert the header against THIS and the rows against the same offsets -- the
+# caption-column pairing that three shipped defects on this project all broke.
+READING_COLUMNS: tuple[str, ...] = (
+    "rung", "arm", "gain", "ci_low", "ci_high", "seeds", "clears",
+)
+
+# Field widths for READING_COLUMNS, in the same order. Kept beside the names so
+# the header and the rows -- two separate f-strings -- cannot drift apart, and
+# sized so a realistic value cannot EQUAL its width and glue onto the previous
+# column with no separator (the arm-name-overflow defect this project shipped
+# once already: "random_vit" is 10 characters, so its field is 13).
+READING_WIDTHS: tuple[int, ...] = (15, 13, 10, 10, 10, 8, 8)
+
+LADDER_COLUMNS: tuple[str, ...] = (
+    "target", "rung", "k", "mean gain", "arms", "seeds", "clears",
+)
+LADDER_WIDTHS: tuple[int, ...] = (13, 15, 6, 12, 8, 8, 8)
+
+
+def _row(values, widths) -> str:
+    return "  " + "".join(
+        f"{value:>{width}}" for value, width in zip(values, widths, strict=True)
+    )
+
+
+def _yes(flag: bool) -> str:
+    return "yes" if flag else "no"
+
+
+def _seed_arms(arms: dict[str, RungArm]) -> tuple[int, int]:
+    """`(arms clearing, seeds clearing across all of them)`."""
+    return (
+        sum(1 for arm in arms.values() if arm.clears()),
+        sum(arm.seeds_clear for arm in arms.values()),
+    )
+
+
+def format_reading_retention(reading: RetentionStatus, inputs: RetentionInputs) -> str:
+    """Reading E as it is printed and written to `retention.txt`, byte for byte.
+
+    The caption names the statistic, the target, the horizon, the one-sided rule
+    and the cluster count, because a table whose header does not say what its
+    columns hold is how this project has shipped a wrong number three times.
+    The two controls print beside the verdict rather than in a companion table:
+    the base control is a GATE, and whether rotation read is a different LEVER
+    from whether nothing read, so both belong on the face of the reading.
+    """
+    k = DECISION_K
+    rows = inputs.ladder["translation"][k]
+    lines = [
+        f"--- Reading E: what each rung adds over enc(t) about translation "
+        f"already observed, at k = {k} "
+        f"(gain over enc(t) in mean R^2, one-sided: clears when ci_low > 0 in "
+        f"{SEEDS_REQUIRED} of 3 seeds and {ARMS_REQUIRED} of 3 arms); "
+        f"{inputs.rows.get(k, 0)} rows over {inputs.clusters} clusters ---",
+        _row(READING_COLUMNS, READING_WIDTHS),
+    ]
+    for rung in RUNGS:
+        for arm_name in sorted(rows[rung]):
+            arm = rows[rung][arm_name]
+            lines.append(_row((
+                rung, arm_name,
+                f"{arm.gain:+.4f}", f"{arm.ci_low:+.4f}", f"{arm.ci_high:+.4f}",
+                f"{arm.seeds_clear}/{arm.seeds_total}", _yes(arm.clears()),
+            ), READING_WIDTHS))
+    base = "  base control (enc(t) -> absolute position, must clear r2 " + (
+        f"{BASE_R2_FLOOR:.2f}): "
+    ) + ", ".join(
+        f"{name} r2={inputs.base[name].r2:+.3f} "
+        f"{inputs.base[name].seeds_clear}/{inputs.base[name].seeds_total}"
+        for name in sorted(inputs.base)
+    )
+    rotation = "  rotation control (positive; reads where translation cannot): " + (
+        ", ".join(reading.rotation_rungs) if reading.rotation_rungs
+        else "no rung cleared rotation at any horizon"
+    )
+    lines += [
+        base,
+        rotation,
+        f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}",
+    ]
+    return "\n".join(lines)
+
+
+def format_ladder(inputs: RetentionInputs) -> str:
+    """Every rung at every horizon for both targets -- the disjunction, in full.
+
+    Reported so a reader can check the rule rather than take it on trust. No row
+    decides on its own and the caption says so: M3i's companion table printed
+    `decides: no` beside every row because exactly one horizon DID decide there,
+    and a reader carrying that habit across would misread this one.
+    """
+    lines = [
+        f"--- The ladder: gain over enc(t) at every horizon, both targets "
+        f"(translation decides, rotation controls; any horizon counts -- the "
+        f"rule is a disjunction over k = "
+        f"{', '.join(str(k) for k in K_REPORTED)}) ---",
+        _row(LADDER_COLUMNS, LADDER_WIDTHS),
+    ]
+    for target in TARGETS:
+        for rung in RUNGS:
+            for k in K_REPORTED:
+                arms = inputs.ladder[target][k][rung]
+                clearing, seeds = _seed_arms(arms)
+                lines.append(_row((
+                    target, rung, str(k),
+                    f"{np.mean([a.gain for a in arms.values()]):+.4f}",
+                    f"{clearing}/{len(arms)}",
+                    f"{seeds}/{sum(a.seeds_total for a in arms.values())}",
+                    _yes(clearing >= ARMS_REQUIRED),
+                ), LADDER_WIDTHS))
+    return "\n".join(lines)
