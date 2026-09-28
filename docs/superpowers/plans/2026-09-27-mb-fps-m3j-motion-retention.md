@@ -3254,8 +3254,8 @@ because `study.py` and `scripts/eval_rollout.py` read it by that name.
 ## Task 9 results
 
 **Reading E is `MOTION RETAINED`** — and the sentence that must sit beside it is that the
-pre-registered rule cleared on a margin roughly **fifty times smaller than the neighbouring rung's
-gain**, while every magnitude in the run says the bottleneck is destroying the motion. Both
+pre-registered rule cleared on a margin roughly **63 times smaller than the neighbouring rung's
+gain**, while every magnitude bearing on `z` says the bottleneck is destroying the motion. Both
 statements are true, both are reported, and the rule is not rewritten after the fact.
 
 The verdict was decided by the `stochastic` rung at k = 15, whose mean gain over the nine cells is
@@ -3264,8 +3264,9 @@ The verdict was decided by the `stochastic` rung at k = 15, whose mean gain over
 translation and **negative** on rotation at every horizon. So spec 3.3's pre-registered consequence
 for `MOTION_RETAINED` (M3i partially overturned, M3h section 8's prior-side levers return) is owed
 by the rule as written, and the measured magnitudes point somewhere else: at the 32x32 categorical
-bottleneck, which is `BOTTLENECK_LOSS`'s lever. Section 9 below sets out what the project should
-actually do with that.
+bottleneck, which is `BOTTLENECK_LOSS`'s lever — **and, section 9 below also shows, at the objective**,
+because `h` itself recovers less displacement than two raw frames at the longest horizon. Section 9
+sets out what the project should actually do with both.
 
 ### 1. Provenance
 
@@ -3420,6 +3421,14 @@ as written: M3i's `NO_MOTION` was a statement about *forward* prediction rather 
 representation's content, and M3h section 8's blanket retirement of the prior-side levers is
 reversed.
 
+**Two more facts strengthen that stand.** `BOTTLENECK_LOSS` is **near-unreachable by construction**:
+`full` is `h (+) z`, a strict superset of `deterministic`'s information, so `BOTTLENECK_LOSS`
+requires `deterministic` to clear translation while `full` does not — a status this ladder was never
+on equal footing to reach regardless of what `z` carries. And under the corrected
+`Z_BEARING_RUNGS = ("stochastic",)` this reading is **still** `MOTION_RETAINED`: as section 5 above
+already shows, `stochastic` itself clears in 2 of 3 arms at k = 15, so the corrected rule reaches the
+same status the shipped one did without leaning on `full` at all.
+
 **And the rule is recorded as miscalibrated, for the same reason M3i recorded its control.** A
 milestone reusing this status set should put **only `stochastic`** in `Z_BEARING_RUNGS`, because
 only `stochastic` isolates the bottleneck's output. `full` belongs beside `deterministic` as a
@@ -3429,23 +3438,67 @@ it.
 **What the measured magnitudes say, stated separately from the status.** Three facts, none of which
 the status encodes:
 
-- `z` alone carries **+0.00033** of translation at the deciding horizon, against `h`'s **+0.02071**
-  — a factor of 63.
+- `z` alone carries **+0.00033** of translation at k = 15 — the horizon that decided this reading —
+  against `h`'s **+0.02071**, a factor of 63.
 - `z` adds **+0.0006 or less** over `h` on translation, and **−0.005 to −0.008** on rotation: on the
   target the instrument reads best, appending `z` makes the fit *worse*.
 - `z` carries **+0.00007** of rotation where `h` carries **+0.325**, a factor of ~4,600.
 
 A latent whose stochastic half contributes three ten-thousandths of an R² where its deterministic
 half contributes two hundredths is not one that retains motion in any sense a training decision
-should rest on. The ladder's honest reading is the one `BOTTLENECK_LOSS` names: **`h` carries it and
-the 32x32 categorical bottleneck destroys it.**
+should rest on. That is the reading `BOTTLENECK_LOSS` names: **`h` carries translation and the 32x32
+categorical bottleneck destroys it.** It is not, however, the only lever the magnitudes support.
 
-**So the lever the evidence supports is the bottleneck** — `z_cats` x `z_classes` (32x32, at most
-~160 bits) and `rep_scale = 0.1`, five times below `dyn_scale` — even though the status word is
-`MOTION_RETAINED`. Whether to follow the pre-registered status or the magnitudes is the human's
-decision, and this section exists so it is made on both rather than on one word. The two agree on
-one thing: M3i's `NO_MOTION` cannot stand as a claim about the representation, because `h` is part
-of the latent M3i probed and `h` demonstrably carries motion.
+**A fourth fact: two raw frames beat `h` outright at the longest horizon.** At k = 15 on translation,
+`two_frame` (`enc(t-15)`, width 2048) linearly recovers *more* displacement than `deterministic`
+(`h(t)`, width 512), in 8 of the 9 cells:
+
+```
+  frozen_ssl s0  two_frame +0.02243   deterministic +0.02109   two_frame wins
+  frozen_ssl s1  two_frame +0.03036   deterministic +0.02470   two_frame wins
+  frozen_ssl s2  two_frame +0.02123   deterministic +0.00602   two_frame wins
+  pixel_ae   s0  two_frame +0.03329   deterministic +0.03411   deterministic wins by 0.0008
+  pixel_ae   s1  two_frame +0.03313   deterministic +0.02131   two_frame wins
+  pixel_ae   s2  two_frame +0.03414   deterministic +0.01225   two_frame wins
+  random_vit s0  two_frame +0.05066   deterministic +0.01704   two_frame wins
+  random_vit s1  two_frame +0.04924   deterministic +0.02833   two_frame wins
+  random_vit s2  two_frame +0.03950   deterministic +0.02151   two_frame wins
+
+  two_frame beats deterministic in 8 of 9 cells at k=15
+  means: k=1  tf +0.00216 / det +0.00751   k=4  tf +0.00869 / det +0.01327   k=15  tf +0.03489 / det +0.02071
+```
+
+`h` has every frame between `t-15` and `t`, *and* the whole 15-step action sequence, and still
+recovers less translation than the two endpoint frames alone give a plain linear probe. That is not a
+statement about the bottleneck — `two_frame` never touches `z` — it is evidence that the RSSM
+**discards translation information the encoder demonstrably provided**, which is
+`MOTION_DISCARDED`'s story, and the lever it names is the **objective**: `world_model.py:81`'s
+embedding loss reconstructs only the frame just seen and never asks `h` to retain displacement (§1).
+
+**The honest synthesis is that the magnitudes support two upstream levers, not one.** `z` adds
+nothing over `h` (the bottleneck argument, three bullets above), *and* `h` recovers less displacement
+than two raw frames at k = 15 (the objective argument here). The two are not in tension — they are
+about different parts of the path — and read together they say the bottleneck destroys what little
+the RSSM was already failing to retain in `h`.
+
+**The caveat, in the same breath as the finding.** `two_frame`'s joint probe (`enc(t)` plus its
+2048-wide block) is 4096 features wide against `deterministic`'s 2560, and n/p at k = 15 is **~2.0**
+at that widest rung — the low end of spec 3.4's own 2.0–2.7 range (2.6 sits at `DECISION_K`, not
+k = 15) — which is not n ≫ p. A wider block can win a comparably-sized ridge fit on selection slack
+alone, the same mechanism spec 2.1 and `SELECT_EPISODES`'s own docstring warn flips a gain's *sign*
+on a one-episode selection error. If width explains some or all of the `two_frame`-over-`deterministic`
+margin, this comparison is uninformative about the objective specifically — and either way the prose
+cannot say "every magnitude" points at the bottleneck alone, because this comparison exists and has
+not been ruled out.
+
+**So the magnitudes support two candidate levers, not a single one** — the bottleneck (`z_cats` x
+`z_classes`, 32x32, at most ~160 bits, and `rep_scale = 0.1`, five times below `dyn_scale`) and the
+objective (`world_model.py:81`'s embedding loss, which never asks `h` to retain displacement) — even
+though the status word is `MOTION_RETAINED`. Whether to follow the pre-registered status or the
+magnitudes, and which upstream lever to spend the retrain on, is the human's decision, and this
+section exists so it is made on all three readings rather than on one word. All three agree on one
+thing: M3i's `NO_MOTION` cannot stand as a claim about the representation, because `h` is part of the
+latent M3i probed and `h` demonstrably carries motion.
 
 ### 10. What this milestone does not claim
 
@@ -3461,3 +3514,17 @@ of the latent M3i probed and `h` demonstrably carries motion.
 - The gated base r2 is a 4-column mean, not position alone (section 4).
 - It changes no M3 gate, no `aggregate.py`, no `filtering_gain` recorded number, and no M3b–M3i
   verdict.
+
+### 11. Spec divergence, noted rather than resolved silently
+
+Spec 3.5 originally said the per-rung `joint_r2` / `embedding_r2` levels and the selected ridges are
+"printed beside the reading" together with the row count at each k and the two control readings.
+`retention.txt` prints the two control readings and the row count at `DECISION_K` only; the per-rung
+levels and ridges are in every JSON record but nowhere in the printed reading. Spec 3.5 has been
+amended, during the final whole-branch review, to say so and to give the reason: the two shipped
+tables (`format_ladder`, `format_reading_retention`) are pinned column-for-column by offset tests,
+and adding a third table for five numbers per rung that carry no threshold was judged not worth the
+risk to those pins. The bridge to M3i's recorded numbers and to `latent_selection_r2` that spec 3.5
+names is therefore in the records, not on the face of `retention.txt` — a fact a reader of the
+artefact alone would not otherwise know. No number, table, or verdict in this milestone moved because
+of this.

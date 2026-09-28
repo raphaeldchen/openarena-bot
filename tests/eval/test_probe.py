@@ -1664,6 +1664,23 @@ def test_gain_from_splits_output_is_byte_identical_after_the_generalisation():
     }
 
 
+def test_gain_from_splits_rejects_a_score_split_that_is_not_whole_windows():
+    """`_require_whole_windows`'s own docstring claims existing tests pin its
+    message through BOTH call sites: `_block_bootstrap_ci`'s positional branch
+    (`test_block_bootstrap_rejects_rows_that_are_not_whole_windows`, above) and
+    `_gain_from_splits`. Only the first existed before this test -- this closes
+    the second, so the docstring's claim is true rather than merely asserted."""
+    latent, embedding, targets = _history_case(207, seed=5)
+    fit, select, score = slice(0, 100), slice(100, 200), slice(200, 207)
+    with pytest.raises(ValueError, match="whole number"):
+        _gain_from_splits(
+            _split(latent[fit], embedding[fit], targets[fit]),
+            _split(latent[select], embedding[select], targets[select]),
+            _split(latent[score], embedding[score], targets[score]),
+            h_dim=2, window=GAIN_WINDOW, resamples=10, seed=0,
+        )
+
+
 def _blocks(latent, embedding, targets, rows, h_dim=2):
     """A `GainSplit` over `rows`, with the deterministic half as the block --
     the same arrangement `_gain_from_splits` builds, so the two can be compared."""

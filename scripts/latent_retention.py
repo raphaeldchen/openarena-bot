@@ -18,11 +18,10 @@ and what does not.
             `B` in `RUNGS` and displacement in `TARGETS`, at every reported k;
             plus the base control `enc(t)` -> absolute position. One record
             per cell.
-  read      NOT YET BUILT -- Task 8 pools these records into Reading E and
-            decides the lever. `EXIT_BASE_UNRESOLVED` and
-            `EXIT_MOTION_UNRESOLVED` are that phase's; they are defined here
-            because this script owns the exit-code range, not because
-            `measure_phase` raises them.
+  read      pools these records into Reading E and decides the lever.
+            `EXIT_BASE_UNRESOLVED` and `EXIT_MOTION_UNRESOLVED` are that
+            phase's; they are defined here because this script owns the
+            exit-code range, not because `measure_phase` raises them.
 
 LOADING IS `trust_horizon.py`'S, exactly as `scripts/latent_motion.py` loads
 it: `Cell`, `CellMissing`, `load_cell`, `self_check` and `prepare_cell` are
@@ -263,7 +262,7 @@ def cell_ladder(fit: dict, select: dict | None, score: dict, *, h_dim: int,
                 seed: int = 0, ks=K_REPORTED) -> dict:
     """Every `(target, k, rung)` gain for one cell, plus the row count per k.
 
-EVERY RUNG AT ONE (target, k) IS HANDED A BYTE-IDENTICAL BASE ARRAY, which is
+    EVERY RUNG AT ONE (target, k) IS HANDED A BYTE-IDENTICAL BASE ARRAY, which is
     what makes the four gains differences against the same base level and so
     comparable to each other rather than each only to its own fit (spec 2.1).
     `fit_probe` is deterministic, so identical inputs give an identical base

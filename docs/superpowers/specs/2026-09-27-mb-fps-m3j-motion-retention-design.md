@@ -242,10 +242,22 @@ rows. The row counts are written into every record so the claim is checkable.
 
 ### 3.5 Companions — change no verdict
 
-Printed beside the reading and carried in the records: every rung's `joint_r2` and `embedding_r2`
-level, the ridge selected for each arm, the row count at each k, and the two control readings. The
-levels are what bridge to M3i's recorded numbers and to the `latent_selection_r2` 0.18–0.34 the
-earlier milestones quote. None of them carries a threshold.
+Carried in the records: every rung's `joint_r2` and `embedding_r2` level, the ridge selected for
+each arm, the row count at each k, and the two control readings. The levels are what bridge to
+M3i's recorded numbers and to the `latent_selection_r2` 0.18–0.34 the earlier milestones quote.
+None of them carries a threshold.
+
+**Record-only, not printed.** An earlier draft of this section said all five companions are
+"printed beside the reading." Only the two control readings and the row count at `DECISION_K` are:
+`retention.txt` never prints the per-rung `joint_r2` / `embedding_r2` levels or the selected
+ridges, even though they are in every JSON record. Amended here, during the final whole-branch
+review, rather than in code: the two shipped tables (`format_ladder`, `format_reading_retention`)
+are pinned column-for-column by offset tests, and a third table for five numbers per rung that
+carry no threshold was judged not worth the risk to those pins. A reader who needs the bridge to
+M3i's numbers or to `latent_selection_r2` reads the JSON records directly; the plan's
+`## Task 9 results` section 11 records this divergence. A successor that wants these on the face of
+the artefact should add them as a clearly-separated fourth table, not by folding them into either
+pinned one.
 
 ---
 

@@ -286,12 +286,18 @@ def _ladder(clearing: dict) -> dict:
 
 def _inputs(
     clearing: dict, *, base_r2: float = 0.30, base_seeds: int | None = None,
-    clusters: int = 24,
+    clusters: int = 24, rows: dict | None = None,
 ) -> RetentionInputs:
     """Same tally-follows-the-value pattern as `_arm`, for the base control:
     `BaseControl.clears()` reads only `seeds_clear`, so a `base_r2` below
     `BASE_R2_FLOOR` must default to a tally that fails it, not the fixed `3`
-    that made every arm hold regardless of `base_r2`."""
+    that made every arm hold regardless of `base_r2`.
+
+    `rows` defaults to the real production row counts -- which is exactly why
+    a caption test needs to override it (see
+    `test_reading_caption_reads_the_row_count_from_the_inputs`): every fixture
+    in this file would otherwise supply the same numbers a hardcoded caption
+    could match by accident."""
     if base_seeds is None:
         base_seeds = 3 if base_r2 > BASE_R2_FLOOR else 0
     return RetentionInputs(
@@ -299,7 +305,7 @@ def _inputs(
         base={a: BaseControl(r2=base_r2, seeds_clear=base_seeds, seeds_total=3)
               for a in ARMS},
         clusters=clusters,
-        rows={1: 11221, 4: 10534, 15: 8015},
+        rows={1: 11221, 4: 10534, 15: 8015} if rows is None else rows,
     )
 
 
@@ -736,6 +742,20 @@ def test_reading_caption_reads_the_cluster_count_from_the_inputs():
     assert "24 clusters" not in caption
 
 
+def test_reading_caption_reads_the_row_count_from_the_inputs():
+    """The twin of `test_reading_caption_reads_the_cluster_count_from_the_inputs`,
+    one field to the left in the same f-string. Every other fixture in this
+    file uses `_inputs`'s default `rows` (the real production counts, `10534`
+    at `DECISION_K`), so a caption that hardcoded `10534 rows` -- as opposed to
+    threading `inputs.rows.get(k, 0)` -- passed every caption test in this file
+    until this one. Leaving this unpinned while its neighbour is pinned is
+    inconsistent with the branch's own standard for this defect class."""
+    inputs = _inputs({}, rows={1: 11221, DECISION_K: 4242, 15: 8015})
+    caption = format_reading_retention(reading_retention(inputs), inputs).splitlines()[0]
+    assert "4242 rows" in caption, caption
+    assert "10534 rows" not in caption
+
+
 def test_reading_table_puts_each_value_under_its_own_caption():
     """Each column's value must sit under its own caption, not under the
     previous column's or the next column's caption.
@@ -1086,6 +1106,47 @@ def test_ladder_table_puts_each_value_under_its_own_caption():
     expected_clears = "yes" if clearing_count2 >= ARMS_REQUIRED else "no"
     assert clears_str == expected_clears, (
         f"clears under caption: expected {expected_clears}, got {clears_str}"
+    )
+
+
+def test_ladder_clears_column_requires_arms_required_not_merely_one():
+    """`clears` must read `_yes(clearing >= ARMS_REQUIRED)`, not `_yes(clearing
+    >= 1)`. `_ladder` gives every arm in a cell the SAME `ci_low` (`_arm(ci_low)
+    for a in ARMS`), so every other test in this file can only ever produce 0
+    or 3 clearing arms out of 3 -- and `>= ARMS_REQUIRED` (2) and `>= 1` agree
+    on both 0 and 3, so nothing above can tell them apart. This builds a cell
+    with exactly ONE clearing arm out of three and asserts its `clears` cell
+    reads `no` -- the reading this table exists so a reader can check the rule
+    against (the M3h 'Reading N' failure), so its own threshold has to be
+    pinned to `ARMS_REQUIRED` and not merely to non-zero."""
+    inputs = _inputs({})
+    inputs.ladder["translation"][4]["full"] = {
+        "frozen_ssl": _arm(0.2, seeds_clear=3),    # clears
+        "pixel_ae": _arm(-0.01, seeds_clear=0),    # does not
+        "random_vit": _arm(-0.01, seeds_clear=0),  # does not
+    }
+    lines = [line for line in format_ladder(inputs).splitlines() if line.startswith("  ")]
+
+    def find_row(target, rung, k):
+        for line in lines[1:]:
+            t = line[2:2 + LADDER_WIDTHS[0]].strip()
+            r = line[2 + LADDER_WIDTHS[0]:2 + LADDER_WIDTHS[0] + LADDER_WIDTHS[1]].strip()
+            w0, w1, w2 = LADDER_WIDTHS[0], LADDER_WIDTHS[1], LADDER_WIDTHS[2]
+            k_val = int(line[2 + w0 + w1:2 + w0 + w1 + w2].strip())
+            if t == target and r == rung and k_val == k:
+                return line
+        return None
+
+    row = find_row("translation", "full", 4)
+    assert row is not None, "could not find the translation/full/k=4 row"
+    offset = 2 + sum(LADDER_WIDTHS[:4])
+    arms_str = row[offset:offset + LADDER_WIDTHS[4]].strip()
+    assert arms_str == "1/3", f"expected exactly 1 of 3 arms clearing, got {arms_str!r}"
+    offset += LADDER_WIDTHS[4] + LADDER_WIDTHS[5]
+    clears_str = row[offset:offset + LADDER_WIDTHS[6]].strip()
+    assert clears_str == "no", (
+        f"1 of 3 arms clearing is below ARMS_REQUIRED={ARMS_REQUIRED}; the "
+        f"clears column must read 'no', got {clears_str!r}"
     )
 
 

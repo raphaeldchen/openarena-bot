@@ -127,10 +127,9 @@ def test_cell_ladder_hands_every_rung_a_byte_identical_base(monkeypatch):
     """Spec 2.1: the four gains at one `(target, k)` must be differences against
     the SAME base, or they are not comparable to each other -- only each to its
     own fit. `fit_probe` is deterministic, so identical base arrays and an
-    identical target give an identical base level, which is therefore the
-    property to pin is therefore that the ARRAYS are identical, which four
-    independent row selections would silently break while still producing four
-    plausible gains.
+    identical target give an identical base level, so the property to pin is
+    that the ARRAYS are identical, which four independent row selections would
+    silently break while still producing four plausible gains.
 
     Both targets share a row set at a given k (Task 4 pins that), so the base is
     byte-identical across targets too and one distinct array is the correct
@@ -246,6 +245,45 @@ def test_base_control_reports_the_level_not_a_gain():
         "control is reading the wrong array"
     )
     assert "gain" not in control, "the base control is a level, not a gain"
+
+
+def test_base_control_probes_the_raw_encoder_embedding_not_the_predicted_one():
+    """`base_control`'s `probe_for` must read `data["encoder_embedding"]`, not
+    `data["embedding"]` (the model's PREDICTED embedding) -- `_gathered`'s own
+    docstring names this exact call site as one of the two the asymmetric
+    fixture exists to protect, and `test_base_control_reports_the_level_not_a_gain`
+    only asserts `r2 > 0.5`, which this fixture's `embedding` array also clears
+    (it is `encoder_embedding` plus extra noise, still linearly related to
+    position) -- so that test alone cannot catch the swap.
+
+    This test recomputes the expected r2 independently, straight from
+    `encoder_embedding` through the same `fit_probe` / `probe_r2` calls
+    `base_control` makes internally, and pins `control["r2"]` to that exact
+    value. It also proves the mutation would be CAUGHT: probing `embedding`
+    instead gives a measurably different r2 on this fixture."""
+    from mbfps.eval.probe import fit_probe, probe_r2
+
+    fit, select, score = (_gathered(seed=s) for s in (0, 1, 2))
+    control = script.base_control(fit, select, score)
+
+    probe = fit_probe(
+        fit["encoder_embedding"], fit["targets"],
+        select["encoder_embedding"], select["targets"],
+    )
+    expected = probe_r2(probe, score["encoder_embedding"], score["targets"])
+    assert control["r2"] == pytest.approx(expected), (
+        "base_control's r2 must come from encoder_embedding, computed exactly "
+        "as this test computes it independently"
+    )
+
+    wrong_probe = fit_probe(
+        fit["embedding"], fit["targets"], select["embedding"], select["targets"],
+    )
+    wrong = probe_r2(wrong_probe, score["embedding"], score["targets"])
+    assert expected != pytest.approx(wrong), (
+        "encoder_embedding and embedding must give distinguishable r2 on this "
+        "fixture, or a probe_for swap would not be catchable at all"
+    )
 
 
 def test_base_control_records_position_r2_beside_the_gated_mean():
@@ -746,11 +784,23 @@ def test_retention_inputs_reads_the_base_control_against_the_floor():
     the boundary -- so a read that pooled one arm's base control from
     another arm's seeds, or from all nine records at once, lands on a
     different number for at least one arm instead of reproducing the same
-    pass/fail by coincidence."""
+    pass/fail by coincidence.
+
+    Both cases also give `position_r2` the OPPOSITE pass/fail from `r2`
+    (`_record` defaults `position_r2` to `r2`, which is why a gate that read
+    `["position_r2"]` instead of `["r2"]` used to pass this test unnoticed --
+    `retention_inputs`'s and `base_control`'s own docstrings insist the gate is
+    the 4-column mean, not `position_r2`). If the read ever switches keys, the
+    clears()/does-not-clear() assertions below flip and this test fails."""
     from mbfps.eval.retention import BASE_R2_FLOOR
 
-    holding = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR + 0.05))
-    assert all(c.clears() for c in holding.base.values())
+    holding = script.retention_inputs(_records(
+        base_r2=BASE_R2_FLOOR + 0.05, position_r2=BASE_R2_FLOOR - 0.05,
+    ))
+    assert all(c.clears() for c in holding.base.values()), (
+        "the gate reads r2 (clears here); position_r2 does not clear in this "
+        "fixture, so this would fail if the gate read position_r2 instead"
+    )
     levels = [control.r2 for control in holding.base.values()]
     assert len(set(round(level, 6) for level in levels)) == len(levels), (
         "every arm's base r2 must be distinguishable, or a cross-arm swap "
@@ -773,8 +823,13 @@ def test_retention_inputs_reads_the_base_control_against_the_floor():
             "collapsed the seeds or gathered them from another arm"
         )
 
-    failing = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR - 0.05))
-    assert not any(c.clears() for c in failing.base.values())
+    failing = script.retention_inputs(_records(
+        base_r2=BASE_R2_FLOOR - 0.05, position_r2=BASE_R2_FLOOR + 0.05,
+    ))
+    assert not any(c.clears() for c in failing.base.values()), (
+        "the gate reads r2 (fails here); position_r2 clears in this fixture, "
+        "so this would fail if the gate read position_r2 instead"
+    )
 
     on_the_line = script.retention_inputs(
         _records(base_r2=BASE_R2_FLOOR, distinguish=False)
