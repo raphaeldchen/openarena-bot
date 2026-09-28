@@ -286,6 +286,7 @@ def _ladder(clearing: dict) -> dict:
 
 def _inputs(
     clearing: dict, *, base_r2: float = 0.30, base_seeds: int | None = None,
+    clusters: int = 24,
 ) -> RetentionInputs:
     """Same tally-follows-the-value pattern as `_arm`, for the base control:
     `BaseControl.clears()` reads only `seeds_clear`, so a `base_r2` below
@@ -297,7 +298,7 @@ def _inputs(
         ladder=_ladder(clearing),
         base={a: BaseControl(r2=base_r2, seeds_clear=base_seeds, seeds_total=3)
               for a in ARMS},
-        clusters=24,
+        clusters=clusters,
         rows={1: 11221, 4: 10534, 15: 8015},
     )
 
@@ -700,6 +701,39 @@ def test_every_reading_width_admits_its_widest_realistic_value():
             f"column {name!r} is {width} wide but holds up to {widest[name]} "
             "characters; a full-width value glues onto its left neighbour"
         )
+
+
+def test_every_ladder_width_admits_its_widest_realistic_value():
+    """The ladder's counterpart to the reading width test, which the plan left
+    out -- so nothing would have caught a future edit shrinking a LADDER_WIDTHS
+    entry until a value glued onto its left neighbour with no separator. That is
+    the defect class this whole task exists to close, and it had coverage on one
+    of the two tables only."""
+    widest = {
+        "target": len("translation"), "rung": len("deterministic"),
+        "k": len("15"), "mean gain": len("-12.3456"),
+        "arms": len("3/3"), "seeds": len("9/9"), "clears": len("yes"),
+    }
+    for name, width in zip(LADDER_COLUMNS, LADDER_WIDTHS, strict=True):
+        assert width > widest[name], (
+            f"column {name!r} is {width} wide but holds up to {widest[name]} "
+            "characters; a full-width value glues onto its left neighbour"
+        )
+
+
+def test_reading_caption_reads_the_cluster_count_from_the_inputs():
+    """Pins that the caption is THREADED from `inputs.clusters` rather than
+    hardcoded.
+
+    Every other fixture in this file fixes `clusters=24`, so a caption that
+    simply said "24 clusters" passed every caption test -- measured: mutating
+    the f-string to a literal 24 left the suite green. A caption that does not
+    reflect its data is the failure this task's own history is about, so the
+    threading is pinned with a value no fixture would supply by accident."""
+    inputs = _inputs({}, clusters=7)
+    caption = format_reading_retention(reading_retention(inputs), inputs).splitlines()[0]
+    assert "7 clusters" in caption, caption
+    assert "24 clusters" not in caption
 
 
 def test_reading_table_puts_each_value_under_its_own_caption():
