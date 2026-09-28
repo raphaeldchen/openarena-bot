@@ -702,23 +702,155 @@ def test_every_reading_width_admits_its_widest_realistic_value():
         )
 
 
-def test_reading_header_captions_the_columns_it_prints():
-    """The header and the rows must agree COLUMN BY COLUMN, sliced at the same
-    offsets. Asserting the two strings look plausible is what let three wrong
-    captions ship."""
-    inputs = _inputs({("translation", DECISION_K, "full"): 0.2})
+def test_reading_table_puts_each_value_under_its_own_caption():
+    """Each column's value must sit under its own caption, not under the
+    previous column's or the next column's caption.
+
+    Asserting only that the header text matches and that rows are non-empty
+    is what let this project ship a wrong caption three times. The defect
+    class: swapping two adjacent numeric columns (e.g., gain and ci_low)
+    leaves both captions and all values intact while changing which value
+    sits under which caption. This test catches that mutation by asserting
+    the PARSED VALUE under each caption against that column's known value
+    from the ladder.
+
+    Tested with both positive ci_low (arm clears) and negative ci_low
+    (arm does not clear) to catch sign-dropping or absolute-value bugs.
+    """
+    # One positive ci_low and one negative ci_low, to catch sign bugs
+    clearing = {
+        ("translation", DECISION_K, "full"): 0.2,  # makes _arm(0.2) with ci_low=0.2 (positive)
+        ("translation", DECISION_K, "two_frame"): -0.01,  # makes _arm(-0.01) with ci_low=-0.01 (negative)
+    }
+    inputs = _inputs(clearing)
     text = format_reading_retention(reading_retention(inputs), inputs)
     lines = [line for line in text.splitlines() if line.startswith("  ")]
-    header, first = lines[0], lines[1]
+    header = lines[0]
+
+    # First check: header captions are in place
     offset = 2
     for name, width in zip(READING_COLUMNS, READING_WIDTHS, strict=True):
         assert header[offset:offset + width].strip() == name, (
             f"header column at offset {offset} is not {name!r}"
         )
-        assert first[offset:offset + width].strip() != "", (
-            f"the first row has nothing under the {name!r} caption"
-        )
         offset += width
+
+    # Second check: each numeric column's value matches what the ladder says it should be
+    # Find rows for specific (rung, arm) combinations and verify their values
+    k = DECISION_K
+    rows_data = inputs.ladder["translation"][k]
+
+    # Test case 1: "full" rung, "frozen_ssl" arm (positive ci_low)
+    rung1, arm1 = "full", "frozen_ssl"
+    arm_obj1 = rows_data[rung1][arm1]
+    row1_text = None
+    for line in lines[1:]:  # Skip header
+        if line.strip().startswith(rung1):
+            if arm1 in line:
+                row1_text = line
+                break
+    assert row1_text is not None, f"could not find row for {rung1}/{arm1}"
+
+    # Parse values from row1 at the expected offsets
+    offset = 2
+    # rung
+    parsed_rung = row1_text[offset:offset + READING_WIDTHS[0]].strip()
+    assert parsed_rung == rung1
+    offset += READING_WIDTHS[0]
+    # arm
+    parsed_arm = row1_text[offset:offset + READING_WIDTHS[1]].strip()
+    assert parsed_arm == arm1
+    offset += READING_WIDTHS[1]
+    # gain
+    gain_str = row1_text[offset:offset + READING_WIDTHS[2]].strip()
+    parsed_gain = float(gain_str)
+    assert parsed_gain == pytest.approx(arm_obj1.gain), (
+        f"gain under caption: expected {arm_obj1.gain}, got {parsed_gain}"
+    )
+    offset += READING_WIDTHS[2]
+    # ci_low
+    ci_low_str = row1_text[offset:offset + READING_WIDTHS[3]].strip()
+    parsed_ci_low = float(ci_low_str)
+    assert parsed_ci_low == pytest.approx(arm_obj1.ci_low), (
+        f"ci_low under caption: expected {arm_obj1.ci_low}, got {parsed_ci_low}"
+    )
+    offset += READING_WIDTHS[3]
+    # ci_high
+    ci_high_str = row1_text[offset:offset + READING_WIDTHS[4]].strip()
+    parsed_ci_high = float(ci_high_str)
+    assert parsed_ci_high == pytest.approx(arm_obj1.ci_high), (
+        f"ci_high under caption: expected {arm_obj1.ci_high}, got {parsed_ci_high}"
+    )
+    offset += READING_WIDTHS[4]
+    # seeds
+    seeds_str = row1_text[offset:offset + READING_WIDTHS[5]].strip()
+    expected_seeds = f"{arm_obj1.seeds_clear}/{arm_obj1.seeds_total}"
+    assert seeds_str == expected_seeds, (
+        f"seeds under caption: expected {expected_seeds}, got {seeds_str}"
+    )
+    offset += READING_WIDTHS[5]
+    # clears
+    clears_str = row1_text[offset:offset + READING_WIDTHS[6]].strip()
+    expected_clears = "yes" if arm_obj1.clears() else "no"
+    assert clears_str == expected_clears, (
+        f"clears under caption: expected {expected_clears}, got {clears_str}"
+    )
+
+    # Test case 2: "two_frame" rung, "frozen_ssl" arm (negative ci_low)
+    rung2, arm2 = "two_frame", "frozen_ssl"
+    arm_obj2 = rows_data[rung2][arm2]
+    row2_text = None
+    for line in lines[1:]:  # Skip header
+        if line.strip().startswith(rung2):
+            if arm2 in line:
+                row2_text = line
+                break
+    assert row2_text is not None, f"could not find row for {rung2}/{arm2}"
+
+    # Parse values from row2 at the expected offsets
+    offset = 2
+    # rung
+    parsed_rung = row2_text[offset:offset + READING_WIDTHS[0]].strip()
+    assert parsed_rung == rung2
+    offset += READING_WIDTHS[0]
+    # arm
+    parsed_arm = row2_text[offset:offset + READING_WIDTHS[1]].strip()
+    assert parsed_arm == arm2
+    offset += READING_WIDTHS[1]
+    # gain
+    gain_str = row2_text[offset:offset + READING_WIDTHS[2]].strip()
+    parsed_gain = float(gain_str)
+    assert parsed_gain == pytest.approx(arm_obj2.gain), (
+        f"gain under caption: expected {arm_obj2.gain}, got {parsed_gain}"
+    )
+    offset += READING_WIDTHS[2]
+    # ci_low
+    ci_low_str = row2_text[offset:offset + READING_WIDTHS[3]].strip()
+    parsed_ci_low = float(ci_low_str)
+    assert parsed_ci_low == pytest.approx(arm_obj2.ci_low), (
+        f"ci_low under caption: expected {arm_obj2.ci_low}, got {parsed_ci_low}"
+    )
+    offset += READING_WIDTHS[3]
+    # ci_high
+    ci_high_str = row2_text[offset:offset + READING_WIDTHS[4]].strip()
+    parsed_ci_high = float(ci_high_str)
+    assert parsed_ci_high == pytest.approx(arm_obj2.ci_high), (
+        f"ci_high under caption: expected {arm_obj2.ci_high}, got {parsed_ci_high}"
+    )
+    offset += READING_WIDTHS[4]
+    # seeds
+    seeds_str = row2_text[offset:offset + READING_WIDTHS[5]].strip()
+    expected_seeds = f"{arm_obj2.seeds_clear}/{arm_obj2.seeds_total}"
+    assert seeds_str == expected_seeds, (
+        f"seeds under caption: expected {expected_seeds}, got {seeds_str}"
+    )
+    offset += READING_WIDTHS[5]
+    # clears
+    clears_str = row2_text[offset:offset + READING_WIDTHS[6]].strip()
+    expected_clears = "yes" if arm_obj2.clears() else "no"
+    assert clears_str == expected_clears, (
+        f"clears under caption: expected {expected_clears}, got {clears_str}"
+    )
 
 
 def test_reading_names_the_target_the_horizon_and_the_clusters_in_its_caption():
@@ -771,15 +903,156 @@ def test_ladder_prints_every_rung_at_every_horizon_for_both_targets():
     assert len(rows) == len(TARGETS) * len(RUNGS) * len(K_REPORTED)
 
 
-def test_ladder_header_captions_the_columns_it_prints():
-    inputs = _inputs({})
-    lines = [line for line in format_ladder(inputs).splitlines() if line.startswith("  ")]
-    header, first = lines[0], lines[1]
+def test_ladder_table_puts_each_value_under_its_own_caption():
+    """Each column's value must sit under its own caption, not under a
+    neighboring column's caption.
+
+    Asserting only that the header text matches and that rows are non-empty
+    is what let this project ship a wrong caption three times. The defect
+    class: swapping two adjacent numeric columns (e.g., mean gain and arms)
+    leaves both captions and all values intact while changing which value
+    sits under which caption. This test catches that mutation by asserting
+    the PARSED VALUE under each caption against the value computed from
+    the ladder for that cell.
+
+    Tested with both positive and negative mean gains to catch sign-dropping
+    or absolute-value bugs.
+    """
+    # One positive and one negative mean gain, to catch sign bugs
+    clearing = {
+        ("translation", 4, "full"): 0.2,   # positive
+        ("rotation", 4, "two_frame"): -0.01,  # negative
+    }
+    inputs = _inputs(clearing)
+    text = format_ladder(inputs)
+    lines = [line for line in text.splitlines() if line.startswith("  ")]
+    header = lines[0]
+
+    # First check: header captions are in place
     offset = 2
     for name, width in zip(LADDER_COLUMNS, LADDER_WIDTHS, strict=True):
-        assert header[offset:offset + width].strip() == name
-        assert first[offset:offset + width].strip() != ""
+        assert header[offset:offset + width].strip() == name, (
+            f"header column at offset {offset} is not {name!r}"
+        )
         offset += width
+
+    # Helper to find a specific row by (target, rung, k)
+    def find_row(target, rung, k):
+        for line in lines[1:]:
+            # Parse the row's target, rung, k fields to find an exact match
+            t = line[2:2 + LADDER_WIDTHS[0]].strip()
+            r = line[2 + LADDER_WIDTHS[0]:2 + LADDER_WIDTHS[0] + LADDER_WIDTHS[1]].strip()
+            k_val = int(line[2 + LADDER_WIDTHS[0] + LADDER_WIDTHS[1]:2 + LADDER_WIDTHS[0] + LADDER_WIDTHS[1] + LADDER_WIDTHS[2]].strip())
+            if t == target and r == rung and k_val == k:
+                return line
+        return None
+
+    # Second check: each numeric column's value matches the computed value
+    # Find and verify a positive gain row: translation, full, k=4
+    target1, rung1, k1 = "translation", "full", 4
+    row1_text = find_row(target1, rung1, k1)
+    assert row1_text is not None, f"could not find row for {target1}/{rung1}/k={k1}"
+
+    arms1 = inputs.ladder[target1][k1][rung1]
+
+    # Parse values from row1 at the expected offsets
+    offset = 2
+    # target
+    target_str = row1_text[offset:offset + LADDER_WIDTHS[0]].strip()
+    assert target_str == target1
+    offset += LADDER_WIDTHS[0]
+    # rung
+    rung_str = row1_text[offset:offset + LADDER_WIDTHS[1]].strip()
+    assert rung_str == rung1
+    offset += LADDER_WIDTHS[1]
+    # k
+    k_str = row1_text[offset:offset + LADDER_WIDTHS[2]].strip()
+    assert int(k_str) == k1
+    offset += LADDER_WIDTHS[2]
+    # mean gain
+    mean_gain_str = row1_text[offset:offset + LADDER_WIDTHS[3]].strip()
+    parsed_mean_gain = float(mean_gain_str)
+    expected_mean_gain = float(np.mean([a.gain for a in arms1.values()]))
+    assert parsed_mean_gain == pytest.approx(expected_mean_gain), (
+        f"mean gain under caption: expected {expected_mean_gain}, got {parsed_mean_gain}"
+    )
+    offset += LADDER_WIDTHS[3]
+    # arms
+    arms_str = row1_text[offset:offset + LADDER_WIDTHS[4]].strip()
+    clearing_count1 = sum(1 for arm in arms1.values() if arm.clears())
+    expected_arms = f"{clearing_count1}/{len(arms1)}"
+    assert arms_str == expected_arms, (
+        f"arms under caption: expected {expected_arms}, got {arms_str}"
+    )
+    offset += LADDER_WIDTHS[4]
+    # seeds
+    seeds_str = row1_text[offset:offset + LADDER_WIDTHS[5]].strip()
+    total_seeds_clear = sum(arm.seeds_clear for arm in arms1.values())
+    total_seeds = sum(arm.seeds_total for arm in arms1.values())
+    expected_seeds = f"{total_seeds_clear}/{total_seeds}"
+    assert seeds_str == expected_seeds, (
+        f"seeds under caption: expected {expected_seeds}, got {seeds_str}"
+    )
+    offset += LADDER_WIDTHS[5]
+    # clears
+    clears_str = row1_text[offset:offset + LADDER_WIDTHS[6]].strip()
+    expected_clears = "yes" if clearing_count1 >= ARMS_REQUIRED else "no"
+    assert clears_str == expected_clears, (
+        f"clears under caption: expected {expected_clears}, got {clears_str}"
+    )
+
+    # Find and verify a negative gain row: rotation, two_frame, k=4
+    target2, rung2, k2 = "rotation", "two_frame", 4
+    row2_text = find_row(target2, rung2, k2)
+    assert row2_text is not None, f"could not find row for {target2}/{rung2}/k={k2}"
+
+    arms2 = inputs.ladder[target2][k2][rung2]
+
+    # Parse values from row2 at the expected offsets
+    offset = 2
+    # target
+    target_str = row2_text[offset:offset + LADDER_WIDTHS[0]].strip()
+    assert target_str == target2
+    offset += LADDER_WIDTHS[0]
+    # rung
+    rung_str = row2_text[offset:offset + LADDER_WIDTHS[1]].strip()
+    assert rung_str == rung2
+    offset += LADDER_WIDTHS[1]
+    # k
+    k_str = row2_text[offset:offset + LADDER_WIDTHS[2]].strip()
+    assert int(k_str) == k2
+    offset += LADDER_WIDTHS[2]
+    # mean gain
+    mean_gain_str = row2_text[offset:offset + LADDER_WIDTHS[3]].strip()
+    parsed_mean_gain = float(mean_gain_str)
+    expected_mean_gain = float(np.mean([a.gain for a in arms2.values()]))
+    assert parsed_mean_gain == pytest.approx(expected_mean_gain), (
+        f"mean gain under caption: expected {expected_mean_gain}, got {parsed_mean_gain}"
+    )
+    offset += LADDER_WIDTHS[3]
+    # arms
+    arms_str = row2_text[offset:offset + LADDER_WIDTHS[4]].strip()
+    clearing_count2 = sum(1 for arm in arms2.values() if arm.clears())
+    expected_arms = f"{clearing_count2}/{len(arms2)}"
+    assert arms_str == expected_arms, (
+        f"arms under caption: expected {expected_arms}, got {arms_str}"
+    )
+    offset += LADDER_WIDTHS[4]
+    # seeds
+    seeds_str = row2_text[offset:offset + LADDER_WIDTHS[5]].strip()
+    total_seeds_clear = sum(arm.seeds_clear for arm in arms2.values())
+    total_seeds = sum(arm.seeds_total for arm in arms2.values())
+    expected_seeds = f"{total_seeds_clear}/{total_seeds}"
+    assert seeds_str == expected_seeds, (
+        f"seeds under caption: expected {expected_seeds}, got {seeds_str}"
+    )
+    offset += LADDER_WIDTHS[5]
+    # clears
+    clears_str = row2_text[offset:offset + LADDER_WIDTHS[6]].strip()
+    expected_clears = "yes" if clearing_count2 >= ARMS_REQUIRED else "no"
+    assert clears_str == expected_clears, (
+        f"clears under caption: expected {expected_clears}, got {clears_str}"
+    )
 
 
 def test_ladder_says_it_decides_nothing_on_its_own():
