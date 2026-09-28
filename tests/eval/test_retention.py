@@ -144,13 +144,21 @@ def test_backward_translation_at_k_one_is_the_single_step_move():
 
 
 def test_backward_rotation_reads_the_change_in_the_right_direction():
-    """Pins the direction of the subtraction: a reversal flips the sign of the
-    sin column. The fixture spans the 360° boundary (350°→20° is +30, not −330),
-    confirming that the arctan2 reconstruction in backward_rotation needs no
-    special wrapping -- it handles the wrap implicitly. Note: no wrap mutation is
-    observable through (sin, cos) because both are 2π-periodic; sin(−330°) and
-    sin(+30°) are bit-identical, as are their cosines. This test must not be read
-    as covering wrap correctness; it only pins the direction of the difference."""
+    """Pins the DIRECTION of the subtraction: reversing it to `then - now` flips
+    the sign of the sin column, which these assertions catch.
+
+    IT DOES NOT COVER WRAP CORRECTNESS, and must not be read as if it did. No
+    wrap mutation is observable through this target at all: sin and cos are both
+    2π-periodic, so an unwrapped 20° - 350° = -330° and the wrapped +30° agree to
+    floating-point precision in BOTH columns (measured: a difference of at most
+    1 ULP, ~8e-16, far inside this test's atol). An earlier version of this test
+    claimed the opposite -- that the pair "only matches if the wrap is handled" --
+    and that claim is false; it is recorded here so it does not get re-added.
+
+    The 350°→20° fixture still earns its place: it spans the 360° boundary and
+    shows the result needs no special-casing there. The reason is the periodicity
+    above, NOT anything arctan2 does -- a naive raw-degree subtraction that skips
+    the reconstruction entirely gives the same sin and cos."""
     values, rows = backward_rotation(_targets(), WINDOW, STEP, 1)
     assert rows.tolist() == [1, 2, 3, 5, 6, 7]
     thirty = [np.sin(np.deg2rad(30.0)), np.cos(np.deg2rad(30.0))]
