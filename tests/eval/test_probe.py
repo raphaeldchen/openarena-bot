@@ -962,14 +962,15 @@ def test_gather_probe_data_windows_an_episode_exactly_as_the_rollout_does(tmp_pa
     np.testing.assert_array_equal(data["latent"][:, 0], expected)
 
 
-def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
+def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     tmp_path,
 ):
     """Two consumers read this dict by key and pair their arrays at the SAME
     timestep, so misaligned rows would compare two different frames and no
     shape check would notice.
 
-    There are FOUR keys, and the two embeddings are not interchangeable:
+    There are SIX keys -- four payload arrays and M3i's two row indices --
+    and the two embeddings are not interchangeable:
     `"embedding"` is the head's PREDICTED embedding (the space the rollout band
     is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
     RAW encoder output for the same frame (the reference the filtering gate
@@ -979,7 +980,9 @@ def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
     paths = _write_episodes(tmp_path, [20])
     data = _gather(paths, head_width=7, context=2, horizon=3)
 
-    assert set(data) == {"latent", "embedding", "encoder_embedding", "targets"}
+    assert set(data) == {
+        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+    }
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
     assert data["encoder_embedding"].shape == (20, 1), (
@@ -995,6 +998,48 @@ def test_gather_probe_data_returns_aligned_rows_under_the_four_documented_keys(
                                atol=1e-4)
     np.testing.assert_allclose(data["targets"][:, 0],
                                DX * data["encoder_embedding"][:, 0], atol=1e-4)
+
+
+def test_gather_probe_data_labels_every_row_with_its_window_and_step(tmp_path):
+    """M3i reconstructs per-window trajectories from these rows, which needs
+    the window each row came from and its order inside that window. Without
+    them a caller has to reshape on an undocumented regularity."""
+    paths = _write_episodes(tmp_path, [20, 20])
+    data = _gather(paths, context=2, horizon=3)
+    n = data["latent"].shape[0]
+    window, step = data["window"], data["step"]
+
+    assert window.shape == (n,) and step.shape == (n,)
+    assert window.dtype.kind == "i" and step.dtype.kind == "i"
+    # Every window contributes exactly context + horizon rows, in order.
+    assert set(np.unique(step).tolist()) == set(range(2 + 3))
+    for w in np.unique(window):
+        rows = step[window == w]
+        assert rows.tolist() == list(range(2 + 3)), f"window {w} is not in step order"
+    # The indices are row-aligned with the payload, not a separate ordering.
+    assert data["targets"].shape[0] == n and data["encoder_embedding"].shape[0] == n
+
+
+def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_path):
+    """Two calls over the same paths and kwargs must agree row for row, and
+    the returned dict must carry exactly the four payload arrays plus the two
+    row indices -- no more, no fewer.
+
+    Both sides of the array comparison below are calls made AFTER the indices
+    were added, so this pins determinism across calls, not invariance against
+    some pre-change array (those no longer exist to compare against; the
+    call-site audit that established the four original keys are unchanged by
+    every existing caller is recorded elsewhere, not here). The six-key set is
+    pinned by exact equality, so an extra or missing key fails even if every
+    array happens to match."""
+    paths = _write_episodes(tmp_path, [20, 20])
+    first = _gather(paths, context=2, horizon=3)
+    second = _gather(paths, context=2, horizon=3)
+    for key in ("latent", "embedding", "encoder_embedding", "targets"):
+        np.testing.assert_array_equal(first[key], second[key], err_msg=key)
+    assert set(first) == {
+        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+    }
 
 
 def test_gather_probe_data_skips_episodes_too_short_for_one_window(tmp_path):
