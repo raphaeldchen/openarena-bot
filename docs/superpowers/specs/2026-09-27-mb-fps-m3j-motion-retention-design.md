@@ -86,9 +86,14 @@ so a ridge maximum taken on the scored rows favours the wider one and manufactur
 out of the selection alone. `filtering_gain`'s measured example has **the sign flipping on a
 one-step selection error**, which is why `select_episodes` stays at 20.
 
-**The base arm is fit once per (target, k) and shared across all four rungs.** This is not only
-cheaper: it means the four gains are differences against the *same* base number, so they are
-comparable to each other and not merely each to its own fit.
+**Every rung at one (target, k) is handed a byte-identical base array.** That is what makes the four
+gains differences against the *same* base level, so they are comparable to each other and not merely
+each to its own fit. Four independent row selections would break the property while still producing
+four plausible gains, so it is pinned by a test on the arrays rather than left to inspection. The
+base probe is refit inside each rung's call and that costs accuracy nothing, because the fit is
+deterministic on identical inputs; sharing the fitted probe instead would save about 11% of solve
+time (a 2048-wide base solve is roughly an eighth of a 4096-wide joint one) and is not worth the
+extra interface.
 
 ### 2.2 The ladder of second blocks
 
