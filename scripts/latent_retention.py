@@ -84,21 +84,30 @@ own sketch of `measure_cell` passes around:
     exist on a real record; a live run would `KeyError` on the first cell.
 """
 
+import argparse
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.split import VAL_FRACTION, episode_split
+from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.probe import (
     GainSplit, apply_probe, fit_probe, gain_from_blocks, gather_probe_data, probe_r2,
 )
 from mbfps.eval.retention import (
-    CONFIDENCE, DECISION_K, K_REPORTED, RESAMPLES, RUNGS, TARGETS,
-    backward_rotation, backward_translation, rung_block, shifted_rows,
+    ARMS_REQUIRED, BASE_R2_FLOOR, CONFIDENCE, DECISION_K, K_REPORTED, RESAMPLES, RUNGS,
+    SEEDS_REQUIRED, TARGETS, BaseControl, RetentionInputs, RetentionStatus,
+    backward_rotation, backward_translation, format_ladder, format_reading_retention,
+    reading_retention, rung_arm, rung_block, shifted_rows,
 )
-from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
+from mbfps.utils.config import ARMS
+from mbfps.utils.device import get_device
 
 
 def _sibling(name: str):
@@ -460,9 +469,17 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
     same `write_record` `scripts/latent_motion.py` uses -- so the non-finite
     scan and the `git_sha` provenance are shared -- prints one line per cell,
     and returns the first non-`EXIT_OK` status or `EXIT_OK`.
+
+    CELLS ARE LOADED FROM `args.source`, NOT `args.out`. `--out` is this
+    script's own record directory -- where retention records are WRITTEN,
+    below -- and the nine M3c checkpoints, study records and diagnostics live
+    in the study directory instead, exactly as `scripts/latent_motion.py`
+    splits `--out` (its motion records) from `--reference` (the same M3c
+    study). Loading from `args.out` here would look for those three files in
+    a directory that starts out empty and fail before a single cell measured.
     """
     try:
-        loaded = [load_cell(args.out, arm, seed) for arm, seed in cells]
+        loaded = [load_cell(args.source, arm, seed) for arm, seed in cells]
     except CellMissing as error:
         print(f"NO CELL: {error}")
         return EXIT_NO_CHECKPOINTS
@@ -486,3 +503,332 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
             f"{headline}; wrote {path}"
         )
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# read: the nine records pooled into Reading E.
+# ---------------------------------------------------------------------------
+
+
+def require_readable_plan(arms, seeds) -> None:
+    """Refuse a plan too narrow for the rule to reach any status.
+
+    The rule needs `ARMS_REQUIRED` arms, each clearing in `SEEDS_REQUIRED`
+    seeds. A plan with fewer cannot reach MOTION_RETAINED, BOTTLENECK_LOSS,
+    MOTION_DISCARDED or TRANSLATION_UNRESOLVED at all -- it can only ever print
+    UNRESOLVED_MOTION, which would look like a finding. M3i shipped this defect
+    and caught it in review: a narrowed plan printed `z +996.13, 3/3 up` beside
+    a NO DIFFERENCE verdict.
+    """
+    if len(arms) < ARMS_REQUIRED or len(seeds) < SEEDS_REQUIRED:
+        raise SystemExit(
+            f"a plan of {len(arms)} arm(s) x {len(seeds)} seed(s) cannot reach any "
+            f"status: the rule needs {ARMS_REQUIRED} arms clearing in "
+            f"{SEEDS_REQUIRED} seeds each, so this plan can only ever print "
+            f"UNRESOLVED_MOTION -- which would read as a finding"
+        )
+
+
+def load_retention(out_dir: Path, arms, seeds) -> dict:
+    """Every planned cell's record, keyed by `(arm, seed)` -- or `CellMissing`
+    naming the first that is not on disk.
+
+    Named, never skipped: a pool over the cells that happen to be present,
+    printed under the nine cells' names, is exactly the failure
+    `pooling.MissingCell` exists for. A record whose own `arm`/`seed` disagree
+    with the file it was read under is refused too -- a swapped pair of files
+    would pool one cell under another's name with every count still right.
+    """
+    records: dict[tuple[str, int], dict] = {}
+    for arm in arms:
+        for seed in seeds:
+            path = retention_record_path(out_dir, arm, int(seed))
+            if not path.exists():
+                raise CellMissing(
+                    f"{arm} seed {int(seed)}: no retention record at {path}; "
+                    "run --phase measure first"
+                )
+            record = load_record(path)
+            if record.get("arm") != arm or int(record.get("seed", -1)) != int(seed):
+                raise ValueError(
+                    f"{path.name} was read for {arm} seed {int(seed)} but its record says "
+                    f"arm={record.get('arm')!r} seed={record.get('seed')!r}"
+                )
+            records[(arm, int(seed))] = record
+    return records
+
+
+def require_one_protocol(records: dict) -> None:
+    """Every record reports the same protocol on the same windows, or the two
+    that disagree are named with the field.
+
+    Nine cells pooled into one reading must describe the same rows: two
+    protocols pooled as one would be a reading over a union nothing measured,
+    and `clusters` -- the one cluster count `format_reading_retention` prints
+    -- would silently become whichever record was read last.
+    """
+    items = sorted(records.items())
+    if not items:
+        raise SystemExit("no retention record to read")
+    (first_cell, first) = items[0]
+    for cell, record in items[1:]:
+        for field, pick in (
+            ("windows.episode", lambda r: list(r["windows"]["episode"])),
+            ("episodes.val", lambda r: list(r["episodes"]["val"])),
+            ("context", lambda r: int(r["context"])),
+            ("horizon", lambda r: int(r["horizon"])),
+            ("device", lambda r: str(r["device"])),
+        ):
+            mine, theirs = pick(record), pick(first)
+            if mine != theirs:
+                shown = (
+                    f" ({len(mine)} vs {len(theirs)} windows)" if field == "windows.episode"
+                    else f": {mine!r} vs {theirs!r}"
+                )
+                raise SystemExit(
+                    f"{cell[0]} seed {cell[1]} and {first_cell[0]} seed {first_cell[1]} "
+                    f"disagree on {field}{shown}; they are not one measurement and their "
+                    "arms cannot be read against one bar"
+                )
+
+
+def retention_inputs(records: dict) -> RetentionInputs:
+    """Pool the nine records into Reading E's input.
+
+    The seed tally is built from the per-seed intervals in the records, not
+    from a pooled estimate: r2 is not a per-window quantity, so there is
+    nothing to pool the way `pooling.paired_contrast` pools a contrast. The
+    agreement requirement IS the rule here (spec 3.1), which is also what
+    carries the multiple-comparison burden across 4 rungs x 3 horizons.
+
+    `retention.rung_arm` raises on a non-finite gain or bound -- M3i's ledger
+    note, closed there rather than here: a NaN must stop the read rather than
+    evaluate False in every predicate at once.
+
+    THE BASE CONTROL READS `["r2"]`, THE GATED 4-COLUMN MEAN -- not
+    `embedding_r2` (the task brief's stale *Interfaces* prose named a key
+    `base_control` has never returned; its own Step 3 sketch, and the shipped
+    `base_control` in this file, both agree on `"r2"`). `position_r2`, the
+    companion this milestone's read phase also reports, is read separately by
+    `retention_text` from the raw records -- it plays no part in the gate and
+    so has no place on `RetentionInputs`, which carries only what Reading E is
+    decided on.
+    """
+    arms = sorted({arm for arm, _ in records})
+    ladder: dict = {}
+    for target in TARGETS:
+        ladder[target] = {}
+        for k in K_REPORTED:
+            ladder[target][k] = {}
+            for rung in RUNGS:
+                ladder[target][k][rung] = {
+                    arm: rung_arm([
+                        records[(arm, seed)]["ladder"][target][k_key(k)][rung]
+                        for _, seed in sorted(cell for cell in records if cell[0] == arm)
+                    ])
+                    for arm in arms
+                }
+    base = {}
+    for arm in arms:
+        levels = [
+            float(records[(arm, seed)]["base_control"]["r2"])
+            for _, seed in sorted(cell for cell in records if cell[0] == arm)
+        ]
+        if not all(np.isfinite(levels)):
+            raise ValueError(f"non-finite base control r2 in arm {arm}: {levels}")
+        base[arm] = BaseControl(
+            r2=float(np.mean(levels)),
+            seeds_clear=sum(1 for r in levels if r > BASE_R2_FLOOR),
+            seeds_total=len(levels),
+        )
+    first = records[next(iter(sorted(records)))]
+    return RetentionInputs(
+        ladder=ladder, base=base,
+        clusters=int(first["clusters"]),
+        rows={k: int(first["rows"][k_key(k)]) for k in K_REPORTED},
+    )
+
+
+READ_EXITS = {
+    "UNRESOLVED_BASE": EXIT_BASE_UNRESOLVED,
+    "UNRESOLVED_MOTION": EXIT_MOTION_UNRESOLVED,
+}
+"""Status -> exit code, for the two statuses that are refusals. Every other
+status is a reading and exits 0: a milestone that exited non-zero on a finding
+would make "the run worked" and "the news was good" the same signal."""
+
+
+# The self-check table's columns, restricted to what every retention record
+# carries -- `arm`, `seed`, `step`, the windows and clusters it was scored
+# over, and whether this script's own measure pass reproduced the cell's
+# diagnostic. A real record's `self_check` also carries the two curve deltas
+# `trust_horizon.SelfCheck.record()` writes, but nothing downstream of `read`
+# needs them re-printed here, and pinning this table to fields every record
+# actually has (rather than to the richer schema `measure_cell` happens to
+# produce) is what keeps a minimal fixture a genuine drive through this
+# script rather than a fixture shaped to fit a wider table.
+SELF_CHECK_COLUMNS: tuple[str, ...] = ("arm", "seed", "step", "windows", "clusters", "ok")
+SELF_CHECK_WIDTHS: tuple[str, ...] = ("<12", ">5", ">8", ">9", ">10", ">5")
+
+
+def _table_line(values, widths) -> str:
+    return "  " + "".join(
+        f"{value!s:{spec}}" for value, spec in zip(values, widths, strict=True)
+    )
+
+
+def _self_check_table(records: dict) -> str:
+    """What this script's own measure pass reproduced, per cell -- printed
+    first, so a reader meets the instrument before the ladder built on it."""
+    lines = [
+        "--- self-check per record: this script's measure pass against the cell's "
+        "diagnostic, and the windows it was scored on ---",
+        _table_line(SELF_CHECK_COLUMNS, SELF_CHECK_WIDTHS),
+    ]
+    for (arm, seed), record in sorted(records.items()):
+        lines.append(_table_line((
+            arm,
+            int(seed),
+            int(record["step"]),
+            len(record["windows"]["episode"]),
+            int(record["clusters"]),
+            "yes" if record["self_check"]["ok"] else "NO",
+        ), SELF_CHECK_WIDTHS))
+    return "\n".join(lines)
+
+
+def _position_companion(records: dict) -> str:
+    """This script's own companion to the base control line printed above it
+    -- Correction 3.
+
+    `base_control`'s `r2` stays the GATED 4-column mean (position and heading
+    mixed), calibrated against `latent_selection_r2`'s scale; re-pointing the
+    gate at `position_r2` alone would silently change what `BASE_R2_FLOOR`
+    means. But `EXIT_BASE_UNRESOLVED`'s own docstring and this reading's rule
+    text both describe the gate as being about whether the current frame can
+    say "absolute position", while the gated `r2` mixes heading into that
+    claim -- so a cell whose `r2` clears the floor while `position_r2` does
+    not (plausible for a frozen single-frame backbone, where heading can be
+    far easier to read than map position) is a fact the results must REPORT,
+    not one the mean is allowed to hide.
+
+    Read PER CELL (arm, seed) here, not off the aggregated `BaseControl` on
+    `RetentionInputs`: the aggregate carries only a seed TALLY against the
+    gate, and averaging `position_r2` first would wash out exactly the
+    divergence this function exists to catch, the same way the 4-column mean
+    already washes out position against heading.
+    """
+    arms = sorted({arm for arm, _ in records})
+
+    def cells_for(arm: str):
+        return [(a, s) for a, s in sorted(records) if a == arm]
+
+    line = "  position control (enc(t) -> absolute position, x/y only; the same fitted " \
+        "probe's r2 against position alone, reported beside the gated 4-column r2 above): " \
+        + ", ".join(
+            f"{arm} position_r2="
+            f"{np.mean([float(records[cell]['base_control']['position_r2']) for cell in cells_for(arm)]):+.3f}"
+            for arm in arms
+        )
+    warnings = []
+    for (arm, seed), record in sorted(records.items()):
+        base = record["base_control"]
+        r2, position_r2 = float(base["r2"]), float(base["position_r2"])
+        if r2 > BASE_R2_FLOOR and not position_r2 > BASE_R2_FLOOR:
+            warnings.append(
+                f"  WARNING: {arm} seed {seed} clears BASE_R2_FLOOR ({BASE_R2_FLOOR:.2f}) on "
+                f"the gated r2 ({r2:+.3f}) but its position_r2 ({position_r2:+.3f}) does not "
+                "-- the 4-column mean here is carried by heading, not by absolute position; "
+                "see base_control's docstring"
+            )
+    return "\n".join([line, *warnings])
+
+
+def retention_text(records: dict, inputs: RetentionInputs, reading: RetentionStatus) -> str:
+    """Everything `read` prints, in the order a reader should meet it: the
+    self-check, the ladder in full, Reading E's verdict, and this script's own
+    position-control companion (Correction 3) -- written to `retention.txt`
+    and printed to stdout byte for byte the same string.
+
+    THE LADDER PRINTS BEFORE THE VERDICT, on purpose: a reader meets the
+    evidence before the conclusion, `motion.txt`'s own order.
+    """
+    return "\n\n".join([
+        _self_check_table(records),
+        format_ladder(inputs),
+        format_reading_retention(reading, inputs),
+        _position_companion(records),
+    ]) + "\n"
+
+
+def write_text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def read_phase(args) -> int:
+    """Refuse a plan that cannot reach the verdict, pool every requested cell
+    (11 names the first missing), decide Reading E, write `retention.txt`,
+    print the same text, and return `READ_EXITS.get(reading.status, EXIT_OK)`
+    -- 0 for every reading, 39 or 40 for the two refusals.
+    """
+    require_readable_plan(args.arms, args.seeds)
+    try:
+        records = load_retention(args.out, args.arms, [int(s) for s in args.seeds])
+    except CellMissing as error:
+        print(f"NO CELL: {error}")
+        return EXIT_NO_CHECKPOINTS
+    require_one_protocol(records)
+    inputs = retention_inputs(records)
+    reading = reading_retention(inputs)
+    text = retention_text(records, inputs, reading)
+    print(text, end="")
+    write_text(args.out / "retention.txt", text)
+    return READ_EXITS.get(reading.status, EXIT_OK)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", type=Path, default=Path("runs/m3j_retention"))
+    parser.add_argument("--source", type=Path, default=Path("runs/m3_study_v2"),
+                        help="the M3c study directory: the nine 20,000-step cells")
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
+    parser.add_argument("--device", default="mps")
+    # None -> the cell's diagnostic says what it was written at; a value that
+    # disagrees is refused (`protocol_mismatch`, 14).
+    parser.add_argument("--context", type=int, default=None)
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
+    parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
+    parser.add_argument("--phase", choices=PHASES, default=PHASES[-1])
+    return parser
+
+
+def main(argv: list[str] | None = None, *, ks=K_REPORTED) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    device = get_device(prefer=args.device)
+    cells = [(arm, int(seed)) for arm in args.arms for seed in args.seeds]
+    if args.phase in ("measure", "all"):
+        buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+        train, val = episode_split(
+            buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED,
+        )
+        status = measure_phase(args, cells, device, train, val, ks=ks)
+        if status != EXIT_OK:
+            return status
+    if args.phase in ("read", "all"):
+        status = read_phase(args)
+        if status != EXIT_OK:
+            return status
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

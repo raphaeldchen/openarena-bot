@@ -1,6 +1,7 @@
 """M3j's script: the three gathers, the shared bases, and the record schema."""
 
 import importlib.util
+import json
 import types
 from pathlib import Path
 
@@ -423,3 +424,265 @@ def test_measure_cell_refuses_a_failed_self_check_and_records_steps(monkeypatch)
         "h_dim", "ks", "split_seed", "torch_version", "ladder", "rows",
         "base_control", "clusters", "windows", "self_check", "episodes",
     }
+
+
+def test_measure_phase_loads_cells_from_source_and_writes_records_to_out(monkeypatch, tmp_path):
+    """Correction 2, pinned by watching which directory each call actually
+    used, not by asserting on a path string an unrelated implementation could
+    satisfy by coincidence.
+
+    `--out` is this script's OWN record directory -- empty until `measure`
+    writes to it -- and the nine M3c checkpoints, study records and
+    diagnostics live in the study directory instead. `measure_phase` used to
+    call `load_cell(args.out, ...)`, which would look for those three files in
+    the empty output directory and fail before a single cell was measured;
+    the fix reads `args.source`. `measure_cell` itself is replaced here, so
+    this test is only about which directory each of the two real calls this
+    function makes -- `load_cell` and `write_record` -- actually reads from
+    and writes to.
+    """
+    source_dir = tmp_path / "source"
+    out_dir = tmp_path / "out"
+    source_dir.mkdir()
+
+    seen_load = []
+
+    def fake_load_cell(directory, arm, seed):
+        seen_load.append(Path(directory))
+        return types.SimpleNamespace(arm=arm, seed=seed, record={}, diagnostic={})
+
+    def fake_measure_cell(args, cell, device, train, val, ks=None):
+        return script.EXIT_OK, {
+            "arm": cell.arm, "seed": cell.seed, "ladder": {},
+            "base_control": {"r2": 1.0},
+        }
+
+    written = []
+
+    def fake_write_record(path, record):
+        written.append(Path(path))
+        return record
+
+    monkeypatch.setattr(script, "load_cell", fake_load_cell)
+    monkeypatch.setattr(script, "measure_cell", fake_measure_cell)
+    monkeypatch.setattr(script, "write_record", fake_write_record)
+    monkeypatch.setattr(script, "git_sha", lambda: "deadbeef")
+
+    args = types.SimpleNamespace(out=out_dir, source=source_dir)
+    status = script.measure_phase(args, [("pixel_ae", 0)], "cpu", [], [], ks=(1,))
+
+    assert status == script.EXIT_OK
+    assert seen_load == [source_dir], (
+        f"the cell was loaded from {seen_load}, not from --source ({source_dir})"
+    )
+    assert written == [script.retention_record_path(out_dir, "pixel_ae", 0)], (
+        "the record was not written under --out"
+    )
+    assert out_dir.exists(), "the output directory must still be created"
+
+
+# ---------------------------------------------------------------------------
+# read: the nine records pooled into Reading E.
+# ---------------------------------------------------------------------------
+
+
+def _record(arm: str, seed: int, *, clearing=(), base_r2: float = 0.30,
+            position_r2: float | None = None, episodes: int = 24) -> dict:
+    """A minimal record with the schema `read` addresses. `clearing` is a set
+    of `(target, k, rung)` triples whose interval excludes zero. `position_r2`
+    defaults to `base_r2` (no position/heading divergence) -- Correction 3's
+    own two tests below override a single cell's to build one."""
+    ladder = {}
+    for target in TARGETS:
+        ladder[target] = {}
+        for k in K_REPORTED:
+            ladder[target][f"k{k}"] = {}
+            for rung in RUNGS:
+                hit = (target, k, rung) in clearing
+                ladder[target][f"k{k}"][rung] = {
+                    "gain": 0.25 if hit else -0.01,
+                    "ci_low": 0.10 if hit else -0.08,
+                    "ci_high": 0.40 if hit else 0.03,
+                    "joint_r2": 0.5, "embedding_r2": 0.25,
+                    "confidence": 0.95, "n_scored_windows": episodes,
+                    "ridge_selected": True, "joint_ridge": 1e3,
+                    "embedding_ridge": 1e3,
+                }
+    return {
+        "arm": arm, "seed": seed, "step": 20000, "device": "cpu",
+        "context": 5, "horizon": 45, "h_dim": 512,
+        "ladder": ladder,
+        "rows": {f"k{k}": 11221 - k * 229 for k in K_REPORTED},
+        "base_control": {
+            "r2": base_r2,
+            "position_r2": base_r2 if position_r2 is None else position_r2,
+            "ridge": 1e3, "ridge_selected": True, "rows": 11450,
+        },
+        "clusters": episodes,
+        "windows": {"episode": list(range(episodes)), "window": list(range(episodes))},
+        "self_check": {"ok": True},
+        "episodes": {"fit": [], "select": [], "val": [f"e{i}" for i in range(episodes)]},
+    }
+
+
+def _records(clearing=(), base_r2: float = 0.30, position_r2: float | None = None) -> dict:
+    arms = ("frozen_ssl", "pixel_ae", "random_vit")
+    return {
+        (arm, seed): _record(
+            arm, seed, clearing=clearing, base_r2=base_r2, position_r2=position_r2,
+        )
+        for arm in arms for seed in (0, 1, 2)
+    }
+
+
+def test_require_readable_plan_refuses_a_plan_too_narrow_to_reach_a_verdict():
+    """The rule needs ARMS_REQUIRED arms of SEEDS_REQUIRED seeds. A narrower
+    plan cannot reach any status, so reading it would print a verdict the data
+    could not have supported -- M3i shipped exactly that defect and caught it in
+    review, where a narrowed plan printed `z +996.13, 3/3 up` beside NO
+    DIFFERENCE."""
+    with pytest.raises(SystemExit):
+        script.require_readable_plan(("pixel_ae",), (0, 1, 2))
+    with pytest.raises(SystemExit):
+        script.require_readable_plan(("pixel_ae", "frozen_ssl"), (0,))
+    script.require_readable_plan(("pixel_ae", "frozen_ssl"), (0, 1))
+
+
+def test_require_one_protocol_refuses_records_scored_on_different_windows():
+    """Nine cells pooled into one reading must describe the same rows. Two
+    protocols pooled as one would be a reading over a union nothing measured."""
+    records = _records()
+    records[("pixel_ae", 1)]["windows"]["episode"] = list(range(20))
+    with pytest.raises(SystemExit):
+        script.require_one_protocol(records)
+
+
+def test_retention_inputs_tallies_seeds_and_arms_from_the_records():
+    """The tally IS the rule, so it has to come from the per-seed intervals in
+    the records rather than from a pooled number."""
+    clearing = {("translation", 4, "full")}
+    inputs = script.retention_inputs(_records(clearing))
+    arm = inputs.ladder["translation"][4]["full"]["pixel_ae"]
+    assert arm.seeds_clear == 3 and arm.seeds_total == 3
+    other = inputs.ladder["translation"][1]["full"]["pixel_ae"]
+    assert other.seeds_clear == 0
+
+
+def test_retention_inputs_refuses_a_non_finite_gain_in_any_record():
+    """M3i's ledger note, closed. A NaN must stop the read, not read as a
+    non-clear."""
+    records = _records()
+    records[("pixel_ae", 1)]["ladder"]["translation"]["k4"]["full"]["gain"] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        script.retention_inputs(records)
+
+
+def test_retention_inputs_reads_the_base_control_against_the_floor():
+    from mbfps.eval.retention import BASE_R2_FLOOR
+    holding = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR + 0.05))
+    assert all(c.clears() for c in holding.base.values())
+    failing = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR - 0.05))
+    assert not any(c.clears() for c in failing.base.values())
+
+
+def test_retention_text_is_what_read_prints_byte_for_byte():
+    """`retention.txt` and stdout must be the same bytes, or the artefact and
+    the log disagree about what the run said."""
+    from mbfps.eval.retention import reading_retention
+    records = _records({("translation", 4, "two_frame")})
+    inputs = script.retention_inputs(records)
+    text = script.retention_text(records, inputs, reading_retention(inputs))
+    assert "Reading E" in text and "verdict: MOTION DISCARDED" in text
+    assert "The ladder" in text
+    # The ladder is printed BEFORE the verdict, so a reader meets the evidence
+    # before the conclusion -- the order M3i's motion.txt uses.
+    assert text.index("The ladder") < text.index("Reading E")
+
+
+def test_retention_text_prints_position_r2_beside_the_base_control():
+    """Correction 3: `base_control`'s `r2` stays the gated 4-column mean
+    (position and heading mixed) and the gate stays on it -- but the read
+    phase must also print the per-arm `position_r2` companion, the same
+    fitted probe's r2 against absolute position alone, because
+    `EXIT_BASE_UNRESOLVED`'s own rule text describes the gate as being about
+    absolute position while the gated number mixes in heading."""
+    from mbfps.eval.retention import reading_retention
+    clearing = {("translation", 4, "stochastic")}
+    records = _records(clearing)
+    inputs = script.retention_inputs(records)
+    text = script.retention_text(records, inputs, reading_retention(inputs))
+    assert "position control" in text
+    for arm in ("frozen_ssl", "pixel_ae", "random_vit"):
+        assert f"{arm} position_r2=" in text
+    assert "WARNING" not in text, "no cell here diverges, so no warning should print"
+
+
+def test_retention_text_warns_when_r2_clears_but_position_r2_does_not():
+    """The gate stays on the mixed 4-column `r2`, so a cell shaped like a
+    frozen single-frame backbone that reads heading far more easily than map
+    position -- clearing on `r2` while `position_r2` sits under the same
+    floor -- would otherwise read as a clean pass nothing flags. `pixel_ae`
+    seed 1 is built into exactly that shape: `r2` = 0.30 (clears
+    `BASE_R2_FLOOR` = 0.10) while `position_r2` is pulled to 0.05 (does not)."""
+    from mbfps.eval.retention import BASE_R2_FLOOR, reading_retention
+    clearing = {("translation", 4, "stochastic")}
+    records = _records(clearing)
+    records[("pixel_ae", 1)]["base_control"]["position_r2"] = BASE_R2_FLOOR - 0.05
+    inputs = script.retention_inputs(records)
+    text = script.retention_text(records, inputs, reading_retention(inputs))
+    assert "WARNING" in text
+    assert "pixel_ae seed 1" in text
+    # No OTHER cell diverges, so the warning names this one and not another.
+    warning_lines = [line for line in text.splitlines() if "WARNING" in line]
+    assert len(warning_lines) == 1, warning_lines
+
+
+@pytest.mark.parametrize("clearing,expected", [
+    ({("translation", 4, "stochastic")}, "MOTION RETAINED"),
+    ({("translation", 15, "full")}, "MOTION RETAINED"),
+    ({("translation", 4, "deterministic")}, "BOTTLENECK LOSS"),
+    ({("translation", 4, "two_frame")}, "MOTION DISCARDED"),
+    ({("rotation", 4, "two_frame")}, "TRANSLATION UNRESOLVED"),
+    (set(), "UNRESOLVED MOTION"),
+])
+def test_read_reaches_every_status_end_to_end(tmp_path, capsys, clearing, expected):
+    """Every branch reachable, driven through the real `read` phase to a printed
+    verdict. M3i's spec promised a MOTION_ENCODED path and nothing tested it;
+    the final whole-branch review found it, and a fixture per status is the
+    cheap version of that check.
+
+    UNRESOLVED_MOTION is the one row here that does NOT exit 0: it is one of
+    the two statuses `READ_EXITS` maps to a refusal code (40, see
+    `test_read_exits_40_when_nothing_reads_either_target`), because "no rung
+    read either target at any horizon" is an empty measurement rather than a
+    finding a lever gets chosen from. Every other status here is a finding
+    and exits 0 -- a milestone that exited non-zero on a finding would make
+    "the run worked" and "the news was good" the same signal.
+    """
+    for (arm, seed), record in _records(clearing).items():
+        path = script.retention_record_path(tmp_path, arm, seed)
+        path.write_text(json.dumps(record))
+    status = script.main(["--phase", "read", "--out", str(tmp_path)])
+    printed = capsys.readouterr().out
+    assert f"verdict: {expected}" in printed
+    assert (tmp_path / "retention.txt").read_text() in printed
+    if expected == "UNRESOLVED MOTION":
+        assert status == script.EXIT_MOTION_UNRESOLVED
+    else:
+        assert status == script.EXIT_OK
+
+
+def test_read_exits_39_when_the_base_control_fails(tmp_path, capsys):
+    """A broken instrument is a refusal with its own exit code, not a status
+    printed beside a reading."""
+    from mbfps.eval.retention import BASE_R2_FLOOR
+    for (arm, seed), record in _records(base_r2=BASE_R2_FLOOR - 0.05).items():
+        script.retention_record_path(tmp_path, arm, seed).write_text(json.dumps(record))
+    assert script.main(["--phase", "read", "--out", str(tmp_path)]) == 39
+    assert "UNRESOLVED BASE" in capsys.readouterr().out
+
+
+def test_read_exits_40_when_nothing_reads_either_target(tmp_path):
+    for (arm, seed), record in _records().items():
+        script.retention_record_path(tmp_path, arm, seed).write_text(json.dumps(record))
+    assert script.main(["--phase", "read", "--out", str(tmp_path)]) == 40
