@@ -544,6 +544,21 @@ def filtering_report(
     )
 
 
+def _require_whole_windows(n_rows: int, window: int) -> None:
+    """Both `_block_bootstrap_ci`'s positional branch and `_gain_from_splits`
+    need `n_rows` to be a whole number of `window`-row blocks -- a labelled
+    call reaches neither check, since it blocks by `groups` instead. Shared so
+    the two messages cannot drift apart silently; existing tests pin both
+    wordings through both call sites, so neither string may change here."""
+    if window < 1:
+        raise ValueError(f"window must be at least 1 row, got {window}")
+    if n_rows % window:
+        raise ValueError(
+            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
+            "the block bootstrap would mix parts of two windows into one block"
+        )
+
+
 def _block_bootstrap_ci(
     joint_predicted: np.ndarray,
     embedding_predicted: np.ndarray,
@@ -594,13 +609,7 @@ def _block_bootstrap_ci(
 
     n_rows = targets.shape[0]
     if groups is None:
-        if window < 1:
-            raise ValueError(f"window must be at least 1 row, got {window}")
-        if n_rows % window:
-            raise ValueError(
-                f"{n_rows} scored rows is not a whole number of {window}-row windows; "
-                "the block bootstrap would mix parts of two windows into one block"
-            )
+        _require_whole_windows(n_rows, window)
         strides = np.arange(n_rows).reshape(n_rows // window, window)
         n_blocks = strides.shape[0]
 
@@ -702,12 +711,30 @@ def gain_from_blocks(
     positional wrapper that equals `rows // window`, which is what it always
     meant; under a filtered row set it is the number of surviving groups, which
     is what the interval actually resamples.
+
+    `groups` must carry at least two distinct labels. With one, or with zero
+    scored rows, every bootstrap resample draws the same single block, so the
+    percentile interval collapses to zero width -- reading as maximal
+    confidence rather than "one resampling unit, no information".
     """
     n_scored = score.rows()
+    groups_arr = np.asarray(groups)
+    if groups_arr.shape != (n_scored,):
+        raise ValueError(
+            f"groups must be one label per scored row; got {groups_arr.shape} "
+            f"for {n_scored} rows"
+        )
+    n_groups = int(np.unique(groups_arr).size)
+    if n_groups < 2:
+        raise ValueError(
+            "a bootstrap interval needs at least two resampling units (distinct "
+            f"`groups` labels); got {n_groups}"
+        )
     fit.rows()
     joint_fit, base_fit = fit.joint(), np.asarray(fit.base, dtype=np.float64)
     joint_score, base_score = score.joint(), np.asarray(score.base, dtype=np.float64)
-    target_fit, target_score = fit.target, score.target
+    target_fit = np.asarray(fit.target, dtype=np.float64)
+    target_score = np.asarray(score.target, dtype=np.float64)
 
     if select is None:
         joint_probe = fit_probe(joint_fit, target_fit)
@@ -726,7 +753,7 @@ def gain_from_blocks(
     base_r2 = _mean_r2(base_predicted, target_score)
     low, high = _block_bootstrap_ci(
         joint_predicted, base_predicted, target_score,
-        groups=groups, resamples=resamples, confidence=confidence, seed=seed,
+        groups=groups_arr, resamples=resamples, confidence=confidence, seed=seed,
     )
     return {
         "gain": joint_r2 - base_r2,
@@ -735,7 +762,7 @@ def gain_from_blocks(
         "ci_low": low,
         "ci_high": high,
         "confidence": confidence,
-        "n_scored_windows": int(np.unique(np.asarray(groups)).size),
+        "n_scored_windows": n_groups,
         "ridge_selected": select is not None,
         "joint_ridge": joint_probe["ridge"],
         "embedding_ridge": base_probe["ridge"],
@@ -781,13 +808,7 @@ def _gain_from_splits(
         return GainSplit(base=embedding, block=latent[:, :h_dim], target=data["targets"])
 
     n_rows = np.asarray(score["targets"]).shape[0]
-    if window < 1:
-        raise ValueError(f"window must be at least 1 row, got {window}")
-    if n_rows % window:
-        raise ValueError(
-            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
-            "the block bootstrap would mix parts of two windows into one block"
-        )
+    _require_whole_windows(n_rows, window)
     return gain_from_blocks(
         split(fit), None if select is None else split(select), split(score),
         # The same blocks the stride path builds, as labels: Task 2's

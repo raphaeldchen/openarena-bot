@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from mbfps.eval.probe import (
+    GainSplit,
     PROBE_EPISODE_LIMIT,
     PROBE_KEYS,
     RIDGES,
@@ -15,6 +16,7 @@ from mbfps.eval.probe import (
     filtering_comparison,
     fit_probe,
     fit_probes,
+    gain_from_blocks,
     position_error,
     probe_episodes,
     probe_r2,
@@ -1662,9 +1664,6 @@ def test_gain_from_splits_output_is_byte_identical_after_the_generalisation():
     }
 
 
-from mbfps.eval.probe import GainSplit, gain_from_blocks  # noqa: E402
-
-
 def _blocks(latent, embedding, targets, rows, h_dim=2):
     """A `GainSplit` over `rows`, with the deterministic half as the block --
     the same arrangement `_gain_from_splits` builds, so the two can be compared."""
@@ -1673,10 +1672,20 @@ def _blocks(latent, embedding, targets, rows, h_dim=2):
     )
 
 
-def test_gain_from_blocks_matches_gain_from_splits_on_the_same_arrangement():
-    """The generalisation must be a generalisation. Handed the block and target
-    `_gain_from_splits` builds internally, and labels describing its positional
-    blocks, it must return the same dict."""
+def test_gain_from_splits_wrapper_builds_the_h_head_and_stride_groups():
+    """NOT a check that `gain_from_blocks` generalises `_gain_from_splits`
+    correctly: `_gain_from_splits` is now a thin wrapper over `gain_from_blocks`,
+    so `reference` below runs through `gain_from_blocks` too, and any bug inside
+    it would appear identically on both sides of `general == reference` and
+    cancel. That equivalence guarantee lives entirely in the byte-identity pin
+    above, which was captured before `gain_from_blocks` existed.
+
+    What this test still pins is that the WRAPPER assembles the right
+    `GainSplit`/`groups` arrangement before handing it to `gain_from_blocks`:
+    block = `latent[:, :h_dim]` (the `h`-head slice, not the tail), target = the
+    privileged state, and groups = `np.arange(n_rows) // window` (positional
+    strides) -- built here explicitly via `_blocks` and `np.arange(200) // 5`
+    and compared against what the wrapper builds internally."""
     latent, embedding, targets = _history_case(600, seed=0)
     sl = (slice(0, 200), slice(200, 400), slice(400, 600))
     parts = [_split(latent[s], embedding[s], targets[s]) for s in sl]
@@ -1724,7 +1733,9 @@ def test_gain_from_blocks_counts_groups_not_rows_over_a_window():
         _blocks(latent, embedding, targets, rows[200:300]),
         groups=groups[200:300], resamples=50, confidence=0.9, seed=4,
     )
-    assert out["n_scored_windows"] == len(np.unique(groups[200:300]))
+    # groups[200:300] spans only labels 5 and 6, at 40 and 60 rows -- the
+    # "unequal groups" case this test names rests on that single 40-vs-60 pair.
+    assert out["n_scored_windows"] == 2
 
 
 def test_gain_from_blocks_puts_the_base_in_both_arms():
@@ -1747,6 +1758,10 @@ def test_gain_from_blocks_puts_the_base_in_both_arms():
         f"a noise block cleared zero (ci_low={out['ci_low']}); the base is not "
         "in both arms, or the selection is being taken on the scored rows"
     )
+    assert out["gain"] > -0.05, (
+        f"a noise block cost {out['gain']:.4f} of R^2; the base is missing from the "
+        "JOINT arm, so the two arms are not nested"
+    )
 
 
 def test_gain_from_blocks_rejects_misaligned_rows():
@@ -1761,6 +1776,39 @@ def test_gain_from_blocks_rejects_misaligned_rows():
         gain_from_blocks(bad, None, good, groups=np.arange(100) // 5, resamples=10)
     with pytest.raises(ValueError, match="one label per scored row"):
         gain_from_blocks(good, None, good, groups=np.arange(99) // 5, resamples=10)
+
+
+def test_gain_from_blocks_rejects_a_single_group():
+    """One distinct label makes `generator.integers(0, 1, size=n_blocks)` draw
+    the same block on every resample, so the percentile interval collapses to
+    zero width -- reading as maximal confidence rather than "one resampling
+    unit, no information". Unreachable while blocking was always positional
+    (`window` implies at least `n_rows // window` blocks whenever rows exist);
+    reachable now that a caller can hand in its own labels, and M3j's episode
+    labels are exactly such a caller."""
+    latent, embedding, targets = _history_case(200, seed=12)
+    rows = np.arange(200)
+    blocks = _blocks(latent, embedding, targets, rows)
+    with pytest.raises(ValueError, match="at least two resampling units"):
+        gain_from_blocks(
+            blocks, None, blocks, groups=np.zeros(200, dtype=int), resamples=10,
+        )
+
+
+def test_gain_from_blocks_rejects_zero_scored_rows():
+    """Zero rows hits the same defect through a different route: `np.split` of
+    an empty array on no split points returns ONE empty part, so `n_blocks ==
+    1` just as with a single label -- and `np.percentile` over the resulting
+    all-NaN draws would otherwise return NaN with a `RuntimeWarning` instead of
+    raising."""
+    latent, embedding, targets = _history_case(200, seed=12)
+    rows = np.arange(200)
+    fit = _blocks(latent, embedding, targets, rows)
+    empty = GainSplit(base=embedding[:0], block=latent[:0, :2], target=targets[:0])
+    with pytest.raises(ValueError, match="at least two resampling units"):
+        gain_from_blocks(
+            fit, None, empty, groups=np.array([], dtype=int), resamples=10,
+        )
 
 
 def test_gain_from_blocks_without_a_selection_split_falls_back_unbiased():
