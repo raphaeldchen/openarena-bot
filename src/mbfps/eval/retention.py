@@ -28,6 +28,8 @@ no record schema. `scripts/latent_retention.py` owns all three.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # Pre-registered (spec 2.2, 2.3, 3.1). Three arms, every gain within a cell
@@ -199,3 +201,262 @@ def rung_block(data: dict, rung: str, *, rows, source, h_dim: int) -> np.ndarray
     if rung == "stochastic":
         return latent[rows, h_dim:]
     return latent[rows]
+
+
+BASE_R2_FLOOR: float = 0.10
+"""The r2 `enc(t)` -> absolute position must exceed for the reading to be taken.
+
+A POSITIVE CONTROL promoted to a gate. M3i's equivalent lived only in its final
+review and in no record; its own section 9 provenance note asked a successor to
+build it into the measure phase, which is what this is.
+
+The value has to fail only when the instrument is broken, never when a cell is
+merely weak. The M3c records' `latent_selection_r2` runs 0.18-0.34, with one
+outlier at -0.008 -- and that outlier is on the LATENT, a 32x32 bottleneck,
+not on the 2048 continuous floats this control probes. M3i measured `enc(t)` ->
+position at +0.291 and +0.165 from 132 rows; this milestone fits ~10,500. So
+0.10 sits below every recorded figure and far above zero.
+"""
+
+
+@dataclass(frozen=True)
+class RungArm:
+    """One arm's rung at one target and horizon, summarised over its seeds.
+
+    `gain` is the seed MEAN, so the printed number describes the arm. `ci_low`
+    is the LEAST lower bound across the seeds -- the conservative summary, so a
+    rung is never credited with an interval only its luckiest seed achieved, and
+    `ci_high` is the GREATEST upper bound so the printed pair is a real interval
+    rather than a one-sided stub. None of the three decides anything:
+    `seeds_clear` does, and it counts seeds whose OWN lower bound excluded zero.
+    `ci_high` is reported only -- the rule is one-sided, so nothing reads it.
+    """
+
+    gain: float
+    ci_low: float
+    ci_high: float
+    seeds_clear: int
+    seeds_total: int
+
+    def clears(self) -> bool:
+        """ONE-SIDED, and that is deliberate.
+
+        A negative gain means appending the block made held-out R^2 WORSE, which
+        is noise or selection slack rather than a finding about the
+        representation. M3i shipped a two-sided control on the argument that a
+        result reliably worse than chance is as broken an instrument as one
+        reliably better; its own run refuted that (`## Task 8 results` section 5
+        of `docs/superpowers/plans/2026-09-26-mb-fps-m3i-latent-motion.md`), and
+        the lesson is applied here rather than re-derived.
+        """
+        return self.seeds_clear >= SEEDS_REQUIRED
+
+
+@dataclass(frozen=True)
+class BaseControl:
+    """One arm's base control: `enc(t)` -> absolute position, as an r2 LEVEL.
+
+    Not a gain. There is nothing to take an increment over -- this is the arm
+    the increments are measured against, and the question is only whether it
+    reads at all.
+    """
+
+    r2: float
+    seeds_clear: int
+    seeds_total: int
+
+    def clears(self) -> bool:
+        return self.seeds_clear >= SEEDS_REQUIRED
+
+
+@dataclass(frozen=True)
+class RetentionInputs:
+    """Everything Reading E is decided on.
+
+    `ladder` is `target -> k -> rung -> arm -> RungArm`, four levels because
+    every one of them is quantified over in the rule: a rung clears a target if
+    it clears at ANY k, in ARMS_REQUIRED arms, each in SEEDS_REQUIRED seeds.
+    `rows` carries the scored row count per k so the reading prints the
+    conditioning it was taken at rather than leaving it to be recomputed.
+    """
+
+    ladder: dict[str, dict[int, dict[str, dict[str, RungArm]]]]
+    base: dict[str, BaseControl]
+    clusters: int
+    rows: dict[int, int]
+
+
+@dataclass(frozen=True)
+class RetentionStatus:
+    status: str
+    rule: str
+    surviving: str | None
+    translation_rungs: tuple[str, ...]
+    rotation_rungs: tuple[str, ...]
+    base_failed: tuple[str, ...]
+
+
+def rung_arm(gains: list[dict]) -> RungArm:
+    """One arm's `RungArm` from its per-seed `probe.gain_from_blocks` dicts.
+
+    THE FINITENESS GUARD LIVES HERE, and it raises. M3i's ledger left this as
+    the one note for its successor: `clears_up`, `clears_down` and `leaks` all
+    evaluate False on NaN, so a single non-finite cell would read "no clear" and
+    "no leak" at once -- moving a verdict toward the wrong status while looking
+    like a clean null. A non-finite gain or interval bound is an ERROR about the
+    measurement, never a statement about the representation, so it is refused
+    at the point where the number first becomes a reading.
+    """
+    if not gains:
+        raise ValueError("a rung needs at least one seed to summarise")
+    for index, seed in enumerate(gains):
+        values = {k: float(seed[k]) for k in ("gain", "ci_low", "ci_high")}
+        bad = {k: v for k, v in values.items() if not np.isfinite(v)}
+        if bad:
+            raise ValueError(
+                f"non-finite {', '.join(sorted(bad))} in seed index {index}: {bad}. "
+                "A non-finite gain is an error about the measurement, not a "
+                "non-clear -- see this function's docstring."
+            )
+    return RungArm(
+        gain=float(np.mean([g["gain"] for g in gains])),
+        ci_low=float(min(float(g["ci_low"]) for g in gains)),
+        ci_high=float(max(float(g["ci_high"]) for g in gains)),
+        seeds_clear=sum(1 for g in gains if float(g["ci_low"]) > 0.0),
+        seeds_total=len(gains),
+    )
+
+
+def rung_clears_at(inputs: RetentionInputs, target: str, rung: str) -> tuple[int, ...]:
+    """The horizons at which `rung` clears `target`, in `K_REPORTED` order.
+
+    A tuple rather than a boolean because the rule is a DISJUNCTION over
+    `K_REPORTED` (spec 2.3) and the reading's rule text names the horizons it
+    cleared at. Empty means the rung did not clear anywhere.
+    """
+    cleared = []
+    for k in K_REPORTED:
+        arms = inputs.ladder[target][k][rung]
+        if sum(1 for arm in arms.values() if arm.clears()) >= ARMS_REQUIRED:
+            cleared.append(k)
+    return tuple(cleared)
+
+
+def _cleared_rungs(inputs: RetentionInputs, target: str) -> dict[str, tuple[int, ...]]:
+    """Every rung that cleared `target`, mapped to its horizons, in RUNGS order."""
+    found = {}
+    for rung in RUNGS:
+        at = rung_clears_at(inputs, target, rung)
+        if at:
+            found[rung] = at
+    return found
+
+
+def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
+    """Reading E: the last rung on the path at which observed motion survives.
+
+    Precedence, and it is the point (spec 3.2). `UNRESOLVED_BASE` is the one
+    true control failure and outranks every result -- a null on displacement
+    means nothing if the current frame cannot say where it is. Then the ladder,
+    highest surviving rung first, so the status IS the lever: a z-bearing rung
+    means the bottleneck kept it and M3i is partially overturned; `h` alone
+    means the bottleneck destroyed it; `two_frame` alone means the RSSM
+    discarded available information; nothing on translation but something on
+    rotation means translation is below the encoder's spatial resolution.
+
+    THE LATENT RUNGS ARE CHECKED BEFORE `two_frame`, and `UNRESOLVED_MOTION` IS
+    LAST. `h` integrates the action sequence, which two frames do not contain,
+    so a latent rung can legitimately clear where `two_frame` does not. An
+    earlier draft of the spec put `UNRESOLVED_MOTION` second, refusing whenever
+    `two_frame` was silent on both targets -- which would have refused precisely
+    that case. `UNRESOLVED_MOTION` therefore requires the WHOLE ladder to be
+    silent on BOTH targets, and it is not a control failure but an empty
+    measurement, which is why it sorts with the readings rather than ahead of
+    them.
+
+    A suppressed reading reports no rungs at all rather than reporting them
+    beside a warning nobody reads.
+    """
+    base_failed = tuple(
+        sorted(arm for arm, control in inputs.base.items() if not control.clears())
+    )
+    holding = len(inputs.base) - len(base_failed)
+    if holding < ARMS_REQUIRED:
+        return RetentionStatus(
+            status="UNRESOLVED_BASE",
+            rule=(
+                f"enc(t) -> absolute position cleared r2 {BASE_R2_FLOOR:.2f} in only "
+                f"{holding} of {len(inputs.base)} arms ({', '.join(base_failed)} failed); "
+                f"the current frame cannot linearly say where it is, so the instrument "
+                f"is broken and no reading is taken"
+            ),
+            surviving=None, translation_rungs=(), rotation_rungs=(), base_failed=base_failed,
+        )
+
+    translation = _cleared_rungs(inputs, "translation")
+    rotation = _cleared_rungs(inputs, "rotation")
+    t_rungs = tuple(translation)
+    r_rungs = tuple(rotation)
+
+    def at(rung: str) -> str:
+        return ", ".join(f"k = {k}" for k in translation[rung])
+
+    for rung in Z_BEARING_RUNGS:
+        if rung in translation:
+            return RetentionStatus(
+                status="MOTION_RETAINED",
+                rule=(
+                    f"the {rung} rung adds displacement the current frame lacks at "
+                    f"{at(rung)}, in at least {ARMS_REQUIRED} arms and {SEEDS_REQUIRED} "
+                    f"seeds each; the bottlenecked latent retains motion it has observed, "
+                    f"so M3i's NO_MOTION was about forward prediction rather than about "
+                    f"the representation's content"
+                ),
+                surviving=rung, translation_rungs=t_rungs, rotation_rungs=r_rungs,
+                base_failed=(),
+            )
+    if "deterministic" in translation:
+        return RetentionStatus(
+            status="BOTTLENECK_LOSS",
+            rule=(
+                f"the deterministic rung adds displacement at {at('deterministic')} but "
+                f"no z-bearing rung does; h carries motion and the 32x32 categorical "
+                f"bottleneck destroys it"
+            ),
+            surviving="deterministic", translation_rungs=t_rungs, rotation_rungs=r_rungs,
+            base_failed=(),
+        )
+    if "two_frame" in translation:
+        return RetentionStatus(
+            status="MOTION_DISCARDED",
+            rule=(
+                f"two real frames add displacement at {at('two_frame')} and no part of "
+                f"the latent does; the information is available and the RSSM discards it, "
+                f"which is what a loss whose reconstruction target is the frame just seen "
+                f"would predict"
+            ),
+            surviving="two_frame", translation_rungs=t_rungs, rotation_rungs=r_rungs,
+            base_failed=(),
+        )
+    if rotation:
+        return RetentionStatus(
+            status="TRANSLATION_UNRESOLVED",
+            rule=(
+                f"no rung adds translation at any of k = "
+                f"{', '.join(str(k) for k in K_REPORTED)}, but "
+                f"{', '.join(r_rungs)} adds ROTATION; translation is below what "
+                f"112x112 frozen single-frame features resolve, so the lever is the "
+                f"encoder's input rather than the loss"
+            ),
+            surviving=None, translation_rungs=t_rungs, rotation_rungs=r_rungs,
+            base_failed=(),
+        )
+    return RetentionStatus(
+        status="UNRESOLVED_MOTION",
+        rule=(
+            f"no rung adds either translation or rotation at any of k = "
+            f"{', '.join(str(k) for k in K_REPORTED)}; a linear read detects no motion "
+            f"anywhere on the path, so the measurement is empty and no lever is chosen"
+        ),
+        surviving=None, translation_rungs=(), rotation_rungs=(), base_failed=(),
+    )
