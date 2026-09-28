@@ -109,6 +109,15 @@ def test_shifted_rows_rejects_a_k_below_one():
         shifted_rows(WINDOW, STEP, 0)
 
 
+def test_shifted_rows_rejects_duplicate_labels():
+    """A duplicate (window, step) pair makes the pairing ambiguous. The builder
+    must refuse, not silently pick one arbitrarily."""
+    window = [0, 0, 0, 0]
+    step = [0, 1, 1, 2]
+    with pytest.raises(ValueError, match="duplicate label"):
+        shifted_rows(window, step, 1)
+
+
 def test_shifted_rows_returns_nothing_when_no_window_is_long_enough():
     """Not an error: the caller reports the row count and a horizon with no rows
     is a fact about the protocol, not a bug. Returning empty keeps the caller's
@@ -134,11 +143,14 @@ def test_backward_translation_at_k_one_is_the_single_step_move():
     ])
 
 
-def test_backward_rotation_wraps_through_360():
-    """Window 0's first step is 350 deg -> 20 deg. That is +30, and a plain
-    subtraction of the two angles gives -330. The target is (sin, cos) of the
-    change, so the two differ: sin(-330) == sin(30) but the pair as a whole only
-    matches if the wrap is handled -- which is why BOTH columns are asserted."""
+def test_backward_rotation_reads_the_change_in_the_right_direction():
+    """Pins the direction of the subtraction: a reversal flips the sign of the
+    sin column. The fixture spans the 360° boundary (350°→20° is +30, not −330),
+    confirming that the arctan2 reconstruction in backward_rotation needs no
+    special wrapping -- it handles the wrap implicitly. Note: no wrap mutation is
+    observable through (sin, cos) because both are 2π-periodic; sin(−330°) and
+    sin(+30°) are bit-identical, as are their cosines. This test must not be read
+    as covering wrap correctness; it only pins the direction of the difference."""
     values, rows = backward_rotation(_targets(), WINDOW, STEP, 1)
     assert rows.tolist() == [1, 2, 3, 5, 6, 7]
     thirty = [np.sin(np.deg2rad(30.0)), np.cos(np.deg2rad(30.0))]

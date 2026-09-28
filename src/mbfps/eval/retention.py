@@ -28,8 +28,6 @@ no record schema. `scripts/latent_retention.py` owns all three.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
 # Pre-registered (spec 2.2, 2.3, 3.1). Three arms, every gain within a cell
@@ -99,7 +97,14 @@ def shifted_rows(window, step, k: int) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError(
             f"window {window.shape} and step {step.shape} must be the same 1-D shape"
         )
-    index = {(int(w), int(s)): i for i, (w, s) in enumerate(zip(window, step))}
+    index = {}
+    for i, (w, s) in enumerate(zip(window, step)):
+        key = (int(w), int(s))
+        if key in index:
+            raise ValueError(
+                f"duplicate label {key}: the pairing between window and step is ambiguous"
+            )
+        index[key] = i
     rows, source = [], []
     for i, (w, s) in enumerate(zip(window, step)):
         partner = index.get((int(w), int(s) - k))
