@@ -3250,3 +3250,214 @@ left for a reviewer:
 `gain_from_blocks` returns `"embedding_r2"` (not `"base_r2"`) in Tasks 3, 7, 8,
 because `study.py` and `scripts/eval_rollout.py` read it by that name.
 `_block_bootstrap_ci` takes `window` XOR `groups` in Tasks 2, 3, 7.
+
+## Task 9 results
+
+**Reading E is `MOTION RETAINED`** — and the sentence that must sit beside it is that the
+pre-registered rule cleared on a margin roughly **fifty times smaller than the neighbouring rung's
+gain**, while every magnitude in the run says the bottleneck is destroying the motion. Both
+statements are true, both are reported, and the rule is not rewritten after the fact.
+
+The verdict was decided by the `stochastic` rung at k = 15, whose mean gain over the nine cells is
+**+0.00033**. At the same horizon the `deterministic` rung's mean gain is **+0.02071** — 63x larger
+— and `full` minus `deterministic`, which is exactly what `z` adds over `h`, is **+0.00064** on
+translation and **negative** on rotation at every horizon. So spec 3.3's pre-registered consequence
+for `MOTION_RETAINED` (M3i partially overturned, M3h section 8's prior-side levers return) is owed
+by the rule as written, and the measured magnitudes point somewhere else: at the 32x32 categorical
+bottleneck, which is `BOTTLENECK_LOSS`'s lever. Section 9 below sets out what the project should
+actually do with that.
+
+### 1. Provenance
+
+| | |
+|---|---|
+| `git_sha` (all nine records) | `8bd6f93` |
+| `record_git_sha` (the M3c cells read) | `ca3e140` |
+| device / torch | `mps` / 2.13.0 |
+| protocol | context 5, horizon 45, `split_seed` 0, 24 val episodes, `K_REPORTED` (1, 4, 15), `DECISION_K` 4 |
+| smoke (one cell, timed) | 2026-09-28T17:32:45Z -> 17:35:38Z (**2 m 53 s**) |
+| measure (nine cells) | 2026-09-28T17:35:54Z -> 18:01:52Z (**25 m 58 s**) |
+| `read` exit | **0** |
+| artefacts | nine `retention_<arm>_seed<n>.json`, `retention.txt` (4,643 bytes) |
+| `nonfinite` | empty on all nine |
+
+`retention.txt` is byte-identical to what a second `--phase read` prints, verified with `cmp`.
+No checkpoint was written or altered and nothing under `runs/` was removed; the phase is
+evaluation only.
+
+### 2. The smoke run earned its place, and the plan was wrong
+
+The first smoke (`runs/m3j_smoke/`, kept) came back with **20 clusters and 9,261 rows at k = 1**
+against the **24 and 11,221** spec sections 3.4 and 6 state and accept on. The cause:
+`probe.filtering_gain`'s `limit` caps the fit split **and** the scored split at the same number —
+its own docstring says "episodes for the fit split, and for the scored split" — and Task 7 was told
+to mirror that function exactly. Mirroring it literally scored 20 of the 24 validation episodes and
+silently discarded four, 17% of the evaluation data, on a protocol every milestone since M3d reads
+as 229 windows over 24 episodes.
+
+Fixed, and the second smoke (`runs/m3j_smoke2/`) reproduces the spec's numbers exactly. The test
+that was supposed to pin this asserted `limit == FIT_EPISODES` on a fixture where `len(val)` was
+**also** 20, so the two numbers could not be told apart; it now uses a fixture where they differ.
+
+*This is what a smoke run is for, and it is the second milestone running where the smoke caught
+something the whole suite had missed.*
+
+### 3. Acceptance
+
+Nine records; one `git_sha` equal to `.head`; all on `mps`; `self_check.ok` on 9/9 within M3h spec
+2.4's reproduction bound; **11,450 scored rows over 229 distinct windows and 24 episode clusters on
+every cell**; `rows` exactly `{k1: 11221, k4: 10534, k15: 8015}` on every cell; `step` 20000; every
+gain and interval bound finite; `nonfinite` empty throughout; the base control holding in 3 of 3
+arms. Passed on every check.
+
+### 4. The base control, and its companion
+
+```
+  base control (enc(t) -> absolute position, must clear r2 0.10):
+      frozen_ssl r2=+0.334 3/3,  pixel_ae r2=+0.337 3/3,  random_vit r2=+0.318 3/3
+  position control (x/y only, same fitted probe):
+      frozen_ssl +0.682,  pixel_ae +0.704,  random_vit +0.660
+```
+
+The gate is on the 4-column mean over `pos_x`, `pos_y`, `sin(angle)`, `cos(angle)`, because
+`BASE_R2_FLOOR = 0.10` was calibrated against `latent_selection_r2`, which is also a 4-column mean.
+A review raised that three docstrings call that number "absolute position" while it does not
+isolate position, and that a cell with position r2 ~ 0 and heading r2 ~ 0.25 would clear the floor
+on heading alone. The companion was recorded so the record could not hide that.
+
+**Measured, it does not happen, and it fails in the safe direction.** Position alone reads
+**0.66–0.70** in every cell, roughly double the gated 4-column mean of 0.32–0.34 — the heading
+columns are what drag the mean down. No cell diverges, and the gate is if anything conservative.
+
+### 5. Reading E
+
+```
+             rung          arm      gain    ci_low   ci_high   seeds  clears
+        two_frame   frozen_ssl   +0.0101   -0.0021   +0.0227     1/3      no
+        two_frame     pixel_ae   +0.0062   -0.0082   +0.0232     0/3      no
+        two_frame   random_vit   +0.0098   -0.0033   +0.0197     2/3     yes
+    deterministic   frozen_ssl   +0.0119   -0.0042   +0.0224     2/3     yes
+    deterministic     pixel_ae   +0.0154   +0.0035   +0.0390     3/3     yes
+    deterministic   random_vit   +0.0126   +0.0052   +0.0236     3/3     yes
+       stochastic   frozen_ssl   +0.0005   -0.0002   +0.0012     2/3     yes
+       stochastic     pixel_ae   +0.0020   -0.0035   +0.0132     1/3      no
+       stochastic   random_vit   +0.0002   -0.0004   +0.0011     1/3      no
+             full   frozen_ssl   +0.0121   -0.0041   +0.0228     2/3     yes
+             full     pixel_ae   +0.0156   +0.0037   +0.0396     3/3     yes
+             full   random_vit   +0.0127   +0.0053   +0.0240     3/3     yes
+  verdict: MOTION RETAINED
+```
+
+At `DECISION_K` itself `stochastic` clears in only **1 of 3 arms**. The rule is a disjunction over
+`K_REPORTED`, and what carried it is k = 15, where `stochastic` clears in 2 of 3 arms.
+
+### 6. The ladder — the whole disjunction, and where the story actually is
+
+Mean gain over all nine cells:
+
+| rung | tr k=1 | tr k=4 | tr k=15 | rot k=1 | rot k=4 | rot k=15 |
+|---|---|---|---|---|---|---|
+| `two_frame` | +0.00216 | +0.00869 | **+0.03489** | +0.00012 | +0.00251 | +0.00051 |
+| `deterministic` | +0.00751 | +0.01327 | +0.02071 | **+0.49380** | **+0.25648** | **+0.32484** |
+| `stochastic` | +0.00066 | +0.00091 | +0.00033 | +0.00002 | −0.00002 | +0.00007 |
+| `full` | +0.00765 | +0.01347 | +0.02135 | +0.48585 | +0.24928 | +0.31942 |
+
+**`z` adds nothing over `h`, and on rotation it subtracts.** `full` minus `deterministic` — the
+increment the bottleneck contributes on top of the recurrent state — is:
+
+| | k = 1 | k = 4 | k = 15 |
+|---|---|---|---|
+| translation | +0.000144 | +0.000209 | +0.000642 |
+| rotation | **−0.007953** | **−0.007203** | **−0.005421** |
+
+### 7. The rotation control says the action channel is doing the work
+
+`deterministic` reads rotation at **+0.494 / +0.256 / +0.325**, in **9 of 9 seeds at every
+horizon** — one to two orders above anything on translation. `two_frame` reads rotation at
+**+0.0001 / +0.0025 / +0.0005**, essentially nothing.
+
+Two real frames give almost no rotation; the recurrent state gives half an R². The difference
+between them is the **action sequence**, which `h` integrates and two frames do not contain —
+exactly the asymmetry spec 2.2 predicted when it insisted `two_frame` is a reference and not a
+ceiling. Turning in `my_way_home` is commanded directly by the action, so `h` can integrate it
+almost perfectly; translation is mediated by geometry and collision, and `h` recovers far less of
+it.
+
+It also means the rotation control did its job in the direction that matters: the instrument can
+read motion — hugely — so the small translation numbers are a fact about translation, not about a
+dead probe.
+
+### 8. `two_frame` grows with the horizon, as the sizing predicted
+
+`two_frame` on translation runs **+0.00216 -> +0.00869 -> +0.03489** across k = 1, 4, 15, and only
+clears at k = 15. Spec 2.3 sized a 1-step move at 5.77 map units — 0.6% of the map extent, against
+a recorded probe position error of 222–247 units — and a 15-step move at 57.49. Two real frames
+resolve a 57-unit displacement and not a 6-unit one, which is what the table shows.
+
+### 9. A flaw in this milestone's own status set, disclosed rather than passed over
+
+**`Z_BEARING_RUNGS = ("stochastic", "full")` cannot distinguish the two cases it exists to
+separate.** `full` is `h (+) z`, so a `full` that clears says only that the *concatenation* beats
+`enc(t)` — it cannot tell "motion survived into `z`" from "`h` carries it and `z` is dead weight".
+Including it in the z-bearing set makes `MOTION_RETAINED` reachable on `h` alone, which is
+precisely what `BOTTLENECK_LOSS` was written to name.
+
+This is not hypothetical here. Re-running the shipped `reading_retention` with `stochastic` forced
+to clear **nowhere**, at any horizon, in any arm:
+
+```
+as measured                  -> MOTION_RETAINED  | surviving: stochastic
+if z alone cleared nowhere   -> MOTION_RETAINED  | surviving: full
+```
+
+The status does not move. So the verdict never rested on `z` carrying anything, and
+`full - deterministic = +0.0002` on translation says `z` does not.
+
+**The verdict stands as taken.** It was read under the rule exactly as pre-registered — one-sided,
+`ci_low > 0`, 2 of 3 seeds in 2 of 3 arms, disjunction over `K_REPORTED` — and this project does
+not rewrite a rule after seeing the numbers. Spec 3.3's consequence for `MOTION_RETAINED` follows
+as written: M3i's `NO_MOTION` was a statement about *forward* prediction rather than about the
+representation's content, and M3h section 8's blanket retirement of the prior-side levers is
+reversed.
+
+**And the rule is recorded as miscalibrated, for the same reason M3i recorded its control.** A
+milestone reusing this status set should put **only `stochastic`** in `Z_BEARING_RUNGS`, because
+only `stochastic` isolates the bottleneck's output. `full` belongs beside `deterministic` as a
+descriptive rung: useful for reading how much the concatenation carries, useless for attributing
+it.
+
+**What the measured magnitudes say, stated separately from the status.** Three facts, none of which
+the status encodes:
+
+- `z` alone carries **+0.00033** of translation at the deciding horizon, against `h`'s **+0.02071**
+  — a factor of 63.
+- `z` adds **+0.0006 or less** over `h` on translation, and **−0.005 to −0.008** on rotation: on the
+  target the instrument reads best, appending `z` makes the fit *worse*.
+- `z` carries **+0.00007** of rotation where `h` carries **+0.325**, a factor of ~4,600.
+
+A latent whose stochastic half contributes three ten-thousandths of an R² where its deterministic
+half contributes two hundredths is not one that retains motion in any sense a training decision
+should rest on. The ladder's honest reading is the one `BOTTLENECK_LOSS` names: **`h` carries it and
+the 32x32 categorical bottleneck destroys it.**
+
+**So the lever the evidence supports is the bottleneck** — `z_cats` x `z_classes` (32x32, at most
+~160 bits) and `rep_scale = 0.1`, five times below `dyn_scale` — even though the status word is
+`MOTION_RETAINED`. Whether to follow the pre-registered status or the magnitudes is the human's
+decision, and this section exists so it is made on both rather than on one word. The two agree on
+one thing: M3i's `NO_MOTION` cannot stand as a claim about the representation, because `h` is part
+of the latent M3i probed and `h` demonstrably carries motion.
+
+### 10. What this milestone does not claim
+
+- A **linear** probe is a lower bound. Every null here says no linear read-out of that block beats
+  the current frame; not that the information is absent under every decoder.
+- `two_frame` is **not** an upper bound, and section 7 is the measured proof: `h` exceeds it by two
+  orders of magnitude on rotation, because it has the action channel.
+- **Backward is not forward.** Everything measured here is motion the posterior has already
+  observed. Nothing in this milestone says the M3 gate can pass, and no status here is a statement
+  about `gap_closed`.
+- The intervals hold the probes fixed across resamples — an interval on the scored sample, not on
+  the fit/select/score pipeline. `_block_bootstrap_ci`'s own caveat, inherited.
+- The gated base r2 is a 4-column mean, not position alone (section 4).
+- It changes no M3 gate, no `aggregate.py`, no `filtering_gain` recorded number, and no M3b–M3i
+  verdict.
