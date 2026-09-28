@@ -534,12 +534,45 @@ def test_measure_cell_loads_the_checkpoint_from_source_not_out(monkeypatch):
     assert seen["out"] != args.out
 
 
+_RECORD_ARMS = ("frozen_ssl", "pixel_ae", "random_vit")
+
+
+def _cell_offset(arm: str, seed: int) -> float:
+    """A small, deterministic, per-`(arm, seed)` offset -- distinguishable
+    across BOTH arms and seeds -- so a record that gets pooled under the
+    wrong arm, or fed to every arm at once, changes a printed number rather
+    than reproducing a byte-identical payload.
+
+    Before this, `_record`'s ladder and base-control numbers depended only on
+    `clearing` and `base_r2` -- never on `arm` or `seed` -- so with the
+    `arm`/`seed` labels dropped, all nine records serialised to ONE distinct
+    payload: an implementation that paired `frozen_ssl` with `pixel_ae`'s
+    seeds, or fed all nine records to every arm, produced identical
+    `RungArm`s / `BaseControl`s and no test noticed.
+
+    Kept well inside the margins every existing test already relies on
+    (`BASE_R2_FLOOR` +/- 0.05, the hit/non-hit gain gap of ~0.26) so it can
+    never flip a clearing boundary on its own -- callers that need the exact
+    boundary (`BASE_R2_FLOOR` itself) pass `distinguish=False` instead.
+    """
+    return 0.005 * _RECORD_ARMS.index(arm) + 0.001 * seed
+
+
 def _record(arm: str, seed: int, *, clearing=(), base_r2: float = 0.30,
-            position_r2: float | None = None, episodes: int = 24) -> dict:
+            position_r2: float | None = None, episodes: int = 24,
+            distinguish: bool = True) -> dict:
     """A minimal record with the schema `read` addresses. `clearing` is a set
     of `(target, k, rung)` triples whose interval excludes zero. `position_r2`
     defaults to `base_r2` (no position/heading divergence) -- Correction 3's
-    own two tests below override a single cell's to build one."""
+    own two tests below override a single cell's to build one.
+
+    `distinguish=True` (the default) offsets this cell's gains and base r2 by
+    `_cell_offset(arm, seed)` -- see that function's docstring for why. Pass
+    `distinguish=False` for a test that needs every cell byte-identical
+    except for the field under test, such as pinning the exact
+    `BASE_R2_FLOOR` boundary.
+    """
+    offset = _cell_offset(arm, seed) if distinguish else 0.0
     ladder = {}
     for target in TARGETS:
         ladder[target] = {}
@@ -548,22 +581,23 @@ def _record(arm: str, seed: int, *, clearing=(), base_r2: float = 0.30,
             for rung in RUNGS:
                 hit = (target, k, rung) in clearing
                 ladder[target][f"k{k}"][rung] = {
-                    "gain": 0.25 if hit else -0.01,
-                    "ci_low": 0.10 if hit else -0.08,
-                    "ci_high": 0.40 if hit else 0.03,
+                    "gain": (0.25 if hit else -0.01) + (offset if hit else -offset),
+                    "ci_low": (0.10 if hit else -0.08) + (offset if hit else -offset),
+                    "ci_high": (0.40 if hit else 0.03) + (offset if hit else -offset),
                     "joint_r2": 0.5, "embedding_r2": 0.25,
                     "confidence": 0.95, "n_scored_windows": episodes,
                     "ridge_selected": True, "joint_ridge": 1e3,
                     "embedding_ridge": 1e3,
                 }
+    r2 = base_r2 + offset
     return {
         "arm": arm, "seed": seed, "step": 20000, "device": "cpu",
         "context": 5, "horizon": 45, "h_dim": 512,
         "ladder": ladder,
         "rows": {f"k{k}": 11221 - k * 229 for k in K_REPORTED},
         "base_control": {
-            "r2": base_r2,
-            "position_r2": base_r2 if position_r2 is None else position_r2,
+            "r2": r2,
+            "position_r2": r2 if position_r2 is None else position_r2,
             "ridge": 1e3, "ridge_selected": True, "rows": 11450,
         },
         "clusters": episodes,
@@ -573,13 +607,14 @@ def _record(arm: str, seed: int, *, clearing=(), base_r2: float = 0.30,
     }
 
 
-def _records(clearing=(), base_r2: float = 0.30, position_r2: float | None = None) -> dict:
-    arms = ("frozen_ssl", "pixel_ae", "random_vit")
+def _records(clearing=(), base_r2: float = 0.30, position_r2: float | None = None,
+             distinguish: bool = True) -> dict:
     return {
         (arm, seed): _record(
             arm, seed, clearing=clearing, base_r2=base_r2, position_r2=position_r2,
+            distinguish=distinguish,
         )
-        for arm in arms for seed in (0, 1, 2)
+        for arm in _RECORD_ARMS for seed in (0, 1, 2)
     }
 
 
@@ -596,22 +631,83 @@ def test_require_readable_plan_refuses_a_plan_too_narrow_to_reach_a_verdict():
     script.require_readable_plan(("pixel_ae", "frozen_ssl"), (0, 1))
 
 
-def test_require_one_protocol_refuses_records_scored_on_different_windows():
-    """Nine cells pooled into one reading must describe the same rows. Two
-    protocols pooled as one would be a reading over a union nothing measured."""
+# Every field `require_one_protocol` compares, mapped to a mutation that
+# changes it on one victim cell. `windows.episode` through `device` are the
+# five the module shipped with (before this fix, only `windows.episode` --
+# via the one hand-written test this table replaces -- was ever driven to a
+# refusal). `ks` and `torch_version` mirror `scripts/latent_motion.py`'s own
+# `require_one_protocol`, which already compares them; `git_sha` is new even
+# there, added because Task 9's acceptance step requires nine records at one
+# `git_sha`, and pooling across two code versions is exactly what this
+# refusal exists to prevent.
+_PROTOCOL_FIELD_MUTATIONS = {
+    "windows.episode": lambda r: r["windows"].update(episode=list(range(5))),
+    "episodes.val": lambda r: r["episodes"].update(val=["different.npz"]),
+    "context": lambda r: r.update(context=999),
+    "horizon": lambda r: r.update(horizon=999),
+    "device": lambda r: r.update(device="mps"),
+    "ks": lambda r: r.update(ks=[1, 4]),
+    "torch_version": lambda r: r.update(torch_version="1.9.0"),
+    "git_sha": lambda r: r.update(git_sha="def456"),
+}
+
+
+@pytest.mark.parametrize("field", sorted(_PROTOCOL_FIELD_MUTATIONS))
+def test_require_one_protocol_refuses_a_disagreement_on_every_compared_field(field):
+    """Table-driven over every field `require_one_protocol` compares. `ks`,
+    `torch_version` and `git_sha` are given a matching BASELINE value on every
+    record first (a real record always carries them) before the victim cell's
+    is changed, so this test is about the comparison catching a mismatch, not
+    about the `.get(...)` default."""
     records = _records()
-    records[("pixel_ae", 1)]["windows"]["episode"] = list(range(20))
-    with pytest.raises(SystemExit):
+    for record in records.values():
+        record["ks"] = [1, 4, 15]
+        record["torch_version"] = "2.1.0"
+        record["git_sha"] = "abc123"
+    _PROTOCOL_FIELD_MUTATIONS[field](records[("pixel_ae", 1)])
+    with pytest.raises(SystemExit, match="disagree on"):
         script.require_one_protocol(records)
+
+
+def test_require_one_protocol_does_not_raise_when_ks_and_provenance_are_absent():
+    """A record written before `ks`/`torch_version`/`git_sha` were compared --
+    or before they existed at all -- must not be refused by their absence:
+    `.get(...)` defaults each of the three identically across every record
+    rather than raising a bare `KeyError` or reading a spurious disagreement.
+    `_records()`'s fixture carries none of the three, so this is exactly that
+    case."""
+    script.require_one_protocol(_records())
 
 
 def test_retention_inputs_tallies_seeds_and_arms_from_the_records():
     """The tally IS the rule, so it has to come from the per-seed intervals in
-    the records rather than from a pooled number."""
+    the records rather than from a pooled number -- and each arm's OWN seeds,
+    not any other cell's. Before this fix, every one of the nine records in
+    `_records()` serialised to the same payload once its `arm`/`seed` labels
+    were dropped (`_cell_offset`'s docstring), so an implementation that
+    pooled the wrong three seeds under an arm -- or all nine under every arm
+    -- produced identical tallies and this test could not tell the
+    difference. `_record`'s `distinguish=True` default gives every `(arm,
+    seed)` its own gain, so the exact per-arm MEAN is now pinned, not just its
+    seed count."""
     clearing = {("translation", 4, "full")}
-    inputs = script.retention_inputs(_records(clearing))
+    records = _records(clearing)
+    inputs = script.retention_inputs(records)
     arm = inputs.ladder["translation"][4]["full"]["pixel_ae"]
     assert arm.seeds_clear == 3 and arm.seeds_total == 3
+    expected_gain = sum(
+        records[("pixel_ae", seed)]["ladder"]["translation"]["k4"]["full"]["gain"]
+        for seed in (0, 1, 2)
+    ) / 3
+    assert arm.gain == pytest.approx(expected_gain), (
+        "pixel_ae's RungArm must be the mean of pixel_ae's OWN three seeds' "
+        "gains, not another arm's or a pool of all nine"
+    )
+    other_arm = inputs.ladder["translation"][4]["full"]["frozen_ssl"]
+    assert other_arm.gain != pytest.approx(arm.gain), (
+        "frozen_ssl and pixel_ae must be built from their own distinguishable "
+        "seeds; equal means here would mean the arm filter did nothing"
+    )
     other = inputs.ladder["translation"][1]["full"]["pixel_ae"]
     assert other.seeds_clear == 0
 
@@ -626,24 +722,53 @@ def test_retention_inputs_refuses_a_non_finite_gain_in_any_record():
 
 
 def test_retention_inputs_reads_the_base_control_against_the_floor():
+    """`seeds_clear=sum(1 for r in levels if r > BASE_R2_FLOOR)` is a STRICT
+    `>`, pinned exactly at the boundary here (`distinguish=False`, so every
+    cell sits on EXACTLY `BASE_R2_FLOOR` with nothing to round it either way)
+    rather than +/- 0.05 away from it, where a `>=` bug would pass unnoticed.
+
+    The holding/failing cases use the default `distinguish=True`, which gives
+    every arm's base r2 a distinguishable value (`_cell_offset`) well clear of
+    the boundary -- so a read that pooled one arm's base control from
+    another arm's seeds, or from all nine records at once, lands on a
+    different number for at least one arm instead of reproducing the same
+    pass/fail by coincidence."""
     from mbfps.eval.retention import BASE_R2_FLOOR
+
     holding = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR + 0.05))
     assert all(c.clears() for c in holding.base.values())
+    levels = [control.r2 for control in holding.base.values()]
+    assert len(set(round(level, 6) for level in levels)) == len(levels), (
+        "every arm's base r2 must be distinguishable, or a cross-arm swap "
+        "would reproduce the same numbers"
+    )
+
     failing = script.retention_inputs(_records(base_r2=BASE_R2_FLOOR - 0.05))
     assert not any(c.clears() for c in failing.base.values())
 
+    on_the_line = script.retention_inputs(
+        _records(base_r2=BASE_R2_FLOOR, distinguish=False)
+    )
+    assert not any(c.clears() for c in on_the_line.base.values()), (
+        "a cell sitting exactly on BASE_R2_FLOOR must not clear it -- the "
+        "rule is a strict '>', not '>='"
+    )
 
-def test_retention_text_is_what_read_prints_byte_for_byte():
-    """`retention.txt` and stdout must be the same bytes, or the artefact and
-    the log disagree about what the run said."""
+
+def test_retention_text_contains_the_ladder_before_reading_e():
+    """`retention_text`'s pure return value: Reading E's verdict and the
+    ladder are both present, with the ladder printed BEFORE the verdict so a
+    reader meets the evidence before the conclusion -- the order M3i's
+    motion.txt uses. This does NOT check that `retention.txt` matches stdout
+    byte for byte; that exact-equality guarantee is
+    `test_read_reaches_every_status_end_to_end`'s job, via
+    `read_bytes() == printed.encode()`."""
     from mbfps.eval.retention import reading_retention
     records = _records({("translation", 4, "two_frame")})
     inputs = script.retention_inputs(records)
     text = script.retention_text(records, inputs, reading_retention(inputs))
     assert "Reading E" in text and "verdict: MOTION DISCARDED" in text
     assert "The ladder" in text
-    # The ladder is printed BEFORE the verdict, so a reader meets the evidence
-    # before the conclusion -- the order M3i's motion.txt uses.
     assert text.index("The ladder") < text.index("Reading E")
 
 
@@ -670,7 +795,7 @@ def test_retention_text_warns_when_r2_clears_but_position_r2_does_not():
     frozen single-frame backbone that reads heading far more easily than map
     position -- clearing on `r2` while `position_r2` sits under the same
     floor -- would otherwise read as a clean pass nothing flags. `pixel_ae`
-    seed 1 is built into exactly that shape: `r2` = 0.30 (clears
+    seed 1 is built into exactly that shape: `r2` = ~0.30 (clears
     `BASE_R2_FLOOR` = 0.10) while `position_r2` is pulled to 0.05 (does not)."""
     from mbfps.eval.retention import BASE_R2_FLOOR, reading_retention
     clearing = {("translation", 4, "stochastic")}
@@ -683,6 +808,17 @@ def test_retention_text_warns_when_r2_clears_but_position_r2_does_not():
     # No OTHER cell diverges, so the warning names this one and not another.
     warning_lines = [line for line in text.splitlines() if "WARNING" in line]
     assert len(warning_lines) == 1, warning_lines
+
+
+def test_position_companion_refuses_a_record_missing_position_r2():
+    """A record written before `position_r2` shipped (Correction 3) must
+    raise a NAMED refusal -- naming the missing key and the cell -- rather
+    than dying with a bare `KeyError` the way this function's named-refusal
+    neighbours (`load_retention`, `require_one_protocol`) never do."""
+    records = _records()
+    del records[("pixel_ae", 1)]["base_control"]["position_r2"]
+    with pytest.raises(ValueError, match=r"pixel_ae seed 1.*position_r2"):
+        script._position_companion(records)
 
 
 @pytest.mark.parametrize("clearing,expected", [
@@ -713,7 +849,13 @@ def test_read_reaches_every_status_end_to_end(tmp_path, capsys, clearing, expect
     status = script.main(["--phase", "read", "--out", str(tmp_path)])
     printed = capsys.readouterr().out
     assert f"verdict: {expected}" in printed
-    assert (tmp_path / "retention.txt").read_text() in printed
+    # EXACT byte equality, not containment: `print(text)` (an extra trailing
+    # newline) or `write_text(text.rstrip())` would both still satisfy a
+    # containment check, and the artefact and the log would quietly disagree
+    # about what the run said.
+    assert (tmp_path / "retention.txt").read_bytes() == printed.encode(), (
+        "retention.txt and stdout must be byte-identical"
+    )
     if expected == "UNRESOLVED MOTION":
         assert status == script.EXIT_MOTION_UNRESOLVED
     else:

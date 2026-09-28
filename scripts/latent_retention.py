@@ -87,9 +87,8 @@ own sketch of `measure_cell` passes around:
 import argparse
 import importlib.util
 import sys
-from pathlib import Path
-
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -403,8 +402,7 @@ def _cell_args(args, source: Path) -> types.SimpleNamespace:
     `scripts/latent_motion.py`.
     """
     return types.SimpleNamespace(
-        out=Path(source), device=args.device,
-        context=getattr(args, "context", None), horizon=getattr(args, "horizon", None),
+        out=Path(source), device=args.device, context=args.context, horizon=args.horizon,
     )
 
 
@@ -582,9 +580,23 @@ def require_one_protocol(records: dict) -> None:
     that disagree are named with the field.
 
     Nine cells pooled into one reading must describe the same rows: two
-    protocols pooled as one would be a reading over a union nothing measured,
-    and `clusters` -- the one cluster count `format_reading_retention` prints
-    -- would silently become whichever record was read last.
+    protocols pooled as one would be a reading over a union nothing measured.
+    Mirrors `scripts/latent_motion.py`'s namesake, which compares `ks` and
+    `torch_version` in addition to the windows/protocol fields below -- a
+    retention record carries both keys too, so without them here nine cells
+    measured on different torch builds, or against different reported k
+    grids, would pool with no refusal at all. `git_sha` is compared for the
+    same reason: Task 9's acceptance step requires nine records at one
+    `git_sha`, and pooling across two code versions is exactly what this
+    refusal exists to prevent. All three are read with `.get(...)` so a
+    record written before they existed is handled -- defaulted identically
+    across every record -- rather than raising a bare `KeyError`.
+
+    `clusters` and `rows` are NOT compared here: they are print-only
+    (`retention_inputs` takes both from whichever record sorts first, by its
+    own docstring) and gate nothing downstream, so no lever can flip on
+    them -- this function guards only the fields a wrong pooling could act
+    on.
     """
     items = sorted(records.items())
     if not items:
@@ -597,6 +609,9 @@ def require_one_protocol(records: dict) -> None:
             ("context", lambda r: int(r["context"])),
             ("horizon", lambda r: int(r["horizon"])),
             ("device", lambda r: str(r["device"])),
+            ("ks", lambda r: list(r.get("ks", []))),
+            ("torch_version", lambda r: str(r.get("torch_version", ""))),
+            ("git_sha", lambda r: str(r.get("git_sha", ""))),
         ):
             mine, theirs = pick(record), pick(first)
             if mine != theirs:
@@ -716,6 +731,21 @@ def _self_check_table(records: dict) -> str:
     return "\n".join(lines)
 
 
+def _position_r2(record: dict, cell: tuple[str, int]) -> float:
+    """`base_control["position_r2"]`, named -- not a bare `KeyError` -- for a
+    record written before `position_r2` shipped (Correction 3), unlike this
+    function's named-refusal neighbours (`load_retention`,
+    `require_one_protocol`)."""
+    base = record["base_control"]
+    if "position_r2" not in base:
+        raise ValueError(
+            f"{cell[0]} seed {cell[1]}: this record's base_control has no "
+            "'position_r2' -- it predates Correction 3 and must be re-measured "
+            "before this reading can report the position companion"
+        )
+    return float(base["position_r2"])
+
+
 def _position_companion(records: dict) -> str:
     """This script's own companion to the base control line printed above it
     -- Correction 3.
@@ -746,13 +776,13 @@ def _position_companion(records: dict) -> str:
         "probe's r2 against position alone, reported beside the gated 4-column r2 above): " \
         + ", ".join(
             f"{arm} position_r2="
-            f"{np.mean([float(records[cell]['base_control']['position_r2']) for cell in cells_for(arm)]):+.3f}"
+            f"{np.mean([_position_r2(records[cell], cell) for cell in cells_for(arm)]):+.3f}"
             for arm in arms
         )
     warnings = []
     for (arm, seed), record in sorted(records.items()):
-        base = record["base_control"]
-        r2, position_r2 = float(base["r2"]), float(base["position_r2"])
+        r2 = float(record["base_control"]["r2"])
+        position_r2 = _position_r2(record, (arm, seed))
         if r2 > BASE_R2_FLOOR and not position_r2 > BASE_R2_FLOOR:
             warnings.append(
                 f"  WARNING: {arm} seed {seed} clears BASE_R2_FLOOR ({BASE_R2_FLOOR:.2f}) on "
@@ -802,8 +832,8 @@ def read_phase(args) -> int:
     inputs = retention_inputs(records)
     reading = reading_retention(inputs)
     text = retention_text(records, inputs, reading)
-    print(text, end="")
     write_text(args.out / "retention.txt", text)
+    print(text, end="")
     return READ_EXITS.get(reading.status, EXIT_OK)
 
 
