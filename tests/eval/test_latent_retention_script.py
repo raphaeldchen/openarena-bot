@@ -411,12 +411,12 @@ def test_measure_cell_refuses_a_failed_self_check_and_records_steps(monkeypatch)
     val = [Path(f"val_ep{i}") for i in range(10)]
 
     monkeypatch.setattr(script, "self_check", lambda traj, diagnostic: _Check(False))
-    status, record = script.measure_cell(object(), cell, "cpu", train, val, ks=(1,))
+    status, record = script.measure_cell(_measure_args(), cell, "cpu", train, val, ks=(1,))
     assert status == script.EXIT_SELF_CHECK_FAILED
     assert record is None
 
     monkeypatch.setattr(script, "self_check", lambda traj, diagnostic: _Check(True))
-    status, record = script.measure_cell(object(), cell, "cpu", train, val, ks=(1,))
+    status, record = script.measure_cell(_measure_args(), cell, "cpu", train, val, ks=(1,))
     assert status == script.EXIT_OK
     assert record["step"] == 20000
     assert set(record) == {
@@ -484,6 +484,54 @@ def test_measure_phase_loads_cells_from_source_and_writes_records_to_out(monkeyp
 # ---------------------------------------------------------------------------
 # read: the nine records pooled into Reading E.
 # ---------------------------------------------------------------------------
+
+
+def _measure_args(source="runs/m3_study_v2"):
+    """The attributes `measure_cell` reads off its args. `source` is the STUDY
+    directory: `prepare_cell` loads the checkpoint from the `out` of the args it
+    is handed, so passing this script's own `--out` through would hunt for the
+    nine M3c checkpoints among the retention records.
+    """
+    import types as _types
+    return _types.SimpleNamespace(
+        source=source, out="runs/m3j_retention", device="cpu",
+        context=None, horizon=None,
+    )
+
+
+def test_measure_cell_loads_the_checkpoint_from_source_not_out(monkeypatch):
+    """`prepare_cell` loads the checkpoint from the `out` of the args IT is
+    handed (`trust_horizon.load_checkpoint_model(args.out, ...)`), which is the
+    STUDY directory -- while this script's own `--out` holds the retention
+    records. Handing `args` through unchanged hunts for the nine M3c
+    checkpoints among the records and refuses every cell, so a `measure` run
+    fails on its first cell with a refusal that names the wrong directory.
+
+    Nothing else catches this: every other test in this file stubs
+    `prepare_cell` or feeds `cell_ladder` directly, so the one line that routes
+    the directories is exercised only here.
+    """
+    seen = {}
+
+    def recording_prepare_cell(cell_args, cell, device, train, val):
+        seen["out"] = str(cell_args.out)
+        seen["device"] = cell_args.device
+        return script.EXIT_SELF_CHECK_FAILED, None
+
+    monkeypatch.setattr(script, "prepare_cell", recording_prepare_cell)
+    import types as _types
+    cell = _types.SimpleNamespace(
+        arm="pixel_ae", seed=0, record={"steps": 20000}, diagnostic={},
+    )
+    args = _measure_args(source="runs/m3_study_v2")
+    status, record = script.measure_cell(args, cell, "cpu", [], [])
+
+    assert status == script.EXIT_SELF_CHECK_FAILED and record is None
+    assert seen["out"] == "runs/m3_study_v2", (
+        f"prepare_cell was handed out={seen['out']!r}; it must be the STUDY "
+        "directory (--source), never this script's record directory (--out)"
+    )
+    assert seen["out"] != args.out
 
 
 def _record(arm: str, seed: int, *, clearing=(), base_r2: float = 0.30,

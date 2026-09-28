@@ -89,6 +89,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import types
+
 import numpy as np
 import torch
 
@@ -391,6 +393,21 @@ def base_control(fit: dict, select: dict | None, score: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _cell_args(args, source: Path) -> types.SimpleNamespace:
+    """`prepare_cell` reads `out`, `device`, `context` and `horizon` off its
+    args, and its `out` is the STUDY directory the checkpoint is loaded from
+    (`trust_horizon.load_checkpoint_model(args.out, ...)`). This script's own
+    `--out` holds the retention records and nothing else, so handing `args`
+    through unchanged would look for the nine M3c checkpoints in the output
+    directory and refuse every cell. Same shim, same reason, as
+    `scripts/latent_motion.py`.
+    """
+    return types.SimpleNamespace(
+        out=Path(source), device=args.device,
+        context=getattr(args, "context", None), horizon=getattr(args, "horizon", None),
+    )
+
+
 def measure_cell(args, cell: Cell, device, train, val, ks=K_REPORTED) -> tuple[int, dict | None]:
     """One cell: the checks, the three gathers, the ladder, the base control.
 
@@ -414,7 +431,9 @@ def measure_cell(args, cell: Cell, device, train, val, ks=K_REPORTED) -> tuple[i
     `write_record`.
     """
     arm, seed = cell.arm, cell.seed
-    status, prepared = prepare_cell(args, cell, device, train, val)
+    status, prepared = prepare_cell(
+        _cell_args(args, args.source), cell, device, train, val
+    )
     if prepared is None:
         return status, None
 
