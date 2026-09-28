@@ -98,13 +98,22 @@ while `z(t)` sees `h(t)` and `enc(t)`. `_pack` already returns `h` and `z` separ
 
 | rung | `B` | width | asks |
 |---|---|---|---|
-| `two_frame` | `enc(t-1)` | 2048 | what two real frames linearly provide |
+| `two_frame` | `enc(t-k)` | 2048 | what two real frames linearly provide |
 | `deterministic` | `h(t)` | 512 | what the recurrent state adds |
 | `stochastic` | `z(t)` | 1024 | what the bottlenecked latent adds |
 | `full` | `h(t) (+) z(t)` | 1536 | M3i's input — the bridge to `NO_MOTION` |
 
 `enc(t) (+) h(t)` is therefore exactly "this frame plus everything strictly before it", which is
 what backward displacement requires and what `enc(t)` alone provably lacks.
+
+**`two_frame`'s block is `enc(t-k)`, not `enc(t-1)`, and the distinction is not cosmetic.** The two
+frames that determine `p(t) - p(t-k)` are `t` and `t-k`. Pairing `enc(t)` with `enc(t-1)` would
+hand the reference a frame one step back and ask it about a 15-step displacement, making the rung
+near-uninformative at every k > 1 and the phrase "what two real frames linearly provide" false. It
+would also break the comparison the design rests on: `h(t)` sees every frame `0..t-1`, `t-k`
+included, so the reference must see `t-k` as well or the latent rungs gain an advantage they did not
+earn. At k = 1 the two definitions coincide, which is what made the error invisible in the first
+draft of this section.
 
 **`two_frame` is a reference, not a ceiling, and must not be described as one.** `h` integrates the
 **action** sequence, which two frames do not contain, so a latent rung can legitimately exceed it.
