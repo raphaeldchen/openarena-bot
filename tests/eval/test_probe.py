@@ -969,7 +969,7 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     timestep, so misaligned rows would compare two different frames and no
     shape check would notice.
 
-    There are SIX keys -- four payload arrays and M3i's two row indices --
+    There are SEVEN keys -- four payload arrays and M3j's three row indices --
     and the two embeddings are not interchangeable:
     `"embedding"` is the head's PREDICTED embedding (the space the rollout band
     is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
@@ -981,7 +981,8 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     data = _gather(paths, head_width=7, context=2, horizon=3)
 
     assert set(data) == {
-        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+        "latent", "embedding", "encoder_embedding", "targets",
+        "window", "step", "episode",
     }
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
@@ -1020,16 +1021,52 @@ def test_gather_probe_data_labels_every_row_with_its_window_and_step(tmp_path):
     assert data["targets"].shape[0] == n and data["encoder_embedding"].shape[0] == n
 
 
-def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_path):
+def test_gather_probe_data_labels_every_row_with_its_episode(tmp_path):
+    """M3j resamples EPISODES, not windows: 229 non-overlapping windows cut from
+    24 trajectories are not 229 independent observations. The label has to come
+    from the gather, because by the time a caller holds the arrays the episode
+    boundary is gone."""
+    paths = _write_episodes(tmp_path, [20, 20, 20])
+    data = _gather(paths, context=2, horizon=3)
+    n = data["latent"].shape[0]
+    episode, window = data["episode"], data["window"]
+
+    assert episode.shape == (n,) and episode.dtype.kind == "i"
+    # Three contributing episodes, labelled 0..2 with no gaps.
+    assert np.unique(episode).tolist() == [0, 1, 2]
+    # Every window sits inside exactly one episode -- so grouping by episode is
+    # strictly COARSER than grouping by window, which is the whole point.
+    for w in np.unique(window):
+        assert len(set(episode[window == w].tolist())) == 1, f"window {w} spans episodes"
+    # And every episode contributes more than one window, or the two groupings
+    # would coincide and this label would buy nothing.
+    assert all(
+        len(np.unique(window[episode == e])) > 1 for e in np.unique(episode)
+    ), "each episode must contribute several windows or the label is pointless"
+
+
+def test_gather_probe_data_episode_labels_skip_episodes_that_contribute_nothing(tmp_path):
+    """An episode too short for one window is `continue`d before it appends any
+    row. If the counter advanced anyway the labels would carry gaps, and a
+    caller sizing its bootstrap from `episode.max() + 1` would resample empty
+    groups."""
+    paths = _write_episodes(tmp_path, [20, 3, 20])
+    data = _gather(paths, context=2, horizon=3)
+    assert np.unique(data["episode"]).tolist() == [0, 1], (
+        "the short episode must not consume a label"
+    )
+
+
+def test_gather_probe_data_is_deterministic_and_returns_exactly_seven_keys(tmp_path):
     """Two calls over the same paths and kwargs must agree row for row, and
-    the returned dict must carry exactly the four payload arrays plus the two
+    the returned dict must carry exactly the four payload arrays plus the three
     row indices -- no more, no fewer.
 
     Both sides of the array comparison below are calls made AFTER the indices
     were added, so this pins determinism across calls, not invariance against
     some pre-change array (those no longer exist to compare against; the
     call-site audit that established the four original keys are unchanged by
-    every existing caller is recorded elsewhere, not here). The six-key set is
+    every existing caller is recorded elsewhere, not here). The seven-key set is
     pinned by exact equality, so an extra or missing key fails even if every
     array happens to match."""
     paths = _write_episodes(tmp_path, [20, 20])
@@ -1038,7 +1075,8 @@ def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_pat
     for key in ("latent", "embedding", "encoder_embedding", "targets"):
         np.testing.assert_array_equal(first[key], second[key], err_msg=key)
     assert set(first) == {
-        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+        "latent", "embedding", "encoder_embedding", "targets",
+        "window", "step", "episode",
     }
 
 

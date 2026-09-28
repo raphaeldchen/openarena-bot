@@ -192,7 +192,7 @@ def gather_probe_data(
     prevent. What is matched here is the filtering DEPTH, which is what the
     three references actually share.
 
-    Returns six row-aligned arrays:
+    Returns seven row-aligned arrays:
 
     - `"latent"` `(N, LATENT)` -- the posterior latent.
     - `"embedding"` `(N, EMBED)` -- the model's PREDICTED embedding, i.e.
@@ -206,6 +206,10 @@ def gather_probe_data(
       window, `0 .. context + horizon - 1`. M3i reconstructs per-window
       trajectories from these two so it can compute displacement WITHIN a
       window; every earlier caller ignores them.
+    - `"episode"` `(N,)` int -- the 0-based index of the episode each row came
+      from, over the episodes that contributed at least one window. M3j
+      resamples on this rather than on `"window"`; see `_block_bootstrap_ci`'s
+      `groups`.
 
     THE TWO EMBEDDINGS ARE NOT REDUNDANT AND MUST NOT BE COLLAPSED INTO ONE.
     They answer different questions, and each is the wrong array for the
@@ -242,7 +246,9 @@ def gather_probe_data(
     latents, embeddings, encoder_embeddings, targets = [], [], [], []
     windows: list[np.ndarray] = []
     steps: list[np.ndarray] = []
+    episodes: list[np.ndarray] = []
     window_index = 0
+    episode_index = 0
 
     for path in list(paths)[:limit]:
         episode = load_episode(path)
@@ -292,7 +298,12 @@ def gather_probe_data(
             rows = int(latent.shape[1])
             windows.append(np.full(rows, window_index, dtype=np.int64))
             steps.append(np.arange(rows, dtype=np.int64))
+            episodes.append(np.full(rows, episode_index, dtype=np.int64))
             window_index += 1
+        # Advanced only here, AFTER the window loop, so an episode that reached
+        # `continue` above (too short for one window) never consumes a label and
+        # the labels stay gap-free.
+        episode_index += 1
 
     if not latents:
         raise ValueError(
@@ -309,6 +320,12 @@ def gather_probe_data(
         # trajectories from these; every earlier caller ignores them.
         "window": np.concatenate(windows),
         "step": np.concatenate(steps),
+        # Which EPISODE each row came from, 0-based over the episodes that
+        # actually contributed a window. The coarsest correlated unit the scored
+        # array contains: windows are cut non-overlapping, but several windows
+        # from one trajectory are not independent observations, and every
+        # reading from M3e onward clusters on episodes rather than windows.
+        "episode": np.concatenate(episodes),
     }
 
 
