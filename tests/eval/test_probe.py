@@ -1634,6 +1634,34 @@ def test_filtering_gain_reads_the_deterministic_head_of_the_latent():
     assert gain_for(latent) > 0.5, "the stochastic tail was probed, not h"
 
 
+def test_gain_from_splits_output_is_byte_identical_after_the_generalisation():
+    """THE regression pin for Task 3. `filtering_gain` reports through
+    `_gain_from_splits` onto the gate's own path (`study.py:589`,
+    `scripts/eval_rollout.py:201`), so generalising its body is only safe if the
+    numbers do not move. Every value below was captured from the code BEFORE
+    `gain_from_blocks` existed. If a refactor changes one, the refactor is
+    wrong -- do not re-record them."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    parts = [
+        _split(latent[s], embedding[s], targets[s])
+        for s in (slice(0, 200), slice(200, 400), slice(400, 600))
+    ]
+    out = _gain_from_splits(parts[0], parts[1], parts[2], h_dim=2,
+                            window=5, resamples=200, confidence=0.9, seed=11)
+    assert out == {
+        "gain": 0.9996786109619562,
+        "joint_r2": 0.9996512622688909,
+        "embedding_r2": -2.7348693065254448e-05,
+        "ci_low": 0.9996553965287523,
+        "ci_high": 1.0154949292104678,
+        "confidence": 0.9,
+        "n_scored_windows": 40,
+        "ridge_selected": True,
+        "joint_ridge": 0.1,
+        "embedding_ridge": 10000000.0,
+    }
+
+
 def test_filtering_gain_puts_the_raw_embedding_in_both_arms():
     """The whole reason this is immune to the bottleneck.
 
