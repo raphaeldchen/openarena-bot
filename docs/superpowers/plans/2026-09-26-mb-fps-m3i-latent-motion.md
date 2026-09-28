@@ -1441,3 +1441,262 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - **Spec coverage.** §2 protocol → Tasks 6, 8. §2.1 the displacement probe → Tasks 1 (the indices it needs), 2 (the statistic), 6 (the fit). §2.2 the control → Tasks 3 (precedence), 6 (the derangement), 7 (the gate). §2.3 the descriptive family → Task 5. §3.1 pooling → Task 7's `motion_inputs`. §3.2 Reading D → Tasks 3, 4. §3.3 the pre-registered consequence → Task 8 Step 6 item 10. §3.4 `pixel_ae`/s1 → Task 8 Step 6 item 9. §4 non-claims → Task 8 Step 6 item 10. §5 code shape → Tasks 2–7 as named; the registry → Task 7. §6 the run → Task 8. §7 files → the File Structure table.
 - **Placeholders.** None: every code step carries its code, and the three places that say "read the existing file first" name what to read and why (the `_sibling` class trap, the registry test's own helper names, `fit_probe`'s real signature) rather than deferring a decision.
 - **Type consistency.** `MotionArm(estimate, se, z, seeds_up, seeds_down, seeds_total)` (Task 3) is what Task 7's `_arm_from_pool` builds and Task 4's formatter reads; `MotionInputs(arms, control, z_fam, k, clusters)` is built only in Task 7 and consumed in Tasks 3 and 4; `MotionStatus(status, rule, arms_up, arms_down, leaked)` is produced in Task 3 and read in Task 4; `contrast_series` and `displacement` (Task 2) are called only in Task 6; `READING_COLUMNS` (Task 4) is the single spelling of the table's headers; `EXIT_CONTROL_LEAKED = 38` (Task 6) is asserted in Task 7's registry test; `motion_record_path` (Task 6) is used by Task 7's tests; `"window"` / `"step"` (Task 1) are consumed only in Task 6 Step 3 item 3.
+
+## Task 8 results
+
+**Reading D is `NO MOTION`.** At the decision horizon the posterior latent is measurably **worse**
+than predicting no displacement at all, in all three arms. All three of M3h §8's remaining
+prior-side levers are refuted in advance by §3.3, and the project's next lever is upstream: the
+encoder and the representation loss.
+
+The sharper finding is the post-hoc companion in §9: the probe does **exactly as well on a random
+window's displacement as on its own** — paired z of 0.13, −0.12 and 0.08 at k = 15. The latent
+carries no window-specific displacement information at all, which is a stronger statement than
+losing to persistence and does not depend on persistence being a fair baseline.
+
+### 1. Provenance
+
+| | |
+|---|---|
+| `git_sha` (all nine records) | `9213440` |
+| device / torch | `mps` / 2.13.0 |
+| reference cells | `runs/m3_study_v2`, `record_git_sha` `ca3e140`, step 20000 |
+| protocol | context 5, horizon 45, `split_seed` 0, 24 val episodes, `decision_h` 15 |
+| `motion.started` → `motion.finished` | 2026-09-27T23:40:45Z → 2026-09-27T23:54:40Z (**13 m 55 s**) |
+| `motion.exit` | **0** |
+| artefacts | nine `motion_<arm>_seed<n>.json`, `motion.txt` |
+| `nonfinite` | empty on all nine |
+
+`motion.txt` is byte-identical to what `--phase read` prints, verified by diffing a second read
+against the written file. No checkpoint was written or altered and nothing under `runs/` was
+removed; the phase is evaluation only.
+
+*The plan's Step 3 asked for a smoke run whose `motion.txt` would be read for format before the
+real run. Task 7's own `require_readable_plan` correctly refuses a one-cell read — a plan that
+narrow cannot reach the verdict — so those two steps of the plan contradicted each other. The order
+was inverted instead: `measure` is the expensive half and `read` only pools existing records, so
+the format was checked on all nine real cells and could have been re-read without re-measuring.
+The one-cell smoke still ran and its `pixel_ae`/s0 numbers are identical to the same cell in the
+real run, which is a reproducibility check the plan did not ask for.*
+
+### 2. Suite
+
+`1818 passed in 2035.36s (0:33:55)` at `9213440`, 0 skipped, 0 warnings, 0 failures, under
+`caffeinate -dimsu`. The pytest tmpdir stayed at 1.0 GB across the whole run rather than the ~24 GB
+per run it consumed before `tmp_path_retention_policy = "failed"` landed in PR #8.
+
+### 3. Acceptance
+
+Nine records, one `git_sha` equal to `motion.head`, all on `mps`, `self_check.ok` on 9/9, 229
+windows over 24 episode clusters on every cell, `step` 20000, all five horizons in every record,
+and **every contrast and control series exactly 229 rows**. `nonfinite` empty throughout. Passed.
+
+*One correction to the acceptance script itself: it asserted `windows.clusters`, which the record
+does not carry — the cluster count is derived from the episode index rather than stored. The check
+now asserts `len(set(windows.episode)) == 24` and `len(windows.episode) == 229`, which is the
+stronger statement anyway: it pins that the index labels every window, not just that 24 clusters
+exist somewhere.*
+
+### 4. The self-check — the reproduction bound
+
+```
+  arm          seed    step  ref max|d|  pers max|d|  windows  clusters   ok
+  frozen_ssl      0   20000     0.0e+00      5.7e-14      229        24  yes
+  frozen_ssl      1   20000     1.7e-13      1.1e-13      229        24  yes
+  frozen_ssl      2   20000     5.7e-14      2.8e-14      229        24  yes
+  pixel_ae        0   20000     8.5e-14      1.1e-13      229        24  yes
+  pixel_ae        1   20000     0.0e+00      0.0e+00      229        24  yes
+  pixel_ae        2   20000     8.5e-14      8.5e-14      229        24  yes
+  random_vit      0   20000     1.4e-13      8.5e-14      229        24  yes
+  random_vit      1   20000     1.1e-13      1.4e-13      229        24  yes
+  random_vit      2   20000     1.4e-13      1.1e-13      229        24  yes
+```
+
+Identical, cell for cell, to what M3h's sweep recorded at the same nine cells — worst delta
+`1.705303e-13` on `frozen_ssl`/s1, **6 ULPs** against a bound of 64, two cells still exactly 0.0.
+M3h §2.4's bound is doing its job on a second, independent milestone.
+
+### 5. The control
+
+At the decision horizon the permuted control did **not** leak: z = **−1.85 / −1.75 / −1.75**, all
+inside ±2.582, so Reading D was taken as the pre-registered rule allows.
+
+**A flaw in this milestone's own design, disclosed rather than quietly passed over.** Spec §2.2 and
+§3.2 made the control **two-sided**, on the argument that a permuted pairing reliably worse than
+chance is as broken an instrument as one reliably better. That argument is wrong, and the run shows
+it: the control's z is negative at every horizon in every arm, and it exceeds the bar at k = 1
+(−6.92, −6.17, −2.97), at k = 5 for `pixel_ae` (−4.31) and at k = 45 (−3.00, −3.07).
+
+Measured, that negative sign is the *correct* behaviour of a working instrument. The contrast is
+`||true|| − ||predicted − true||`, so the persistence baseline is exactly the zero prediction;
+against a randomly-paired displacement any **nonzero** prediction can only increase the error.
+Sweeping an uninformative prediction of growing size against 2000 real displacements gives mean
+controls of 0.0000, −0.0383, −0.1509, −0.4626 and −2.4594 — monotone in the prediction's magnitude
+and exactly 0 only when the probe emits nothing. So the gate should have been **one-sided**: only a
+control clearing **positive** means signal where none can exist.
+
+What this does and does not change. It does **not** change the verdict: the gate did not fire at
+k = 15, the reading was taken under the rule as written, and a one-sided gate is strictly more
+permissive about negative controls, so `NO_MOTION` stands either way. It does mean the milestone
+came within one horizon of being suppressed by a control behaving exactly as it should — had
+`DECISION_H` been 1 instead of 15, M3i would have exited 38 and reported nothing. The rule is not
+rewritten after the fact; it is recorded as miscalibrated, and any milestone reusing this control
+should make it one-sided.
+
+### 6. Reading D
+
+```
+           arm     estimate      se       z      up      dn  clears
+    frozen_ssl      -0.6316  0.2249   -2.81     0/3     2/3    down
+      pixel_ae      -0.6774  0.2311   -2.93     0/3     3/3    down
+    random_vit      -0.6126  0.2269   -2.70     0/3     2/3    down
+  control (permuted pairing, cannot carry signal): frozen_ssl z=-1.85, pixel_ae z=-1.75, random_vit z=-1.75
+  verdict: NO MOTION -- decided by: no arm beats staying put at k = 15, and the latent is WORSE
+           than staying put by more than -2.58 in 3 of 3 arms (frozen_ssl, pixel_ae, random_vit)
+```
+
+`z_fam = cluster_threshold(3, 24) = 2.582`. `seeds_up` is **0/3 in every arm** — no seed of any arm
+beats staying put. The per-seed z the tallies count:
+
+| arm | s0 | s1 | s2 | down |
+|---|---|---|---|---|
+| `frozen_ssl` | −2.93 | −2.50 | −2.95 | 2/3 |
+| `pixel_ae` | −2.93 | −2.67 | −3.06 | 3/3 |
+| `random_vit` | −2.22 | −2.93 | −2.93 | 2/3 |
+
+Every one of the nine cells is negative; the two arms at 2/3 miss a third seed by 0.08 and 0.36 of
+a z respectively, not by direction.
+
+### 7. The other horizons — reported, deciding nothing
+
+```
+  k      arm                estimate         se          z       up       dn        ctl z  decides
+  k=1    frozen_ssl          -0.1581     0.0279      -5.67      0/3      2/3        -6.92       no
+  k=1    pixel_ae            -0.1899     0.0290      -6.55      0/3      3/3        -6.17       no
+  k=1    random_vit          -0.0276     0.0099      -2.78      0/3      2/3        -2.97       no
+  k=5    frozen_ssl          -0.2092     0.0657      -3.18      0/3      3/3        -2.51       no
+  k=5    pixel_ae            -1.0882     0.1413      -7.70      0/3      3/3        -4.31       no
+  k=5    random_vit          -0.1825     0.0646      -2.82      0/3      3/3        -2.15       no
+  k=30   frozen_ssl          -0.8188     0.3203      -2.56      0/3      1/3        -2.09       no
+  k=30   pixel_ae            -1.1209     0.5197      -2.16      0/3      1/3        -2.35       no
+  k=30   random_vit          -0.6674     0.3519      -1.90      0/3      0/3        -1.93       no
+  k=45   frozen_ssl          -1.0295     0.4662      -2.21      0/3      0/3        -1.96       no
+  k=45   pixel_ae            -1.1854     0.6866      -1.73      0/3      0/3        -3.00       no
+  k=45   random_vit          -1.0609     0.8284      -1.28      0/3      0/3        -3.07       no
+```
+
+`seeds_up` is **0/3 in all twelve rows above**, and in §6's three at k = 15 — so across all
+fifteen (arm, horizon) pairs no arm beats staying put in any seed. The estimate grows more negative with k while its standard error grows faster, so the
+z weakens past k = 15 — which is what a fixed per-step error integrated over a longer horizon looks
+like, and is why the decision horizon was pre-registered rather than chosen from this table.
+
+### 8. The latent, described — reported, deciding nothing
+
+```
+  arm          seed  entropy   ln(C)   live  groups  top1 post  top1 prior  KL mean   KL med
+  frozen_ssl      0    0.873   3.466   32.0      32      0.534       0.508    0.602    0.591
+  frozen_ssl      1    1.022   3.466   31.0      32      0.481       0.461    0.377    0.331
+  frozen_ssl      2    0.875   3.466   29.0      32      0.540       0.527    0.423    0.352
+  pixel_ae        0    0.706   3.466   29.0      32      0.591       0.573    0.401    0.327
+  pixel_ae        1    0.774   3.466   27.0      32      0.577       0.573    0.203    0.096
+  pixel_ae        2    0.864   3.466   31.0      32      0.542       0.533    0.265    0.180
+  random_vit      0    0.781   3.466   26.0      32      0.576       0.558    0.484    0.307
+  random_vit      1    0.932   3.466   31.0      32      0.517       0.496    0.502    0.418
+  random_vit      2    0.911   3.466   29.0      32      0.528       0.511    0.483    0.370
+```
+
+Three things this says, none of them decisive and all of them now in a committed artefact rather
+than a scratch measurement:
+
+- **The latent is not dead, and it is not collapsed.** The median window has **26 to 32 of its 32
+  groups** changing argmax at least once. Whatever the code is doing, it is not sitting still.
+- **The posterior is sharp, not diffuse.** Per-group entropy is 0.71–1.02 nats against a ceiling of
+  `ln 32 = 3.466`, i.e. a fifth to a third of maximum, and top-1 mass is 0.48–0.59. M3h's spec §1
+  described the prior's top-1 mass as 0.51–0.57 from a scratch measurement; the recorded posterior
+  figures bracket that, and the prior's (0.461–0.573) sit just below the posterior's in every cell.
+  **So "the prior is diffuse" was the wrong diagnosis** — it is about as sharp as the posterior it
+  is trying to match.
+- **The prior already knows nearly everything the posterior knows**, confirmed on this milestone's
+  own pass: KL(posterior ‖ teacher-forced prior) is **0.203–0.602 nats** summed over 32 groups.
+  Averaged within each arm these reproduce M3g's recorded figures **to three decimals** —
+  `pixel_ae` 0.2897 against 0.290, `frozen_ssl` 0.4673 against 0.467, `random_vit` 0.4897
+  against 0.489 — an independent cross-milestone confirmation that both passes read the same
+  229 windows, and the number §1 of the spec opened on, closed here.
+
+### 9. The mechanism — a post-hoc companion, deciding nothing
+
+Reading D says the latent loses to staying put. That leaves open *why*, and the permutation already
+in the record answers it. Pooling `contrast − control` per window — the same predictions on their
+own window versus on a random one, which isolates whatever window-**specific** information the
+probe carries:
+
+| k | `frozen_ssl` | `pixel_ae` | `random_vit` |
+|---|---|---|---|
+| 1 | +0.025 (z 0.72) | −0.029 (−0.75) | +0.002 (0.17) |
+| 5 | +0.031 (0.40) | −0.162 (−0.70) | +0.013 (0.17) |
+| **15** | **+0.051 (0.13)** | **−0.045 (−0.12)** | **+0.029 (0.08)** |
+| 30 | +0.152 (0.30) | +0.336 (0.43) | +0.249 (0.44) |
+| 45 | +0.074 (0.12) | +0.768 (1.16) | +1.251 (1.49) |
+
+**Indistinguishable from zero everywhere**, and at the decision horizon |z| ≤ 0.13 in all three
+arms. The probe's predictions are statistically independent of which window they are applied to.
+
+This is the load-bearing observation, and it is stronger than the headline for two reasons. It does
+not depend on persistence being a fair baseline — it is a paired comparison of the probe against
+itself. And it explains the headline's sign without appealing to anti-correlation: both the
+treatment and the control are negative because any nonzero prediction beats nothing only when it
+points the right way, and these point nowhere in particular. The selected ridge agrees — **1e5 or
+1e7 in all nine cells, the top of `RIDGES`**, which is the fit shrinking almost to the training
+mean because there was nothing else to find.
+
+This statistic is **not** pre-registered and decides nothing. It is reported because it was
+computable from the records the pre-registered rule already required.
+
+### 10. `pixel_ae`/s1
+
+Spec §3.4 kept the cell whose recorded `latent_selection_r2` is −0.008 in the nine, and said the
+results would report whether Reading D splits along it. **It does not.** `pixel_ae` is the one arm
+at 3/3 seeds down, and s1's own z is −2.67, between s0's −2.93 and s2's −3.06. The cell whose
+latent predicts absolute position essentially not at all behaves like the cells that do — which is
+itself a small piece of evidence that position information and displacement information are
+separable, the distinction this milestone was built on.
+
+### 11. Read against §3.3 and §4
+
+**Per arm.** `frozen_ssl`: no seed beats staying put; 2 of 3 clear −2.582 (z −2.93, −2.50, −2.95).
+`pixel_ae`: none up; 3 of 3 down (−2.93, −2.67, −3.06). `random_vit`: none up; 2 of 3 down (−2.22,
+−2.93, −2.93). §3.2's `NO_MOTION` requires no arm clearing positively and ≥ 2 arms clearing
+negatively; three of three did.
+
+**The pre-registered consequence, applied as written.** §3.3 committed this project in advance: on
+`NO_MOTION`, all three of M3h §8's levers — the dyn-KL weight, the free-bits floor's
+batch-and-time-mean clamp, and action conditioning — are **refuted**, because they are prior-side
+and the prior has ~0.4 nats of headroom over a latent that carries no displacement. §8 above
+confirms both halves of that premise on this milestone's own pass: the KL is 0.203–0.602 nats, and
+§9 shows the displacement information is absent rather than merely unexploited. The next lever is
+upstream — the encoder and the representation loss, where `rep_scale = 0.1` sits five times below
+`dyn_scale`. That is applied here as the rule said, not renegotiated now that the number is known.
+
+**The non-claims, restated as measured.** No arm was ranked against another: every contrast is
+within a cell, against that cell's own persistence baseline on the same windows. No checkpoint was
+altered and nothing was trained; the nine `world_model_*.pt` under `runs/m3_study_v2` are
+untouched. The M3 gate, `aggregate.py`, `report_study.py` and every M3b–M3h verdict stand.
+
+**The limit §4 stated, and it binds.** Reading D uses a **linear** ridge probe, so `NO_MOTION` says
+no *linear* read-out of the posterior latent beats staying put — not that the information is absent
+under every decoder. The claim is scoped to what the rollout's own linear machinery can exploit,
+which is the machinery the M3 gate uses. §9 strengthens it in one direction only: the probe's
+output is independent of the window, so there is nothing for a *linear* read-out to find. A
+nonlinear decoder is not excluded by this evidence.
+
+**What the anchor decision changed, disclosed.** The probe reads the latent at window row
+`context − 1`, the rollout's own t0. The plan originally read row 0 — the posterior after **one**
+real frame from a zero state, which cannot encode a two-frame quantity even in principle, and whose
+only route to a positive contrast was a correlation between absolute position and displacement.
+That was corrected before the run, and it moved the numbers: on `pixel_ae`/s0 the k = 15 contrast
+went from −0.20 to −0.65 and the curve became monotone in k. The direction did not change. Had it
+not been corrected, `NO_MOTION` would have been reachable through the read-out point rather than
+through the latent, and the result would have looked identical.
+
+**A reading at k = 15** on `my_way_home`'s 24 validation episodes, context 5 / horizon 45, at
+20,000 steps, on these nine checkpoints. It is not a statement that the world model works.
