@@ -1777,7 +1777,7 @@ def test_gain_from_blocks_puts_the_base_in_both_arms():
     """
     base, block, targets = _base_carries_target_case(600, seed=11)
     rows = np.arange(600)
-    splits = (slice(0, 200), slice(200, 400), slice(400, 600))
+
     def split(sl):
         return GainSplit(base=base[sl], block=block[sl], target=targets[sl])
 
@@ -1792,18 +1792,20 @@ def test_gain_from_blocks_puts_the_base_in_both_arms():
         "the fixture assumption is wrong"
     )
 
-    # A pure-noise block must not show a gain: if this fails, the base is missing
-    # from the JOINT arm and the two arms are not nested.
+    # A pure-noise block must not APPEAR to help. Measured, dropping the base
+    # from the BASE arm sends the gain to +0.9996, so this is the side that
+    # catches that mutation.
     assert out["ci_low"] <= 0.0, (
         f"a noise block cleared zero (ci_low={out['ci_low']}); the base is missing "
-        "from the JOINT arm or selection is being taken on the scored rows"
+        "from the BASE arm, or selection is being taken on the scored rows"
     )
 
-    # If this fails, the base is missing from the BASE arm and adding the block
-    # collapses the joint arm's score.
+    # And it must not appear to hurt. Measured, dropping the base from the JOINT
+    # arm sends the gain to -1.0308, so this is the side that catches that one --
+    # the mutation the earlier one-sided version of this test let through.
     assert out["gain"] > -0.05, (
         f"a noise block cost {out['gain']:.4f} of R^2; the base is missing from the "
-        "BASE arm, so the two arms are not nested"
+        "JOINT arm, so the two arms are not nested"
     )
 
 
