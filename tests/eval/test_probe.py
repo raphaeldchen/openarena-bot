@@ -1662,6 +1662,121 @@ def test_gain_from_splits_output_is_byte_identical_after_the_generalisation():
     }
 
 
+from mbfps.eval.probe import GainSplit, gain_from_blocks  # noqa: E402
+
+
+def _blocks(latent, embedding, targets, rows, h_dim=2):
+    """A `GainSplit` over `rows`, with the deterministic half as the block --
+    the same arrangement `_gain_from_splits` builds, so the two can be compared."""
+    return GainSplit(
+        base=embedding[rows], block=latent[rows, :h_dim], target=targets[rows],
+    )
+
+
+def test_gain_from_blocks_matches_gain_from_splits_on_the_same_arrangement():
+    """The generalisation must be a generalisation. Handed the block and target
+    `_gain_from_splits` builds internally, and labels describing its positional
+    blocks, it must return the same dict."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    sl = (slice(0, 200), slice(200, 400), slice(400, 600))
+    parts = [_split(latent[s], embedding[s], targets[s]) for s in sl]
+    reference = _gain_from_splits(parts[0], parts[1], parts[2], h_dim=2,
+                                  window=5, resamples=200, confidence=0.9, seed=11)
+    general = gain_from_blocks(
+        _blocks(latent, embedding, targets, np.arange(600)[sl[0]]),
+        _blocks(latent, embedding, targets, np.arange(600)[sl[1]]),
+        _blocks(latent, embedding, targets, np.arange(600)[sl[2]]),
+        groups=np.arange(200) // 5, resamples=200, confidence=0.9, seed=11,
+    )
+    assert general == reference
+
+
+def test_gain_from_blocks_accepts_a_filtered_row_set():
+    """The reason it exists. Backward displacement at k has no target for the
+    first k rows of a window, so the scored set is not a whole number of
+    windows and `_gain_from_splits` cannot express it."""
+    latent, embedding, targets = _history_case(600, seed=1)
+    keep = np.arange(600)[np.arange(600) % 5 != 0]   # drop row 0 of every block
+    sl = (keep[keep < 200], keep[(keep >= 200) & (keep < 400)], keep[keep >= 400])
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, sl[0]),
+        _blocks(latent, embedding, targets, sl[1]),
+        _blocks(latent, embedding, targets, sl[2]),
+        groups=sl[2] // 5, resamples=100, confidence=0.9, seed=2,
+    )
+    assert out["n_scored_windows"] == 40, "one group per surviving window"
+    assert out["gain"] > 0.5, (
+        "the lagged block still carries the target after filtering; a near-zero "
+        "gain here means the rows and the target came apart"
+    )
+
+
+def test_gain_from_blocks_counts_groups_not_rows_over_a_window():
+    """`n_scored_windows` was `rows // window`. With labels there is no window
+    length, so it has to be the number of distinct labels -- and unequal groups
+    are exactly the case that separates the two."""
+    latent, embedding, targets = _history_case(300, seed=3)
+    rows = np.arange(300)
+    groups = np.repeat(np.arange(7), (40, 40, 40, 40, 40, 40, 60))
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, rows[:100]),
+        _blocks(latent, embedding, targets, rows[100:200]),
+        _blocks(latent, embedding, targets, rows[200:300]),
+        groups=groups[200:300], resamples=50, confidence=0.9, seed=4,
+    )
+    assert out["n_scored_windows"] == len(np.unique(groups[200:300]))
+
+
+def test_gain_from_blocks_puts_the_base_in_both_arms():
+    """The cancellation the whole statistic rests on. If the base appeared only
+    in one arm, the gain would measure the two feature sets' widths as much as
+    the block's contribution -- and neither the bottleneck nor the
+    position-constrains-motion confound would cancel."""
+    latent, embedding, targets = _history_case(600, seed=5)
+    rows = np.arange(600)
+    # A block of pure noise must not show a gain: the base is identical in both
+    # arms, so there is nothing for extra width alone to buy.
+    noise = np.random.default_rng(9).normal(size=(600, 2))
+    def split(sl):
+        return GainSplit(base=embedding[sl], block=noise[sl], target=targets[sl])
+    out = gain_from_blocks(
+        split(rows[:200]), split(rows[200:400]), split(rows[400:600]),
+        groups=np.arange(200) // 5, resamples=200, confidence=0.9, seed=6,
+    )
+    assert out["ci_low"] <= 0.0, (
+        f"a noise block cleared zero (ci_low={out['ci_low']}); the base is not "
+        "in both arms, or the selection is being taken on the scored rows"
+    )
+
+
+def test_gain_from_blocks_rejects_misaligned_rows():
+    """Three arrays that do not describe the same rows is the defect this
+    function is most exposed to, because its caller row-selects all three
+    separately."""
+    latent, embedding, targets = _history_case(300, seed=7)
+    rows = np.arange(300)
+    good = _blocks(latent, embedding, targets, rows[:100])
+    bad = GainSplit(base=embedding[:100], block=latent[:99, :2], target=targets[:100])
+    with pytest.raises(ValueError, match="same number of rows"):
+        gain_from_blocks(bad, None, good, groups=np.arange(100) // 5, resamples=10)
+    with pytest.raises(ValueError, match="one label per scored row"):
+        gain_from_blocks(good, None, good, groups=np.arange(99) // 5, resamples=10)
+
+
+def test_gain_from_blocks_without_a_selection_split_falls_back_unbiased():
+    """`select=None` must take `fit_probe`'s default penalty for BOTH arms and
+    say so, rather than selecting on the rows it scores."""
+    latent, embedding, targets = _history_case(400, seed=8)
+    rows = np.arange(400)
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, rows[:200]), None,
+        _blocks(latent, embedding, targets, rows[200:]),
+        groups=np.arange(200) // 5, resamples=50, confidence=0.9, seed=1,
+    )
+    assert out["ridge_selected"] is False
+    assert out["joint_ridge"] == 1e3 and out["embedding_ridge"] == 1e3
+
+
 def test_filtering_gain_puts_the_raw_embedding_in_both_arms():
     """The whole reason this is immune to the bottleneck.
 
