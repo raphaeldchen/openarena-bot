@@ -88,16 +88,17 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.probe import (
-    GainSplit, fit_probe, gain_from_blocks, gather_probe_data, probe_r2,
+    GainSplit, apply_probe, fit_probe, gain_from_blocks, gather_probe_data, probe_r2,
 )
 from mbfps.eval.retention import (
     CONFIDENCE, DECISION_K, K_REPORTED, RESAMPLES, RUNGS, TARGETS,
     backward_rotation, backward_translation, rung_block, shifted_rows,
 )
-from mbfps.eval.study import git_sha, write_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
 
 
 def _sibling(name: str):
@@ -172,6 +173,14 @@ TARGET_BUILDERS = {
 target named in `retention.TARGETS` and missing here fails at import-time
 lookup rather than silently producing a ladder with a hole in it."""
 
+assert set(TARGET_BUILDERS) == set(TARGETS), (
+    f"TARGET_BUILDERS {sorted(TARGET_BUILDERS)} must name exactly retention.TARGETS "
+    f"{sorted(TARGETS)} -- otherwise the docstring above's 'fails at import-time lookup' "
+    "claim is false: a target missing from this dict would instead raise a plain "
+    "KeyError the first time cell_ladder looked it up, at runtime, with a hole already "
+    "in the ladder."
+)
+
 
 def gather_three_splits(prepared, train, val, *, seed: int):
     """The three DISJOINT gathers `probe.gain_from_blocks` needs.
@@ -231,7 +240,7 @@ def _split_for(data: dict, target: str, k: int, rung: str, h_dim: int):
 
 
 def cell_ladder(fit: dict, select: dict | None, score: dict, *, h_dim: int,
-                ks=K_REPORTED) -> dict:
+                seed: int = 0, ks=K_REPORTED) -> dict:
     """Every `(target, k, rung)` gain for one cell, plus the row count per k.
 
 EVERY RUNG AT ONE (target, k) IS HANDED A BYTE-IDENTICAL BASE ARRAY, which is
@@ -245,10 +254,22 @@ EVERY RUNG AT ONE (target, k) IS HANDED A BYTE-IDENTICAL BASE ARRAY, which is
     producing four plausible gains, which is why a test pins the arrays.
 
     The bootstrap groups on `episode`, not `window` (spec 3.1).
+
+    `seed` IS THE CELL'S SEED, threaded into every `gain_from_blocks` call's own
+    bootstrap draw -- `filtering_gain`'s convention exactly (it passes its own
+    `seed` straight through to `_gain_from_splits` and on into
+    `gain_from_blocks`). A caller that left this at its default would hand every
+    cell, rung, target and horizon the SAME bootstrap draw (seed 0), which
+    correlates the interval noise across cells that the seeds x arms agreement
+    rule in `retention.py` treats as independent -- and that rule carries this
+    milestone's entire multiple-comparison burden. Common random numbers across
+    rungs WITHIN one cell are fine and intended (they are what makes the four
+    gains comparable); it is only across cells that the draws must differ.
     """
     ladder: dict = {target: {} for target in TARGETS}
     rows_by_k: dict[str, int] = {}
     for k in ks:
+        rows_by_target: dict[str, int] = {}
         for target in TARGETS:
             splits, row_sets = {}, {}
             for rung in RUNGS:
@@ -261,15 +282,45 @@ EVERY RUNG AT ONE (target, k) IS HANDED A BYTE-IDENTICAL BASE ARRAY, which is
                     splits[rung][name] = split
                     row_sets[name] = rows
             groups = np.asarray(score["episode"])[row_sets["score"]]
-            rows_by_k[k_key(k)] = int(row_sets["score"].size)
+            rows_by_target[target] = int(row_sets["score"].size)
             ladder[target][k_key(k)] = {
                 rung: gain_from_blocks(
                     splits[rung]["fit"], splits[rung]["select"], splits[rung]["score"],
-                    groups=groups, resamples=RESAMPLES, confidence=CONFIDENCE,
+                    groups=groups, resamples=RESAMPLES, confidence=CONFIDENCE, seed=seed,
                 )
                 for rung in RUNGS
             }
+        # Both targets are built from the same `shifted_rows(window, step, k)`
+        # (Task 4 pins that), so they MUST agree on the scored row count at
+        # this k; assigning inside the target loop above (as this used to)
+        # silently kept only the last target's count under one shared key. A
+        # future target with a different row rule would then relabel an
+        # earlier target's count without either loop noticing.
+        counts = set(rows_by_target.values())
+        if len(counts) != 1:
+            raise ValueError(
+                f"k={k}: targets disagree on scored row count {rows_by_target}, but "
+                "every target at one k is supposed to share one row set"
+            )
+        rows_by_k[k_key(k)] = counts.pop()
     return {"ladder": ladder, "rows": rows_by_k}
+
+
+def _per_column_r2(predicted: np.ndarray, targets: np.ndarray) -> list[float]:
+    """`probe._mean_r2`'s four addends, UNAVERAGED -- pos_x, pos_y, sin(angle),
+    cos(angle) in that order. Duplicates that function's per-column formula
+    rather than importing its private name, so a zero-variance column reports
+    NaN here (a fact about that column) instead of silently vanishing from an
+    average the way it does inside `_mean_r2` itself."""
+    scores = []
+    for c in range(targets.shape[1]):
+        truth = targets[:, c]
+        denom = float(((truth - truth.mean()) ** 2).sum())
+        if denom == 0.0:
+            scores.append(float("nan"))
+            continue
+        scores.append(1.0 - float(((truth - predicted[:, c]) ** 2).sum()) / denom)
+    return scores
 
 
 def base_control(fit: dict, select: dict | None, score: dict) -> dict:
@@ -282,6 +333,25 @@ def base_control(fit: dict, select: dict | None, score: dict) -> dict:
 
     A level, not a gain: this is the arm every gain in `cell_ladder` is measured
     against, so the only question is whether it reads at all.
+
+    `r2` IS THE GATED NUMBER and it stays a 4-column mean over pos_x, pos_y,
+    sin(angle), cos(angle) -- the same shape as `latent_selection_r2`, on
+    purpose: `retention.BASE_R2_FLOOR` (0.10) was calibrated against that
+    number's scale, and re-pointing the gate at position alone would silently
+    change what a pre-registered threshold means.
+
+    `position_r2` is a COMPANION, not a second gate: the same fitted probe's
+    r2 against the first two target columns only. It exists because
+    `EXIT_BASE_UNRESOLVED`'s docstring and this reading's rule text both say
+    the gate is about whether the current frame can say "absolute position",
+    while the gated `r2` mixes heading into that claim. A cell whose `r2`
+    clears 0.10 while `position_r2` does not (plausible for a frozen
+    single-frame backbone, where heading can be far easier to read than map
+    position) is a fact the results section must REPORT, not one this record
+    is allowed to hide by averaging it away.
+
+    `per_column_r2` is the same probe's four individual column scores, so the
+    split between position and heading is checkable without refitting anything.
     """
     def probe_for(data):
         return (
@@ -296,8 +366,11 @@ def base_control(fit: dict, select: dict | None, score: dict) -> dict:
     else:
         select_x, select_y = probe_for(select)
         probe = fit_probe(fit_x, fit_y, select_x, select_y)
+    predicted = apply_probe(probe, score_x)
     return {
         "r2": probe_r2(probe, score_x, score_y),
+        "position_r2": probe_r2(probe, score_x, score_y[:, :2]),
+        "per_column_r2": _per_column_r2(predicted, score_y),
         "ridge": probe["ridge"],
         "ridge_selected": select is not None,
         "rows": int(score_y.shape[0]),
@@ -350,11 +423,18 @@ def measure_cell(args, cell: Cell, device, train, val, ks=K_REPORTED) -> tuple[i
 
     fit, select, score = gather_three_splits(prepared, train, val, seed=cell.seed)
     h_dim = int(prepared.model.rssm.cfg.h_dim)
-    ladder = cell_ladder(fit, select, score, h_dim=h_dim, ks=ks)
+    # `seed=cell.seed`, matching `filtering_gain`'s convention exactly -- see
+    # `cell_ladder`'s own docstring for why leaving this at cell_ladder's
+    # default (seed 0) would correlate the bootstrap noise across cells.
+    ladder = cell_ladder(fit, select, score, h_dim=h_dim, seed=cell.seed, ks=ks)
     record = {
         "arm": cell.arm, "seed": cell.seed, "step": int(cell.record["steps"]),
+        "record_git_sha": cell.record.get("git_sha", "unknown"),
         "device": str(device), "context": prepared.context, "horizon": prepared.horizon,
         "h_dim": h_dim,
+        "ks": [int(k) for k in ks],
+        "split_seed": SPLIT_SEED,
+        "torch_version": torch.__version__,
         "ladder": ladder["ladder"],
         "rows": ladder["rows"],
         "base_control": base_control(fit, select, score),
@@ -398,7 +478,7 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
         translation = record["ladder"].get(TARGETS[0], {})
         if decision_key in translation:
             det = translation[decision_key]["deterministic"]
-            headline = f"translation/deterministic gain at k={DECISION_K} {det['gain']:+.3f}"
+            headline = f"{TARGETS[0]}/deterministic gain at k={DECISION_K} {det['gain']:+.3f}"
         else:
             headline = f"k={DECISION_K} not reported"
         print(
