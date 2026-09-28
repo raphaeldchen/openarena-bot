@@ -259,6 +259,15 @@ class BaseControl:
     Not a gain. There is nothing to take an increment over -- this is the arm
     the increments are measured against, and the question is only whether it
     reads at all.
+
+    `clears()` reads only `seeds_clear`, never `self.r2` -- deliberately, the
+    same division of labour as `RungArm.seeds_clear`: a BUILDER applies the
+    threshold and this class only reads the tally it was handed. The threshold
+    is `BASE_R2_FLOOR`, and it is applied by the caller that builds this class
+    (`scripts/latent_retention.py`'s read phase), which computes
+    `seeds_clear=sum(1 for r in levels if r > BASE_R2_FLOOR)` per seed before
+    this dataclass ever sees the tally. Nothing in this module compares `r2` to
+    `BASE_R2_FLOOR` directly.
     """
 
     r2: float
@@ -306,10 +315,22 @@ def rung_arm(gains: list[dict]) -> RungArm:
     like a clean null. A non-finite gain or interval bound is an ERROR about the
     measurement, never a statement about the representation, so it is refused
     at the point where the number first becomes a reading.
+
+    A missing key, an inverted interval (`ci_low > ci_high`), a `gain` outside
+    `[ci_low, ci_high]`, or fewer than `SEEDS_REQUIRED` seeds are all refused
+    the same way and for the same reason: each would otherwise pass silently
+    and read as a null -- an arm with one seed, in particular, can never
+    satisfy `seeds_clear >= SEEDS_REQUIRED` and so can never clear, which is a
+    refusal wearing the shape of a finding.
     """
     if not gains:
         raise ValueError("a rung needs at least one seed to summarise")
     for index, seed in enumerate(gains):
+        missing = [k for k in ("gain", "ci_low", "ci_high") if k not in seed]
+        if missing:
+            raise ValueError(
+                f"seed index {index} is missing {', '.join(sorted(missing))}"
+            )
         values = {k: float(seed[k]) for k in ("gain", "ci_low", "ci_high")}
         bad = {k: v for k, v in values.items() if not np.isfinite(v)}
         if bad:
@@ -318,6 +339,22 @@ def rung_arm(gains: list[dict]) -> RungArm:
                 "A non-finite gain is an error about the measurement, not a "
                 "non-clear -- see this function's docstring."
             )
+        if values["ci_low"] > values["ci_high"]:
+            raise ValueError(
+                f"seed index {index} has ci_low {values['ci_low']} > ci_high "
+                f"{values['ci_high']}: an inverted interval is not a reading"
+            )
+        if not values["ci_low"] <= values["gain"] <= values["ci_high"]:
+            raise ValueError(
+                f"seed index {index} has gain {values['gain']} outside its own "
+                f"interval [{values['ci_low']}, {values['ci_high']}]"
+            )
+    if len(gains) < SEEDS_REQUIRED:
+        raise ValueError(
+            f"a rung needs at least SEEDS_REQUIRED={SEEDS_REQUIRED} seeds to "
+            f"summarise, got {len(gains)}: an under-seeded arm can never clear "
+            "and would otherwise read as a silent null"
+        )
     return RungArm(
         gain=float(np.mean([g["gain"] for g in gains])),
         ci_low=float(min(float(g["ci_low"]) for g in gains)),
@@ -352,6 +389,37 @@ def _cleared_rungs(inputs: RetentionInputs, target: str) -> dict[str, tuple[int,
     return found
 
 
+def _validate_family_shape(inputs: RetentionInputs) -> None:
+    """Refuse rather than read a status from an under-populated ladder or base.
+
+    A missing (target, k) or (target, k, rung) KEY is already loud -- a
+    KeyError -- but a short or empty ARM dict at one is silent: it reads as
+    "did not clear" (`rung_clears_at` needs `ARMS_REQUIRED` of the arms
+    present to clear, so fewer arms only makes clearing harder, never
+    impossible-to-read) and the silence can surface as a pre-registered
+    finding manufactured from insufficient data rather than a refusal.
+    `scripts/latent_retention.py` guards the plan's arms x seeds shape too,
+    but that is defence in depth, not a reason to skip the guard here: this
+    function produces a pre-registered finding and must refuse to produce one
+    from insufficient data regardless of caller.
+    """
+    for target in TARGETS:
+        for k in K_REPORTED:
+            for rung in RUNGS:
+                arms = inputs.ladder[target][k][rung]
+                if len(arms) != RETENTION_FAMILY:
+                    raise ValueError(
+                        f"ladder[{target!r}][{k}][{rung!r}] has {len(arms)} arm(s) "
+                        f"({sorted(arms)}), expected exactly RETENTION_FAMILY="
+                        f"{RETENTION_FAMILY}"
+                    )
+    if len(inputs.base) != RETENTION_FAMILY:
+        raise ValueError(
+            f"base has {len(inputs.base)} arm(s) ({sorted(inputs.base)}), expected "
+            f"exactly RETENTION_FAMILY={RETENTION_FAMILY}"
+        )
+
+
 def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
     """Reading E: the last rung on the path at which observed motion survives.
 
@@ -377,6 +445,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
     A suppressed reading reports no rungs at all rather than reporting them
     beside a warning nobody reads.
     """
+    _validate_family_shape(inputs)
     base_failed = tuple(
         sorted(arm for arm, control in inputs.base.items() if not control.clears())
     )
@@ -413,7 +482,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
                     f"the representation's content"
                 ),
                 surviving=rung, translation_rungs=t_rungs, rotation_rungs=r_rungs,
-                base_failed=(),
+                base_failed=base_failed,
             )
     if "deterministic" in translation:
         return RetentionStatus(
@@ -424,7 +493,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
                 f"bottleneck destroys it"
             ),
             surviving="deterministic", translation_rungs=t_rungs, rotation_rungs=r_rungs,
-            base_failed=(),
+            base_failed=base_failed,
         )
     if "two_frame" in translation:
         return RetentionStatus(
@@ -436,7 +505,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
                 f"would predict"
             ),
             surviving="two_frame", translation_rungs=t_rungs, rotation_rungs=r_rungs,
-            base_failed=(),
+            base_failed=base_failed,
         )
     if rotation:
         return RetentionStatus(
@@ -449,7 +518,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
                 f"encoder's input rather than the loss"
             ),
             surviving=None, translation_rungs=t_rungs, rotation_rungs=r_rungs,
-            base_failed=(),
+            base_failed=base_failed,
         )
     return RetentionStatus(
         status="UNRESOLVED_MOTION",
@@ -458,5 +527,5 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
             f"{', '.join(str(k) for k in K_REPORTED)}; a linear read detects no motion "
             f"anywhere on the path, so the measurement is empty and no lever is chosen"
         ),
-        surviving=None, translation_rungs=(), rotation_rungs=(), base_failed=(),
+        surviving=None, translation_rungs=(), rotation_rungs=(), base_failed=base_failed,
     )

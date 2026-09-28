@@ -305,21 +305,22 @@ def _inputs(
 # --- the finiteness guard: M3i's ledger left this as a note for its successor --
 
 
-def test_rung_arm_refuses_a_non_finite_gain():
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["gain", "ci_low", "ci_high"])
+def test_rung_arm_refuses_a_non_finite_value_in_any_field(field, bad):
     """M3i's `clears_up`, `clears_down` and `leaks` ALL evaluate False on NaN, so
     one NaN would read "no clear" and "no leak" at once -- moving a verdict
     toward the wrong status while looking like a clean null. A refusal here is
-    the whole point: a non-finite gain is an error, never a non-clear."""
-    for bad in (float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(ValueError, match="non-finite"):
-            rung_arm([{"gain": bad, "ci_low": 0.1, "ci_high": 0.2}])
+    the whole point: a non-finite value is an error, never a non-clear.
 
-
-def test_rung_arm_refuses_a_non_finite_interval_bound():
+    3x3 over {gain, ci_low, ci_high} x {nan, inf, -inf}: the shipped guard is a
+    uniform `np.isfinite` over all three fields, but a partial guard (e.g.
+    `math.isnan(ci_low)` alone) would still pass a suite that only ever put the
+    bad value in `gain`, as the two tests this replaces did."""
+    seed = {"gain": 0.1, "ci_low": 0.05, "ci_high": 0.2}
+    seed[field] = bad
     with pytest.raises(ValueError, match="non-finite"):
-        rung_arm([{"gain": 0.1, "ci_low": float("nan"), "ci_high": 0.2}])
-    with pytest.raises(ValueError, match="non-finite"):
-        rung_arm([{"gain": 0.1, "ci_low": 0.0, "ci_high": float("inf")}])
+        rung_arm([seed])
 
 
 def test_rung_arm_refuses_an_empty_seed_list():
@@ -327,17 +328,57 @@ def test_rung_arm_refuses_an_empty_seed_list():
         rung_arm([])
 
 
+def test_rung_arm_refuses_fewer_than_seeds_required_seeds():
+    """A one-seed arm can never satisfy `seeds_clear >= SEEDS_REQUIRED`, so
+    without this guard it silently reads as a null instead of refusing --
+    exactly the shape of error `UNRESOLVED_MOTION`/`BOTTLENECK_LOSS` would wear
+    if the milestone's finding were actually "not enough data was collected"."""
+    with pytest.raises(ValueError, match="SEEDS_REQUIRED"):
+        rung_arm([{"gain": 0.1, "ci_low": 0.05, "ci_high": 0.2}])
+
+
+def test_rung_arm_refuses_a_seed_missing_a_key():
+    """A missing key must raise the module's `ValueError` idiom, not a bare
+    `KeyError` that looks like a bug rather than a refusal."""
+    with pytest.raises(ValueError, match="missing"):
+        rung_arm([
+            {"gain": 0.1, "ci_low": 0.05},
+            {"gain": 0.1, "ci_low": 0.05, "ci_high": 0.2},
+        ])
+
+
+def test_rung_arm_refuses_an_inverted_interval():
+    with pytest.raises(ValueError, match="ci_low"):
+        rung_arm([
+            {"gain": 0.1, "ci_low": 0.2, "ci_high": 0.05},
+            {"gain": 0.1, "ci_low": 0.05, "ci_high": 0.2},
+        ])
+
+
+def test_rung_arm_refuses_a_gain_outside_its_own_interval():
+    with pytest.raises(ValueError, match="outside"):
+        rung_arm([
+            {"gain": 0.9, "ci_low": 0.05, "ci_high": 0.2},
+            {"gain": 0.1, "ci_low": 0.05, "ci_high": 0.2},
+        ])
+
+
 def test_rung_arm_reports_the_seed_mean_and_the_least_lower_bound():
     """The gain is a MEAN so the printed number describes the arm; `ci_low` is
     the LEAST of the seeds' bounds, which is the conservative summary -- a rung
     is not credited for an interval only its luckiest seed achieved. The tally
-    is what decides, and it counts seeds whose OWN bound cleared zero."""
+    is what decides, and it counts seeds whose OWN bound cleared zero.
+
+    Gains are 0.45/0.20/0.10 rather than the earlier 0.30/0.20/0.10: that
+    fixture's mean and median were both 0.20, so it was symmetric under a
+    mean -> median substitution in the implementation. 0.45/0.20/0.10 has
+    mean 0.25 and median 0.20, which differ."""
     arm = rung_arm([
-        {"gain": 0.30, "ci_low": 0.10, "ci_high": 0.50},
+        {"gain": 0.45, "ci_low": 0.10, "ci_high": 0.50},
         {"gain": 0.20, "ci_low": -0.05, "ci_high": 0.45},
         {"gain": 0.10, "ci_low": 0.02, "ci_high": 0.18},
     ])
-    assert arm.gain == pytest.approx(0.20)
+    assert arm.gain == pytest.approx(0.25)
     assert arm.ci_low == pytest.approx(-0.05)
     assert arm.ci_high == pytest.approx(0.50), "the GREATEST upper bound, not the mean"
     assert arm.seeds_clear == 2 and arm.seeds_total == 3
@@ -399,16 +440,67 @@ def test_rung_clears_at_needs_seeds_required_seeds_in_each_arm():
 def test_reading_is_unresolved_base_when_the_current_frame_cannot_locate_itself():
     """The one true control failure, and it outranks every result. If `enc(t)`
     cannot linearly say where it is, the instrument is broken and a null on
-    displacement means nothing."""
+    displacement means nothing.
+
+    `base` is rebuilt here in REVERSE of `ARMS` order: `ARMS` is already
+    alphabetically sorted, so building it in `ARMS` order (as `_inputs` does)
+    would leave `reading_retention`'s `sorted()` call unexercised -- the
+    assertion below would pass even if that call were deleted."""
     inputs = _inputs({("translation", 4, "full"): 0.5}, base_r2=0.01)
+    inputs = RetentionInputs(
+        ladder=inputs.ladder,
+        base={a: inputs.base[a] for a in reversed(ARMS)},
+        clusters=inputs.clusters,
+        rows=inputs.rows,
+    )
     reading = reading_retention(inputs)
     assert reading.status == "UNRESOLVED_BASE"
-    assert reading.base_failed == ARMS
+    assert reading.base_failed == tuple(sorted(ARMS))
     assert reading.surviving is None
     assert reading.translation_rungs == (), (
         "a suppressed reading must report no rungs at all, not report them "
         "beside a warning nobody reads"
     )
+
+
+def test_reading_is_taken_when_only_one_base_arm_fails():
+    """`ARMS_REQUIRED` = 2 of 3, so the gate must permit exactly one arm to
+    fail. Verified survivors of the shipped threshold `holding <
+    ARMS_REQUIRED`: replacing it with `bool(base_failed)` refuses whenever ANY
+    arm fails (this test would then wrongly get `UNRESOLVED_BASE`), and with
+    `holding == 0` refuses only when ALL arms fail (caught instead by the two-
+    arm-failure test below). This test and that one together pin the
+    threshold at exactly `ARMS_REQUIRED`."""
+    inputs = _inputs({("translation", 4, "full"): 0.3})
+    inputs.base["pixel_ae"] = BaseControl(r2=0.01, seeds_clear=0, seeds_total=3)
+    reading = reading_retention(inputs)
+    assert reading.status == "MOTION_RETAINED", (
+        "one failing arm out of three must still let a reading be taken"
+    )
+
+
+def test_reading_is_unresolved_base_when_two_of_three_arms_fail():
+    """Two failures leave only one holding arm, below `ARMS_REQUIRED` = 2."""
+    inputs = _inputs({("translation", 4, "full"): 0.3})
+    inputs.base["pixel_ae"] = BaseControl(r2=0.01, seeds_clear=0, seeds_total=3)
+    inputs.base["random_vit"] = BaseControl(r2=0.01, seeds_clear=0, seeds_total=3)
+    reading = reading_retention(inputs)
+    assert reading.status == "UNRESOLVED_BASE"
+
+
+def test_reading_records_the_real_base_failed_on_a_normal_reading():
+    """The gate permits one arm to fail while still taking a reading (spec:
+    `ARMS_REQUIRED` of `RETENTION_FAMILY`). Every non-refusal branch used to
+    hardcode `base_failed=()`, which would have this reading claim a clean
+    positive control despite one arm having actually failed -- and Tasks 6/7
+    write `RetentionStatus` into a record, so that false claim would persist.
+    `UNRESOLVED_BASE`'s suppression of `translation_rungs`/`rotation_rungs` is
+    a different, spec-required thing and is untouched by this."""
+    inputs = _inputs({("translation", 4, "full"): 0.3})
+    inputs.base["pixel_ae"] = BaseControl(r2=0.01, seeds_clear=0, seeds_total=3)
+    reading = reading_retention(inputs)
+    assert reading.status == "MOTION_RETAINED"
+    assert reading.base_failed == ("pixel_ae",)
 
 
 def test_reading_is_motion_retained_when_a_z_bearing_rung_clears():
@@ -428,6 +520,28 @@ def test_reading_is_motion_retained_even_when_two_frame_is_silent():
     reading = reading_retention(inputs)
     assert reading.status == "MOTION_RETAINED"
     assert reading.translation_rungs == ("full",)
+
+
+def test_the_top_of_the_ladder_wins_when_every_rung_clears():
+    """The one state that pins the ladder's ORDER rather than its membership.
+
+    Both other MOTION_RETAINED fixtures clear exactly one rung, so they read the
+    same under any reordering of the status checks. Measured: with
+    `deterministic` checked before the z-bearing rungs, this state reads
+    BOTTLENECK_LOSS/deterministic instead -- which would send the project at the
+    32x32 bottleneck and `rep_scale` when the finding is that motion survived
+    INTO z and M3i is partially overturned. That is the wrong-lever error this
+    whole milestone exists to avoid, and until this test existed the suite was
+    green under it.
+
+    `surviving` is `stochastic` rather than `full` because `Z_BEARING_RUNGS` is
+    traversed in order and `stochastic` is the stronger claim: motion survived
+    into z alone, not merely into the concatenation that still carries h.
+    """
+    inputs = _inputs({("translation", 4, rung): 0.2 for rung in RUNGS})
+    reading = reading_retention(inputs)
+    assert reading.status == "MOTION_RETAINED"
+    assert reading.surviving == "stochastic"
 
 
 def test_reading_is_bottleneck_loss_when_only_the_deterministic_rung_clears():
@@ -472,11 +586,20 @@ def test_reading_is_unresolved_motion_when_nothing_clears_anything():
     assert reading.translation_rungs == () and reading.rotation_rungs == ()
 
 
-def test_the_six_statuses_are_exhaustive_and_mutually_exclusive():
-    """Every combination of (which rungs clear translation, which clear
-    rotation, does the base hold) must land on exactly one status, and all six
-    must be reachable. M3i shipped a status nothing exercised until the final
-    review; this is the cheap version of that check."""
+def test_every_status_is_reachable():
+    """All six statuses must be reachable from SOME combination of (which rungs
+    clear translation, which clear rotation, does the base hold). M3i shipped a
+    status nothing exercised until the final review; this is the cheap version
+    of that check.
+
+    This collects only the SET of statuses seen across every combination, so it
+    is invariant under any reordering of `reading_retention`'s status checks --
+    it pins REACHABILITY, not which combination maps to which status. That
+    mapping is pinned by the per-status tests above, including
+    `test_the_top_of_the_ladder_wins_when_every_rung_clears`, which is the one
+    combination (every rung clearing at once) none of the others exercise and
+    that is therefore free to read as the wrong status under a reordering while
+    this test still sees all six and stays green."""
     import itertools
 
     seen = set()
@@ -507,3 +630,35 @@ def test_base_control_floor_is_below_every_recorded_latent_selection_r2():
     M3i measured `enc(t)` -> position at +0.291 and +0.165 from 132 rows. The
     floor sits below all of those and well above zero."""
     assert 0.0 < BASE_R2_FLOOR < 0.165
+
+
+def test_base_r2_floor_is_the_pre_registered_value():
+    """Pre-registered (spec), like every other constant in this module, so it
+    is pinned by exact equality rather than only by the provenance range
+    above -- that range alone would let the value drift anywhere inside it."""
+    assert BASE_R2_FLOOR == 0.10
+
+
+# --- shape refusals: a short or empty collection is a silent null, not data -
+
+
+def test_reading_retention_refuses_a_ladder_cell_with_too_few_arms():
+    """A cell with fewer than `RETENTION_FAMILY` arms must refuse rather than
+    silently read as "did not clear", which would surface as a pre-registered
+    finding manufactured from insufficient data. If left unguarded, an empty
+    ladder cell reaches `UNRESOLVED_MOTION` -- whose rule text asserts "a
+    linear read detects no motion anywhere on the path" -- from missing data
+    rather than from an actual reading."""
+    inputs = _inputs({("translation", 4, "full"): 0.3})
+    del inputs.ladder["translation"][4]["full"]["pixel_ae"]
+    with pytest.raises(ValueError, match="arm"):
+        reading_retention(inputs)
+
+
+def test_reading_retention_refuses_a_base_with_too_few_arms():
+    """An empty (or short) `base` must refuse rather than take `holding = 0` as
+    "0 of 0 arms failed" and report `UNRESOLVED_BASE` from no data at all."""
+    inputs = _inputs({("translation", 4, "full"): 0.3})
+    del inputs.base["pixel_ae"]
+    with pytest.raises(ValueError, match="arm"):
+        reading_retention(inputs)
