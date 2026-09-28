@@ -546,10 +546,11 @@ def _block_bootstrap_ci(
     joint_predicted: np.ndarray,
     embedding_predicted: np.ndarray,
     targets: np.ndarray,
-    window: int,
-    resamples: int,
-    confidence: float,
-    seed: int,
+    window: int | None = None,
+    resamples: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+    groups: np.ndarray | None = None,
 ) -> tuple[float, float]:
     """Percentile interval for the gain, resampling WHOLE WINDOWS.
 
@@ -564,26 +565,67 @@ def _block_bootstrap_ci(
     The probes are held FIXED across resamples. This is an interval on the
     scored sample -- how much the gain would move on a different draw of
     evaluation windows -- not on the whole fit/select/score pipeline.
+
+    TWO WAYS TO BLOCK, EXACTLY ONE PER CALL. `window` blocks POSITIONALLY, in
+    fixed strides, which is what `filtering_gain` has always reported through
+    and is byte-for-byte unchanged. `groups` blocks by LABEL: rows sharing a
+    label travel together. Two callers need the label form and the positional
+    form cannot express either. Backward displacement at k drops the first k
+    rows of every window, so the groups stop being equal-length and the stride
+    arithmetic below would raise; and M3j clusters on the 24 EPISODES rather
+    than the 229 windows, because several non-overlapping windows cut from one
+    trajectory are not independent observations. Given labels that describe the
+    same blocks the stride builds, the two paths agree to the last bit -- the
+    same `picked` indices in the same order from the same generator -- and a
+    test pins that.
     """
-    if window < 1:
-        raise ValueError(f"window must be at least 1 row, got {window}")
-    n_rows = targets.shape[0]
-    if n_rows % window:
+    if (window is None) == (groups is None):
         raise ValueError(
-            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
-            "the block bootstrap would mix parts of two windows into one block"
+            "pass exactly one of `window` (positional blocks) or `groups` "
+            "(labelled blocks); passing both or neither leaves the resampling "
+            "unit ambiguous"
         )
     if resamples < 1:
         raise ValueError(f"resamples must be at least 1, got {resamples}")
     if not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must be in (0, 1), got {confidence}")
 
-    blocks = np.arange(n_rows).reshape(n_rows // window, window)
+    n_rows = targets.shape[0]
+    if groups is None:
+        if window < 1:
+            raise ValueError(f"window must be at least 1 row, got {window}")
+        if n_rows % window:
+            raise ValueError(
+                f"{n_rows} scored rows is not a whole number of {window}-row windows; "
+                "the block bootstrap would mix parts of two windows into one block"
+            )
+        strides = np.arange(n_rows).reshape(n_rows // window, window)
+        n_blocks = strides.shape[0]
+
+        def pick(indices: np.ndarray) -> np.ndarray:
+            return strides[indices].reshape(-1)
+    else:
+        labels = np.asarray(groups)
+        if labels.shape != (n_rows,):
+            raise ValueError(
+                f"groups must be one label per scored row; got {labels.shape} "
+                f"for {n_rows} rows"
+            )
+        # Stable sort, so a group's rows keep their original relative order and
+        # the labelled path reproduces the positional one row for row.
+        order = np.argsort(labels, kind="stable")
+        _, starts = np.unique(labels[order], return_index=True)
+        parts = np.split(order, starts[1:])
+        n_blocks = len(parts)
+
+        def pick(indices: np.ndarray) -> np.ndarray:
+            return np.concatenate([parts[j] for j in indices])
+
     generator = np.random.default_rng(seed)
     draws = np.empty(resamples, dtype=np.float64)
     for i in range(resamples):
-        picked = generator.integers(0, blocks.shape[0], size=blocks.shape[0])
-        rows = blocks[picked].reshape(-1)
+        picked = generator.integers(0, n_blocks, size=n_blocks)
+        rows = pick(picked)
         draws[i] = _mean_r2(joint_predicted[rows], targets[rows]) - _mean_r2(
             embedding_predicted[rows], targets[rows]
         )

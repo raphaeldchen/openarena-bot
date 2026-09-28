@@ -1797,6 +1797,87 @@ def test_block_bootstrap_rejects_rows_that_are_not_whole_windows():
                             resamples=10, confidence=0.95, seed=0)
 
 
+def _bootstrap_arrays(n_rows: int, seed: int = 7):
+    """Two predictions and a target with real structure, so the interval is not
+    degenerate and a change in the resampling actually moves it."""
+    rng = np.random.default_rng(seed)
+    targets = rng.normal(size=(n_rows, 2)) * 10.0
+    joint = targets + rng.normal(size=(n_rows, 2)) * 2.0
+    embedding = targets + rng.normal(size=(n_rows, 2)) * 4.0
+    return joint, embedding, targets
+
+
+def test_block_bootstrap_by_label_reproduces_the_positional_path_exactly():
+    """THE equivalence pin. Grouping by label must be a generalisation, not a
+    replacement: given labels that describe the same blocks the positional path
+    builds, the two must agree to the last bit. Without this, Task 3 silently
+    re-bases every recorded `filtering_gain` interval."""
+    joint, embedding, targets = _bootstrap_arrays(60)
+    positional = _block_bootstrap_ci(
+        joint, embedding, targets, window=10, resamples=200, confidence=0.9, seed=3,
+    )
+    labelled = _block_bootstrap_ci(
+        joint, embedding, targets,
+        groups=np.arange(60) // 10, resamples=200, confidence=0.9, seed=3,
+    )
+    assert labelled == positional, (
+        f"labelled {labelled} != positional {positional}; the label path is not "
+        "a generalisation of the positional one"
+    )
+
+
+def test_block_bootstrap_by_label_accepts_groups_of_unequal_size():
+    """The reason the label path exists: backward displacement at k drops the
+    first k rows of every window, so the groups are no longer equal-length and
+    the positional path cannot express them."""
+    joint, embedding, targets = _bootstrap_arrays(23)
+    groups = np.array([0] * 5 + [1] * 11 + [2] * 7)
+    low, high = _block_bootstrap_ci(
+        joint, embedding, targets, groups=groups, resamples=100, confidence=0.9, seed=1,
+    )
+    assert low < high and np.isfinite([low, high]).all()
+
+
+def test_block_bootstrap_rejects_both_or_neither_blocking():
+    """Two ways to block is an ambiguity, not a convenience: a caller passing
+    both would silently get one of them."""
+    joint, embedding, targets = _bootstrap_arrays(20)
+    with pytest.raises(ValueError, match="exactly one"):
+        _block_bootstrap_ci(joint, embedding, targets, resamples=10,
+                            confidence=0.9, seed=0)
+    with pytest.raises(ValueError, match="exactly one"):
+        _block_bootstrap_ci(joint, embedding, targets, window=10,
+                            groups=np.arange(20) // 10, resamples=10,
+                            confidence=0.9, seed=0)
+
+
+def test_block_bootstrap_rejects_a_label_per_row_mismatch():
+    """One label per scored row. A shorter `groups` would silently drop rows
+    from every resample."""
+    joint, embedding, targets = _bootstrap_arrays(20)
+    with pytest.raises(ValueError, match="one label per scored row"):
+        _block_bootstrap_ci(joint, embedding, targets, groups=np.arange(19),
+                            resamples=10, confidence=0.9, seed=0)
+
+
+def test_block_bootstrap_by_label_is_order_independent():
+    """Labels identify groups; the row ORDER within the array must not change
+    which rows travel together. A gather that emitted rows in a different order
+    has to give the same interval."""
+    joint, embedding, targets = _bootstrap_arrays(30)
+    groups = np.arange(30) // 6
+    straight = _block_bootstrap_ci(
+        joint, embedding, targets, groups=groups, resamples=150,
+        confidence=0.9, seed=5,
+    )
+    order = np.random.default_rng(0).permutation(30)
+    shuffled = _block_bootstrap_ci(
+        joint[order], embedding[order], targets[order], groups=groups[order],
+        resamples=150, confidence=0.9, seed=5,
+    )
+    assert shuffled == pytest.approx(straight, abs=1e-12)
+
+
 def test_gain_rejects_an_h_dim_that_does_not_index_the_latent():
     """A wrong `h_dim` probes the wrong slice with no shape error to show for
     it, so it is rejected at the boundary rather than silently truncated."""
