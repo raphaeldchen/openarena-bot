@@ -665,7 +665,7 @@ def test_the_parser_defaults_are_the_specs():
     assert args.reference == Path("runs/m3_study_v2") and args.data == Path("data/my_way_home")
     assert args.device == "mps" and args.context is None and args.horizon is None
     assert args.arms == ["pixel_ae", "frozen_ssl", "random_vit"] and args.seeds == [0, 1, 2]
-    assert args.phase == script.PHASES[-1]
+    assert args.phase == "all", "reordering PHASES must not silently change the default phase"
 
 
 def test_the_record_path_names_both_the_arm_and_the_seed(tmp_path):
@@ -772,6 +772,27 @@ def _leak_at(k):
     def change(record):
         entry = record["k"][f"k{int(k)}"]
         entry["control"] = [x + 500.0 for x in entry["contrast"]]
+    return change
+
+
+def _motion_encoded_at(k):
+    """Every record's own displacement series at `k`, replaced with twelve
+    hand-typed values -- the fixture's own window count (see the module
+    docstring: 12 val windows over 6 clusters) -- comfortably positive and no
+    two alike, so the latent PLAINLY beats staying put. The control series is
+    left untouched, so it still reads as `planned` already does: inside the
+    bar, not leaking.
+    """
+    boosted = [
+        48.00, 51.00, 49.50, 52.50, 47.50, 50.50,
+        53.00, 46.50, 49.00, 52.00, 48.50, 51.50,
+    ]
+    def change(record):
+        entry = record["k"][f"k{int(k)}"]
+        assert len(entry["contrast"]) == len(boosted), (
+            "the fixture's window count changed; re-type the boosted series to match"
+        )
+        entry["contrast"] = list(boosted)
     return change
 
 
@@ -975,6 +996,32 @@ def test_read_writes_motion_txt_byte_identical_to_what_it_printed(planned, capsy
     printed = capsys.readouterr().out
     written = (planned.motion / "motion.txt").read_text()
     assert written == printed, "motion.txt must be what the reader saw"
+
+
+def test_a_doctored_latent_that_plainly_beats_staying_put_reads_MOTION_ENCODED(
+    planned, capsys,
+):
+    """Spec 3.2 promises that a latent encoding displacement exactly must read
+    MOTION_ENCODED. Every other MOTION_ENCODED assertion in this project is on
+    a hand-built `MotionArm`, never on the script's own pipeline -- so this
+    drives `--phase read` to that printed verdict for real, proving the
+    pipeline is not sign-locked.
+
+    The plan's nine records are doctored at k = 15 (DECISION_H) to a contrast
+    series no persistence baseline can match, leaving the control untouched.
+    Every record is a copy of the same one cell (see `planned`'s docstring),
+    so the doctoring lands identically in all three arms and all three seeds
+    of each: every arm clears positive in all three of its seeds, well past
+    both `ARMS_REQUIRED` and `SEEDS_REQUIRED`.
+    """
+    _doctor(planned, _motion_encoded_at(15))
+    assert _read(planned) == script.EXIT_OK
+    out = capsys.readouterr().out
+    assert "verdict: MOTION ENCODED" in out
+    assert "UNRESOLVED CONTROL" not in out and "NO MOTION" not in out
+    path = planned.motion / "motion.txt"
+    assert path.exists(), "a clean read must write motion.txt"
+    assert path.read_text() == out, "motion.txt must be what the reader saw"
 
 
 def test_the_reading_is_decided_at_DECISION_H_and_reports_the_others(planned, capsys):

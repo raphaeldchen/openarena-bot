@@ -174,8 +174,22 @@ def test_a_leaking_control_suppresses_a_result_that_would_otherwise_pass():
 
 
 def test_the_control_leaks_on_a_NEGATIVE_clear_too():
-    """The control is two-sided: a permuted pairing that is reliably WORSE
-    than chance is as much a broken instrument as one that is better."""
+    """Pins the SHIPPED rule, including its known miscalibration -- not a
+    rationale for it. The rule is two-sided and pre-registered, so a control
+    that clears the bar negative still gates UNRESOLVED_CONTROL under the code
+    as written, and this asserts exactly that.
+
+    The rationale it originally shipped with -- that a permuted pairing
+    reliably worse than chance is as broken an instrument as one reliably
+    better -- was measured and found wrong (`## Task 8 results` section 5 of
+    `docs/superpowers/plans/2026-09-26-mb-fps-m3i-latent-motion.md`):
+    persistence is the zero prediction, so any nonzero prediction scored
+    against a permuted pairing can only add error, and a NEGATIVE clear is the
+    EXPECTED behaviour of a working instrument. Only a POSITIVE clear means
+    signal where none can exist. The rule is not rewritten after the fact
+    because the verdict was taken under it as written; a milestone reusing
+    this control should gate one-sided instead.
+    """
     arms = {"pixel_ae": _arm(0.2), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.3)}
     control = {"pixel_ae": _arm(-4.5), "frozen_ssl": _arm(0.1), "random_vit": _arm(0.2)}
     assert reading_displacement(_inputs(arms, control=control)).status == "UNRESOLVED_CONTROL"

@@ -128,10 +128,25 @@ class MotionArm:
         return self.z <= -z_fam and self.seeds_down >= SEEDS_REQUIRED
 
     def leaks(self, z_fam: float) -> bool:
-        """For a CONTROL arm: cleared the bar in either direction. Two-sided
-        on purpose -- a permuted pairing that is reliably worse than chance is
-        as much a broken instrument as one that is better, and only the seed
+        """For a CONTROL arm: cleared the bar in either direction. The seed
         tallies are ignored here because a control has no result to replicate.
+
+        The shipped rule is TWO-SIDED and pre-registered (spec 2.2, 3.2); the
+        verdict was taken under it and it is not rewritten after the fact. But
+        the rationale it shipped with -- that a permuted pairing reliably
+        worse than chance is as broken an instrument as one reliably better --
+        was measured and found wrong (`## Task 8 results` section 5 of
+        `docs/superpowers/plans/2026-09-26-mb-fps-m3i-latent-motion.md`). The
+        contrast is `||true|| - ||predicted - true||`, so persistence IS the
+        zero prediction: against a permuted pairing any NONZERO prediction can
+        only add error, never reduce it. A sweep of an uninformative
+        prediction of growing size against the real displacements gave mean
+        controls of 0.0000, -0.0383, -0.1509, -0.4626, -2.4594 -- monotone in
+        the prediction's magnitude and exactly 0 only when the probe emits
+        nothing. So a NEGATIVE clear is the EXPECTED behaviour of a working
+        instrument, not a broken one; only a control clearing POSITIVE means
+        signal where none can exist. A milestone reusing this control should
+        make its own gate one-sided.
         """
         return abs(self.z) >= z_fam
 
@@ -161,11 +176,20 @@ def reading_displacement(inputs: MotionInputs) -> MotionStatus:
     """Does the posterior latent encode displacement (spec 3.2)?
 
     Precedence, and it is the point: UNRESOLVED_CONTROL outranks every
-    result. The control's pairing was permuted, so it cannot carry signal; a
-    control that clears means the instrument is reading structure that does
-    not exist, and the reading it would otherwise have printed is precisely
-    the one not to trust. A suppressed reading reports no arms at all rather
-    than reporting them beside a warning nobody reads.
+    result. The control's pairing was permuted, so it cannot carry signal --
+    but `MotionArm.leaks` gates on EITHER sign clearing, and only one of those
+    two directions actually means that. Measured (`## Task 8 results` section
+    5 of `docs/superpowers/plans/2026-09-26-mb-fps-m3i-latent-motion.md`): a
+    control clearing NEGATIVE is the expected behaviour of a working
+    instrument, because persistence is the zero prediction and any nonzero
+    prediction scored against a permuted pairing can only add error; a
+    control clearing POSITIVE is the one case that means the instrument is
+    reading structure that does not exist. The gate stays two-sided here
+    regardless, because it was pre-registered and the verdict was taken under
+    it as written -- that is not rewritten after the fact. A milestone
+    reusing this control should gate one-sided instead. A suppressed reading
+    reports no arms at all rather than reporting them beside a warning nobody
+    reads.
     """
     z_fam = float(inputs.z_fam)
     leaked = tuple(sorted(a for a, arm in inputs.control.items() if arm.leaks(z_fam)))

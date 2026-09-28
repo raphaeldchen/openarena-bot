@@ -1020,9 +1020,18 @@ def test_gather_probe_data_labels_every_row_with_its_window_and_step(tmp_path):
     assert data["targets"].shape[0] == n and data["encoder_embedding"].shape[0] == n
 
 
-def test_gather_probe_data_leaves_the_four_original_arrays_unchanged(tmp_path):
-    """The indices are ADDITIVE. `fit_probes` and every existing caller read
-    the four original keys and must see byte-identical arrays."""
+def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_path):
+    """Two calls over the same paths and kwargs must agree row for row, and
+    the returned dict must carry exactly the four payload arrays plus the two
+    row indices -- no more, no fewer.
+
+    Both sides of the array comparison below are calls made AFTER the indices
+    were added, so this pins determinism across calls, not invariance against
+    some pre-change array (those no longer exist to compare against; the
+    call-site audit that established the four original keys are unchanged by
+    every existing caller is recorded elsewhere, not here). The six-key set is
+    pinned by exact equality, so an extra or missing key fails even if every
+    array happens to match."""
     paths = _write_episodes(tmp_path, [20, 20])
     first = _gather(paths, context=2, horizon=3)
     second = _gather(paths, context=2, horizon=3)
