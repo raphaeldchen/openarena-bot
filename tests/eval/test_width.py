@@ -690,23 +690,52 @@ def test_exactly_two_base_failing_arms_is_unresolved_base():
     assert reading.arms_up == () and reading.arms_down == ()
 
 
-@pytest.mark.parametrize("status, arms, anchors", [
-    ("UNRESOLVED_ANCHOR", {a: _arm(0.1, 0.3) for a in ARMS}, {"down": False, "up": True}),
-    ("PAST_FRAME_AHEAD", {a: _arm(0.1, 0.3) for a in ARMS}, {"down": True, "up": True}),
-    ("RECURRENT_AHEAD", {a: _arm(-0.3, -0.1) for a in ARMS}, {"down": True, "up": True}),
-    ("INDISTINGUISHABLE", {a: _arm(-0.01, 0.01) for a in ARMS}, {"down": True, "up": True}),
+# Every case carries a failed base arm, a broken anchor, AND arms clearing in
+# BOTH directions, so all four reported tuples are non-empty in every branch.
+# A case that cleared only one way, or ran with unbroken anchors, could not tell
+# `arms_down=down` from `arms_down=()`.
+_UP, _DOWN, _FLAT = (0.1, 0.3), (-0.3, -0.1), (-0.01, 0.01)
+
+
+def _mixed(first, second, third) -> dict:
+    """Arms clearing in the given directions, one per arm, in `ARMS` order."""
+    return dict(zip(ARMS, (_arm(*first), _arm(*second), _arm(*third))))
+
+
+@pytest.mark.parametrize("status, arms, anchors, up, down", [
+    # `down` broken gates the reading; `up` broken gates nothing, so the four
+    # decided branches all run with `up` broken to pin `anchors_broken`.
+    ("UNRESOLVED_ANCHOR", _mixed(_UP, _UP, _DOWN), {"down": False, "up": True}, (), ()),
+    ("PAST_FRAME_AHEAD", _mixed(_UP, _UP, _DOWN), {"down": True, "up": False},
+     ("frozen_ssl", "pixel_ae"), ("random_vit",)),
+    ("RECURRENT_AHEAD", _mixed(_DOWN, _DOWN, _UP), {"down": True, "up": False},
+     ("random_vit",), ("frozen_ssl", "pixel_ae")),
+    ("INDISTINGUISHABLE", _mixed(_UP, _FLAT, _DOWN), {"down": True, "up": False},
+     ("frozen_ssl",), ("random_vit",)),
 ])
-def test_a_partial_base_failure_is_reported_in_every_branch_that_gets_past_the_base_gate(
-    status, arms, anchors,
+def test_every_branch_past_the_base_gate_reports_all_four_of_its_tuples(
+    status, arms, anchors, up, down,
 ):
     """`base_failed` was hardcoded `()` in four of five branches while
     `anchors_broken` was propagated in all of them. Every branch past the base
     gate is a verdict reached WITH a failed arm, and Task 6 writes the research
-    ledger from this field, so each must say which arm failed."""
+    ledger from these fields, so each must report all four.
+
+    THE CROSS-DIRECTION TUPLE IS THE SUBTLE ONE. An earlier version of this test
+    gave every case one-directional arms and unbroken anchors, so `arms_down=()`
+    in PAST_FRAME_AHEAD, `arms_up=()` in RECURRENT_AHEAD and `anchors_broken=()`
+    in two more branches each survived the whole suite -- the same defect one
+    field over from the one this test was written to close. A ledger recording
+    "no arm read the other way" beside a table printing `down` for that arm is
+    the caption-disagrees-with-columns shape this project has shipped three
+    times. So every case here clears in both directions at once (never both at
+    the bar, which is refused) and runs with `up` broken."""
     reading = reading_contrast(_inputs(arms, base_r2={"pixel_ae": BASE_FAILS}, anchors=anchors))
     assert reading.status == status
     assert reading.base_failed == ("pixel_ae",)
     assert reading.anchors_broken == tuple(sorted(p for p, ok in anchors.items() if not ok))
+    assert reading.arms_up == up, "the up tally the record carries"
+    assert reading.arms_down == down, "the CROSS-DIRECTION tally, the unpinned one"
 
 
 def test_reading_contrast_refuses_too_few_arms_rather_than_reading_indistinguishable():
