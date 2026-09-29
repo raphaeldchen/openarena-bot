@@ -246,6 +246,27 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
     )
 
 
+def _common_seeds_total(arms: dict) -> int:
+    """The arms' one shared `seeds_total`, or a refusal.
+
+    Arms that disagree on it are refused rather than reconciled. Two separate
+    things break at once if they disagree: the caption's "N of M seeds" would be
+    true of some rows and false of others, and the two-sided rule's
+    mutual-exclusion argument is stated per seed count, so a mixed table has no
+    single argument to stand on.
+    """
+    counts = {arm.seeds_total for arm in arms.values()}
+    if len(counts) != 1:
+        per_arm = {name: arm.seeds_total for name, arm in sorted(arms.items())}
+        raise ValueError(
+            "the arms must share one seeds_total for the "
+            f"'{SEEDS_REQUIRED} of N seeds' rule to be true of every row, "
+            f"got {per_arm}"
+        )
+    (total,) = counts
+    return total
+
+
 def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     """Reading F: at equal block width, does the past frame still beat the
     recurrent state?
@@ -265,7 +286,11 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     down in `SEEDS_REQUIRED` others, which needs `2 * SEEDS_REQUIRED` of its
     seeds (`contrast_arm` refuses an interval that would let one seed count
     both ways); and two disjoint sets of `ARMS_REQUIRED` arms need
-    `2 * ARMS_REQUIRED` arms. With 3 seeds and 3 arms neither is available.
+    `2 * ARMS_REQUIRED` arms. BOTH halves are ENFORCED, not assumed: the
+    arms-count guard below refuses fewer than `ARMS_REQUIRED` arms, and the
+    seeds-count guard refuses a `seeds_total` at which `2 * SEEDS_REQUIRED`
+    seeds would be available -- so the ambiguous state is unreachable rather
+    than merely absent from the study's 3 x 3 shape.
 
     `base_failed` is REPORTED in every branch, including the ones that go on to
     take a reading. `ARMS_REQUIRED` of the arms holding is enough to proceed, so
@@ -290,6 +315,15 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             "inputs.anchors has no 'down' entry; the down anchor is the only "
             "thing that gates Reading F, so a missing one is an error about the "
             f"measurement, not a pass (got {sorted(inputs.anchors)})"
+        )
+    seeds_total = _common_seeds_total(inputs.arms)
+    if 2 * SEEDS_REQUIRED <= seeds_total:
+        raise ValueError(
+            f"{seeds_total} seeds per arm with SEEDS_REQUIRED={SEEDS_REQUIRED} "
+            "would let one arm clear UP in some seeds and DOWN in others, so "
+            "PAST_FRAME_AHEAD and RECURRENT_AHEAD could both hold and the "
+            "two-sided precedence would decide an ambiguous reading by the "
+            f"order of its checks; needs 2 * {SEEDS_REQUIRED} > seeds_total"
         )
     base_failed = tuple(
         sorted(a for a, control in inputs.base.items() if not control.clears())
@@ -377,14 +411,7 @@ def format_reading_contrast(reading: ContrastStatus, inputs: ContrastInputs) -> 
     then be true of some rows and false of others, and picking one silently
     would print a rule the table does not follow.
     """
-    seed_counts = {arm.seeds_total for arm in inputs.arms.values()}
-    if len(seed_counts) != 1:
-        per_arm = {name: arm.seeds_total for name, arm in sorted(inputs.arms.items())}
-        raise ValueError(
-            "the arms must share one seeds_total for the caption's "
-            f"'{SEEDS_REQUIRED} of N seeds' to be true of every row, got {per_arm}"
-        )
-    (seeds_total,) = seed_counts
+    seeds_total = _common_seeds_total(inputs.arms)
     lines = [
         f"--- Reading F: at EQUAL block width ({DOWN_WIDTH}), does two_frame still beat "
         f"deterministic on translation at k = {CONTRAST_K}? "

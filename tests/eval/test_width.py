@@ -841,8 +841,13 @@ def test_reading_caption_uses_the_inputs_not_a_hardcoded_value():
     or "of 3 arms" would pass every one of them. This is the exact "one value
     fixed in every fixture" trap the task warns about. Built directly (not
     through `_inputs`) so every number differs from every other test's fixture:
-    4 arms of 5 seeds each, and a patched `DOWN_WIDTH`, so a literal for any of
-    them is exposed.
+    4 arms of 5 seeds each, with `DOWN_WIDTH` and `SEEDS_REQUIRED` patched, so a
+    literal for any of them is exposed and the caption's numerator and
+    denominator are different numbers (a "2 of 2" caption could not tell a
+    numerator/denominator swap from the truth). `SEEDS_REQUIRED` must be patched
+    to keep 5 seeds legal at all: `reading_contrast` refuses a `seeds_total` at
+    which `2 * SEEDS_REQUIRED` seeds are available, because one arm could then
+    clear both directions.
 
     The project has shipped a caption that disagreed with its own columns three
     times; the worst printed the up tally beside a verdict read from the down
@@ -856,13 +861,16 @@ def test_reading_caption_uses_the_inputs_not_a_hardcoded_value():
         anchors={"down": True, "up": True},
         clusters=7, rows=123,
     )
-    with patch.object(width, "DOWN_WIDTH", 256):
+    with patch.object(width, "DOWN_WIDTH", 256), patch.object(
+        width, "SEEDS_REQUIRED", 3
+    ):
         text = format_reading_contrast(reading_contrast(inputs), inputs)
     caption = text.splitlines()[0]
     assert "7 clusters" in caption and "123 rows" in caption
     assert "24 clusters" not in caption and "8015 rows" not in caption
-    assert f"in {SEEDS_REQUIRED} of 5 seeds" in caption
+    assert "in 3 of 5 seeds" in caption
     assert "of 3 seeds" not in caption
+    assert f"in {SEEDS_REQUIRED} of" not in caption
     assert f"and {ARMS_REQUIRED} of 4 arms" in caption
     assert "of 3 arms" not in caption
     assert "at EQUAL block width (256)" in caption
@@ -897,3 +905,52 @@ def test_reading_caption_refuses_arms_that_disagree_on_seeds_total():
     fake_reading = reading_contrast(_inputs())
     with pytest.raises(ValueError, match="share one seeds_total"):
         format_reading_contrast(fake_reading, empty)
+
+
+def test_reading_contrast_refuses_a_seed_count_that_would_let_one_arm_clear_both_ways():
+    """The two-sided rule's mutual exclusion is an ARGUMENT, and half of it is
+    about seeds: an arm lands in both the up and the down list only if it clears
+    up in `SEEDS_REQUIRED` seeds and down in `SEEDS_REQUIRED` others, which needs
+    `2 * SEEDS_REQUIRED` seeds available. At 3 seeds it is not. At 4 it is -- and
+    then PAST_FRAME_AHEAD and RECURRENT_AHEAD could both hold and the precedence
+    would settle an ambiguous reading by the order of its `if`s, silently.
+
+    `SEEDS_REQUIRED` is pre-registered at 2, so the rule is only well defined
+    below 4 seeds; a successor wanting more seeds must re-register the rule
+    rather than inherit an ambiguous one. Hence a refusal, not a repair."""
+    arms = ("frozen_ssl", "pixel_ae", "random_vit")
+    legal = ContrastInputs(
+        arms={a: _arm(0.1, 0.3, seeds_total=3) for a in arms},
+        base={a: _base(BASE_HOLDS) for a in arms},
+        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    )
+    assert reading_contrast(legal).status == "PAST_FRAME_AHEAD"
+    assert 2 * SEEDS_REQUIRED > 3, "this test's premise moved with the constant"
+
+    ambiguous = ContrastInputs(
+        arms={a: _arm(0.1, 0.3, seeds_total=2 * SEEDS_REQUIRED) for a in arms},
+        base={a: _base(BASE_HOLDS, seeds_total=2 * SEEDS_REQUIRED) for a in arms},
+        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    )
+    with pytest.raises(ValueError, match="clear UP in some seeds and DOWN"):
+        reading_contrast(ambiguous)
+
+
+def test_reading_contrast_refuses_arms_that_disagree_on_their_seed_count():
+    """A mixed table has no single mutual-exclusion argument to stand on, and no
+    true "N of M seeds" caption either -- M is different per row. Refused at the
+    READING, not only at the printing: a reading computed under mixed seed counts
+    and only refused when someone went to print it would still have been the
+    number a caller acted on."""
+    arms = ("frozen_ssl", "pixel_ae", "random_vit")
+    mixed = ContrastInputs(
+        arms={
+            "frozen_ssl": _arm(0.1, 0.3, seeds_total=3),
+            "pixel_ae": _arm(0.1, 0.3, seeds_total=3),
+            "random_vit": _arm(0.1, 0.3, seeds_total=2),
+        },
+        base={a: _base(BASE_HOLDS) for a in arms},
+        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    )
+    with pytest.raises(ValueError, match="must share one seeds_total"):
+        reading_contrast(mixed)
