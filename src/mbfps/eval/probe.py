@@ -19,6 +19,8 @@ Two properties of `my_way_home`, measured rather than assumed:
 Positions are Doom map units, not metres.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -192,7 +194,7 @@ def gather_probe_data(
     prevent. What is matched here is the filtering DEPTH, which is what the
     three references actually share.
 
-    Returns six row-aligned arrays:
+    Returns seven row-aligned arrays:
 
     - `"latent"` `(N, LATENT)` -- the posterior latent.
     - `"embedding"` `(N, EMBED)` -- the model's PREDICTED embedding, i.e.
@@ -206,6 +208,10 @@ def gather_probe_data(
       window, `0 .. context + horizon - 1`. M3i reconstructs per-window
       trajectories from these two so it can compute displacement WITHIN a
       window; every earlier caller ignores them.
+    - `"episode"` `(N,)` int -- the 0-based index of the episode each row came
+      from, over the episodes that contributed at least one window. M3j
+      resamples on this rather than on `"window"`; see `_block_bootstrap_ci`'s
+      `groups`.
 
     THE TWO EMBEDDINGS ARE NOT REDUNDANT AND MUST NOT BE COLLAPSED INTO ONE.
     They answer different questions, and each is the wrong array for the
@@ -242,7 +248,9 @@ def gather_probe_data(
     latents, embeddings, encoder_embeddings, targets = [], [], [], []
     windows: list[np.ndarray] = []
     steps: list[np.ndarray] = []
+    episodes: list[np.ndarray] = []
     window_index = 0
+    episode_index = 0
 
     for path in list(paths)[:limit]:
         episode = load_episode(path)
@@ -292,7 +300,12 @@ def gather_probe_data(
             rows = int(latent.shape[1])
             windows.append(np.full(rows, window_index, dtype=np.int64))
             steps.append(np.arange(rows, dtype=np.int64))
+            episodes.append(np.full(rows, episode_index, dtype=np.int64))
             window_index += 1
+        # Advanced only here, AFTER the window loop, so an episode that reached
+        # `continue` above (too short for one window) never consumes a label and
+        # the labels stay gap-free.
+        episode_index += 1
 
     if not latents:
         raise ValueError(
@@ -309,6 +322,12 @@ def gather_probe_data(
         # trajectories from these; every earlier caller ignores them.
         "window": np.concatenate(windows),
         "step": np.concatenate(steps),
+        # Which EPISODE each row came from, 0-based over the episodes that
+        # actually contributed a window. The coarsest correlated unit the scored
+        # array contains: windows are cut non-overlapping, but several windows
+        # from one trajectory are not independent observations, and every
+        # reading from M3e onward clusters on episodes rather than windows.
+        "episode": np.concatenate(episodes),
     }
 
 
@@ -525,14 +544,30 @@ def filtering_report(
     )
 
 
+def _require_whole_windows(n_rows: int, window: int) -> None:
+    """Both `_block_bootstrap_ci`'s positional branch and `_gain_from_splits`
+    need `n_rows` to be a whole number of `window`-row blocks -- a labelled
+    call reaches neither check, since it blocks by `groups` instead. Shared so
+    the two messages cannot drift apart silently; existing tests pin both
+    wordings through both call sites, so neither string may change here."""
+    if window < 1:
+        raise ValueError(f"window must be at least 1 row, got {window}")
+    if n_rows % window:
+        raise ValueError(
+            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
+            "the block bootstrap would mix parts of two windows into one block"
+        )
+
+
 def _block_bootstrap_ci(
     joint_predicted: np.ndarray,
     embedding_predicted: np.ndarray,
     targets: np.ndarray,
-    window: int,
-    resamples: int,
-    confidence: float,
-    seed: int,
+    window: int | None = None,
+    resamples: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+    groups: np.ndarray | None = None,
 ) -> tuple[float, float]:
     """Percentile interval for the gain, resampling WHOLE WINDOWS.
 
@@ -547,31 +582,192 @@ def _block_bootstrap_ci(
     The probes are held FIXED across resamples. This is an interval on the
     scored sample -- how much the gain would move on a different draw of
     evaluation windows -- not on the whole fit/select/score pipeline.
+
+    TWO WAYS TO BLOCK, EXACTLY ONE PER CALL. `window` blocks POSITIONALLY, in
+    fixed strides, which is what `filtering_gain` has always reported through
+    and is byte-for-byte unchanged. `groups` blocks by LABEL: rows sharing a
+    label travel together. Two callers need the label form and the positional
+    form cannot express either. Backward displacement at k drops the first k
+    rows of every window, so the groups stop being equal-length and the stride
+    arithmetic below would raise; and M3j clusters on the 24 EPISODES rather
+    than the 229 windows, because several non-overlapping windows cut from one
+    trajectory are not independent observations. Given labels that describe the
+    same blocks the stride builds, the two paths agree to the last bit -- the
+    same `picked` indices in the same order from the same generator -- and a
+    test pins that.
     """
-    if window < 1:
-        raise ValueError(f"window must be at least 1 row, got {window}")
-    n_rows = targets.shape[0]
-    if n_rows % window:
+    if (window is None) == (groups is None):
         raise ValueError(
-            f"{n_rows} scored rows is not a whole number of {window}-row windows; "
-            "the block bootstrap would mix parts of two windows into one block"
+            "pass exactly one of `window` (positional blocks) or `groups` "
+            "(labelled blocks); passing both or neither leaves the resampling "
+            "unit ambiguous"
         )
     if resamples < 1:
         raise ValueError(f"resamples must be at least 1, got {resamples}")
     if not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must be in (0, 1), got {confidence}")
 
-    blocks = np.arange(n_rows).reshape(n_rows // window, window)
+    n_rows = targets.shape[0]
+    if groups is None:
+        _require_whole_windows(n_rows, window)
+        strides = np.arange(n_rows).reshape(n_rows // window, window)
+        n_blocks = strides.shape[0]
+
+        def pick(indices: np.ndarray) -> np.ndarray:
+            return strides[indices].reshape(-1)
+    else:
+        labels = np.asarray(groups)
+        if labels.shape != (n_rows,):
+            raise ValueError(
+                f"groups must be one label per scored row; got {labels.shape} "
+                f"for {n_rows} rows"
+            )
+        # Stable sort, so a group's rows keep their original relative order and
+        # the labelled path reproduces the positional one row for row.
+        order = np.argsort(labels, kind="stable")
+        _, starts = np.unique(labels[order], return_index=True)
+        parts = np.split(order, starts[1:])
+        n_blocks = len(parts)
+
+        def pick(indices: np.ndarray) -> np.ndarray:
+            return np.concatenate([parts[j] for j in indices])
+
     generator = np.random.default_rng(seed)
     draws = np.empty(resamples, dtype=np.float64)
     for i in range(resamples):
-        picked = generator.integers(0, blocks.shape[0], size=blocks.shape[0])
-        rows = blocks[picked].reshape(-1)
+        picked = generator.integers(0, n_blocks, size=n_blocks)
+        rows = pick(picked)
         draws[i] = _mean_r2(joint_predicted[rows], targets[rows]) - _mean_r2(
             embedding_predicted[rows], targets[rows]
         )
     tail = 100.0 * (1.0 - confidence) / 2.0
     return float(np.percentile(draws, tail)), float(np.percentile(draws, 100.0 - tail))
+
+
+@dataclass(frozen=True)
+class GainSplit:
+    """One split's three arrays for `gain_from_blocks`, already row-selected.
+
+    `base` goes into BOTH arms and `block` into the joint arm only, which is
+    what makes the statistic an increment rather than a level. The caller
+    row-selects all three together: a target defined on a subset of the rows
+    (backward displacement has none for the first k rows of a window) must be
+    handed the SAME subset of features, and `gain_from_blocks` checks the three
+    row counts rather than trusting it.
+    """
+
+    base: np.ndarray
+    block: np.ndarray
+    target: np.ndarray
+
+    def joint(self) -> np.ndarray:
+        return np.concatenate(
+            [np.asarray(self.base, dtype=np.float64),
+             np.asarray(self.block, dtype=np.float64)], axis=1,
+        )
+
+    def rows(self) -> int:
+        counts = {
+            np.asarray(self.base).shape[0],
+            np.asarray(self.block).shape[0],
+            np.asarray(self.target).shape[0],
+        }
+        if len(counts) != 1:
+            raise ValueError(
+                f"base, block and target must describe the same number of rows; "
+                f"got {sorted(counts)}"
+            )
+        return counts.pop()
+
+
+def gain_from_blocks(
+    fit: GainSplit,
+    select: GainSplit | None,
+    score: GainSplit,
+    *,
+    groups: np.ndarray,
+    resamples: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> dict:
+    """`R2([base (+) block] -> target) - R2([base] -> target)` on three splits.
+
+    The general form of `_gain_from_splits`, which is now a wrapper. Three
+    things are the caller's here rather than hardcoded: the second feature
+    block, the target, and the resampling groups. M3j needs all three -- a
+    ladder of blocks (`enc(t-k)`, `h`, `z`, `h (+) z`), two motion targets, and
+    episode-level rather than window-level clustering.
+
+    The split discipline is unchanged and is the reason this is not
+    `filtering_comparison`: weights from `fit`, ridge selected on `select`,
+    reported R^2 and interval from `score`. A gain is a DIFFERENCE OF LEVELS
+    between feature sets of different widths, so a ridge maximum taken on the
+    scored rows favours the wider one and manufactures a positive gain out of
+    the selection alone. `select=None` skips selection and takes `fit_probe`'s
+    default penalty for both arms -- unbiased too, just weaker, and
+    `ridge_selected` says which happened.
+
+    `n_scored_windows` is the number of distinct `groups` labels. Under the
+    positional wrapper that equals `rows // window`, which is what it always
+    meant; under a filtered row set it is the number of surviving groups, which
+    is what the interval actually resamples.
+
+    `groups` must carry at least two distinct labels. With one, or with zero
+    scored rows, every bootstrap resample draws the same single block, so the
+    percentile interval collapses to zero width -- reading as maximal
+    confidence rather than "one resampling unit, no information".
+    """
+    n_scored = score.rows()
+    groups_arr = np.asarray(groups)
+    if groups_arr.shape != (n_scored,):
+        raise ValueError(
+            f"groups must be one label per scored row; got {groups_arr.shape} "
+            f"for {n_scored} rows"
+        )
+    n_groups = int(np.unique(groups_arr).size)
+    if n_groups < 2:
+        raise ValueError(
+            "a bootstrap interval needs at least two resampling units (distinct "
+            f"`groups` labels); got {n_groups}"
+        )
+    fit.rows()
+    joint_fit, base_fit = fit.joint(), np.asarray(fit.base, dtype=np.float64)
+    joint_score, base_score = score.joint(), np.asarray(score.base, dtype=np.float64)
+    target_fit = np.asarray(fit.target, dtype=np.float64)
+    target_score = np.asarray(score.target, dtype=np.float64)
+
+    if select is None:
+        joint_probe = fit_probe(joint_fit, target_fit)
+        base_probe = fit_probe(base_fit, target_fit)
+    else:
+        select.rows()
+        select_target = np.asarray(select.target, dtype=np.float64)
+        joint_probe = fit_probe(joint_fit, target_fit, select.joint(), select_target)
+        base_probe = fit_probe(
+            base_fit, target_fit,
+            np.asarray(select.base, dtype=np.float64), select_target,
+        )
+
+    joint_predicted = apply_probe(joint_probe, joint_score)
+    base_predicted = apply_probe(base_probe, base_score)
+    joint_r2 = _mean_r2(joint_predicted, target_score)
+    base_r2 = _mean_r2(base_predicted, target_score)
+    low, high = _block_bootstrap_ci(
+        joint_predicted, base_predicted, target_score,
+        groups=groups_arr, resamples=resamples, confidence=confidence, seed=seed,
+    )
+    return {
+        "gain": joint_r2 - base_r2,
+        "joint_r2": joint_r2,
+        "embedding_r2": base_r2,
+        "ci_low": low,
+        "ci_high": high,
+        "confidence": confidence,
+        "n_scored_windows": n_groups,
+        "ridge_selected": select is not None,
+        "joint_ridge": joint_probe["ridge"],
+        "embedding_ridge": base_probe["ridge"],
+    }
 
 
 def _gain_from_splits(
@@ -592,10 +788,17 @@ def _gain_from_splits(
     `filtering_comparison`, no part of the number on the scored rows was tuned
     on those rows. `select=None` skips selection entirely and takes
     `fit_probe`'s default penalty; that is unbiased too, just weaker.
+
+    This is now a thin wrapper over `gain_from_blocks`, which took over the
+    split, selection and bootstrap logic so M3j could reuse it with a different
+    block and target. What is fixed HERE is the block (`latent[:, :h_dim]`, the
+    deterministic head), the target (the privileged state) and the blocking
+    (positional, in `window`-row strides). Its output is pinned byte-for-byte by
+    a test, because `filtering_gain` reports through it onto the gate's own path.
     """
-    def features(split: dict) -> tuple[np.ndarray, np.ndarray]:
-        embedding = np.asarray(split["encoder_embedding"], dtype=np.float64)
-        latent = np.asarray(split["latent"], dtype=np.float64)
+    def split(data: dict) -> GainSplit:
+        embedding = np.asarray(data["encoder_embedding"], dtype=np.float64)
+        latent = np.asarray(data["latent"], dtype=np.float64)
         if not 1 <= h_dim <= latent.shape[1]:
             raise ValueError(
                 f"h_dim={h_dim} does not index a {latent.shape[1]}-wide latent"
@@ -603,44 +806,17 @@ def _gain_from_splits(
         # `latent` is `cat([h, z])` -- h FIRST, per RSSM.observe. Slicing the
         # tail instead reads the stochastic state and answers a different
         # question with the same shapes.
-        deterministic = latent[:, :h_dim]
-        return np.concatenate([embedding, deterministic], axis=1), embedding
+        return GainSplit(base=embedding, block=latent[:, :h_dim], target=data["targets"])
 
-    joint_fit, embedding_fit = features(fit)
-    joint_score, embedding_score = features(score)
-    targets_fit, targets_score = fit["targets"], score["targets"]
-
-    if select is None:
-        joint_probe = fit_probe(joint_fit, targets_fit)
-        embedding_probe = fit_probe(embedding_fit, targets_fit)
-    else:
-        joint_select, embedding_select = features(select)
-        targets_select = select["targets"]
-        joint_probe = fit_probe(joint_fit, targets_fit, joint_select, targets_select)
-        embedding_probe = fit_probe(
-            embedding_fit, targets_fit, embedding_select, targets_select
-        )
-
-    joint_predicted = apply_probe(joint_probe, joint_score)
-    embedding_predicted = apply_probe(embedding_probe, embedding_score)
-    joint_r2 = _mean_r2(joint_predicted, targets_score)
-    embedding_r2 = _mean_r2(embedding_predicted, targets_score)
-    low, high = _block_bootstrap_ci(
-        joint_predicted, embedding_predicted, targets_score,
-        window=window, resamples=resamples, confidence=confidence, seed=seed,
+    n_rows = np.asarray(score["targets"]).shape[0]
+    _require_whole_windows(n_rows, window)
+    return gain_from_blocks(
+        split(fit), None if select is None else split(select), split(score),
+        # The same blocks the stride path builds, as labels: Task 2's
+        # equivalence pin is what makes this substitution legal.
+        groups=np.arange(n_rows) // window,
+        resamples=resamples, confidence=confidence, seed=seed,
     )
-    return {
-        "gain": joint_r2 - embedding_r2,
-        "joint_r2": joint_r2,
-        "embedding_r2": embedding_r2,
-        "ci_low": low,
-        "ci_high": high,
-        "confidence": confidence,
-        "n_scored_windows": targets_score.shape[0] // window,
-        "ridge_selected": select is not None,
-        "joint_ridge": joint_probe["ridge"],
-        "embedding_ridge": embedding_probe["ridge"],
-    }
 
 
 def filtering_gain(

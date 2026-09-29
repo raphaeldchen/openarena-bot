@@ -21,6 +21,7 @@ no record schema. `scripts/latent_motion.py` owns all three.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -104,6 +105,24 @@ def contrast_series(predicted, true) -> np.ndarray:
     return error_persist - error_model
 
 
+def _finite(value: float, what: str) -> float:
+    """Refuse a non-finite statistic rather than letting it read as a non-clear.
+
+    `clears_up`, `clears_down` and `leaks` are all comparisons, and every
+    comparison against NaN is False -- so a single non-finite z would read "no
+    clear" AND "no leak" at once, moving a verdict toward NO_DIFFERENCE or
+    masking a leaking control, in both cases looking like a clean null.
+
+    No M3i verdict moves. All 90 of its recorded series were verified finite, so
+    this guard cannot fire on the data it was written for; it exists so the next
+    milestone to reuse this reading is not the one that finds out.
+    """
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite {what}: {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class MotionArm:
     """One arm's pooled contrast at one k, with the seed tallies BOTH ways.
@@ -122,10 +141,12 @@ class MotionArm:
     seeds_total: int
 
     def clears_up(self, z_fam: float) -> bool:
-        return self.z >= z_fam and self.seeds_up >= SEEDS_REQUIRED
+        return (_finite(self.z, "z") >= _finite(z_fam, "z_fam")
+                and self.seeds_up >= SEEDS_REQUIRED)
 
     def clears_down(self, z_fam: float) -> bool:
-        return self.z <= -z_fam and self.seeds_down >= SEEDS_REQUIRED
+        return (_finite(self.z, "z") <= -_finite(z_fam, "z_fam")
+                and self.seeds_down >= SEEDS_REQUIRED)
 
     def leaks(self, z_fam: float) -> bool:
         """For a CONTROL arm: cleared the bar in either direction. The seed
@@ -148,7 +169,7 @@ class MotionArm:
         signal where none can exist. A milestone reusing this control should
         make its own gate one-sided.
         """
-        return abs(self.z) >= z_fam
+        return abs(_finite(self.z, "z")) >= _finite(z_fam, "z_fam")
 
 
 @dataclass(frozen=True)

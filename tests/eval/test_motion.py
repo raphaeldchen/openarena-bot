@@ -78,6 +78,29 @@ def test_contrast_refuses_mismatched_shapes():
         contrast_series(np.zeros((3, 2)), np.zeros((4, 2)))
 
 
+def test_motion_arm_predicates_refuse_a_non_finite_z():
+    """The one note M3i's ledger left its successor. A NaN z made all three
+    predicates return False at once -- "no clear" and "no leak" together --
+    which reads as a clean null. M3i's own 90 recorded series were verified
+    finite, so no recorded verdict moves; the guard exists for the next reader."""
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        arm = MotionArm(estimate=0.0, se=1.0, z=bad, seeds_up=3, seeds_down=0,
+                        seeds_total=3)
+        for predicate in (arm.clears_up, arm.clears_down, arm.leaks):
+            with pytest.raises(ValueError, match="non-finite z"):
+                predicate(2.582)
+
+
+def test_motion_arm_predicates_are_unchanged_on_finite_input():
+    """The guard must be a guard, not a behaviour change. These are the same
+    assertions the shipped predicates already satisfy."""
+    up = MotionArm(estimate=1.0, se=0.3, z=3.0, seeds_up=2, seeds_down=0, seeds_total=3)
+    assert up.clears_up(2.582) and not up.clears_down(2.582) and up.leaks(2.582)
+    down = MotionArm(estimate=-1.0, se=0.3, z=-3.0, seeds_up=0, seeds_down=2,
+                     seeds_total=3)
+    assert down.clears_down(2.582) and not down.clears_up(2.582) and down.leaks(2.582)
+
+
 Z = 2.5820
 
 

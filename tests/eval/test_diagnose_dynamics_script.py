@@ -603,6 +603,26 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"latent_motion collides with {other} on {clash}"
 
+    retention = statuses("latent_retention")
+    reused_by_retention = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in retention.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_retention, (
+        f"latent_retention shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_retention} is shared on purpose"
+    )
+    assert len(set(retention.values())) == len(retention), retention
+    assert 1 not in retention.values() and 2 not in retention.values()
+    assert retention["EXIT_BASE_UNRESOLVED"] == 39
+    assert retention["EXIT_MOTION_UNRESOLVED"] == 40
+    own = set(retention.values()) - set(reused_by_retention.values()) - {0}
+    assert own == {39, 40}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"latent_retention collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys

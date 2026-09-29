@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from mbfps.eval.probe import (
+    GainSplit,
     PROBE_EPISODE_LIMIT,
     PROBE_KEYS,
     RIDGES,
@@ -15,6 +16,7 @@ from mbfps.eval.probe import (
     filtering_comparison,
     fit_probe,
     fit_probes,
+    gain_from_blocks,
     position_error,
     probe_episodes,
     probe_r2,
@@ -969,7 +971,7 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     timestep, so misaligned rows would compare two different frames and no
     shape check would notice.
 
-    There are SIX keys -- four payload arrays and M3i's two row indices --
+    There are SEVEN keys -- four payload arrays and M3j's three row indices --
     and the two embeddings are not interchangeable:
     `"embedding"` is the head's PREDICTED embedding (the space the rollout band
     is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
@@ -981,7 +983,8 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     data = _gather(paths, head_width=7, context=2, horizon=3)
 
     assert set(data) == {
-        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+        "latent", "embedding", "encoder_embedding", "targets",
+        "window", "step", "episode",
     }
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
@@ -1020,16 +1023,52 @@ def test_gather_probe_data_labels_every_row_with_its_window_and_step(tmp_path):
     assert data["targets"].shape[0] == n and data["encoder_embedding"].shape[0] == n
 
 
-def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_path):
+def test_gather_probe_data_labels_every_row_with_its_episode(tmp_path):
+    """M3j resamples EPISODES, not windows: 229 non-overlapping windows cut from
+    24 trajectories are not 229 independent observations. The label has to come
+    from the gather, because by the time a caller holds the arrays the episode
+    boundary is gone."""
+    paths = _write_episodes(tmp_path, [20, 20, 20])
+    data = _gather(paths, context=2, horizon=3)
+    n = data["latent"].shape[0]
+    episode, window = data["episode"], data["window"]
+
+    assert episode.shape == (n,) and episode.dtype.kind == "i"
+    # Three contributing episodes, labelled 0..2 with no gaps.
+    assert np.unique(episode).tolist() == [0, 1, 2]
+    # Every window sits inside exactly one episode -- so grouping by episode is
+    # strictly COARSER than grouping by window, which is the whole point.
+    for w in np.unique(window):
+        assert len(set(episode[window == w].tolist())) == 1, f"window {w} spans episodes"
+    # And every episode contributes more than one window, or the two groupings
+    # would coincide and this label would buy nothing.
+    assert all(
+        len(np.unique(window[episode == e])) > 1 for e in np.unique(episode)
+    ), "each episode must contribute several windows or the label is pointless"
+
+
+def test_gather_probe_data_episode_labels_skip_episodes_that_contribute_nothing(tmp_path):
+    """An episode too short for one window is `continue`d before it appends any
+    row. If the counter advanced anyway the labels would carry gaps, and a
+    caller sizing its bootstrap from `episode.max() + 1` would resample empty
+    groups."""
+    paths = _write_episodes(tmp_path, [20, 3, 20])
+    data = _gather(paths, context=2, horizon=3)
+    assert np.unique(data["episode"]).tolist() == [0, 1], (
+        "the short episode must not consume a label"
+    )
+
+
+def test_gather_probe_data_is_deterministic_and_returns_exactly_seven_keys(tmp_path):
     """Two calls over the same paths and kwargs must agree row for row, and
-    the returned dict must carry exactly the four payload arrays plus the two
+    the returned dict must carry exactly the four payload arrays plus the three
     row indices -- no more, no fewer.
 
     Both sides of the array comparison below are calls made AFTER the indices
     were added, so this pins determinism across calls, not invariance against
     some pre-change array (those no longer exist to compare against; the
     call-site audit that established the four original keys are unchanged by
-    every existing caller is recorded elsewhere, not here). The six-key set is
+    every existing caller is recorded elsewhere, not here). The seven-key set is
     pinned by exact equality, so an extra or missing key fails even if every
     array happens to match."""
     paths = _write_episodes(tmp_path, [20, 20])
@@ -1038,7 +1077,8 @@ def test_gather_probe_data_is_deterministic_and_returns_exactly_six_keys(tmp_pat
     for key in ("latent", "embedding", "encoder_embedding", "targets"):
         np.testing.assert_array_equal(first[key], second[key], err_msg=key)
     assert set(first) == {
-        "latent", "embedding", "encoder_embedding", "targets", "window", "step",
+        "latent", "embedding", "encoder_embedding", "targets",
+        "window", "step", "episode",
     }
 
 
@@ -1596,6 +1636,257 @@ def test_filtering_gain_reads_the_deterministic_head_of_the_latent():
     assert gain_for(latent) > 0.5, "the stochastic tail was probed, not h"
 
 
+def test_gain_from_splits_output_is_byte_identical_after_the_generalisation():
+    """THE regression pin for Task 3. `filtering_gain` reports through
+    `_gain_from_splits` onto the gate's own path (`study.py:589`,
+    `scripts/eval_rollout.py:201`), so generalising its body is only safe if the
+    numbers do not move. Every value below was captured from the code BEFORE
+    `gain_from_blocks` existed. If a refactor changes one, the refactor is
+    wrong -- do not re-record them."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    parts = [
+        _split(latent[s], embedding[s], targets[s])
+        for s in (slice(0, 200), slice(200, 400), slice(400, 600))
+    ]
+    out = _gain_from_splits(parts[0], parts[1], parts[2], h_dim=2,
+                            window=5, resamples=200, confidence=0.9, seed=11)
+    assert out == {
+        "gain": 0.9996786109619562,
+        "joint_r2": 0.9996512622688909,
+        "embedding_r2": -2.7348693065254448e-05,
+        "ci_low": 0.9996553965287523,
+        "ci_high": 1.0154949292104678,
+        "confidence": 0.9,
+        "n_scored_windows": 40,
+        "ridge_selected": True,
+        "joint_ridge": 0.1,
+        "embedding_ridge": 10000000.0,
+    }
+
+
+def test_gain_from_splits_rejects_a_score_split_that_is_not_whole_windows():
+    """`_require_whole_windows`'s own docstring claims existing tests pin its
+    message through BOTH call sites: `_block_bootstrap_ci`'s positional branch
+    (`test_block_bootstrap_rejects_rows_that_are_not_whole_windows`, above) and
+    `_gain_from_splits`. Only the first existed before this test -- this closes
+    the second, so the docstring's claim is true rather than merely asserted."""
+    latent, embedding, targets = _history_case(207, seed=5)
+    fit, select, score = slice(0, 100), slice(100, 200), slice(200, 207)
+    with pytest.raises(ValueError, match="whole number"):
+        _gain_from_splits(
+            _split(latent[fit], embedding[fit], targets[fit]),
+            _split(latent[select], embedding[select], targets[select]),
+            _split(latent[score], embedding[score], targets[score]),
+            h_dim=2, window=GAIN_WINDOW, resamples=10, seed=0,
+        )
+
+
+def _blocks(latent, embedding, targets, rows, h_dim=2):
+    """A `GainSplit` over `rows`, with the deterministic half as the block --
+    the same arrangement `_gain_from_splits` builds, so the two can be compared."""
+    return GainSplit(
+        base=embedding[rows], block=latent[rows, :h_dim], target=targets[rows],
+    )
+
+
+def test_gain_from_splits_wrapper_builds_the_h_head_and_stride_groups():
+    """NOT a check that `gain_from_blocks` generalises `_gain_from_splits`
+    correctly: `_gain_from_splits` is now a thin wrapper over `gain_from_blocks`,
+    so `reference` below runs through `gain_from_blocks` too, and any bug inside
+    it would appear identically on both sides of `general == reference` and
+    cancel. That equivalence guarantee lives entirely in the byte-identity pin
+    above, which was captured before `gain_from_blocks` existed.
+
+    What this test still pins is that the WRAPPER assembles the right
+    `GainSplit`/`groups` arrangement before handing it to `gain_from_blocks`:
+    block = `latent[:, :h_dim]` (the `h`-head slice, not the tail), target = the
+    privileged state, and groups = `np.arange(n_rows) // window` (positional
+    strides) -- built here explicitly via `_blocks` and `np.arange(200) // 5`
+    and compared against what the wrapper builds internally."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    sl = (slice(0, 200), slice(200, 400), slice(400, 600))
+    parts = [_split(latent[s], embedding[s], targets[s]) for s in sl]
+    reference = _gain_from_splits(parts[0], parts[1], parts[2], h_dim=2,
+                                  window=5, resamples=200, confidence=0.9, seed=11)
+    general = gain_from_blocks(
+        _blocks(latent, embedding, targets, np.arange(600)[sl[0]]),
+        _blocks(latent, embedding, targets, np.arange(600)[sl[1]]),
+        _blocks(latent, embedding, targets, np.arange(600)[sl[2]]),
+        groups=np.arange(200) // 5, resamples=200, confidence=0.9, seed=11,
+    )
+    assert general == reference
+
+
+def test_gain_from_blocks_accepts_a_filtered_row_set():
+    """The reason it exists. Backward displacement at k has no target for the
+    first k rows of a window, so the scored set is not a whole number of
+    windows and `_gain_from_splits` cannot express it."""
+    latent, embedding, targets = _history_case(600, seed=1)
+    keep = np.arange(600)[np.arange(600) % 5 != 0]   # drop row 0 of every block
+    sl = (keep[keep < 200], keep[(keep >= 200) & (keep < 400)], keep[keep >= 400])
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, sl[0]),
+        _blocks(latent, embedding, targets, sl[1]),
+        _blocks(latent, embedding, targets, sl[2]),
+        groups=sl[2] // 5, resamples=100, confidence=0.9, seed=2,
+    )
+    assert out["n_scored_windows"] == 40, "one group per surviving window"
+    assert out["gain"] > 0.5, (
+        "the lagged block still carries the target after filtering; a near-zero "
+        "gain here means the rows and the target came apart"
+    )
+
+
+def test_gain_from_blocks_counts_groups_not_rows_over_a_window():
+    """`n_scored_windows` was `rows // window`. With labels there is no window
+    length, so it has to be the number of distinct labels -- and unequal groups
+    are exactly the case that separates the two."""
+    latent, embedding, targets = _history_case(300, seed=3)
+    rows = np.arange(300)
+    groups = np.repeat(np.arange(7), (40, 40, 40, 40, 40, 40, 60))
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, rows[:100]),
+        _blocks(latent, embedding, targets, rows[100:200]),
+        _blocks(latent, embedding, targets, rows[200:300]),
+        groups=groups[200:300], resamples=50, confidence=0.9, seed=4,
+    )
+    # groups[200:300] spans only labels 5 and 6, at 40 and 60 rows -- the
+    # "unequal groups" case this test names rests on that single 40-vs-60 pair.
+    assert out["n_scored_windows"] == 2
+
+
+def _base_carries_target_case(n: int, seed: int):
+    """`base` predicts the target almost perfectly; `block` is pure noise.
+
+    The arrangement `_history_case` deliberately does NOT provide: there, the
+    encoder embedding carries no information about the target, so a probe on
+    the joint arm and a probe on the base arm both saturate the ridge grid and
+    score the same. That makes `_history_case` right for testing what the
+    deterministic block adds, and useless for testing that the base is in both
+    arms -- removing it from either arm changes nothing measurable.
+
+    Here the base explains the target, so the two one-sided mutations separate:
+    dropping the base from the JOINT arm collapses `joint_r2` while `base_r2`
+    stays high (gain goes strongly negative), and dropping it from the BASE arm
+    leaves `joint_r2` high while `base_r2` collapses (gain goes strongly
+    positive). A correct implementation sits at gain ~= 0, because a pure-noise
+    block can neither help nor hurt.
+    """
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=n)
+    base = signal[:, None] * np.ones((1, 3)) + 0.01 * rng.normal(size=(n, 3))
+    block = rng.normal(size=(n, 2))
+    targets = np.column_stack([signal] * 4) * 3.0 + 0.05 * rng.normal(size=(n, 4))
+    return base, block, targets
+
+
+def test_gain_from_blocks_puts_the_base_in_both_arms():
+    """The cancellation the whole statistic rests on. If the base appeared only
+    in one arm, the gain would measure the two feature sets' widths as much as
+    the block's contribution -- and neither the bottleneck nor the
+    position-constrains-motion confound would cancel.
+
+    Two mutations expose the defect:
+    - Dropping the base from the JOINT arm collapses joint_r2 while base_r2
+      stays high: the gain goes strongly negative, caught by `gain > -0.05`.
+    - Dropping the base from the BASE arm leaves joint_r2 high while base_r2
+      collapses: the gain goes strongly positive, caught by `ci_low <= 0.0`.
+    """
+    base, block, targets = _base_carries_target_case(600, seed=11)
+    rows = np.arange(600)
+
+    def split(sl):
+        return GainSplit(base=base[sl], block=block[sl], target=targets[sl])
+
+    out = gain_from_blocks(
+        split(rows[:200]), split(rows[200:400]), split(rows[400:600]),
+        groups=np.arange(200) // 5, resamples=200, confidence=0.9, seed=6,
+    )
+
+    # Verify the fixture's premise: the base explains the target almost perfectly
+    assert out["embedding_r2"] > 0.9, (
+        f"the base does not carry target signal (embedding_r2={out['embedding_r2']:.4f}); "
+        "the fixture assumption is wrong"
+    )
+
+    # A pure-noise block must not APPEAR to help. Measured, dropping the base
+    # from the BASE arm sends the gain to +0.9996, so this is the side that
+    # catches that mutation.
+    assert out["ci_low"] <= 0.0, (
+        f"a noise block cleared zero (ci_low={out['ci_low']}); the base is missing "
+        "from the BASE arm, or selection is being taken on the scored rows"
+    )
+
+    # And it must not appear to hurt. Measured, dropping the base from the JOINT
+    # arm sends the gain to -1.0308, so this is the side that catches that one --
+    # the mutation the earlier one-sided version of this test let through.
+    assert out["gain"] > -0.05, (
+        f"a noise block cost {out['gain']:.4f} of R^2; the base is missing from the "
+        "JOINT arm, so the two arms are not nested"
+    )
+
+
+def test_gain_from_blocks_rejects_misaligned_rows():
+    """Three arrays that do not describe the same rows is the defect this
+    function is most exposed to, because its caller row-selects all three
+    separately."""
+    latent, embedding, targets = _history_case(300, seed=7)
+    rows = np.arange(300)
+    good = _blocks(latent, embedding, targets, rows[:100])
+    bad = GainSplit(base=embedding[:100], block=latent[:99, :2], target=targets[:100])
+    with pytest.raises(ValueError, match="same number of rows"):
+        gain_from_blocks(bad, None, good, groups=np.arange(100) // 5, resamples=10)
+    with pytest.raises(ValueError, match="one label per scored row"):
+        gain_from_blocks(good, None, good, groups=np.arange(99) // 5, resamples=10)
+
+
+def test_gain_from_blocks_rejects_a_single_group():
+    """One distinct label makes `generator.integers(0, 1, size=n_blocks)` draw
+    the same block on every resample, so the percentile interval collapses to
+    zero width -- reading as maximal confidence rather than "one resampling
+    unit, no information". Unreachable while blocking was always positional
+    (`window` implies at least `n_rows // window` blocks whenever rows exist);
+    reachable now that a caller can hand in its own labels, and M3j's episode
+    labels are exactly such a caller."""
+    latent, embedding, targets = _history_case(200, seed=12)
+    rows = np.arange(200)
+    blocks = _blocks(latent, embedding, targets, rows)
+    with pytest.raises(ValueError, match="at least two resampling units"):
+        gain_from_blocks(
+            blocks, None, blocks, groups=np.zeros(200, dtype=int), resamples=10,
+        )
+
+
+def test_gain_from_blocks_rejects_zero_scored_rows():
+    """Zero rows hits the same defect through a different route: `np.split` of
+    an empty array on no split points returns ONE empty part, so `n_blocks ==
+    1` just as with a single label -- and `np.percentile` over the resulting
+    all-NaN draws would otherwise return NaN with a `RuntimeWarning` instead of
+    raising."""
+    latent, embedding, targets = _history_case(200, seed=12)
+    rows = np.arange(200)
+    fit = _blocks(latent, embedding, targets, rows)
+    empty = GainSplit(base=embedding[:0], block=latent[:0, :2], target=targets[:0])
+    with pytest.raises(ValueError, match="at least two resampling units"):
+        gain_from_blocks(
+            fit, None, empty, groups=np.array([], dtype=int), resamples=10,
+        )
+
+
+def test_gain_from_blocks_without_a_selection_split_falls_back_unbiased():
+    """`select=None` must take `fit_probe`'s default penalty for BOTH arms and
+    say so, rather than selecting on the rows it scores."""
+    latent, embedding, targets = _history_case(400, seed=8)
+    rows = np.arange(400)
+    out = gain_from_blocks(
+        _blocks(latent, embedding, targets, rows[:200]), None,
+        _blocks(latent, embedding, targets, rows[200:]),
+        groups=np.arange(200) // 5, resamples=50, confidence=0.9, seed=1,
+    )
+    assert out["ridge_selected"] is False
+    assert out["joint_ridge"] == 1e3 and out["embedding_ridge"] == 1e3
+
+
 def test_filtering_gain_puts_the_raw_embedding_in_both_arms():
     """The whole reason this is immune to the bottleneck.
 
@@ -1757,6 +2048,87 @@ def test_block_bootstrap_rejects_rows_that_are_not_whole_windows():
     with pytest.raises(ValueError, match="whole number"):
         _block_bootstrap_ci(joint[:47], embedding[:47], targets[:47], window=5,
                             resamples=10, confidence=0.95, seed=0)
+
+
+def _bootstrap_arrays(n_rows: int, seed: int = 7):
+    """Two predictions and a target with real structure, so the interval is not
+    degenerate and a change in the resampling actually moves it."""
+    rng = np.random.default_rng(seed)
+    targets = rng.normal(size=(n_rows, 2)) * 10.0
+    joint = targets + rng.normal(size=(n_rows, 2)) * 2.0
+    embedding = targets + rng.normal(size=(n_rows, 2)) * 4.0
+    return joint, embedding, targets
+
+
+def test_block_bootstrap_by_label_reproduces_the_positional_path_exactly():
+    """THE equivalence pin. Grouping by label must be a generalisation, not a
+    replacement: given labels that describe the same blocks the positional path
+    builds, the two must agree to the last bit. Without this, Task 3 silently
+    re-bases every recorded `filtering_gain` interval."""
+    joint, embedding, targets = _bootstrap_arrays(60)
+    positional = _block_bootstrap_ci(
+        joint, embedding, targets, window=10, resamples=200, confidence=0.9, seed=3,
+    )
+    labelled = _block_bootstrap_ci(
+        joint, embedding, targets,
+        groups=np.arange(60) // 10, resamples=200, confidence=0.9, seed=3,
+    )
+    assert labelled == positional, (
+        f"labelled {labelled} != positional {positional}; the label path is not "
+        "a generalisation of the positional one"
+    )
+
+
+def test_block_bootstrap_by_label_accepts_groups_of_unequal_size():
+    """The reason the label path exists: backward displacement at k drops the
+    first k rows of every window, so the groups are no longer equal-length and
+    the positional path cannot express them."""
+    joint, embedding, targets = _bootstrap_arrays(23)
+    groups = np.array([0] * 5 + [1] * 11 + [2] * 7)
+    low, high = _block_bootstrap_ci(
+        joint, embedding, targets, groups=groups, resamples=100, confidence=0.9, seed=1,
+    )
+    assert low < high and np.isfinite([low, high]).all()
+
+
+def test_block_bootstrap_rejects_both_or_neither_blocking():
+    """Two ways to block is an ambiguity, not a convenience: a caller passing
+    both would silently get one of them."""
+    joint, embedding, targets = _bootstrap_arrays(20)
+    with pytest.raises(ValueError, match="exactly one"):
+        _block_bootstrap_ci(joint, embedding, targets, resamples=10,
+                            confidence=0.9, seed=0)
+    with pytest.raises(ValueError, match="exactly one"):
+        _block_bootstrap_ci(joint, embedding, targets, window=10,
+                            groups=np.arange(20) // 10, resamples=10,
+                            confidence=0.9, seed=0)
+
+
+def test_block_bootstrap_rejects_a_label_per_row_mismatch():
+    """One label per scored row. A shorter `groups` would silently drop rows
+    from every resample."""
+    joint, embedding, targets = _bootstrap_arrays(20)
+    with pytest.raises(ValueError, match="one label per scored row"):
+        _block_bootstrap_ci(joint, embedding, targets, groups=np.arange(19),
+                            resamples=10, confidence=0.9, seed=0)
+
+
+def test_block_bootstrap_by_label_is_order_independent():
+    """Labels identify groups; the row ORDER within the array must not change
+    which rows travel together. A gather that emitted rows in a different order
+    has to give the same interval."""
+    joint, embedding, targets = _bootstrap_arrays(30)
+    groups = np.arange(30) // 6
+    straight = _block_bootstrap_ci(
+        joint, embedding, targets, groups=groups, resamples=150,
+        confidence=0.9, seed=5,
+    )
+    order = np.random.default_rng(0).permutation(30)
+    shuffled = _block_bootstrap_ci(
+        joint[order], embedding[order], targets[order], groups=groups[order],
+        resamples=150, confidence=0.9, seed=5,
+    )
+    assert shuffled == pytest.approx(straight, abs=1e-12)
 
 
 def test_gain_rejects_an_h_dim_that_does_not_index_the_latent():
