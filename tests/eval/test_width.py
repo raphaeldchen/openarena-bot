@@ -3,6 +3,7 @@
 import dataclasses
 import importlib.util
 import itertools
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -400,6 +401,30 @@ def test_contrast_arm_refuses_an_inverted_interval():
     assert contrast_arm([point, point, point]).seeds_up == 3
 
 
+def test_contrast_arm_refuses_a_contrast_outside_its_own_interval():
+    """`retention.rung_arm` refuses a `gain` outside its own `[ci_low, ci_high]`
+    and this is the same refusal for `contrast`. A seed with `contrast=+0.5`
+    beside `[-0.3, -0.1]` printed a row whose contrast contradicted both its
+    interval and its `clears` value, and nothing said so.
+
+    Raised for either side and for the seed that carries it wherever it sits,
+    naming that seed. Every fixture clears the guards ahead of it -- at least
+    SEEDS_REQUIRED seeds, no missing key, everything finite, no inverted
+    interval -- so it is this refusal that matches `outside`, and the interval
+    ends are INCLUSIVE (a contrast sitting exactly on a bound is a reading)."""
+    good = {"contrast": 0.1, "ci_low": 0.05, "ci_high": 0.2}
+    above = {"contrast": +0.5, "ci_low": -0.3, "ci_high": -0.1}
+    below = {"contrast": -0.5, "ci_low": 0.1, "ci_high": 0.3}
+    for bad in (above, below):
+        assert bad["ci_low"] <= bad["ci_high"], "fixture sanity: not an inverted interval"
+        for seeds, index in (([good, good, bad], 2), ([bad, good, good], 0)):
+            with pytest.raises(ValueError, match=rf"seed index {index} has contrast .* outside"):
+                contrast_arm(seeds)
+    on_low = {"contrast": 0.05, "ci_low": 0.05, "ci_high": 0.2}
+    on_high = {"contrast": 0.2, "ci_low": 0.05, "ci_high": 0.2}
+    assert contrast_arm([on_low, on_high]).seeds_up == 2
+
+
 def test_contrast_arm_refuses_a_missing_key_with_value_error_naming_it():
     """A seed dict missing a field is refused with the module's own ValueError,
     not the incidental KeyError of a dict lookup, and the message names both the
@@ -552,8 +577,11 @@ def test_up_and_down_cannot_both_clear_with_three_arms_of_three_seeds():
         ways and sit in both lists.
 
     This is the argument for why the STUDY'S shape cannot reach the ambiguity;
-    it is not what enforces it. `reading_contrast` refuses the ambiguous state
-    directly, at any arm or seed count, and the tests further down pin that.
+    it is not what enforces it. `reading_contrast` refuses both ambiguous
+    states directly, at any arm or seed count -- an arm clearing both ways, and
+    the two directions each reaching the arm bar -- and the tests further down
+    pin each.
+
     Pinned so a later change to ARMS_REQUIRED, SEEDS_REQUIRED or either count
     surfaces here that the study's own shape is no longer immune."""
     assert 2 * ARMS_REQUIRED > len(ARMS)
@@ -708,8 +736,42 @@ def test_reading_contrast_refuses_anchors_with_no_down_entry():
                                      base_r2=BASE_FAILS, anchors=anchors))
 
 
+def test_reading_contrast_refuses_an_anchors_key_that_is_not_a_pass():
+    """Past the `down`-presence check `anchors` was unvalidated: a key outside
+    `PASSES` -- a typo, a rung name mistaken for a pass -- was silently counted
+    into `anchors_broken` and printed beside the real anchors as though it had
+    been checked. Refused, naming it.
+
+    Every fixture clears the guards ahead of it (three arms >= ARMS_REQUIRED, and
+    a `down` entry, so the missing-`down` refusal is not what fires) and is also
+    handed a failing base, to show it raises BEFORE the base gate rather than
+    being masked by the status that outranks it. Keys inside `PASSES` are read."""
+    arms = {a: _arm(0.1, 0.3) for a in ARMS}
+    for stray in ("sideways", "Down", "deterministic"):
+        assert stray not in PASSES
+        anchors = {"down": True, "up": True, stray: False}
+        with pytest.raises(ValueError, match="not passes") as excinfo:
+            reading_contrast(_inputs(arms, anchors=anchors))
+        assert repr([stray]) in str(excinfo.value), "names the offending key"
+        with pytest.raises(ValueError, match="not passes"):
+            reading_contrast(_inputs(arms, base_r2=BASE_FAILS, anchors=anchors))
+    assert reading_contrast(_inputs(arms, anchors={"down": True, "up": False})).status == (
+        "PAST_FRAME_AHEAD"
+    )
+
+
 def test_reading_columns_and_widths_stay_the_same_length():
     assert len(READING_COLUMNS) == len(READING_WIDTHS)
+
+
+def test_reading_columns_and_widths_are_pinned_to_their_values():
+    """The header and every row slice with the SAME `READING_WIDTHS`, so a width
+    edit stays self-consistent and every other table test passes through it
+    unchanged. Only pinning the values makes it visible."""
+    assert READING_COLUMNS == (
+        "arm", "contrast", "ci_low", "ci_high", "up", "dn", "clears",
+    )
+    assert READING_WIDTHS == (13, 12, 11, 11, 7, 7, 9)
 
 
 def test_reading_table_puts_each_value_under_its_own_caption():
@@ -873,8 +935,11 @@ def test_reading_caption_uses_the_inputs_not_a_hardcoded_value():
             "frozen_ssl": _arm(-0.01, 0.06, seeds_up=4, seeds_total=5),
             # down in 3 of 5 seeds -- clears down at the patched bar of 3
             "pixel_ae": _arm(-0.06, 0.01, seeds_down=3, seeds_total=5),
+            # The two "neither" arms tally identically (0/5, 0/5, "no"), so
+            # only their intervals tell them apart -- and those are asserted
+            # below, or transposing the two rows would be undetectable.
             "random_vit": _arm(-0.01, 0.01, seeds_total=5),
-            "clip": _arm(-0.02, 0.02, seeds_total=5),
+            "clip": _arm(-0.02, 0.03, seeds_total=5),
         },
         base={a: _base(BASE_HOLDS, seeds_total=5) for a in names},
         anchors={"down": True, "up": True},
@@ -915,14 +980,20 @@ def test_reading_caption_uses_the_inputs_not_a_hardcoded_value():
     # ...and each number in the caption is the one the table it heads prints,
     # row by row: a transposed tally or a swapped pair of rows fails here.
     expected = {
-        "frozen_ssl": ("4/5", "0/5", "up"),
-        "pixel_ae": ("0/5", "3/5", "down"),
-        "random_vit": ("0/5", "0/5", "no"),
-        "clip": ("0/5", "0/5", "no"),
+        "frozen_ssl": ("+0.0250", "-0.0100", "+0.0600", "4/5", "0/5", "up"),
+        "pixel_ae": ("-0.0250", "-0.0600", "+0.0100", "0/5", "3/5", "down"),
+        "random_vit": ("+0.0000", "-0.0100", "+0.0100", "0/5", "0/5", "no"),
+        "clip": ("+0.0050", "-0.0200", "+0.0300", "0/5", "0/5", "no"),
     }
-    for name, (up, dn, clears) in expected.items():
+    assert len({row[:3] for row in expected.values()}) == len(expected), (
+        "fixture sanity: every row's numbers differ, so no two rows can be transposed unseen"
+    )
+    for name, (contrast, ci_low, ci_high, up, dn, clears) in expected.items():
         row = _parse_row(_table_line(text, name))
-        assert (row["up"], row["dn"], row["clears"]) == (up, dn, clears), name
+        assert (
+            row["contrast"], row["ci_low"], row["ci_high"],
+            row["up"], row["dn"], row["clears"],
+        ) == (contrast, ci_low, ci_high, up, dn, clears), name
 
 
 def test_reading_caption_names_the_real_down_width():
@@ -992,30 +1063,211 @@ def test_reading_contrast_refuses_when_up_and_down_both_clear_in_arms_required_a
     ARMS_REQUIRED), a `down` anchor entry, a `base` naming exactly the four
     arms, one shared `seeds_total` of 3 (>= SEEDS_REQUIRED), all four base
     controls holding, and the down anchor unbroken -- so the refusal it matches
-    is the ambiguity one and no earlier guard's."""
+    is the ambiguity one and no earlier guard's.
+
+    It also proves what it is NOT: every arm here is one-sided, so the per-arm
+    refusal (`incoherent`) cannot be the guard that fired. The two refusals arise
+    from different causes -- four arms split 2/2 reach both bars with no single
+    arm incoherent -- so this aggregate refusal stays, and is reachable, beside
+    the per-arm one."""
     inputs = _four_arm_inputs({"a": "up", "b": "up", "c": "down", "d": "down"})
     assert len(inputs.arms) >= ARMS_REQUIRED
     assert 2 * ARMS_REQUIRED <= len(inputs.arms), "this test's premise moved with the constant"
+    assert not any(a.clears_up() and a.clears_down() for a in inputs.arms.values()), (
+        "fixture sanity: every arm is one-sided, so the per-arm refusal cannot fire here"
+    )
     with pytest.raises(ValueError, match="ambiguous") as excinfo:
         reading_contrast(inputs)
     message = str(excinfo.value)
     assert "a, b" in message and "c, d" in message, "names both arm sets"
     assert "order of its checks" in message
+    assert "incoherent" not in message, "the aggregate refusal, not the per-arm one"
 
 
-def test_the_ambiguity_is_refused_at_a_higher_seed_count_too():
-    """The same condition arising the OTHER way, through seeds rather than arms:
-    three arms of four seeds each, every arm clearing up in two seeds AND down
-    in the other two. Each arm sits in both lists, so both tallies are 3. This is
-    the state the removed seeds-count guard was a proxy for; the direct check
-    catches it with no assumption about `seeds_total`."""
+def _seed(ci_low: float, ci_high: float) -> dict:
+    """One seed's `probe.contrast_from_blocks` dict, for `contrast_arm`."""
+    return {"contrast": (ci_low + ci_high) / 2, "ci_low": ci_low, "ci_high": ci_high}
+
+
+UP_SEED, DOWN_SEED, FLAT_SEED = _seed(0.02, 0.06), _seed(-0.06, -0.02), _seed(-0.01, 0.01)
+
+
+def _arms_through_contrast_arm(shapes: dict[str, list[dict]]) -> dict[str, ContrastArm]:
+    """Arms built from per-seed dicts by the REAL builder, so the tallies a test
+    reads are the ones a run could actually produce."""
+    return {name: contrast_arm(seeds) for name, seeds in shapes.items()}
+
+
+def _per_arm_incoherent_arms() -> dict[str, ContrastArm]:
+    """The reproduced case: `a` is 2 seeds up and 2 seeds down, `b` clears up
+    too, `c` is flat. Up holds {a, b} and down holds only {a}, so
+    `len(down) < ARMS_REQUIRED` and the AGGREGATE refusal cannot fire -- only
+    the per-arm one can catch it."""
+    return _arms_through_contrast_arm({
+        "a": [UP_SEED, UP_SEED, DOWN_SEED, DOWN_SEED],
+        "b": [UP_SEED, UP_SEED, FLAT_SEED, FLAT_SEED],
+        "c": [FLAT_SEED] * 4,
+    })
+
+
+def _aggregate_ambiguous_arms() -> dict[str, ContrastArm]:
+    """Four ONE-SIDED arms of three seeds: a, b clear up and c, d clear down. Both
+    tallies reach ARMS_REQUIRED with no arm incoherent."""
+    return {name: _arm(*bounds) for name, bounds in (
+        ("a", (0.02, 0.06)), ("b", (0.02, 0.06)),
+        ("c", (-0.06, -0.02)), ("d", (-0.06, -0.02)),
+    )}
+
+
+@pytest.mark.parametrize("shapes, up, down", [
+    pytest.param(
+        {"a": [UP_SEED, UP_SEED, DOWN_SEED, DOWN_SEED],
+         "b": [UP_SEED, UP_SEED, FLAT_SEED, FLAT_SEED], "c": [FLAT_SEED] * 4},
+        ("a", "b"), ("a",), id="reproduced-past-frame-side-wins-the-if-order",
+    ),
+    pytest.param(
+        {"a": [UP_SEED, UP_SEED, DOWN_SEED, DOWN_SEED],
+         "b": [DOWN_SEED, DOWN_SEED, FLAT_SEED, FLAT_SEED], "c": [FLAT_SEED] * 4},
+        ("a",), ("a", "b"), id="mirror-down-tally-alone-reaches-the-bar",
+    ),
+    pytest.param(
+        {"a": [UP_SEED, UP_SEED, DOWN_SEED, DOWN_SEED],
+         "b": [FLAT_SEED] * 4, "c": [FLAT_SEED] * 4},
+        ("a",), ("a",), id="lone-incoherent-arm-neither-tally-reaches-the-bar",
+    ),
+])
+def test_an_arm_clearing_both_ways_is_refused_rather_than_labelled_by_its_if_order(
+    shapes, up, down,
+):
+    """`contrast_arm`'s inverted-interval guard stops ONE seed counting both ways;
+    it says nothing about two different seeds disagreeing. An arm split 2-up /
+    2-down across four seeds clears both directions and sat in BOTH `arms_up` and
+    `arms_down`; the aggregate refusal did not fire (`len(down)` was 1), the
+    `clears` column resolved the arm to `up` purely because `clears_up()` is
+    tested first, and the row printed `2/4 2/4` under a PAST FRAME AHEAD verdict.
+    The if-order was settling an incoherent arm -- the shape this project has
+    shipped three times. Refused, not labelled, and not given a sixth status.
+
+    Built THROUGH `contrast_arm`, so this is the reachable path and not a
+    hand-built state; `seeds_total` of 4 is legal and stays legal (no upper bound
+    was reintroduced -- the refusal fires only on an arm that is actually split).
+
+    Every fixture clears every guard ahead of the refusal: three arms (>=
+    ARMS_REQUIRED), a `down` anchor entry with keys inside `PASSES`, a `base`
+    naming exactly the three arms, ONE shared `seeds_total` of 4 (>=
+    SEEDS_REQUIRED), all three base controls holding, and the down anchor
+    unbroken. It also never reaches the AGGREGATE refusal (asserted below), so
+    `incoherent` is the per-arm one and no other guard's."""
+    arms = _arms_through_contrast_arm(shapes)
+    incoherent = arms["a"]
+    assert (incoherent.seeds_up, incoherent.seeds_down) == (SEEDS_REQUIRED, SEEDS_REQUIRED)
+    assert incoherent.clears_up() and incoherent.clears_down()
+    assert tuple(n for n, a in sorted(arms.items()) if a.clears_up()) == up
+    assert tuple(n for n, a in sorted(arms.items()) if a.clears_down()) == down
+    assert not (len(up) >= ARMS_REQUIRED and len(down) >= ARMS_REQUIRED), (
+        "fixture sanity: the aggregate refusal cannot be what fires here"
+    )
+    with pytest.raises(ValueError, match="incoherent") as excinfo:
+        reading_contrast(_inputs(arms))
+    message = str(excinfo.value)
+    assert "a (up 2/4, down 2/4)" in message, "names the arm and both of its tallies"
+    assert "b (up" not in message and "c (up" not in message, "names only the incoherent arm"
+    assert "ambiguous" not in message, "the per-arm refusal, not the aggregate one"
+
+
+def test_reading_contrast_refuses_a_hand_built_arm_clearing_both_ways_too():
+    """The refusal lives in `reading_contrast`, not `contrast_arm`, because
+    `reading_contrast` sees every arm however it was built -- this file's own
+    fixtures build `ContrastArm` directly. Three hand-built arms of four seeds,
+    every one clearing up in two seeds AND down in the other two, are all named.
+    Same guards cleared as the test above."""
     both_ways = ContrastArm(contrast=0.0, ci_low=-0.05, ci_high=0.05,
                             seeds_up=SEEDS_REQUIRED, seeds_down=SEEDS_REQUIRED,
                             seeds_total=2 * SEEDS_REQUIRED)
-    inputs = _inputs({a: both_ways for a in ARMS})
     assert both_ways.clears_up() and both_ways.clears_down()
-    with pytest.raises(ValueError, match="ambiguous"):
-        reading_contrast(inputs)
+    with pytest.raises(ValueError, match="incoherent") as excinfo:
+        reading_contrast(_inputs({a: both_ways for a in ARMS}))
+    message = str(excinfo.value)
+    assert all(f"{a} (up 2/4, down 2/4)" in message for a in ARMS)
+    assert "ambiguous" not in message
+
+
+@pytest.mark.parametrize("seeds_up, seeds_down, status, winners", [
+    pytest.param(SEEDS_REQUIRED, SEEDS_REQUIRED - 1, "PAST_FRAME_AHEAD",
+                 {"arms_up": ("a", "b"), "arms_down": ()}, id="up-at-the-bar-down-one-short"),
+    pytest.param(SEEDS_REQUIRED - 1, SEEDS_REQUIRED, "RECURRENT_AHEAD",
+                 {"arms_up": (), "arms_down": ("a", "b")}, id="down-at-the-bar-up-one-short"),
+])
+def test_an_arm_at_the_bar_one_way_and_one_short_the_other_is_read_not_refused(
+    seeds_up, seeds_down, status, winners,
+):
+    """The per-arm refusal must not be over-broad. An arm with `SEEDS_REQUIRED`
+    seeds one way and `SEEDS_REQUIRED - 1` the other clears ONE direction and is
+    perfectly coherent: it is read, and the short direction does not vote. Built
+    through `contrast_arm` at four seeds, so the split is the reachable one."""
+    mixed = contrast_arm(
+        [UP_SEED] * seeds_up + [DOWN_SEED] * seeds_down
+        + [FLAT_SEED] * (2 * SEEDS_REQUIRED - seeds_up - seeds_down)
+    )
+    lean = contrast_arm(
+        [UP_SEED if seeds_up > seeds_down else DOWN_SEED] * SEEDS_REQUIRED
+        + [FLAT_SEED] * SEEDS_REQUIRED
+    )
+    arms = {"a": mixed, "b": lean, "c": contrast_arm([FLAT_SEED] * (2 * SEEDS_REQUIRED))}
+    assert (mixed.seeds_up, mixed.seeds_down) == (seeds_up, seeds_down)
+    assert mixed.clears_up() != mixed.clears_down(), "exactly one direction clears"
+    reading = reading_contrast(_inputs(arms))
+    assert reading.status == status
+    assert (reading.arms_up, reading.arms_down) == (winners["arms_up"], winners["arms_down"])
+
+
+@pytest.mark.parametrize("make_arms, refusal", [
+    pytest.param(_per_arm_incoherent_arms, "incoherent", id="per-arm"),
+    pytest.param(_aggregate_ambiguous_arms, "ambiguous", id="aggregate"),
+])
+def test_a_failed_base_or_broken_down_anchor_outranks_both_ambiguity_refusals(
+    make_arms, refusal,
+):
+    """Precedence between each ambiguity refusal and the two gates, unpinned
+    until now: no fixture made an ambiguous split true alongside a failed base or
+    a broken `down` anchor, so hoisting the refusal above the gates passed the
+    whole suite. It is correct where it stands. A failed base or a broken `down`
+    anchor takes NO reading, so there is no verdict for the if-order to decide,
+    and refusing there would turn a legitimate UNRESOLVED_BASE or
+    UNRESOLVED_ANCHOR record into a crash. Applies to BOTH refusals.
+
+    Each leg first shows the SAME arms are refused under clean gates (so the
+    fixture really is ambiguous and the status is not returned only because the
+    arms were harmless), then that the gate's status is returned, with the
+    failure reported and no direction voting."""
+    arms = make_arms()
+    with pytest.raises(ValueError, match=refusal):
+        reading_contrast(_inputs(arms))
+
+    based = reading_contrast(_inputs(arms, base_r2=BASE_FAILS))
+    assert based.status == "UNRESOLVED_BASE"
+    assert based.base_failed == tuple(sorted(arms))
+    assert based.arms_up == () and based.arms_down == ()
+
+    anchored = reading_contrast(_inputs(arms, anchors={"down": False, "up": True}))
+    assert anchored.status == "UNRESOLVED_ANCHOR"
+    assert anchored.anchors_broken == ("down",)
+    assert anchored.arms_up == () and anchored.arms_down == ()
+
+    both = reading_contrast(_inputs(arms, base_r2=BASE_FAILS,
+                                    anchors={"down": False, "up": True}))
+    assert both.status == "UNRESOLVED_BASE" and both.anchors_broken == ("down",)
+
+    # Only a base failure that actually GATES suppresses the refusal: one arm
+    # failing still leaves `ARMS_REQUIRED` holding, so a reading is taken and the
+    # ambiguity is refused.
+    last = sorted(arms)[-1]
+    assert len(arms) - 1 >= ARMS_REQUIRED
+    with pytest.raises(ValueError, match=refusal):
+        reading_contrast(_inputs(arms, base_r2={last: BASE_FAILS}))
+    # A broken `up` anchor gates nothing either.
+    with pytest.raises(ValueError, match=refusal):
+        reading_contrast(_inputs(arms, anchors={"down": True, "up": False}))
 
 
 def test_four_arms_with_one_clearing_each_way_is_still_indistinguishable():
@@ -1120,3 +1372,118 @@ def test_reading_contrast_refuses_arms_that_disagree_on_their_seed_count():
     )
     with pytest.raises(ValueError, match="must share one seeds_total"):
         reading_contrast(mixed)
+
+
+# --- The formatter's verdict, anchors and base-control lines -----------------
+#
+# Every `format_reading_contrast` call above either passes an INDISTINGUISHABLE
+# reading or expects a raise, and none asserted the `verdict:` line, the anchors
+# line's ok/BROKEN, or the base-control line's per-arm values. The `verdict:` line
+# could be deleted, and the `'ok' if ok else 'BROKEN'` inverted, with every test
+# still green. Task 6 writes the research ledger from this text, so it is the
+# surface a human actually reads: an anchors line reading `down=ok` beside
+# `verdict: UNRESOLVED ANCHOR` is the caption disagreeing with its columns.
+
+
+@pytest.mark.parametrize("status, printed, arms, base_r2, anchors, anchors_text", [
+    pytest.param(
+        "UNRESOLVED_BASE", "UNRESOLVED BASE", {a: _arm(0.1, 0.3) for a in ARMS},
+        BASE_FAILS, {"down": False, "up": False}, "down=BROKEN, up=BROKEN",
+        id="UNRESOLVED_BASE",
+    ),
+    pytest.param(
+        "UNRESOLVED_ANCHOR", "UNRESOLVED ANCHOR", {a: _arm(0.1, 0.3) for a in ARMS},
+        BASE_HOLDS, {"down": False, "up": True}, "down=BROKEN, up=ok",
+        id="UNRESOLVED_ANCHOR",
+    ),
+    pytest.param(
+        "PAST_FRAME_AHEAD", "PAST FRAME AHEAD", {a: _arm(0.1, 0.3) for a in ARMS},
+        BASE_HOLDS, {"down": True, "up": False}, "down=ok, up=BROKEN",
+        id="PAST_FRAME_AHEAD",
+    ),
+    pytest.param(
+        "RECURRENT_AHEAD", "RECURRENT AHEAD", {a: _arm(-0.3, -0.1) for a in ARMS},
+        BASE_HOLDS, {"down": True, "up": True}, "down=ok, up=ok",
+        id="RECURRENT_AHEAD",
+    ),
+    pytest.param(
+        "INDISTINGUISHABLE", "INDISTINGUISHABLE", {a: _arm(-0.01, 0.01) for a in ARMS},
+        BASE_HOLDS, {"down": True, "up": True}, "down=ok, up=ok",
+        id="INDISTINGUISHABLE",
+    ),
+])
+def test_the_formatter_prints_each_statuss_verdict_and_the_anchors_it_was_taken_under(
+    status, printed, arms, base_r2, anchors, anchors_text,
+):
+    """All five statuses through the formatter. For each: the `verdict:` line
+    names THAT status (spelled out, not raw) and carries the reading's own rule,
+    and the anchors line's ok/BROKEN matches the `anchors` the reading was taken
+    under -- and agrees with `reading.anchors_broken`, so a line printing `ok`
+    for a broken anchor (an inverted ternary) or a verdict that disagrees with
+    the columns beneath it fails here.
+
+    The cases deliberately vary the anchors: BROKEN appears beside every kind of
+    verdict, including the ones that get past the gate (a broken `up` anchor is
+    reported and does not suppress PAST FRAME AHEAD) and the one that outranks
+    it (a failed base beside a broken anchor prints BROKEN and reads UNRESOLVED
+    BASE). Every case is legal `inputs`: three arms, a `down` entry with keys
+    inside `PASSES`, a base naming exactly the arms, one shared `seeds_total`,
+    and no arm clearing both ways -- so nothing refuses before the formatter."""
+    inputs = _inputs(arms, base_r2=base_r2, anchors=anchors)
+    reading = reading_contrast(inputs)
+    assert reading.status == status, "fixture sanity: this case must reach the status it names"
+    text = format_reading_contrast(reading, inputs)
+
+    verdict = _table_line(text, "verdict:")
+    head, separator, rule = verdict.partition(" -- decided by: ")
+    assert separator, verdict
+    assert head == f"  verdict: {printed}"
+    assert rule == reading.rule
+
+    anchors_line = _table_line(text, "anchors")
+    assert anchors_line.rsplit(": ", 1)[1] == anchors_text
+    shown = dict(pair.split("=") for pair in anchors_line.rsplit(": ", 1)[1].split(", "))
+    assert set(shown) == set(anchors)
+    assert {p for p, state in shown.items() if state == "BROKEN"} == set(reading.anchors_broken)
+    assert {p for p, state in shown.items() if state == "ok"} == {
+        p for p, ok in anchors.items() if ok
+    }
+
+
+def test_the_base_control_line_prints_each_arms_own_r2_and_seed_tally():
+    """The floor literal was the only thing pinned on this line. Each arm's
+    `r2=` and `seeds_clear/seeds_total` are read against the `BaseControl` it
+    came from, for a holding arm, a failing arm (negative r2, no seed clearing),
+    and one holding at exactly the bar -- so a line taking one arm's numbers for
+    another's, or swapping the tally's two numbers, fails.
+
+    The base controls' `seeds_total` (4) differs from the arms' (3) on purpose:
+    a formatter reading the tally's denominator off the wrong object prints a
+    different number. All three arms' r2 and tallies differ from each other."""
+    base = {
+        "frozen_ssl": BaseControl(r2=0.6123, seeds_clear=3, seeds_total=4),
+        "pixel_ae": BaseControl(r2=-0.0204, seeds_clear=0, seeds_total=4),
+        "random_vit": BaseControl(r2=0.2718, seeds_clear=2, seeds_total=4),
+    }
+    inputs = ContrastInputs(
+        arms={a: _arm(0.1, 0.3) for a in ARMS}, base=base,
+        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    )
+    reading = reading_contrast(inputs)
+    assert reading.status == "PAST_FRAME_AHEAD"
+    assert reading.base_failed == ("pixel_ae",), "one arm fails, two hold"
+    text = format_reading_contrast(reading, inputs)
+
+    line = _table_line(text, "base")
+    printed = {
+        name: (r2, int(clear), int(total))
+        for name, r2, clear, total in re.findall(r"(\w+) r2=([+-]\d+\.\d+) (\d+)/(\d+)", line)
+    }
+    assert set(printed) == set(base)
+    for name, control in base.items():
+        r2, clear, total = printed[name]
+        assert float(r2) == pytest.approx(control.r2, abs=5e-4), name
+        assert (clear, total) == (control.seeds_clear, control.seeds_total), name
+    assert line.endswith(
+        "frozen_ssl r2=+0.612 3/4, pixel_ae r2=-0.020 0/4, random_vit r2=+0.272 2/4"
+    )

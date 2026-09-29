@@ -167,7 +167,9 @@ class ContrastArm:
 @dataclass(frozen=True)
 class ContrastInputs:
     """Everything Reading F is decided on. `anchors` maps each projecting pass
-    to whether its known-answer rung reproduced its shipped gain."""
+    to whether its known-answer rung reproduced its shipped gain; its keys are
+    drawn from `PASSES` and must include `down`, which `reading_contrast`
+    enforces."""
 
     arms: dict[str, ContrastArm]
     base: dict[str, BaseControl]
@@ -199,17 +201,21 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
     pre-registered finding asserted from a broken number, and the direction of
     the silence is toward a status the project will act on.
 
-    A missing key, an inverted interval (`ci_low > ci_high`), or fewer than
-    `SEEDS_REQUIRED` seeds are refused the same way and for the same reason, as
-    `retention.rung_arm` refuses them one reading over. The inverted interval
-    matters more here than there: Reading F is two-sided, and an inverted
-    interval (`ci_low > 0` AND `ci_high < 0` at once) would count the SAME seed
-    into `seeds_up` and `seeds_down`, letting one arm clear both ways from fewer
-    than `2 * SEEDS_REQUIRED` seeds. Refusing it here makes that state
-    unreachable, not merely untested. (`reading_contrast` refuses the ambiguous
-    verdict itself, at any seed count; this refusal keeps the per-arm tallies
-    honest.) Each field is read and coerced with `float()` exactly once, and
-    every number below is taken from that one read.
+    A missing key, an inverted interval (`ci_low > ci_high`), a `contrast`
+    outside its own `[ci_low, ci_high]`, or fewer than `SEEDS_REQUIRED` seeds
+    are refused the same way and for the same reason, as `retention.rung_arm`
+    refuses them one reading over (there for `gain`). A `contrast` its own
+    interval does not contain would print a row whose number contradicts its
+    interval and its `clears` value. The inverted interval matters more here
+    than there: Reading F is two-sided, and an inverted interval (`ci_low > 0`
+    AND `ci_high < 0` at once) would count the SAME seed into `seeds_up` and
+    `seeds_down`, letting one arm clear both ways from fewer than
+    `2 * SEEDS_REQUIRED` seeds. Refusing it here makes that state unreachable,
+    not merely untested. It does NOT stop two DIFFERENT seeds from disagreeing,
+    so an arm can still land up in some seeds and down in others;
+    `reading_contrast` refuses that arm itself, since it sees every arm however
+    it was built. Each field is read and coerced with `float()` exactly once,
+    and every number below is taken from that one read.
     """
     if len(contrasts) < SEEDS_REQUIRED:
         raise ValueError(
@@ -236,6 +242,12 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
                 f"seed index {index} has ci_low {values['ci_low']} > ci_high "
                 f"{values['ci_high']}: an inverted interval is not a reading, "
                 "and would count this seed as clearing up AND down"
+            )
+        if not values["ci_low"] <= values["contrast"] <= values["ci_high"]:
+            raise ValueError(
+                f"seed index {index} has contrast {values['contrast']} outside "
+                f"its own interval [{values['ci_low']}, {values['ci_high']}]: "
+                "the number would contradict the interval its tally is read from"
             )
         seeds.append(values)
     return ContrastArm(
@@ -304,18 +316,39 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     `two_frame` at equal width is a positive finding about what `h` retains, not
     an absence.
 
-    The two directions COULD both clear -- with `2 * SEEDS_REQUIRED` seeds one
-    arm can land in both lists, and with `2 * ARMS_REQUIRED` arms two disjoint
-    sets of arms can -- and then PAST_FRAME_AHEAD would win only because its
-    `if` is written first. Five statuses in this precedence is a constraint on
-    this reading, so the ambiguity cannot be a sixth status; it is REFUSED, and
-    refused where it actually arises: after `up` and `down` are tallied, if both
-    hold `ARMS_REQUIRED` arms, it raises. That check is the exact condition and
-    needs no assumption about the study's shape -- not its 3 arms, not its 3
-    seeds -- so a run with more of either is read when it is unambiguous and
-    refused only when it is not. The study's own 3 x 3 shape cannot reach it
-    (2 + 2 > 3 arms, and 2 * 2 > 3 seeds), which
+    The two directions COULD both clear, and then PAST_FRAME_AHEAD would win
+    only because its `if` is written first. Five statuses in this precedence is
+    a constraint on this reading, so the ambiguity cannot be a sixth status, and
+    an incoherent arm cannot be given a `"both"` label that lets it still vote:
+    it is REFUSED, and refused where it actually arises. There are two such
+    places, from two different causes, and neither implies the other:
+
+      * PER ARM. With `2 * SEEDS_REQUIRED` seeds one arm can clear up in two
+        seeds and down in two others, and so sit in BOTH lists. `contrast_arm`'s
+        inverted-interval guard stops one seed counting both ways; it says
+        nothing about two different seeds disagreeing. An arm saying "in two
+        seeds the past frame won, in two others the recurrent state won" is not
+        a coherent per-arm reading -- it is an error about the measurement, not
+        a finding, the same discipline `contrast_arm` applies to a non-finite
+        bound, an inverted interval and under-seeding. It is refused HERE rather
+        than in `contrast_arm` because this function sees every arm however it
+        was built, so the two refusals cannot drift apart.
+      * IN THE AGGREGATE. With `2 * ARMS_REQUIRED` arms, two DISJOINT sets of
+        arms can each reach the bar with every arm perfectly one-sided and no
+        arm incoherent. After `up` and `down` are tallied, if both hold
+        `ARMS_REQUIRED` arms, it raises.
+
+    Both are the exact condition and need no assumption about the study's shape
+    -- not its 3 arms, not its 3 seeds -- so a run with more of either is read
+    when it is unambiguous and refused only when it is not. Neither bounds
+    `seeds_total`: `--seeds 0 1 2 3` is a legitimate run. The study's own 3 x 3
+    shape cannot reach either (2 + 2 > 3 arms, and 2 * 2 > 3 seeds), which
     `test_up_and_down_cannot_both_clear_with_three_arms_of_three_seeds` pins.
+
+    BOTH sit AFTER the base and anchor gates, and that ordering is deliberate: a
+    failed base or a broken `down` anchor takes no reading at all, so there is
+    no verdict for the if-order to decide, and refusing there would turn a
+    legitimate UNRESOLVED_BASE or UNRESOLVED_ANCHOR record into a crash.
 
     `base_failed` is REPORTED in every branch, including the ones that go on to
     take a reading. `ARMS_REQUIRED` of the arms holding is enough to proceed, so
@@ -327,12 +360,15 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     Refuses (raises) an `inputs` that cannot support a reading at all, rather
     than reading it: fewer than `ARMS_REQUIRED` arms would return
     INDISTINGUISHABLE from zero or one measurement; an `anchors` with no `down`
-    entry would let the one gate on this verdict fail open; a `base` that does
+    entry would let the one gate on this verdict fail open; an `anchors` key
+    that is not in `PASSES` would be reported in `anchors_broken` and printed
+    beside the real anchors as though it had been checked; a `base` that does
     not name exactly the arms would let an arm vote with no base control at all,
     and leave `base_failed` reading "nothing failed" for it; arms that disagree
     on `seeds_total`, or share one below `SEEDS_REQUIRED`, have no true
-    "N of M seeds" rule; and (after the base and anchor gates) `up` and `down`
-    both clearing in `ARMS_REQUIRED` arms is the ambiguity described above.
+    "N of M seeds" rule; and (after the base and anchor gates) an arm clearing
+    both ways, or `up` and `down` both clearing in `ARMS_REQUIRED` arms, are the
+    two ambiguities described above.
     """
     if len(inputs.arms) < ARMS_REQUIRED:
         raise ValueError(
@@ -346,6 +382,15 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             "thing that gates Reading F, so a missing one is an error about the "
             f"measurement, not a pass (got {sorted(inputs.anchors)})"
         )
+    unknown_passes = sorted(set(inputs.anchors) - set(PASSES))
+    if unknown_passes:
+        raise ValueError(
+            f"inputs.anchors names {unknown_passes}, which are not passes "
+            f"(expected keys drawn from {PASSES}): an unknown key would be "
+            "reported in anchors_broken and printed beside the real anchors as "
+            "though it had been checked, so it is an error about the "
+            "measurement, not an extra entry"
+        )
     if set(inputs.base) != set(inputs.arms):
         no_base = sorted(set(inputs.arms) - set(inputs.base))
         no_arm = sorted(set(inputs.base) - set(inputs.arms))
@@ -355,7 +400,7 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             f"arms with no base control: {no_base}; base controls with no arm: "
             f"{no_arm}"
         )
-    _common_seeds_total(inputs.arms)
+    _common_seeds_total(inputs.arms)  # for its refusals only; the total is unused here
     base_failed = tuple(
         sorted(a for a, control in inputs.base.items() if not control.clears())
     )
@@ -384,6 +429,30 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             ),
             arms_up=(), arms_down=(), base_failed=base_failed,
             anchors_broken=anchors_broken,
+        )
+
+    # Past both gates a reading IS taken, so an ambiguity is now a verdict the
+    # if-order would decide -- and both kinds are refused, per arm first.
+    incoherent = sorted(
+        a for a, arm in inputs.arms.items() if arm.clears_up() and arm.clears_down()
+    )
+    if incoherent:
+        detail = ", ".join(
+            f"{a} (up {inputs.arms[a].seeds_up}/{inputs.arms[a].seeds_total}, "
+            f"down {inputs.arms[a].seeds_down}/{inputs.arms[a].seeds_total})"
+            for a in incoherent
+        )
+        raise ValueError(
+            f"incoherent arm(s) clearing BOTH ways, in at least "
+            f"SEEDS_REQUIRED={SEEDS_REQUIRED} seeds each: {detail}. An arm "
+            "reading 'in some seeds the past frame won, in others the recurrent "
+            "state won' is not a "
+            "per-arm reading; it is an error about the measurement, not a finding "
+            "-- as a non-finite bound, an inverted interval and under-seeding are "
+            "in contrast_arm. It would otherwise be counted in the direction "
+            "tested first and printed under that one label. Refused rather than "
+            "read, and not given a sixth status or a 'both' label that lets it "
+            "still vote"
         )
 
     up = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_up()))
