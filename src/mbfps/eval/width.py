@@ -186,6 +186,9 @@ class ContrastStatus:
     anchors_broken: tuple[str, ...]
 
 
+_SEED_KEYS: tuple[str, ...] = ("contrast", "ci_low", "ci_high")
+
+
 def contrast_arm(contrasts: list[dict]) -> ContrastArm:
     """One arm's `ContrastArm` from its per-seed `probe.contrast_from_blocks`
     dicts.
@@ -195,31 +198,51 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
     "not up" AND "not down" at once. That lands on INDISTINGUISHABLE -- a
     pre-registered finding asserted from a broken number, and the direction of
     the silence is toward a status the project will act on.
+
+    A missing key, an inverted interval (`ci_low > ci_high`), or fewer than
+    `SEEDS_REQUIRED` seeds are refused the same way and for the same reason, as
+    `retention.rung_arm` refuses them one reading over. The inverted interval
+    matters more here than there: Reading F is two-sided, and an inverted
+    interval (`ci_low > 0` AND `ci_high < 0` at once) would count the SAME seed
+    into `seeds_up` and `seeds_down` -- the one way `PAST_FRAME_AHEAD` and
+    `RECURRENT_AHEAD` could both be true. Refusing it here makes that state
+    unreachable, not merely untested. Each field is read and coerced with
+    `float()` exactly once, and every number below is taken from that one read.
     """
     if len(contrasts) < SEEDS_REQUIRED:
         raise ValueError(
             f"an arm needs at least SEEDS_REQUIRED={SEEDS_REQUIRED} seeds to "
             f"summarise, got {len(contrasts)}"
         )
+    seeds = []
     for index, seed in enumerate(contrasts):
-        bad = {
-            key: float(seed[key])
-            for key in ("contrast", "ci_low", "ci_high")
-            if not np.isfinite(float(seed[key]))
-        }
+        missing = [k for k in _SEED_KEYS if k not in seed]
+        if missing:
+            raise ValueError(
+                f"seed index {index} is missing {', '.join(sorted(missing))}"
+            )
+        values = {k: float(seed[k]) for k in _SEED_KEYS}
+        bad = {k: v for k, v in values.items() if not np.isfinite(v)}
         if bad:
             raise ValueError(
                 f"non-finite {', '.join(sorted(bad))} in seed index {index}: "
                 f"{bad}. A non-finite contrast is an error about the "
                 "measurement, not an INDISTINGUISHABLE reading."
             )
+        if values["ci_low"] > values["ci_high"]:
+            raise ValueError(
+                f"seed index {index} has ci_low {values['ci_low']} > ci_high "
+                f"{values['ci_high']}: an inverted interval is not a reading, "
+                "and would count this seed as clearing up AND down"
+            )
+        seeds.append(values)
     return ContrastArm(
-        contrast=float(np.mean([c["contrast"] for c in contrasts])),
-        ci_low=float(min(float(c["ci_low"]) for c in contrasts)),
-        ci_high=float(max(float(c["ci_high"]) for c in contrasts)),
-        seeds_up=sum(1 for c in contrasts if float(c["ci_low"]) > 0.0),
-        seeds_down=sum(1 for c in contrasts if float(c["ci_high"]) < 0.0),
-        seeds_total=len(contrasts),
+        contrast=float(np.mean([v["contrast"] for v in seeds])),
+        ci_low=min(v["ci_low"] for v in seeds),
+        ci_high=max(v["ci_high"] for v in seeds),
+        seeds_up=sum(1 for v in seeds if v["ci_low"] > 0.0),
+        seeds_down=sum(1 for v in seeds if v["ci_high"] < 0.0),
+        seeds_total=len(seeds),
     )
 
 
@@ -237,9 +260,37 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     TWO-SIDED, and that departs from Reading E with a reason. M3j's gain was
     one-sided because a negative gain meant noise. Here `deterministic` beating
     `two_frame` at equal width is a positive finding about what `h` retains, not
-    an absence. The two directions cannot both clear: 2 of 3 arms each way needs
-    4 of 3 arms.
+    an absence. The two directions cannot both clear, by two facts together: an
+    arm lands in both lists only if it clears up in `SEEDS_REQUIRED` seeds AND
+    down in `SEEDS_REQUIRED` others, which needs `2 * SEEDS_REQUIRED` of its
+    seeds (`contrast_arm` refuses an interval that would let one seed count
+    both ways); and two disjoint sets of `ARMS_REQUIRED` arms need
+    `2 * ARMS_REQUIRED` arms. With 3 seeds and 3 arms neither is available.
+
+    `base_failed` is REPORTED in every branch, including the ones that go on to
+    take a reading. `ARMS_REQUIRED` of the arms holding is enough to proceed, so
+    one arm can fail its base control while its contrast still votes in the
+    tallies below; the record must say so rather than read "nothing failed".
+    Gating the verdict is not hiding the fact -- the same reason `anchors_broken`
+    is reported in all five branches.
+
+    Refuses (raises) an `inputs` that cannot support a reading at all, rather
+    than reading it: fewer than `ARMS_REQUIRED` arms would return
+    INDISTINGUISHABLE from zero or one measurement, and an `anchors` with no
+    `down` entry would let the one gate on this verdict fail open.
     """
+    if len(inputs.arms) < ARMS_REQUIRED:
+        raise ValueError(
+            f"Reading F needs at least ARMS_REQUIRED={ARMS_REQUIRED} arms to "
+            f"read, got {len(inputs.arms)}: INDISTINGUISHABLE would be a "
+            "pre-registered finding asserted from too few measurements"
+        )
+    if "down" not in inputs.anchors:
+        raise ValueError(
+            "inputs.anchors has no 'down' entry; the down anchor is the only "
+            "thing that gates Reading F, so a missing one is an error about the "
+            f"measurement, not a pass (got {sorted(inputs.anchors)})"
+        )
     base_failed = tuple(
         sorted(a for a, control in inputs.base.items() if not control.clears())
     )
@@ -266,7 +317,7 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
                 f"shipped gain, so the projection plumbing is wrong and the pass "
                 f"Reading F is taken on is unreadable; no reading is taken"
             ),
-            arms_up=(), arms_down=(), base_failed=(),
+            arms_up=(), arms_down=(), base_failed=base_failed,
             anchors_broken=anchors_broken,
         )
 
@@ -282,7 +333,8 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
                 f"({', '.join(up)}), each in at least {SEEDS_REQUIRED} seeds; M3j's "
                 f"objective-lever argument survives the width matching"
             ),
-            arms_up=up, arms_down=down, base_failed=(), anchors_broken=anchors_broken,
+            arms_up=up, arms_down=down, base_failed=base_failed,
+            anchors_broken=anchors_broken,
         )
     if len(down) >= ARMS_REQUIRED:
         return ContrastStatus(
@@ -293,7 +345,8 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
                 f"({', '.join(down)}); M3j's objective-lever argument is refuted and "
                 f"its k = 15 result was width"
             ),
-            arms_up=up, arms_down=down, base_failed=(), anchors_broken=anchors_broken,
+            arms_up=up, arms_down=down, base_failed=base_failed,
+            anchors_broken=anchors_broken,
         )
     return ContrastStatus(
         status="INDISTINGUISHABLE",
@@ -303,7 +356,8 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             f"DEFAULT rather than by evidence -- we could not tell the two blocks "
             f"apart, which is not the same as ruling one out"
         ),
-        arms_up=up, arms_down=down, base_failed=(), anchors_broken=anchors_broken,
+        arms_up=up, arms_down=down, base_failed=base_failed,
+        anchors_broken=anchors_broken,
     )
 
 
@@ -314,13 +368,30 @@ READING_WIDTHS: tuple[int, ...] = (13, 12, 11, 11, 7, 7, 9)
 
 
 def format_reading_contrast(reading: ContrastStatus, inputs: ContrastInputs) -> str:
-    """Reading F as it is printed and written to `width.txt`, byte for byte."""
+    """Reading F as it is printed and written to `width.txt`, byte for byte.
+
+    Every number in the caption comes from a constant or from `inputs`, never a
+    literal -- this project has shipped a caption that disagreed with its own
+    columns three times. The seed count is the arms' COMMON `seeds_total`; arms
+    that disagree on it are refused, because the caption's "N of M seeds" would
+    then be true of some rows and false of others, and picking one silently
+    would print a rule the table does not follow.
+    """
+    seed_counts = {arm.seeds_total for arm in inputs.arms.values()}
+    if len(seed_counts) != 1:
+        per_arm = {name: arm.seeds_total for name, arm in sorted(inputs.arms.items())}
+        raise ValueError(
+            "the arms must share one seeds_total for the caption's "
+            f"'{SEEDS_REQUIRED} of N seeds' to be true of every row, got {per_arm}"
+        )
+    (seeds_total,) = seed_counts
     lines = [
-        f"--- Reading F: at EQUAL block width (512), does two_frame still beat "
+        f"--- Reading F: at EQUAL block width ({DOWN_WIDTH}), does two_frame still beat "
         f"deterministic on translation at k = {CONTRAST_K}? "
         f"(difference of joint R^2; the shared base cancels; two-sided, clears when "
-        f"an interval excludes 0 in {SEEDS_REQUIRED} of 3 seeds and {ARMS_REQUIRED} "
-        f"of 3 arms); {inputs.rows} rows over {inputs.clusters} clusters ---",
+        f"an interval excludes 0 in {SEEDS_REQUIRED} of {seeds_total} seeds and "
+        f"{ARMS_REQUIRED} of {len(inputs.arms)} arms); "
+        f"{inputs.rows} rows over {inputs.clusters} clusters ---",
         "  " + "".join(
             f"{name:>{width}}"
             for name, width in zip(READING_COLUMNS, READING_WIDTHS, strict=True)
