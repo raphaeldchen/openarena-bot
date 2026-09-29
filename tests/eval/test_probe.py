@@ -2261,3 +2261,94 @@ def test_filtering_gain_defaults_are_the_spec_values():
         "a smaller selection split does not make the gain noisier, it makes it "
         "wrong -- measured, 4 episodes flip the sign"
     )
+
+
+from mbfps.eval.probe import contrast_from_blocks  # noqa: E402
+
+
+def _triple(latent, embedding, targets, rows, h_dim=2, block=None):
+    """A `(fit, select, score)` triple of `GainSplit`s over `rows`."""
+    chosen = latent[rows, :h_dim] if block is None else block[rows]
+    return GainSplit(base=embedding[rows], block=chosen, target=targets[rows])
+
+
+def test_contrast_is_exactly_zero_when_both_arms_are_the_same_block():
+    """The known-answer case. `contrast` is a difference of two joint R^2 values
+    fit on the same rows from the same splits, so handing it the same block
+    twice must give exactly 0.0 -- not approximately. `fit_probe` is
+    deterministic, so any nonzero here means the two arms were not fit on the
+    same thing, which is the defect this function is most exposed to."""
+    latent, embedding, targets = _history_case(600, seed=0)
+    rows = np.arange(600)
+    sl = (rows[:200], rows[200:400], rows[400:600])
+    same = tuple(_triple(latent, embedding, targets, s) for s in sl)
+    out = contrast_from_blocks(same, same, groups=np.arange(200) // 5,
+                               resamples=50, confidence=0.9, seed=1)
+    assert out["contrast"] == 0.0
+    assert out["a_r2"] == out["b_r2"]
+    assert out["ci_low"] == 0.0 and out["ci_high"] == 0.0
+
+
+def test_contrast_equals_the_difference_of_the_two_gains():
+    """The base cancels: contrast(A, B) must equal gain(A) - gain(B) computed on
+    the same splits with the same base. If it does not, the function is not
+    measuring what Reading F claims it measures."""
+    latent, embedding, targets = _history_case(600, seed=2)
+    rows = np.arange(600)
+    sl = (rows[:200], rows[200:400], rows[400:600])
+    noise = np.random.default_rng(3).normal(size=(600, 2))
+    a = tuple(_triple(latent, embedding, targets, s) for s in sl)
+    b = tuple(_triple(latent, embedding, targets, s, block=noise) for s in sl)
+    kw = dict(groups=np.arange(200) // 5, resamples=50, confidence=0.9, seed=1)
+    out = contrast_from_blocks(a, b, **kw)
+    gain_a = gain_from_blocks(a[0], a[1], a[2], **kw)
+    gain_b = gain_from_blocks(b[0], b[1], b[2], **kw)
+    assert out["contrast"] == pytest.approx(gain_a["gain"] - gain_b["gain"], abs=1e-12)
+    assert out["a_r2"] == pytest.approx(gain_a["joint_r2"], abs=1e-12)
+    assert out["b_r2"] == pytest.approx(gain_b["joint_r2"], abs=1e-12)
+
+
+def test_contrast_is_signed_and_antisymmetric():
+    """Reading F is TWO-sided, so the sign carries meaning and swapping the
+    arms must negate it. A function that reported |contrast| would read
+    RECURRENT_AHEAD as PAST_FRAME_AHEAD."""
+    latent, embedding, targets = _history_case(600, seed=4)
+    rows = np.arange(600)
+    sl = (rows[:200], rows[200:400], rows[400:600])
+    noise = np.random.default_rng(5).normal(size=(600, 2))
+    a = tuple(_triple(latent, embedding, targets, s) for s in sl)
+    b = tuple(_triple(latent, embedding, targets, s, block=noise) for s in sl)
+    kw = dict(groups=np.arange(200) // 5, resamples=50, confidence=0.9, seed=1)
+    forward = contrast_from_blocks(a, b, **kw)
+    backward = contrast_from_blocks(b, a, **kw)
+    assert forward["contrast"] > 0, "the lagged block must beat pure noise"
+    assert backward["contrast"] == pytest.approx(-forward["contrast"], abs=1e-12)
+    assert backward["ci_low"] == pytest.approx(-forward["ci_high"], abs=1e-9)
+
+
+def test_contrast_rejects_arms_scored_on_different_rows():
+    """Two arms scored on different rows is not a contrast, it is two unrelated
+    numbers subtracted. The base cancels only if the rows are identical."""
+    latent, embedding, targets = _history_case(400, seed=6)
+    rows = np.arange(400)
+    a = tuple(_triple(latent, embedding, targets, s)
+              for s in (rows[:100], rows[100:200], rows[200:300]))
+    b = tuple(_triple(latent, embedding, targets, s)
+              for s in (rows[:100], rows[100:200], rows[300:400]))
+    with pytest.raises(ValueError, match="same rows"):
+        contrast_from_blocks(a, b, groups=np.arange(100) // 5, resamples=10)
+
+
+def test_contrast_rejects_arms_with_different_bases():
+    """The whole statistic rests on the base cancelling. Two arms with
+    different bases would leave a base term in the difference, and the result
+    would silently stop being a contrast between the blocks."""
+    latent, embedding, targets = _history_case(400, seed=7)
+    rows = np.arange(400)
+    other = embedding + 1.0
+    a = tuple(_triple(latent, embedding, targets, s)
+              for s in (rows[:100], rows[100:200], rows[200:300]))
+    b = tuple(GainSplit(base=other[s], block=latent[s, :2], target=targets[s])
+              for s in (rows[:100], rows[100:200], rows[200:300]))
+    with pytest.raises(ValueError, match="same base"):
+        contrast_from_blocks(a, b, groups=np.arange(100) // 5, resamples=10)
