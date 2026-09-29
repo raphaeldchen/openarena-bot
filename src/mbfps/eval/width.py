@@ -361,7 +361,8 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     than reading it: fewer than `ARMS_REQUIRED` arms would return
     INDISTINGUISHABLE from zero or one measurement; an `anchors` with no `down`
     entry would let the one gate on this verdict fail open; an `anchors` key
-    that is not in `PASSES` would be reported in `anchors_broken` and printed
+    with no anchor -- `shipped`, which projects nothing, or a key outside
+    `PASSES` entirely -- would be reported in `anchors_broken` and printed
     beside the real anchors as though it had been checked; a `base` that does
     not name exactly the arms would let an arm vote with no base control at all,
     and leave `base_failed` reading "nothing failed" for it; arms that disagree
@@ -382,14 +383,16 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             "thing that gates Reading F, so a missing one is an error about the "
             f"measurement, not a pass (got {sorted(inputs.anchors)})"
         )
-    unknown_passes = sorted(set(inputs.anchors) - set(PASSES))
-    if unknown_passes:
+    unanchored = sorted(set(inputs.anchors) - set(ANCHOR))
+    if unanchored:
         raise ValueError(
-            f"inputs.anchors names {unknown_passes}, which are not passes "
-            f"(expected keys drawn from {PASSES}): an unknown key would be "
-            "reported in anchors_broken and printed beside the real anchors as "
-            "though it had been checked, so it is an error about the "
-            "measurement, not an extra entry"
+            f"inputs.anchors names {unanchored}, which have no anchor "
+            f"(expected keys drawn from {sorted(ANCHOR)}): `shipped` projects "
+            "nothing and so has no rung to reproduce, and a key outside PASSES "
+            "names no pass at all -- either would be reported in "
+            "anchors_broken and printed beside the real anchors as though it "
+            "had been checked, so it is an error about the measurement, not an "
+            "extra entry"
         )
     if set(inputs.base) != set(inputs.arms):
         no_base = sorted(set(inputs.arms) - set(inputs.base))
@@ -536,7 +539,20 @@ def format_reading_contrast(reading: ContrastStatus, inputs: ContrastInputs) -> 
     ]
     for name in sorted(inputs.arms):
         arm = inputs.arms[name]
-        clears = "up" if arm.clears_up() else ("down" if arm.clears_down() else "no")
+        if arm.clears_up() and arm.clears_down():
+            # Only reachable inside an UNRESOLVED_* record: `reading_contrast`
+            # refuses this arm outright whenever a reading is actually taken.
+            # There the table is printed for diagnosis, and labelling an arm
+            # "up" beside two EQUAL tallies is the misreading this whole module
+            # is built to refuse -- so the label says the arm is incoherent
+            # rather than picking whichever direction is tested first. This is
+            # not a `clears` VALUE an arm could vote with; nothing counts it.
+            clears = "both?"
+        else:
+            clears = (
+                "up" if arm.clears_up()
+                else ("down" if arm.clears_down() else "no")
+            )
         lines.append("  " + "".join(
             f"{value:>{width}}"
             for value, width in zip((

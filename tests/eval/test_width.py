@@ -736,28 +736,75 @@ def test_reading_contrast_refuses_anchors_with_no_down_entry():
                                      base_r2=BASE_FAILS, anchors=anchors))
 
 
-def test_reading_contrast_refuses_an_anchors_key_that_is_not_a_pass():
-    """Past the `down`-presence check `anchors` was unvalidated: a key outside
-    `PASSES` -- a typo, a rung name mistaken for a pass -- was silently counted
-    into `anchors_broken` and printed beside the real anchors as though it had
-    been checked. Refused, naming it.
+def test_reading_contrast_refuses_an_anchors_key_with_no_anchor():
+    """Past the `down`-presence check `anchors` was unvalidated: a key with no
+    anchor was silently counted into `anchors_broken` and printed beside the real
+    anchors as though it had been checked. Refused, naming it.
+
+    The legal keys are `ANCHOR`'s, NOT `PASSES`'. `shipped` is a pass but has no
+    anchor -- it projects nothing, so it has no rung whose gain must reproduce --
+    so `shipped: False` claims a broken anchor that does not exist. Checking
+    against `PASSES` would let exactly that through, which is why the two are
+    tested side by side here.
 
     Every fixture clears the guards ahead of it (three arms >= ARMS_REQUIRED, and
     a `down` entry, so the missing-`down` refusal is not what fires) and is also
     handed a failing base, to show it raises BEFORE the base gate rather than
-    being masked by the status that outranks it. Keys inside `PASSES` are read."""
+    being masked by the status that outranks it."""
     arms = {a: _arm(0.1, 0.3) for a in ARMS}
-    for stray in ("sideways", "Down", "deterministic"):
-        assert stray not in PASSES
+    assert "shipped" in PASSES and "shipped" not in ANCHOR, (
+        "the premise: a pass that has no anchor, which a PASSES check would admit"
+    )
+    for stray in ("sideways", "Down", "deterministic", "shipped"):
+        assert stray not in ANCHOR
         anchors = {"down": True, "up": True, stray: False}
-        with pytest.raises(ValueError, match="not passes") as excinfo:
+        with pytest.raises(ValueError, match="have no anchor") as excinfo:
             reading_contrast(_inputs(arms, anchors=anchors))
         assert repr([stray]) in str(excinfo.value), "names the offending key"
-        with pytest.raises(ValueError, match="not passes"):
+        with pytest.raises(ValueError, match="have no anchor"):
             reading_contrast(_inputs(arms, base_r2=BASE_FAILS, anchors=anchors))
     assert reading_contrast(_inputs(arms, anchors={"down": True, "up": False})).status == (
         "PAST_FRAME_AHEAD"
     )
+
+
+def test_the_table_refuses_to_label_an_incoherent_arm_with_one_of_its_two_tallies():
+    """`reading_contrast` refuses a both-ways arm whenever a reading is taken, so
+    this row only ever prints inside an UNRESOLVED_* record -- where the table is
+    printed for diagnosis and no verdict asserts a direction. Even there,
+    labelling an arm "up" beside two EQUAL tallies is the misreading this module
+    exists to refuse: a reader scans the `clears` column, not the arithmetic.
+
+    "both?" is deliberately NOT a `clears` value an arm can vote with -- nothing
+    counts it, and adding a sixth status or a countable "both" is forbidden. It
+    is the table declining to pick whichever direction is tested first."""
+    both = ContrastArm(
+        contrast=0.0, ci_low=-0.06, ci_high=0.06,
+        seeds_up=SEEDS_REQUIRED, seeds_down=SEEDS_REQUIRED,
+        seeds_total=2 * SEEDS_REQUIRED,
+    )
+    assert both.clears_up() and both.clears_down(), "the fixture's whole premise"
+    wide = 2 * SEEDS_REQUIRED
+    arms = {
+        "frozen_ssl": both,
+        "pixel_ae": _arm(-0.01, 0.01, seeds_total=wide),
+        "random_vit": _arm(-0.01, 0.01, seeds_total=wide),
+    }
+    inputs = ContrastInputs(
+        arms=arms,
+        base={a: _base(BASE_FAILS, seeds_total=wide) for a in arms},
+        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    )
+    reading = reading_contrast(inputs)
+    assert reading.status == "UNRESOLVED_BASE", (
+        "the only path on which this row is reachable at all"
+    )
+    row = _parse_row(_table_line(format_reading_contrast(reading, inputs), "frozen_ssl"))
+    assert row["up"] == row["dn"] == f"{SEEDS_REQUIRED}/{wide}"
+    assert row["clears"] == "both?", (
+        "the table picked a direction for an arm whose two tallies are equal"
+    )
+    assert row["clears"] not in ("up", "down"), "and it picked it by if-order"
 
 
 def test_reading_columns_and_widths_stay_the_same_length():
