@@ -70,6 +70,23 @@ against `RUNG_WIDTH` by test, so this cannot drift away from the widths."""
 
 
 @lru_cache(maxsize=None)
+def _draw_projection(native: int, target: int, seed: int):
+    """The cached draw, keyed POSITIONALLY so the cache cannot split.
+
+    `lru_cache` keys on the literal call signature, not on resolved defaults,
+    so `projection(2048, 512)` and `projection(2048, 512, seed=0)` would land
+    on two entries holding two equal-valued copies of the same matrix. Keeping
+    the cache on a positional-only helper makes the "drawn exactly once"
+    guarantee hold however the public function is called.
+    """
+    if native == target:
+        return None
+    rng = np.random.default_rng([seed, native, target])
+    matrix = rng.normal(size=(native, target)) / np.sqrt(target)
+    matrix.flags.writeable = False
+    return matrix
+
+
 def projection(native: int, target: int, *, seed: int = PROJECTION_SEED):
     """The fixed matrix taking a `native`-wide block to `target`, or `None`.
 
@@ -86,17 +103,13 @@ def projection(native: int, target: int, *, seed: int = PROJECTION_SEED):
     Memoized with `lru_cache`, so the matrix is drawn exactly once per
     `(native, target, seed)` and the SAME array object is returned to every
     caller thereafter -- Task 5's nested loop over rungs x passes x horizons x
-    targets would otherwise reallocate matrices up to 2048x2048 float64 (32 MB
-    each) on every call. The returned array is marked read-only
-    (`flags.writeable = False`) so one caller cannot mutate the shared cached
-    array out from under another.
+    targets would otherwise reallocate matrices up to 1536x2048 float64 (24 MB,
+    the largest shape actually reachable: 2048x2048 would be the `up` anchor,
+    which returns `None` before allocating) on every call. The returned array is
+    marked read-only (`flags.writeable = False`) so one caller cannot mutate the
+    shared cached array out from under another.
     """
-    if native == target:
-        return None
-    rng = np.random.default_rng([seed, native, target])
-    matrix = rng.normal(size=(native, target)) / np.sqrt(target)
-    matrix.flags.writeable = False
-    return matrix
+    return _draw_projection(native, target, seed)
 
 
 def pass_block(block: np.ndarray, pass_name: str, *, seed: int = PROJECTION_SEED):

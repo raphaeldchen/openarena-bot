@@ -230,3 +230,25 @@ def test_the_up_pass_leaves_no_dead_column():
 def test_pass_block_rejects_an_unknown_pass():
     with pytest.raises(ValueError, match="unknown pass"):
         pass_block(np.zeros((4, 8)), "sideways")
+
+
+def test_the_projection_cache_does_not_split_on_calling_convention():
+    """`lru_cache` keys on the literal call signature, not on resolved
+    defaults, so caching the public function directly would put
+    `projection(2048, 512)` and `projection(2048, 512, seed=0)` in two entries
+    holding two equal-valued copies of the same matrix -- the "drawn exactly
+    once and shared" guarantee would quietly hold only per calling style, and
+    `pass_block` (which always passes `seed=` explicitly) would never share
+    with a direct positional caller. The cache lives on a positional-only
+    helper for exactly this reason."""
+    implicit = projection(2048, DOWN_WIDTH)
+    explicit = projection(2048, DOWN_WIDTH, seed=PROJECTION_SEED)
+    assert implicit is explicit, (
+        "the two calling conventions returned different objects; the cache has "
+        "split on the call signature and the matrix is materialised twice"
+    )
+    block = np.random.default_rng(7).normal(size=(64, 2048))
+    assert pass_block(block, "down") is not None
+    assert projection(2048, DOWN_WIDTH) is implicit, (
+        "pass_block's internal call populated a third cache entry"
+    )
