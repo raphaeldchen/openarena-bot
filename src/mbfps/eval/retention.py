@@ -420,7 +420,9 @@ def _validate_family_shape(inputs: RetentionInputs) -> None:
         )
 
 
-def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
+def reading_retention(
+    inputs: RetentionInputs, *, z_bearing: tuple[str, ...] = Z_BEARING_RUNGS,
+) -> RetentionStatus:
     """Reading E: the last rung on the path at which observed motion survives.
 
     Precedence, and it is the point (spec 3.2). `UNRESOLVED_BASE` is the one
@@ -444,8 +446,23 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
 
     A suppressed reading reports no rungs at all rather than reporting them
     beside a warning nobody reads.
+
+    `z_bearing` defaults to the module's `Z_BEARING_RUNGS` so every existing
+    caller and every M3j record reads exactly as recorded. M3k passes
+    `("stochastic",)` instead, because `full` is `h (+) z` and a clearing
+    `full` cannot attribute anything to `z` -- which made MOTION_RETAINED
+    reachable on `h` alone, as M3j's own results recorded. The CONSTANT IS NOT
+    EDITED: a pre-registered rule is not rewritten after the numbers are seen,
+    and a default-valued parameter keeps both readings alive at once. Do not
+    "simplify" this by hardcoding the corrected tuple.
     """
     _validate_family_shape(inputs)
+    unknown = [rung for rung in z_bearing if rung not in RUNGS]
+    if unknown:
+        raise ValueError(
+            f"z_bearing names {unknown}, which is not a rung; expected a subset "
+            f"of {RUNGS}"
+        )
     base_failed = tuple(
         sorted(arm for arm, control in inputs.base.items() if not control.clears())
     )
@@ -470,7 +487,7 @@ def reading_retention(inputs: RetentionInputs) -> RetentionStatus:
     def at(rung: str) -> str:
         return ", ".join(f"k = {k}" for k in translation[rung])
 
-    for rung in Z_BEARING_RUNGS:
+    for rung in z_bearing:
         if rung in translation:
             return RetentionStatus(
                 status="MOTION_RETAINED",
