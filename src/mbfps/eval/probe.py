@@ -700,6 +700,27 @@ def _fit_and_score(fit_x, fit_y, select_x, select_y, score_x, score_y):
     return predicted, _mean_r2(predicted, score_y), probe["ridge"]
 
 
+def _validate_groups(groups, n: int) -> tuple[np.ndarray, int]:
+    """One `groups` label per scored row, and enough units to resample.
+
+    Shared by `gain_from_blocks` and `contrast_from_blocks` so the two
+    diagnostics refuse identically-shaped inputs with identical wording.
+    """
+    groups_arr = np.asarray(groups)
+    if groups_arr.shape != (n,):
+        raise ValueError(
+            f"groups must be one label per scored row; got {groups_arr.shape} "
+            f"for {n} rows"
+        )
+    n_groups = int(np.unique(groups_arr).size)
+    if n_groups < 2:
+        raise ValueError(
+            "a bootstrap interval needs at least two resampling units (distinct "
+            f"`groups` labels); got {n_groups}"
+        )
+    return groups_arr, n_groups
+
+
 def gain_from_blocks(
     fit: GainSplit,
     select: GainSplit | None,
@@ -738,18 +759,7 @@ def gain_from_blocks(
     confidence rather than "one resampling unit, no information".
     """
     n_scored = score.rows()
-    groups_arr = np.asarray(groups)
-    if groups_arr.shape != (n_scored,):
-        raise ValueError(
-            f"groups must be one label per scored row; got {groups_arr.shape} "
-            f"for {n_scored} rows"
-        )
-    n_groups = int(np.unique(groups_arr).size)
-    if n_groups < 2:
-        raise ValueError(
-            "a bootstrap interval needs at least two resampling units (distinct "
-            f"`groups` labels); got {n_groups}"
-        )
+    groups_arr, n_groups = _validate_groups(groups, n_scored)
     fit.rows()
     joint_fit, base_fit = fit.joint(), np.asarray(fit.base, dtype=np.float64)
     joint_score, base_score = score.joint(), np.asarray(score.base, dtype=np.float64)
@@ -816,20 +826,19 @@ def contrast_from_blocks(
     b_target = np.asarray(b_score.target, dtype=np.float64)
     # `GainSplit` carries no original row indices, only already-selected
     # arrays -- so row alignment can only be verified by content. `target` is
-    # the signal for it: it is untouched by which block or base variant a
-    # caller chose, so it is identical if and only if the two arms' score
-    # splits describe the same underlying rows. A row-count check alone (`n`
-    # vs `b_score.rows()`) cannot catch same-length-different-rows, which is
-    # exactly the case this guards -- two 100-row splits cut from different
-    # ends of the data.
-    if (
-        b_score.rows() != n
-        or target_score.shape != b_target.shape
-        or not np.array_equal(target_score, b_target)
-    ):
+    # the field invariant to the caller's choice of block and base, so content
+    # equality is the strongest row-identity signal available given `GainSplit`
+    # carries no row indices. A collision is not a realistic concern for
+    # continuous position data.
+    b_rows = b_score.rows()
+    if b_rows != n:
         raise ValueError(
-            f"both arms must be scored on the same rows; got {n} and "
-            f"{b_score.rows()}"
+            f"both arms must be scored on the same rows; got {n} and {b_rows}"
+        )
+    if target_score.shape != b_target.shape or not np.array_equal(target_score, b_target):
+        raise ValueError(
+            f"both arms must be scored on the same rows; got same-length "
+            f"targets with different contents"
         )
     a_base = np.asarray(a_score.base, dtype=np.float64)
     b_base = np.asarray(b_score.base, dtype=np.float64)
@@ -838,18 +847,12 @@ def contrast_from_blocks(
             "both arms must carry the same base; the contrast is only a "
             "comparison of the two BLOCKS because the base cancels"
         )
-    groups_arr = np.asarray(groups)
-    if groups_arr.shape != (n,):
+    if (a_select is None) != (b_select is None):
         raise ValueError(
-            f"groups must be one label per scored row; got {groups_arr.shape} "
-            f"for {n} rows"
+            "both arms must use the same ridge-selection policy because the "
+            "contrast compares two blocks under one methodology"
         )
-    n_groups = int(np.unique(groups_arr).size)
-    if n_groups < 2:
-        raise ValueError(
-            "a bootstrap interval needs at least two resampling units (distinct "
-            f"`groups` labels); got {n_groups}"
-        )
+    groups_arr, n_groups = _validate_groups(groups, n)
 
     def arm(fit, select, score):
         select_target = (

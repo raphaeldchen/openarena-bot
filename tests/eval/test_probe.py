@@ -2352,3 +2352,21 @@ def test_contrast_rejects_arms_with_different_bases():
               for s in (rows[:100], rows[100:200], rows[200:300]))
     with pytest.raises(ValueError, match="same base"):
         contrast_from_blocks(a, b, groups=np.arange(100) // 5, resamples=10)
+
+
+def test_contrast_rejects_arms_with_mismatched_ridge_selection():
+    """Both arms must use the same ridge-selection policy. If one arm selects
+    its ridge on a held-out split and the other does not, the two arms were
+    fitted under different methodology and their difference is not a contrast."""
+    latent, embedding, targets = _history_case(600, seed=8)
+    rows = np.arange(600)
+    sl = (rows[:200], rows[200:400], rows[400:600])
+    # Arm a uses ridge selection (select is not None)
+    a = tuple(_triple(latent, embedding, targets, s) for s in sl)
+    # Arm b has no ridge selection (select is None)
+    b_fit = GainSplit(base=embedding[sl[0]], block=latent[sl[0], :2], target=targets[sl[0]])
+    b_select = None  # No selection
+    b_score = GainSplit(base=embedding[sl[2]], block=latent[sl[2], :2], target=targets[sl[2]])
+    b = (b_fit, b_select, b_score)
+    with pytest.raises(ValueError, match="same ridge-selection policy"):
+        contrast_from_blocks(a, b, groups=np.arange(200) // 5, resamples=10)
