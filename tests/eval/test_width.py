@@ -1,5 +1,6 @@
 """M3k: is the past frame's advantage information, or feature count?"""
 
+import dataclasses
 import importlib.util
 import itertools
 import sys
@@ -310,11 +311,16 @@ def _inputs(arms=None, *, base_r2: float | dict[str, float] = BASE_HOLDS,
     """`base_r2` is one level for every arm, or a dict overriding it for the
     named arms only (the rest hold at `BASE_HOLDS`), so a fixture can fail
     exactly one or two arms' base control. `arms` and `anchors` are replaced
-    only when None, never when empty: an empty dict is a fixture, not a default."""
-    per_arm = base_r2 if isinstance(base_r2, dict) else dict.fromkeys(ARMS, base_r2)
+    only when None, never when empty: an empty dict is a fixture, not a default.
+
+    The base controls are keyed by the arms actually given, because
+    `reading_contrast` refuses a `base` that does not name exactly its arms. A
+    fixture that wants a mismatch builds the `ContrastInputs` itself."""
+    arms = arms if arms is not None else {a: _arm(-0.01, 0.01) for a in ARMS}
+    per_arm = base_r2 if isinstance(base_r2, dict) else dict.fromkeys(arms, base_r2)
     return ContrastInputs(
-        arms=arms if arms is not None else {a: _arm(-0.01, 0.01) for a in ARMS},
-        base={a: _base(per_arm.get(a, BASE_HOLDS)) for a in ARMS},
+        arms=arms,
+        base={a: _base(per_arm.get(a, BASE_HOLDS)) for a in arms},
         anchors=anchors if anchors is not None else {"down": True, "up": True},
         clusters=24, rows=8015,
     )
@@ -545,8 +551,11 @@ def test_up_and_down_cannot_both_clear_with_three_arms_of_three_seeds():
         With SEEDS_REQUIRED = 2 a four-seed arm splitting 2/2 would clear both
         ways and sit in both lists.
 
+    This is the argument for why the STUDY'S shape cannot reach the ambiguity;
+    it is not what enforces it. `reading_contrast` refuses the ambiguous state
+    directly, at any arm or seed count, and the tests further down pin that.
     Pinned so a later change to ARMS_REQUIRED, SEEDS_REQUIRED or either count
-    surfaces the contradiction here rather than in a verdict."""
+    surfaces here that the study's own shape is no longer immune."""
     assert 2 * ARMS_REQUIRED > len(ARMS)
     assert 2 * SEEDS_REQUIRED > SEEDS_TOTAL
 
@@ -841,43 +850,79 @@ def test_reading_caption_uses_the_inputs_not_a_hardcoded_value():
     or "of 3 arms" would pass every one of them. This is the exact "one value
     fixed in every fixture" trap the task warns about. Built directly (not
     through `_inputs`) so every number differs from every other test's fixture:
-    4 arms of 5 seeds each, with `DOWN_WIDTH` and `SEEDS_REQUIRED` patched, so a
-    literal for any of them is exposed and the caption's numerator and
-    denominator are different numbers (a "2 of 2" caption could not tell a
-    numerator/denominator swap from the truth). `SEEDS_REQUIRED` must be patched
-    to keep 5 seeds legal at all: `reading_contrast` refuses a `seeds_total` at
-    which `2 * SEEDS_REQUIRED` seeds are available, because one arm could then
-    clear both directions.
+    4 arms of 5 seeds each, with `DOWN_WIDTH`, `SEEDS_REQUIRED`, `ARMS_REQUIRED`
+    and `BASE_R2_FLOOR` all patched, so a literal for any of them is exposed and
+    the caption's numerator and denominator are different numbers (a "2 of 2"
+    caption could not tell a numerator/denominator swap from the truth).
+
+    `ARMS_REQUIRED` is patched UP, to 3, not down: with four arms and one
+    clearing each way, neither tally reaches 3, so the both-directions refusal
+    cannot fire, and 3 of 4 arms is a fraction whose two numbers differ.
 
     The project has shipped a caption that disagreed with its own columns three
     times; the worst printed the up tally beside a verdict read from the down
-    one. So the caption's numbers are checked against the table it heads."""
+    one. So the caption's numbers are checked against the table it heads, on
+    four rows that genuinely differ: one up-clearing, one down-clearing, two
+    neither."""
     import mbfps.eval.width as width
 
     names = ("frozen_ssl", "pixel_ae", "random_vit", "clip")
     inputs = ContrastInputs(
-        arms={a: _arm(-0.01, 0.01, seeds_total=5) for a in names},
+        arms={
+            # up in 4 of 5 seeds -- clears up at the patched bar of 3
+            "frozen_ssl": _arm(-0.01, 0.06, seeds_up=4, seeds_total=5),
+            # down in 3 of 5 seeds -- clears down at the patched bar of 3
+            "pixel_ae": _arm(-0.06, 0.01, seeds_down=3, seeds_total=5),
+            "random_vit": _arm(-0.01, 0.01, seeds_total=5),
+            "clip": _arm(-0.02, 0.02, seeds_total=5),
+        },
         base={a: _base(BASE_HOLDS, seeds_total=5) for a in names},
         anchors={"down": True, "up": True},
         clusters=7, rows=123,
     )
+    # `retention.SEEDS_REQUIRED` and `retention.BASE_R2_FLOOR` are NOT patched,
+    # so two thresholds are live inside this `with`: `ContrastArm.clears_up()`
+    # and the caption read the patched `width` globals, while
+    # `BaseControl.clears()` reads retention's own (2 and 0.10). The base
+    # controls here hold under either, so the two never disagree in this fixture.
     with patch.object(width, "DOWN_WIDTH", 256), patch.object(
         width, "SEEDS_REQUIRED", 3
+    ), patch.object(width, "ARMS_REQUIRED", 3), patch.object(
+        width, "BASE_R2_FLOOR", 0.25
     ):
-        text = format_reading_contrast(reading_contrast(inputs), inputs)
+        reading = reading_contrast(inputs)
+        text = format_reading_contrast(reading, inputs)
+    # Fixture sanity: the arms genuinely differ, and neither direction reached
+    # the patched bar, so this is a reading that was taken, not a refusal dodged.
+    assert (reading.arms_up, reading.arms_down) == (("frozen_ssl",), ("pixel_ae",))
+    assert reading.status == "INDISTINGUISHABLE"
+    assert len({(a.seeds_up, a.seeds_down) for a in inputs.arms.values()}) == 3
+
     caption = text.splitlines()[0]
     assert "7 clusters" in caption and "123 rows" in caption
     assert "24 clusters" not in caption and "8015 rows" not in caption
     assert "in 3 of 5 seeds" in caption
     assert "of 3 seeds" not in caption
     assert f"in {SEEDS_REQUIRED} of" not in caption
-    assert f"and {ARMS_REQUIRED} of 4 arms" in caption
+    assert "and 3 of 4 arms" in caption
+    assert f"and {ARMS_REQUIRED} of" not in caption
     assert "of 3 arms" not in caption
     assert "at EQUAL block width (256)" in caption
     assert "(512)" not in caption
-    # ...and each number in the caption is the one the table it heads prints.
-    row = _parse_row(_table_line(text, "clip"))
-    assert row["up"] == "0/5" and row["dn"] == "0/5"
+    base_line = next(l for l in text.splitlines() if "base control" in l)
+    assert "must clear r2 0.25)" in base_line
+    assert "0.10" not in base_line
+    # ...and each number in the caption is the one the table it heads prints,
+    # row by row: a transposed tally or a swapped pair of rows fails here.
+    expected = {
+        "frozen_ssl": ("4/5", "0/5", "up"),
+        "pixel_ae": ("0/5", "3/5", "down"),
+        "random_vit": ("0/5", "0/5", "no"),
+        "clip": ("0/5", "0/5", "no"),
+    }
+    for name, (up, dn, clears) in expected.items():
+        row = _parse_row(_table_line(text, name))
+        assert (row["up"], row["dn"], row["clears"]) == (up, dn, clears), name
 
 
 def test_reading_caption_names_the_real_down_width():
@@ -893,55 +938,176 @@ def test_reading_caption_refuses_arms_that_disagree_on_seeds_total():
     """The caption prints one "N of M seeds". Arms with different `seeds_total`
     make that true of some rows and false of others, and picking one silently
     would print a rule the table does not follow -- so it raises, and an arm-less
-    input has no common count to print either."""
+    input has no common count to print either.
+
+    The reading is built from a LEGAL input and only the formatter is handed the
+    mixed arms: `reading_contrast(mixed)` raises on its own, before the
+    formatter is entered, so feeding it the mixed input would test that guard
+    and not this one."""
+    legal = _inputs()
+    reading = reading_contrast(legal)
     mixed = _inputs({
         "frozen_ssl": _arm(0.02, 0.06, seeds_total=3),
         "pixel_ae": _arm(0.03, 0.07, seeds_total=5),
         "random_vit": _arm(-0.01, 0.01, seeds_total=3),
     })
     with pytest.raises(ValueError, match="share one seeds_total"):
-        format_reading_contrast(reading_contrast(mixed), mixed)
-    empty = _inputs({})
-    fake_reading = reading_contrast(_inputs())
-    with pytest.raises(ValueError, match="share one seeds_total"):
-        format_reading_contrast(fake_reading, empty)
+        format_reading_contrast(reading, mixed)
+    with pytest.raises(ValueError, match="no arms"):
+        format_reading_contrast(reading, _inputs({}))
 
 
-def test_reading_contrast_refuses_a_seed_count_that_would_let_one_arm_clear_both_ways():
-    """The two-sided rule's mutual exclusion is an ARGUMENT, and half of it is
-    about seeds: an arm lands in both the up and the down list only if it clears
-    up in `SEEDS_REQUIRED` seeds and down in `SEEDS_REQUIRED` others, which needs
-    `2 * SEEDS_REQUIRED` seeds available. At 3 seeds it is not. At 4 it is -- and
-    then PAST_FRAME_AHEAD and RECURRENT_AHEAD could both hold and the precedence
-    would settle an ambiguous reading by the order of its `if`s, silently.
+def test_the_formatter_refuses_a_shared_seed_count_below_seeds_required():
+    """A caption reading "clears when an interval excludes 0 in 2 of 1 seeds" is
+    a rule no row can satisfy. The formatter shares `_common_seeds_total` with
+    the reading, so it refuses what the reading refuses."""
+    reading = reading_contrast(_inputs())
+    one_seed = _inputs({a: _arm(0.1, 0.3, seeds_total=1) for a in ARMS})
+    with pytest.raises(ValueError, match="below SEEDS_REQUIRED"):
+        format_reading_contrast(reading, one_seed)
 
-    `SEEDS_REQUIRED` is pre-registered at 2, so the rule is only well defined
-    below 4 seeds; a successor wanting more seeds must re-register the rule
-    rather than inherit an ambiguous one. Hence a refusal, not a repair."""
-    arms = ("frozen_ssl", "pixel_ae", "random_vit")
-    legal = ContrastInputs(
-        arms={a: _arm(0.1, 0.3, seeds_total=3) for a in arms},
-        base={a: _base(BASE_HOLDS) for a in arms},
-        anchors={"down": True, "up": True}, clusters=24, rows=8015,
-    )
+
+FOUR_ARMS = ("a", "b", "c", "d")
+
+
+def _four_arm_inputs(clears: dict[str, str]) -> ContrastInputs:
+    """Four arms at three seeds each, each clearing "up", "down" or "no". Every
+    arm holds its base control and the down anchor holds, so nothing but the
+    tallies can decide what `reading_contrast` does with it."""
+    intervals = {"up": (0.02, 0.06), "down": (-0.06, -0.02), "no": (-0.01, 0.01)}
+    return _inputs({a: _arm(*intervals[clears[a]]) for a in FOUR_ARMS})
+
+
+def test_reading_contrast_refuses_when_up_and_down_both_clear_in_arms_required_arms():
+    """The ambiguous verdict, reproduced at four arms: two arms clear up (3/3)
+    and two clear down (3/3). Without a refusal `reading_contrast` returned
+    PAST_FRAME_AHEAD purely because its `if` is written first, and the printed
+    table showed two rows reading `0/3 3/3 down` beneath a verdict asserting the
+    opposite -- a verdict read off one tally beside rows showing the other, the
+    shape this project has shipped three times.
+
+    The refusal is the exact condition (`len(up) >= ARMS_REQUIRED and
+    len(down) >= ARMS_REQUIRED`), so it holds at any arm count and any seed
+    count. This fixture clears every guard ahead of it: four arms (>=
+    ARMS_REQUIRED), a `down` anchor entry, a `base` naming exactly the four
+    arms, one shared `seeds_total` of 3 (>= SEEDS_REQUIRED), all four base
+    controls holding, and the down anchor unbroken -- so the refusal it matches
+    is the ambiguity one and no earlier guard's."""
+    inputs = _four_arm_inputs({"a": "up", "b": "up", "c": "down", "d": "down"})
+    assert len(inputs.arms) >= ARMS_REQUIRED
+    assert 2 * ARMS_REQUIRED <= len(inputs.arms), "this test's premise moved with the constant"
+    with pytest.raises(ValueError, match="ambiguous") as excinfo:
+        reading_contrast(inputs)
+    message = str(excinfo.value)
+    assert "a, b" in message and "c, d" in message, "names both arm sets"
+    assert "order of its checks" in message
+
+
+def test_the_ambiguity_is_refused_at_a_higher_seed_count_too():
+    """The same condition arising the OTHER way, through seeds rather than arms:
+    three arms of four seeds each, every arm clearing up in two seeds AND down
+    in the other two. Each arm sits in both lists, so both tallies are 3. This is
+    the state the removed seeds-count guard was a proxy for; the direct check
+    catches it with no assumption about `seeds_total`."""
+    both_ways = ContrastArm(contrast=0.0, ci_low=-0.05, ci_high=0.05,
+                            seeds_up=SEEDS_REQUIRED, seeds_down=SEEDS_REQUIRED,
+                            seeds_total=2 * SEEDS_REQUIRED)
+    inputs = _inputs({a: both_ways for a in ARMS})
+    assert both_ways.clears_up() and both_ways.clears_down()
+    with pytest.raises(ValueError, match="ambiguous"):
+        reading_contrast(inputs)
+
+
+def test_four_arms_with_one_clearing_each_way_is_still_indistinguishable():
+    """The refusal must not be over-broad: four arms give room for two disjoint
+    sets, but ONE arm each way is below the bar in both directions, so it is an
+    ordinary INDISTINGUISHABLE reading, not an ambiguity."""
+    inputs = _four_arm_inputs({"a": "up", "b": "no", "c": "down", "d": "no"})
+    reading = reading_contrast(inputs)
+    assert (reading.arms_up, reading.arms_down) == (("a",), ("c",))
+    assert reading.status == "INDISTINGUISHABLE"
+
+
+def test_four_arms_clearing_one_way_only_is_still_read():
+    """...nor may it refuse a run merely for having four arms: two arms up and
+    two neither is PAST_FRAME_AHEAD with an empty down list, and two down is
+    RECURRENT_AHEAD."""
+    up = reading_contrast(_four_arm_inputs({"a": "up", "b": "up", "c": "no", "d": "no"}))
+    assert up.status == "PAST_FRAME_AHEAD" and up.arms_down == ()
+    down = reading_contrast(_four_arm_inputs({"a": "no", "b": "no", "c": "down", "d": "down"}))
+    assert down.status == "RECURRENT_AHEAD" and down.arms_up == ()
+
+
+def test_a_run_with_more_seeds_than_the_study_is_read_not_refused():
+    """The removed seeds-count guard refused any `seeds_total >= 2 *
+    SEEDS_REQUIRED` outright, so `scripts/latent_retention.py --seeds 0 1 2 3`
+    raised after all the probe work. Four seeds with every arm clearing one way
+    is unambiguous and is read."""
+    assert 2 * SEEDS_REQUIRED <= 4, "this test's premise moved with the constant"
+    inputs = _inputs({a: _arm(0.1, 0.3, seeds_total=4) for a in ARMS})
+    assert reading_contrast(inputs).status == "PAST_FRAME_AHEAD"
+
+
+def test_reading_contrast_refuses_a_base_that_does_not_name_exactly_its_arms():
+    """`holding = len(base) - len(base_failed)` counts only the arms `base`
+    happens to contain, so a `base` covering 2 of 3 voting arms (both holding)
+    returned PAST_FRAME_AHEAD with `base_failed == ()`, "nothing failed", while
+    one voting arm had no base control at all -- the top-precedence gate failing
+    open, the shape the `"down" not in anchors` refusal already closed.
+
+    Refused in both directions and the difference is named. Every fixture clears
+    the guards ahead of this one: three arms (>= ARMS_REQUIRED) and a `down`
+    anchor entry."""
+    legal = _inputs({a: _arm(0.1, 0.3) for a in ARMS})
     assert reading_contrast(legal).status == "PAST_FRAME_AHEAD"
-    assert 2 * SEEDS_REQUIRED > 3, "this test's premise moved with the constant"
 
-    ambiguous = ContrastInputs(
-        arms={a: _arm(0.1, 0.3, seeds_total=2 * SEEDS_REQUIRED) for a in arms},
-        base={a: _base(BASE_HOLDS, seeds_total=2 * SEEDS_REQUIRED) for a in arms},
-        anchors={"down": True, "up": True}, clusters=24, rows=8015,
+    missing = dataclasses.replace(
+        legal, base={a: legal.base[a] for a in ARMS[:2]},
     )
-    with pytest.raises(ValueError, match="clear UP in some seeds and DOWN"):
-        reading_contrast(ambiguous)
+    assert all(b.clears() for b in missing.base.values()), "both listed arms hold"
+    with pytest.raises(ValueError, match="no base control: \\['random_vit'\\]"):
+        reading_contrast(missing)
+
+    extra = dataclasses.replace(legal, base={**legal.base, "clip": _base(BASE_HOLDS)})
+    with pytest.raises(ValueError, match="no arm: \\['clip'\\]"):
+        reading_contrast(extra)
+
+    swapped = dataclasses.replace(
+        legal, base={"frozen_ssl": legal.base["frozen_ssl"],
+                     "pixel_ae": legal.base["pixel_ae"], "clip": _base(BASE_HOLDS)},
+    )
+    with pytest.raises(ValueError, match="random_vit.*clip"):
+        reading_contrast(swapped)
+
+
+def test_reading_contrast_refuses_a_seed_count_below_seeds_required():
+    """The seed-count check was one-sided. Three arms at ONE seed each, with a
+    clearing base, returned INDISTINGUISHABLE -- a pre-registered finding from a
+    single seed per arm, exactly what the arms-count guard refuses one level up.
+    It is unreachable through `contrast_arm` (which needs SEEDS_REQUIRED seeds),
+    so it only bites a hand-built `ContrastInputs`.
+
+    The fixture clears every guard ahead of it: three arms, a `down` anchor, a
+    `base` naming exactly the three arms, and ONE shared `seeds_total` (so it is
+    the low bound that fires, not the mixed-count refusal). Exactly
+    `SEEDS_REQUIRED` seeds is read, so the bound is not over-tight."""
+    assert SEEDS_REQUIRED > 1
+    one_seed = _inputs({a: _arm(0.1, 0.3, seeds_total=1) for a in ARMS})
+    with pytest.raises(ValueError, match="below SEEDS_REQUIRED"):
+        reading_contrast(one_seed)
+
+    at_bar = _inputs({a: _arm(0.1, 0.3, seeds_total=SEEDS_REQUIRED) for a in ARMS})
+    assert reading_contrast(at_bar).status == "PAST_FRAME_AHEAD"
 
 
 def test_reading_contrast_refuses_arms_that_disagree_on_their_seed_count():
-    """A mixed table has no single mutual-exclusion argument to stand on, and no
-    true "N of M seeds" caption either -- M is different per row. Refused at the
-    READING, not only at the printing: a reading computed under mixed seed counts
-    and only refused when someone went to print it would still have been the
-    number a caller acted on."""
+    """A mixed table has no true "N of M seeds" caption -- M is different per
+    row. Refused at the READING, not only at the printing: a reading computed
+    under mixed seed counts and only refused when someone went to print it would
+    still have been the number a caller acted on. (The formatter's own guard is
+    pinned separately, by handing it mixed arms alone.) The fixture clears the
+    guards ahead of this one: three arms, a `down` anchor, and a `base` naming
+    exactly those arms."""
     arms = ("frozen_ssl", "pixel_ae", "random_vit")
     mixed = ContrastInputs(
         arms={

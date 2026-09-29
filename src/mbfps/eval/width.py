@@ -204,10 +204,12 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
     `retention.rung_arm` refuses them one reading over. The inverted interval
     matters more here than there: Reading F is two-sided, and an inverted
     interval (`ci_low > 0` AND `ci_high < 0` at once) would count the SAME seed
-    into `seeds_up` and `seeds_down` -- the one way `PAST_FRAME_AHEAD` and
-    `RECURRENT_AHEAD` could both be true. Refusing it here makes that state
-    unreachable, not merely untested. Each field is read and coerced with
-    `float()` exactly once, and every number below is taken from that one read.
+    into `seeds_up` and `seeds_down`, letting one arm clear both ways from fewer
+    than `2 * SEEDS_REQUIRED` seeds. Refusing it here makes that state
+    unreachable, not merely untested. (`reading_contrast` refuses the ambiguous
+    verdict itself, at any seed count; this refusal keeps the per-arm tallies
+    honest.) Each field is read and coerced with `float()` exactly once, and
+    every number below is taken from that one read.
     """
     if len(contrasts) < SEEDS_REQUIRED:
         raise ValueError(
@@ -249,12 +251,25 @@ def contrast_arm(contrasts: list[dict]) -> ContrastArm:
 def _common_seeds_total(arms: dict) -> int:
     """The arms' one shared `seeds_total`, or a refusal.
 
-    Arms that disagree on it are refused rather than reconciled. Two separate
-    things break at once if they disagree: the caption's "N of M seeds" would be
-    true of some rows and false of others, and the two-sided rule's
-    mutual-exclusion argument is stated per seed count, so a mixed table has no
-    single argument to stand on.
+    Arms that disagree on it are refused rather than reconciled: the caption's
+    "N of M seeds" would be true of some rows and false of others, and picking
+    one silently would print a rule the table does not follow.
+
+    A shared `seeds_total` BELOW `SEEDS_REQUIRED` is refused too. No arm could
+    then clear in `SEEDS_REQUIRED` seeds, so every tally would be empty and the
+    reading would fall through to INDISTINGUISHABLE -- a pre-registered finding
+    asserted from too few seeds, the same silence `reading_contrast` refuses one
+    level up for too few arms. (`contrast_arm` already refuses it one level down,
+    so only a hand-built `ContrastArm` reaches here.) There is deliberately NO
+    upper bound: a run with more seeds is a legitimate run, and the one thing a
+    high seed count makes possible -- an arm clearing both ways -- is refused
+    where it actually arises, in `reading_contrast`, not through this proxy.
     """
+    if not arms:
+        raise ValueError(
+            "there are no arms, so there is no common seeds_total to read a "
+            "verdict or print a caption from"
+        )
     counts = {arm.seeds_total for arm in arms.values()}
     if len(counts) != 1:
         per_arm = {name: arm.seeds_total for name, arm in sorted(arms.items())}
@@ -264,6 +279,12 @@ def _common_seeds_total(arms: dict) -> int:
             f"got {per_arm}"
         )
     (total,) = counts
+    if total < SEEDS_REQUIRED:
+        raise ValueError(
+            f"seeds_total={total} is below SEEDS_REQUIRED={SEEDS_REQUIRED}: no arm "
+            "could clear in that many seeds, so INDISTINGUISHABLE would be a "
+            "pre-registered finding asserted from too few seeds"
+        )
     return total
 
 
@@ -281,16 +302,20 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     TWO-SIDED, and that departs from Reading E with a reason. M3j's gain was
     one-sided because a negative gain meant noise. Here `deterministic` beating
     `two_frame` at equal width is a positive finding about what `h` retains, not
-    an absence. The two directions cannot both clear, by two facts together: an
-    arm lands in both lists only if it clears up in `SEEDS_REQUIRED` seeds AND
-    down in `SEEDS_REQUIRED` others, which needs `2 * SEEDS_REQUIRED` of its
-    seeds (`contrast_arm` refuses an interval that would let one seed count
-    both ways); and two disjoint sets of `ARMS_REQUIRED` arms need
-    `2 * ARMS_REQUIRED` arms. BOTH halves are ENFORCED, not assumed: the
-    arms-count guard below refuses fewer than `ARMS_REQUIRED` arms, and the
-    seeds-count guard refuses a `seeds_total` at which `2 * SEEDS_REQUIRED`
-    seeds would be available -- so the ambiguous state is unreachable rather
-    than merely absent from the study's 3 x 3 shape.
+    an absence.
+
+    The two directions COULD both clear -- with `2 * SEEDS_REQUIRED` seeds one
+    arm can land in both lists, and with `2 * ARMS_REQUIRED` arms two disjoint
+    sets of arms can -- and then PAST_FRAME_AHEAD would win only because its
+    `if` is written first. Five statuses in this precedence is a constraint on
+    this reading, so the ambiguity cannot be a sixth status; it is REFUSED, and
+    refused where it actually arises: after `up` and `down` are tallied, if both
+    hold `ARMS_REQUIRED` arms, it raises. That check is the exact condition and
+    needs no assumption about the study's shape -- not its 3 arms, not its 3
+    seeds -- so a run with more of either is read when it is unambiguous and
+    refused only when it is not. The study's own 3 x 3 shape cannot reach it
+    (2 + 2 > 3 arms, and 2 * 2 > 3 seeds), which
+    `test_up_and_down_cannot_both_clear_with_three_arms_of_three_seeds` pins.
 
     `base_failed` is REPORTED in every branch, including the ones that go on to
     take a reading. `ARMS_REQUIRED` of the arms holding is enough to proceed, so
@@ -301,8 +326,13 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
 
     Refuses (raises) an `inputs` that cannot support a reading at all, rather
     than reading it: fewer than `ARMS_REQUIRED` arms would return
-    INDISTINGUISHABLE from zero or one measurement, and an `anchors` with no
-    `down` entry would let the one gate on this verdict fail open.
+    INDISTINGUISHABLE from zero or one measurement; an `anchors` with no `down`
+    entry would let the one gate on this verdict fail open; a `base` that does
+    not name exactly the arms would let an arm vote with no base control at all,
+    and leave `base_failed` reading "nothing failed" for it; arms that disagree
+    on `seeds_total`, or share one below `SEEDS_REQUIRED`, have no true
+    "N of M seeds" rule; and (after the base and anchor gates) `up` and `down`
+    both clearing in `ARMS_REQUIRED` arms is the ambiguity described above.
     """
     if len(inputs.arms) < ARMS_REQUIRED:
         raise ValueError(
@@ -316,15 +346,16 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             "thing that gates Reading F, so a missing one is an error about the "
             f"measurement, not a pass (got {sorted(inputs.anchors)})"
         )
-    seeds_total = _common_seeds_total(inputs.arms)
-    if 2 * SEEDS_REQUIRED <= seeds_total:
+    if set(inputs.base) != set(inputs.arms):
+        no_base = sorted(set(inputs.arms) - set(inputs.base))
+        no_arm = sorted(set(inputs.base) - set(inputs.arms))
         raise ValueError(
-            f"{seeds_total} seeds per arm with SEEDS_REQUIRED={SEEDS_REQUIRED} "
-            "would let one arm clear UP in some seeds and DOWN in others, so "
-            "PAST_FRAME_AHEAD and RECURRENT_AHEAD could both hold and the "
-            "two-sided precedence would decide an ambiguous reading by the "
-            f"order of its checks; needs 2 * {SEEDS_REQUIRED} > seeds_total"
+            "inputs.base must name exactly the arms in inputs.arms, or an arm "
+            "votes with no base control and the base gate counts the wrong arms; "
+            f"arms with no base control: {no_base}; base controls with no arm: "
+            f"{no_arm}"
         )
+    _common_seeds_total(inputs.arms)
     base_failed = tuple(
         sorted(a for a, control in inputs.base.items() if not control.clears())
     )
@@ -358,6 +389,16 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
     up = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_up()))
     down = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_down()))
 
+    if len(up) >= ARMS_REQUIRED and len(down) >= ARMS_REQUIRED:
+        raise ValueError(
+            f"up clears in {len(up)} arms ({', '.join(up)}) AND down clears in "
+            f"{len(down)} arms ({', '.join(down)}), each at the bar of "
+            f"ARMS_REQUIRED={ARMS_REQUIRED}: the reading is ambiguous, and the "
+            "precedence would settle it by the order of its checks -- "
+            "PAST_FRAME_AHEAD because it is written first -- not by the data. "
+            "Refused rather than read; a study with this many arms or seeds "
+            "must re-register the rule rather than inherit an ambiguous one"
+        )
     if len(up) >= ARMS_REQUIRED:
         return ContrastStatus(
             status="PAST_FRAME_AHEAD",
