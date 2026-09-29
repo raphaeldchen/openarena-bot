@@ -1,5 +1,9 @@
 """M3k: is the past frame's advantage information, or feature count?"""
 
+import importlib.util
+from pathlib import Path
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
@@ -8,6 +12,8 @@ from mbfps.eval.width import (
     ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH,
     TARGET_WIDTH, UP_WIDTH, pass_block, projection,
 )
+
+_WIDTH_PATH = Path(__file__).resolve().parents[2] / "src" / "mbfps" / "eval" / "width.py"
 
 
 def test_constants_are_the_pre_registered_values():
@@ -42,6 +48,41 @@ def test_rung_widths_are_derived_from_the_rssm_config_not_re_spelled():
     }
     assert RUNG_WIDTH["full"] == LATENT_DIM
     assert set(RUNG_WIDTH) == set(RUNGS)
+
+
+def test_rung_width_moves_when_the_rssm_config_it_derives_from_moves():
+    """Value-agreement alone doesn't prove sourcing-by-reference: a hardcoded
+    `RUNG_WIDTH = {"two_frame": 2048, "deterministic": 512, "stochastic": 1024,
+    "full": 1536}` would pass the test above identically, since today's numbers
+    happen to match. Patch `RSSMConfig.h_dim` to a distinctive value, load a
+    FRESH copy of `width.py` under that patch, and check the derived values
+    move with it -- proof by dependency, not by coincidence of numbers.
+
+    A separate throwaway module is loaded via `importlib.util`, under a name
+    that is not `mbfps.eval.width`, rather than `importlib.reload`-ing the
+    canonical module: `reload` would mutate the module object every other test
+    (and `width` itself, imported above) holds a reference to, out from under
+    them.
+    """
+    from mbfps.models.rssm import RSSMConfig
+
+    with patch.object(RSSMConfig, "h_dim", 777):
+        spec = importlib.util.spec_from_file_location(
+            "mbfps.eval._width_derivation_probe", _WIDTH_PATH
+        )
+        fresh_width = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh_width)
+
+    assert fresh_width.RUNG_WIDTH["deterministic"] == 777, (
+        "RUNG_WIDTH['deterministic'] did not follow RSSMConfig.h_dim=777; "
+        "it is re-spelled rather than derived"
+    )
+    assert fresh_width.RUNG_WIDTH["full"] == 777 + RSSMConfig.z_cats * RSSMConfig.z_classes, (
+        "RUNG_WIDTH['full'] did not follow RSSMConfig.h_dim=777; "
+        "it is re-spelled rather than derived"
+    )
+    # The canonical module, imported at collection time, must be untouched.
+    assert RUNG_WIDTH["deterministic"] == RSSMConfig.h_dim == 512
 
 
 def test_each_anchor_is_the_rung_its_pass_leaves_untouched():
@@ -116,6 +157,74 @@ def test_the_up_pass_matches_count_but_preserves_rank():
     )
     already = rng.normal(size=(3000, 2048))
     np.testing.assert_array_equal(pass_block(already, "up"), already)
+
+
+def test_the_down_pass_routes_through_the_real_projection_matrix():
+    """Shape and rank alone don't prove `pass_block` actually multiplies by
+    `projection()`: a fake `down` that just truncates to the first 512 columns
+    gives the same shape (3000, 512) and the same rank 512 on a generic
+    Gaussian block, so it would pass the test above unnoticed. Pin exact
+    equality (not `allclose`) against `block @ projection(native, DOWN_WIDTH)`
+    for every non-anchor native width, so any substitution -- truncation,
+    zero-padding, a different seed, a transposed matrix -- fails here."""
+    rng = np.random.default_rng(0)
+    for native in (2048, 1536, 1024):
+        block = rng.normal(size=(30, native))
+        expected = block.astype(np.float64) @ projection(native, DOWN_WIDTH)
+        np.testing.assert_array_equal(pass_block(block, "down"), expected)
+
+
+def test_the_up_pass_routes_through_the_real_projection_matrix():
+    """The `up` analogue of the routing pin above: a fake `up` that zero-pads
+    the native columns out to 2048 also matches shape and preserves rank (the
+    padded columns are all zero), so it would pass the rank test unnoticed.
+    Pin exact equality against `block @ projection(native, UP_WIDTH)` for
+    every non-anchor native width."""
+    rng = np.random.default_rng(1)
+    for native in (512, 1024, 1536):
+        block = rng.normal(size=(30, native))
+        expected = block.astype(np.float64) @ projection(native, UP_WIDTH)
+        np.testing.assert_array_equal(pass_block(block, "up"), expected)
+
+
+def test_the_down_pass_approximately_preserves_squared_norms():
+    """Johnson-Lindenstrauss: a random projection should roughly preserve each
+    row's squared norm in expectation (mean ratio ~1.0). A fake `down` that
+    truncates to the first 512 columns instead of projecting also matches
+    shape and rank (see the routing test above) but discards 3/4 of the
+    signal's energy, collapsing the mean ratio to ~0.25 -- this is the check
+    that would catch that substitution even if the routing pin above were
+    somehow dodged."""
+    rng = np.random.default_rng(2)
+    native = 2048
+    block = rng.normal(size=(400, native))
+    projected = pass_block(block, "down")
+    before = np.sum(block.astype(np.float64) ** 2, axis=1)
+    after = np.sum(projected ** 2, axis=1)
+    ratio = float(np.mean(after / before))
+    assert abs(ratio - 1.0) < 0.1, (
+        f"mean squared-norm ratio after the `down` projection was {ratio:.4f}, "
+        "expected ~1.0 (Johnson-Lindenstrauss norm preservation); a ratio near "
+        "0.25 means the pass is truncating columns instead of projecting"
+    )
+
+
+def test_the_up_pass_leaves_no_dead_column():
+    """Norm preservation (the check above) cannot catch zero-padding: padding
+    with zeros preserves each row's squared norm exactly. A fake `up` that
+    zero-pads the native 512 columns out to 2048 leaves the 1536 padded
+    columns at std 0 -- dead columns that, for a ridge probe reading the `up`
+    pass, mean the lift adds no features at all. Assert every output column
+    has real spread."""
+    rng = np.random.default_rng(3)
+    block = rng.normal(size=(400, 512))
+    out = pass_block(block, "up")
+    col_std = out.std(axis=0)
+    assert np.all(col_std > 1e-8), (
+        "at least one column of the `up` pass output is constant (std ~0); "
+        "zero-padding the lift leaves those columns dead instead of spreading "
+        "the block's information across all 2048 output columns"
+    )
 
 
 def test_pass_block_rejects_an_unknown_pass():

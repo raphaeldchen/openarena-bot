@@ -22,9 +22,10 @@ no record schema. `scripts/latent_width.py` owns all three.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
-from mbfps.eval.retention import RUNGS
 from mbfps.models.rssm import RSSMConfig
 
 PASSES: tuple[str, ...] = ("shipped", "down", "up")
@@ -68,6 +69,7 @@ shipped one EXACTLY. `shipped` projects nothing and so has no anchor. Pinned
 against `RUNG_WIDTH` by test, so this cannot drift away from the widths."""
 
 
+@lru_cache(maxsize=None)
 def projection(native: int, target: int, *, seed: int = PROJECTION_SEED):
     """The fixed matrix taking a `native`-wide block to `target`, or `None`.
 
@@ -80,20 +82,33 @@ def projection(native: int, target: int, *, seed: int = PROJECTION_SEED):
     on `(native, target)` and therefore SHARED ACROSS ALL NINE CELLS: a matrix
     redrawn per call would make no two cells comparable and would let an arm win
     on a lucky draw.
+
+    Memoized with `lru_cache`, so the matrix is drawn exactly once per
+    `(native, target, seed)` and the SAME array object is returned to every
+    caller thereafter -- Task 5's nested loop over rungs x passes x horizons x
+    targets would otherwise reallocate matrices up to 2048x2048 float64 (32 MB
+    each) on every call. The returned array is marked read-only
+    (`flags.writeable = False`) so one caller cannot mutate the shared cached
+    array out from under another.
     """
     if native == target:
         return None
     rng = np.random.default_rng([seed, native, target])
-    return rng.normal(size=(native, target)) / np.sqrt(target)
+    matrix = rng.normal(size=(native, target)) / np.sqrt(target)
+    matrix.flags.writeable = False
+    return matrix
 
 
 def pass_block(block: np.ndarray, pass_name: str, *, seed: int = PROJECTION_SEED):
     """`block` as `pass_name` sees it.
 
-    `shipped` returns it unchanged. `down` projects to 512, matching count AND
-    rank. `up` lifts to 2048, matching count while LEAVING THE RANK at the
-    block's native width -- that is what makes `up` a pure width control rather
-    than a capacity change, and it is pinned by a rank test.
+    `shipped` casts to float64 and returns it -- the values are unchanged, but
+    the dtype may not be, so every pass hands the probe the same dtype (the
+    cast is lossless for float32 input, so the anchors' bit-identity is
+    unaffected). `down` projects to 512, matching count AND rank. `up` lifts
+    to 2048, matching count while LEAVING THE RANK at the block's native width
+    -- that is what makes `up` a pure width control rather than a capacity
+    change, and it is pinned by a rank test.
     """
     if pass_name not in TARGET_WIDTH:
         raise ValueError(f"unknown pass {pass_name!r}; expected one of {PASSES}")
