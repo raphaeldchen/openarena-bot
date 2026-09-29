@@ -1,0 +1,123 @@
+"""M3k: is the past frame's advantage information, or feature count?"""
+
+import numpy as np
+import pytest
+
+from mbfps.eval.retention import RUNGS
+from mbfps.eval.width import (
+    ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH,
+    TARGET_WIDTH, UP_WIDTH, pass_block, projection,
+)
+
+
+def test_constants_are_the_pre_registered_values():
+    assert PASSES == ("shipped", "down", "up")
+    assert DOWN_WIDTH == 512 and UP_WIDTH == 2048
+    assert CONTRAST_K == 15
+    assert TARGET_WIDTH == {"shipped": None, "down": 512, "up": 2048}
+
+
+def test_contrast_k_is_not_named_decision_k():
+    """`retention.DECISION_K` is 4 and means the horizon Reading E decides at;
+    this module's is 15. Both are imported by the same script, so one name with
+    two meanings is a misreading waiting to happen. Pinned so a later 'tidy-up'
+    cannot unify them."""
+    import mbfps.eval.width as width
+    from mbfps.eval.retention import DECISION_K
+    assert DECISION_K == 4 and CONTRAST_K == 15
+    assert not hasattr(width, "DECISION_K")
+
+
+def test_rung_widths_are_derived_from_the_rssm_config_not_re_spelled():
+    """A hardcoded 512 here would silently disagree with the model if
+    `RSSMConfig` ever changed, and every pass would be matching the wrong
+    width."""
+    from mbfps.models.rssm import LATENT_DIM, RSSMConfig
+    z = RSSMConfig.z_cats * RSSMConfig.z_classes
+    assert RUNG_WIDTH == {
+        "two_frame": RSSMConfig.embed_dim,
+        "deterministic": RSSMConfig.h_dim,
+        "stochastic": z,
+        "full": RSSMConfig.h_dim + z,
+    }
+    assert RUNG_WIDTH["full"] == LATENT_DIM
+    assert set(RUNG_WIDTH) == set(RUNGS)
+
+
+def test_each_anchor_is_the_rung_its_pass_leaves_untouched():
+    """THE structural property the anchors rest on: a pass's anchor must be the
+    rung whose native width already equals that pass's target, so the pass does
+    not touch it and its gain must reproduce the shipped one exactly. Derived
+    here rather than trusted, so ANCHOR cannot drift away from the widths."""
+    for pass_name, rung in ANCHOR.items():
+        target = TARGET_WIDTH[pass_name]
+        assert RUNG_WIDTH[rung] == target, (
+            f"{pass_name}'s anchor {rung!r} is {RUNG_WIDTH[rung]} wide but the "
+            f"pass targets {target}; it would be projected, not untouched"
+        )
+        untouched = [r for r in RUNGS if RUNG_WIDTH[r] == target]
+        assert untouched == [rung], f"{pass_name}: expected exactly one anchor"
+    assert set(ANCHOR) == {"down", "up"}, "`shipped` projects nothing, so it has no anchor"
+
+
+def test_projection_is_the_identity_when_no_projection_is_needed():
+    """None, not an identity matrix: the anchor path must do no matmul at all,
+    so it cannot drift by a floating-point ulp and the anchor test can demand
+    exact equality."""
+    assert projection(512, 512) is None
+    assert projection(2048, 2048) is None
+    assert projection(2048, 512) is not None
+
+
+def test_projection_has_the_johnson_lindenstrauss_shape_and_scale():
+    p = projection(2048, 512)
+    assert p.shape == (2048, 512)
+    # Gaussian / sqrt(target): column norms ~1, so inner products survive.
+    assert np.allclose(p.std(), 1.0 / np.sqrt(512), rtol=0.05)
+
+
+def test_projection_is_fixed_across_calls_and_shared_across_cells():
+    """One matrix per (native, target), drawn once. If it were redrawn per call
+    no two cells would be comparable, and an arm could win on a lucky draw."""
+    a, b = projection(1024, 512), projection(1024, 512)
+    np.testing.assert_array_equal(a, b)
+    assert not np.array_equal(projection(1024, 512), projection(2048, 512)[:1024])
+
+
+def test_pass_block_leaves_the_shipped_pass_untouched():
+    block = np.arange(40, dtype=np.float64).reshape(10, 4)
+    np.testing.assert_array_equal(pass_block(block, "shipped"), block)
+
+
+def test_the_down_pass_matches_count_and_rank():
+    """Projected to 512 every block has 512 columns AND rank 512, so `down` is
+    the pass that can ask who wins at equal capacity."""
+    rng = np.random.default_rng(0)
+    for native in (2048, 1536, 1024):
+        block = rng.normal(size=(3000, native))
+        out = pass_block(block, "down")
+        assert out.shape == (3000, DOWN_WIDTH)
+        assert np.linalg.matrix_rank(out) == DOWN_WIDTH
+    already = rng.normal(size=(3000, 512))
+    np.testing.assert_array_equal(pass_block(already, "down"), already)
+
+
+def test_the_up_pass_matches_count_but_preserves_rank():
+    """THE property that makes `up` a pure width control: lifting adds columns
+    and no information, so the rank must stay at the block's native width. If
+    the rank rose, the lift would be adding capacity and the calibration would
+    measure the wrong thing."""
+    rng = np.random.default_rng(1)
+    block = rng.normal(size=(3000, 512))
+    out = pass_block(block, "up")
+    assert out.shape == (3000, UP_WIDTH)
+    assert np.linalg.matrix_rank(out) == 512, (
+        "the lift changed the rank; it is meant to add columns, not information"
+    )
+    already = rng.normal(size=(3000, 2048))
+    np.testing.assert_array_equal(pass_block(already, "up"), already)
+
+
+def test_pass_block_rejects_an_unknown_pass():
+    with pytest.raises(ValueError, match="unknown pass"):
+        pass_block(np.zeros((4, 8)), "sideways")
