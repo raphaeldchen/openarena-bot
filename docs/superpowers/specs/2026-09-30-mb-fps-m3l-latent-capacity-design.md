@@ -155,7 +155,49 @@ the two-route routing check above.
 
 Note what none of this catches: see the log-base paragraph above.
 
-### 2.4 A companion that decides nothing
+### 2.4 Companions that decide nothing
+
+#### `redundancy_bits` — what makes a high `bits_carried` interpretable
+
+`bits_carried` sums the **per-categorical** informations, so redundancy *across*
+categoricals is counted once per categorical. It therefore **upper-bounds** the
+code's joint information rather than measuring it. Measured: 32 categoricals that
+all copy one 5-bit variable read the full **160.0000**-bit ceiling while carrying
+**5 bits** jointly — a 32× overstatement — and an independent code of the same
+reading carries all 160. **Nothing in `bits_carried` can tell those two apart.**
+
+The consequence is asymmetric, and it is why this companion exists:
+
+- a reading **below** a cut is sound and conservative — if the upper bound is
+  below the cut, the joint information is too;
+- a reading **above** a cut does **not** establish "the capacity is in use",
+  because a fully redundant code reads the ceiling while being almost entirely
+  idle.
+
+`redundancy_bits` is the mean pairwise mutual information between the
+categoricals' argmaxes, against a `PAIR_CEILING_BITS = log₂(z_classes)` = 5-bit
+per-pair ceiling. Near its floor the categoricals are independent, so the summed
+reading approximates the joint one and a high `bits_carried` does mean the
+capacity is in use. Far above it, the reading is inflated. 0.02 s for the 496
+pairs at 11,000 rows.
+
+**`redundancy_floor` is its own known answer, measured from the data.** Mutual
+information is biased upward at finite sample — an independent code reads 0.0644
+bits per pair at 11,008 rows, not 0 — so "near zero" is the wrong comparison and
+a fixed tolerance would be a guess about the sample size. The floor permutes each
+categorical's rows independently, destroying every real dependence while
+preserving the marginals and the row count exactly, so what the estimator then
+reads **is** the bias for this data at this size. Measured: an independent code
+sits at **1.00×** its floor; a duplicated one at **7.8× at n = 1280, 16.5× at
+2560, 77.9× at 11,008**, and the floor itself falls 0.638 → 0.304 → 0.064 as it
+must.
+
+It gates nothing. It is reported beside `bits_carried` so that a `CAPACITY_BOUND`
+verdict can be read against it: **that status resting on a high `bits_carried`
+means nothing unless the redundancy sits near its floor**, and §3.3's fall-through
+caveat applies with or without it.
+
+#### `prior_bits`
 
 `prior_bits` — the same estimator on `prior_logits`. The prior does not see
 `enc(t)`, so this is the information the prior's distribution carries through `h`
@@ -339,7 +381,13 @@ for the other eight when the host swapped. Watch free disk.
 means adding capacity is not what is limiting the model, and the ~13.5 hours
 should go to the objective instead.
 
-**It cannot prove the bottleneck lever**, only fail to refute it — see §3.3.
+**It cannot prove the bottleneck lever**, only fail to refute it — see §3.3. Two
+independent reasons, and only the second is removable: `CAPACITY_BOUND` is a
+fall-through rather than a cleared bar, and `bits_carried` upper-bounds the joint
+information so a high reading does not by itself mean the capacity is in use.
+§2.4's `redundancy_bits` addresses the second — a reading near its floor means
+the categoricals are independent and the summed figure approximates the joint
+one — but the first stands regardless.
 `CAPACITY_BOUND` is a fall-through, and the results must say so.
 
 **It does not reopen M3k.** Reading F stays `INDISTINGUISHABLE`. M3l's finding is

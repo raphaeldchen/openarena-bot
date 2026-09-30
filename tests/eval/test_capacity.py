@@ -303,3 +303,107 @@ def test_the_estimator_refuses_an_empty_gather():
     mode the finiteness guards elsewhere in this project exist for."""
     with pytest.raises(ValueError, match="no rows"):
         bits_carried(np.zeros((0, CATS, CLASSES)))
+
+
+# ---------------------------------------------------------------------------
+# redundancy: the companion that makes a high `bits_carried` interpretable
+# ---------------------------------------------------------------------------
+
+
+def _onehot_from_indices(idx: np.ndarray) -> np.ndarray:
+    probs = np.zeros((idx.shape[0], CATS, CLASSES))
+    np.put_along_axis(probs, idx[..., None], 1.0, axis=-1)
+    return probs
+
+
+def _exactly_uniform_column(n: int, rng) -> np.ndarray:
+    """One categorical using every class EXACTLY `n // CLASSES` times.
+
+    `rng.integers` gives an approximately uniform marginal, and approximate is
+    not good enough: these fixtures' premise is that both codes read EXACTLY the
+    ceiling, and `integers` reads 159.4645 at n = 1280. A shuffled `repeat` makes
+    the marginal exactly uniform, so the reading is exactly 160.0000."""
+    classes = np.repeat(np.arange(CLASSES), n // CLASSES)
+    rng.shuffle(classes)
+    return classes
+
+
+def _independent_and_duplicated(n: int, *, seed: int):
+    """Two codes that `bits_carried` CANNOT tell apart: both read exactly the
+    ceiling, one carrying all 160 bits jointly and one carrying 5."""
+    rng = np.random.default_rng(seed)
+    independent = _onehot_from_indices(
+        np.stack([_exactly_uniform_column(n, rng) for _ in range(CATS)], axis=1)
+    )
+    shared = _exactly_uniform_column(n, rng)
+    return independent, _onehot_from_indices(np.stack([shared] * CATS, axis=1))
+
+
+def test_redundancy_separates_an_independent_code_from_a_duplicated_one():
+    """The companion exists because `bits_carried` CANNOT tell these two apart:
+    both read the full 160-bit ceiling, one carrying 160 bits jointly and one
+    carrying 5. That is the whole reason a high `bits_carried` does not
+    establish "the capacity is in use" on its own.
+
+    So this test asserts the thing `bits_carried` cannot: that the two codes are
+    distinguishable, and in which direction."""
+    from mbfps.eval.capacity import PAIR_CEILING_BITS, redundancy_bits
+
+    independent, duplicated = _independent_and_duplicated(CLASSES * 80, seed=0)
+
+    # The premise: bits_carried is blind to the difference. Both read EXACTLY
+    # the ceiling, so nothing about the level distinguishes them.
+    assert bits_carried(independent) == pytest.approx(CEILING_BITS, abs=1e-9)
+    assert bits_carried(duplicated) == pytest.approx(CEILING_BITS, abs=1e-9)
+
+    low, high = redundancy_bits(independent), redundancy_bits(duplicated)
+    assert high == pytest.approx(PAIR_CEILING_BITS, abs=1e-9), (
+        "every categorical is the same variable, so each pair shares all of it"
+    )
+    assert low < high / 10.0, f"independent {low:.4f} against duplicated {high:.4f}"
+    assert PAIR_CEILING_BITS == pytest.approx(math.log2(CLASSES))
+
+
+def test_the_redundancy_floor_is_measured_from_the_data_not_chosen():
+    """Mutual information is biased UPWARD at finite sample, so an independent
+    code does not read 0 -- it reads ~0.064 bits per pair at 11,000 rows. A fixed
+    tolerance would be a guess about the sample size.
+
+    `redundancy_floor` permutes each categorical's rows independently, which
+    destroys every real dependence while preserving the marginals and the row
+    count, so what it reads IS the bias for this data at this size. Two things
+    must hold: an independent code sits AT its own floor, and a duplicated one
+    sits far above it."""
+    from mbfps.eval.capacity import redundancy_bits, redundancy_floor
+
+    independent, duplicated = _independent_and_duplicated(CLASSES * 80, seed=1)
+
+    floor = redundancy_floor(independent)
+    assert floor > 0.0, "the bias is real; a floor of exactly 0 would be a bug"
+    # Measured: the independent code sits at ratio 1.00 of its own floor at every
+    # size tried, so `rel=0.05` is the tight assertion the data supports rather
+    # than a loose one chosen to pass.
+    assert redundancy_bits(independent) == pytest.approx(floor, rel=0.05), (
+        "an independent code must sit at its own finite-sample floor"
+    )
+    # Measured ratios for the duplicated code: 7.8x at n=1280, 16.5x at 2560,
+    # 77.9x at the ~11,000 a real cell carries. The factor below holds from 2560
+    # up, and the fixture is 2560 -- chosen so the assertion is not tuned to the
+    # one size where it barely passes.
+    assert redundancy_bits(duplicated) > 10.0 * redundancy_floor(duplicated), (
+        "a duplicated code must sit far above the floor, or the floor is "
+        "absorbing the signal it exists to exclude"
+    )
+
+
+def test_the_redundancy_floor_shrinks_as_the_sample_grows():
+    """It is a finite-SAMPLE bias, so it must fall with n. If it did not, it
+    would be measuring something other than the bias -- and a floor that stayed
+    put would silently mis-scale on the real run's ~11,000 rows."""
+    from mbfps.eval.capacity import redundancy_floor
+
+    floors = []
+    for n in (CLASSES * 10, CLASSES * 80):
+        independent, _ = _independent_and_duplicated(n, seed=2)
+        floors.append(redundancy_floor(independent))
+    assert floors[0] > floors[1] * 1.5, f"floors did not shrink with n: {floors}"

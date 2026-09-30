@@ -194,6 +194,74 @@ def live_classes(probs: np.ndarray) -> int:
     return int((flat.max(axis=0) > flat.min(axis=0)).sum())
 
 
+PAIR_CEILING_BITS: float = math.log2(RSSMConfig.z_classes)
+"""The most one pair of categoricals can share: `log2(z_classes)`, at full
+redundancy. Derived, like `CEILING_BITS`, rather than re-spelled."""
+
+
+def _pair_mutual_information(idx: np.ndarray) -> float:
+    """Mean pairwise mutual information between the categoricals, in bits."""
+    n, cats = idx.shape
+    classes = RSSMConfig.z_classes
+    total, pairs = 0.0, 0
+    for a in range(cats):
+        for b in range(a + 1, cats):
+            joint = np.bincount(
+                idx[:, a] * classes + idx[:, b], minlength=classes * classes
+            ).reshape(classes, classes) / n
+            outer = np.outer(joint.sum(axis=1), joint.sum(axis=0))
+            nz = joint > 0.0
+            total += float((joint[nz] * np.log2(joint[nz] / outer[nz])).sum())
+            pairs += 1
+    return total / pairs
+
+
+def redundancy_bits(probs: np.ndarray) -> float:
+    """How much the categoricals duplicate each other, in bits per pair.
+
+    A COMPANION THAT DECIDES NOTHING, and the one that makes a high
+    `bits_carried` interpretable. `bits_carried` sums the per-categorical
+    informations, so redundancy across categoricals is counted once per
+    categorical: 32 categoricals that all copy one 5-bit variable read the full
+    160-bit ceiling while carrying 5 bits jointly. Nothing in `bits_carried`
+    itself can tell that code from an independent one of the same reading.
+
+    Near the floor below, the categoricals are independent and the summed
+    reading approximates the joint one -- so a high `bits_carried` does mean the
+    capacity is in use. Far above it, the reading is inflated and a high value
+    establishes nothing about capacity.
+
+    Measured on the argmax pattern rather than the full distributions: cheaper,
+    interpretable against `PAIR_CEILING_BITS`, and it is the pattern that
+    carries the code's discrete content. 0.02 s for the 496 pairs at 11,000
+    rows.
+    """
+    probs = _require_distributions(probs)
+    return _pair_mutual_information(probs.argmax(axis=-1))
+
+
+def redundancy_floor(probs: np.ndarray, *, seed: int = 0) -> float:
+    """`redundancy_bits`' finite-sample floor, from THIS data.
+
+    Mutual information is biased upward at finite sample: an independent code
+    reads 0.0642 bits per pair at 11,000 rows, not 0. So "near zero" is the wrong
+    comparison and a fixed tolerance would be a guess about the sample size.
+
+    This permutes each categorical's rows INDEPENDENTLY, which destroys every
+    real dependence while preserving the marginals and the row count exactly --
+    so what the estimator then reads IS the bias for this data at this size. A
+    known answer computed through the code path under test, like `floor_bits`,
+    rather than a number chosen in advance. Any reading above it is dependence
+    the data actually carries.
+    """
+    probs = _require_distributions(probs)
+    idx = probs.argmax(axis=-1).copy()
+    rng = np.random.default_rng(seed)
+    for j in range(idx.shape[1]):
+        rng.shuffle(idx[:, j])
+    return _pair_mutual_information(idx)
+
+
 @dataclasses.dataclass(frozen=True)
 class EpisodeStats:
     """Per-episode sufficient statistics for `bits_carried`.

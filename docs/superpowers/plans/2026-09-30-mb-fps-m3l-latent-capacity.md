@@ -13,6 +13,7 @@
 Copied verbatim from `docs/superpowers/specs/2026-09-30-mb-fps-m3l-latent-capacity-design.md`. Every task's requirements implicitly include this section.
 
 - **Evaluation only.** No training, no checkpoint written or altered, nothing under `runs/` removed.
+- **`redundancy_bits` is reported beside `bits_carried`**, against a `redundancy_floor` measured from the data by permuting each categorical's rows. `bits_carried` sums the PER-CATEGORICAL informations, so it upper-bounds the joint: 32 categoricals copying one 5-bit variable read the full 160 while carrying 5. A reading below a cut is conservative; a reading above one does not establish "capacity in use" unless the redundancy sits near its floor.
 - **The ceiling is derived from `RSSMConfig`**, never hardcoded. `CEILING_BITS = RSSMConfig.z_cats * log2(RSSMConfig.z_classes)` = 160.0. A hardcoded 160 would silently disagree with the model if the latent shape changed.
 - **`gather_probe_data`'s change must be provably additive.** It feeds the research gate via `src/mbfps/eval/study.py` and `scripts/eval_rollout.py`. Every pre-existing key must be byte-identical, pinned by test. `gain_from_blocks`' ten-key golden output is pinned by `test_gain_from_splits_output_is_byte_identical_after_the_generalisation` — **that test's values are never re-recorded.**
 - **`BASE_R2_FLOOR` stays 0.10** and is not re-chosen, gated on **position alone**.
@@ -215,7 +216,7 @@ git commit -m "feat: the gather yields the posterior and prior distributions, ad
 
 **Interfaces:**
 - Consumes: `RSSMConfig.z_cats`, `RSSMConfig.z_classes`; `retention.CONFIDENCE`, `retention.RESAMPLES`.
-- Produces, used by Tasks 3, 4 and 5: `CEILING_BITS`, `SPARE_CUT`, `FRAME_CUT`, `entropy_bits(p)`, `bits_carried(probs)`, `floor_bits(probs)`, `ceiling_bits(probs)`, `argmax_marginal_bits(probs)`, `live_classes(probs)`, `EpisodeStats`, `episode_stats(probs, groups)`, `bits_interval(stats, *, resamples, confidence, seed)`.
+- Produces, used by Tasks 3, 4 and 5: `CEILING_BITS`, `SPARE_CUT`, `FRAME_CUT`, `entropy_bits(p)`, `bits_carried(probs)`, `floor_bits(probs)`, `ceiling_bits(probs)`, `argmax_marginal_bits(probs)`, `live_classes(probs)`, `PAIR_CEILING_BITS`, `redundancy_bits(probs)`, `redundancy_floor(probs, *, seed)`, `EpisodeStats`, `episode_stats(probs, groups)`, `bits_interval(stats, *, resamples, confidence, seed)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1603,6 +1604,7 @@ Required, each with its cell count out of 9 and its exception named with its mar
 
 - `bits_carried` per arm and per cell, against the 160-bit ceiling, as a **share** as well as a level — described as **the per-categorical informations summed, an upper bound on the code's joint information**, never as "the code carries N of 160 bits". Measured: 32 categoricals all copying one 5-bit variable read 160.0000 while carrying 5 bits jointly, a 32× overstatement. So a reading BELOW a cut is sound and conservative; a reading ABOVE one does **not** establish that the capacity is in use, and if the status rests on a high reading the write-up must say so in the same breath
 - `frame_share` per arm and per cell, and `live` out of 1024
+- **`redundancy_bits` against `redundancy_floor`** per cell, and what the ratio licenses: near the floor means the categoricals are independent, so the summed `bits_carried` approximates the joint information and a high reading does mean the capacity is in use; far above it means the reading is inflated and a high value establishes nothing. **A `CAPACITY_BOUND` verdict must be reported beside this ratio**, because it means nothing unless the redundancy sits near its floor
 - `prior_bits` as the companion that decides nothing, with one sentence on what it says about M3g's finding that the prior is the failing stage
 - all three estimator checks on all nine cells
 - **Reading G's status under the rule as written** — and if the magnitudes suggest another, report both, say plainly that they disagree, and leave the lever to the human
