@@ -1091,14 +1091,30 @@ def contrast_inputs(records: dict) -> ContrastInputs:
     )
 
 
+READING_E_CAPTION_SEEDS = 3
+"""The seed count `retention.format_reading_retention`'s caption hardcodes.
+
+It is a bare literal there ("in N of 3 seeds and M of 3 arms") and `retention`
+is closed, so it cannot be imported -- it is mirrored here and a test pins the
+mirror against that module's real output, so the two cannot drift. The ARMS half
+of that caption is enforced by `_validate_family_shape`; the SEEDS half is
+enforced nowhere, and `--seeds` accepts any list, so a four-seed run would print
+"of 3 seeds" over twelve rows reading `/4`. That is the caption-disagreeing-with-
+its-columns defect this project has shipped three times, and it would be written
+into `width.txt` as the record."""
+
+
 def _reading_e_unreadable(records: dict) -> str | None:
     """Why Reading E cannot be taken from these records, or `None`.
 
-    Both are limits of the PLAN, not defects in a record: `reading_retention` is
-    defined over exactly `RETENTION_FAMILY` arms and over every `K_REPORTED`
-    horizon. Reading F needs neither -- two arms clear its bar, and it is taken at
-    k = 15 alone -- so the companion says it cannot be read instead of vetoing a
-    verdict that can."""
+    All three are limits of the PLAN, not defects in a record: `reading_retention`
+    is defined over exactly `RETENTION_FAMILY` arms, over every `K_REPORTED`
+    horizon, and -- because its caption hardcodes the denominator -- over
+    `READING_E_CAPTION_SEEDS` seeds. Reading F needs none of the three: two arms
+    clear its bar, it is taken at k = 15 alone, and its own caption is built from
+    its `inputs` rather than from a literal, so it is correct at any seed count.
+    So the companion says it cannot be read instead of vetoing a verdict that
+    can."""
     arms = sorted({arm for arm, _ in records})
     if len(arms) != RETENTION_FAMILY:
         return (
@@ -1117,7 +1133,34 @@ def _reading_e_unreadable(records: dict) -> str | None:
             f"Reading E is a disjunction over k = {', '.join(str(k) for k in K_REPORTED)} "
             f"and these records lack k = {', '.join(str(k) for k in missing)}"
         )
+    seeds = sorted({seed for _, seed in records})
+    if len(seeds) != READING_E_CAPTION_SEEDS:
+        return (
+            "Reading E's caption hardcodes its seed denominator as "
+            f"{READING_E_CAPTION_SEEDS} and these records carry "
+            f"{len(seeds)} ({', '.join(str(seed) for seed in seeds)}), so every "
+            f"row would read /{len(seeds)} beneath a caption saying "
+            f"/{READING_E_CAPTION_SEEDS}"
+        )
     return None
+
+
+def _pooled_row_count(rows: dict, k: int) -> int:
+    """`rows[k_key(k)]`, or a refusal naming the horizon and what is there.
+
+    The one index on the read path that used to bypass this file's `_get`
+    discipline: records whose `passes` carried every horizon but whose `rows`
+    lacked one gave a bare `KeyError` out of `corrected_reading_e`, after
+    `_reading_e_unreadable` had already said the records were fine. The sibling
+    index has a named refusal for exactly this shape."""
+    try:
+        return int(rows[k_key(k)])
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit(
+            f"the pooled shape has no row count for k = {k} (it carries "
+            f"{sorted(rows)}); Reading E's caption reports it per horizon, so a "
+            "missing one cannot be read as zero"
+        ) from None
 
 
 def retention_inputs(records: dict, *, pass_name: str = RETENTION_PASS) -> RetentionInputs:
@@ -1157,7 +1200,7 @@ def retention_inputs(records: dict, *, pass_name: str = RETENTION_PASS) -> Reten
     clusters, rows = _pooled_shape(records)
     return RetentionInputs(
         ladder=ladder, base=base_controls(records), clusters=clusters,
-        rows={k: rows[k_key(k)] for k in K_REPORTED},
+        rows={k: _pooled_row_count(rows, k) for k in K_REPORTED},
     )
 
 

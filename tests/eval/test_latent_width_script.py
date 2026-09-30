@@ -2613,3 +2613,119 @@ def test_main_returns_the_first_phase_status_that_is_not_ok(monkeypatch, failing
 
 def test_read_exits_map_exactly_the_two_refusals():
     assert script.READ_EXITS == {"UNRESOLVED_BASE": 41, "UNRESOLVED_ANCHOR": 42}
+
+
+# ---------------------------------------------------------------------------
+# Reading E's caption is suppressed at a seed count it cannot describe
+# ---------------------------------------------------------------------------
+
+
+def test_reading_e_caption_seeds_mirrors_the_closed_modules_own_literal():
+    """`retention.format_reading_retention` hardcodes its caption's denominator
+    ("in N of 3 seeds and M of 3 arms") as a bare literal, and `retention` is
+    closed, so `READING_E_CAPTION_SEEDS` is a MIRROR. A mirror that can drift is
+    worse than no mirror: this renders the real caption and reads the denominator
+    back out of it, so changing the constant here without the module -- or the
+    module without the constant -- fails."""
+    from mbfps.eval.retention import format_reading_retention, reading_retention
+
+    records = _records()
+    inputs = script.retention_inputs(records)
+    caption = format_reading_retention(
+        reading_retention(inputs, z_bearing=script.CORRECTED_Z_BEARING), inputs,
+    ).splitlines()[0]
+    match = re.search(r"of (\d+) seeds and \d+ of (\d+) arms", caption)
+    assert match, f"the caption's shape moved; it now reads {caption!r}"
+    assert int(match.group(1)) == script.READING_E_CAPTION_SEEDS, (
+        "the caption's seed denominator and READING_E_CAPTION_SEEDS disagree, so "
+        "the suppression is keyed on a number the caption no longer prints"
+    )
+
+
+def test_reading_e_is_unreadable_at_a_seed_count_its_caption_cannot_describe(
+    tmp_path, capsys,
+):
+    """The THIRD hardcode in Reading E's caption, and the one that was missed.
+    Its "3 arms" half is enforced by `_validate_family_shape`; its "3 seeds" half
+    is enforced nowhere, and `--seeds` accepts any list -- so a four-seed run
+    printed "in 2 of 3 seeds" above twelve rows each reading `/4`, into
+    `width.txt`, as the record. That is the caption-disagreeing-with-its-columns
+    defect this project has shipped three times.
+
+    Reading F is unaffected and must still be taken: its caption is built from
+    its own `inputs`, so it is correct at any seed count. The companion says it
+    cannot be read; it does not veto a verdict that can.
+
+    `--seeds` must be passed: the read phase loads exactly `args.seeds`, so
+    writing a fourth record without asking for it would leave nine records read
+    and prove nothing. That is also why this is reachable ONLY from the CLI."""
+    seeds = (0, 1, 2, 3)
+    status, out = _read(
+        tmp_path, capsys, _records(seeds=seeds),
+        "--seeds", *[str(s) for s in seeds],
+    )
+    assert status == 0, "the companion must not veto Reading F"
+    assert "unreadable:" in out
+    assert f"carry {len(seeds)}" in out, "the reason names the seed count it found"
+    assert "of 3 seeds and" not in out, (
+        "the caption printed its hardcoded denominator over rows that read "
+        f"/{len(seeds)}"
+    )
+    assert _verdict_lines(out), "Reading F's own verdict is still printed"
+
+
+def test_the_pooled_row_count_refuses_a_missing_horizon_by_name(tmp_path, capsys):
+    """The one index on the read path that bypassed this file's `_get` discipline.
+    Records whose `passes` carry every horizon but whose `rows` lack one used to
+    give a bare `KeyError` out of `corrected_reading_e` -- after
+    `_reading_e_unreadable` had already reported the records readable, which is
+    the worst possible moment for a traceback."""
+    records = _records()
+    for record in records.values():
+        record["rows"].pop(script.k_key(K_REPORTED[0]))
+    assert script._reading_e_unreadable(records) is None, (
+        "the premise: these records look readable, which is what makes a bare "
+        "KeyError here the worst possible moment for one"
+    )
+    with pytest.raises(SystemExit) as raised:
+        script.retention_inputs(records)
+    assert f"k = {K_REPORTED[0]}" in str(raised.value)
+    assert "cannot be read as zero" in str(raised.value)
+
+
+def test_every_phase_read_test_routes_through_the_measure_guard():
+    """`_main_read` is the guard whose absence cost a real 7-minute measure, and
+    until now nothing made using it MECHANICAL -- a future test calling
+    `script.main(["--phase", "read", ...])` directly would bypass it and could
+    run the GPU again. This reads this module's own source and refuses a bare
+    `main` call carrying `--phase` outside the two helpers that patch the measure
+    half."""
+    # Built at runtime so this scan's own source lines do not match it -- the
+    # first version of this test flagged its own filter expression, and the one
+    # before that flagged its own docstring.
+    call = "script" + ".main("
+    phase = '"' + "read" + '"'
+    offenders = [
+        line.strip() for line in Path(__file__).read_text().splitlines()
+        if call in line and phase in line
+        and not line.lstrip().startswith(("`", "#", '"'))
+    ]
+    assert not offenders, (
+        "call `_main_read(...)` instead of `script.main([...])` so the measure "
+        f"half stays unreachable: {offenders}"
+    )
+
+
+def test_the_width_bias_table_refuses_records_that_disagree_on_rung_width(tmp_path):
+    """`width_bias_table` is a public entry point, so it does not assume
+    `require_one_protocol` ran -- and that guard was unreachable by any test,
+    which is how a guard becomes decoration. Driven directly here."""
+    records = _records()
+    victim = sorted(records)[-1]
+    records[victim]["rung_width"] = dict(
+        records[victim]["rung_width"], deterministic=RUNG_WIDTH["deterministic"] + 1,
+    )
+    with pytest.raises(SystemExit) as raised:
+        script.width_bias_table(records)
+    assert "rung_width" in str(raised.value)
+    assert script._cell_name(victim) in str(raised.value), "names the odd cell out"
