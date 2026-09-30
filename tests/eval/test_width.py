@@ -571,18 +571,29 @@ def test_the_indistinguishable_gloss_claims_no_more_than_the_status_licenses():
     it contradicts itself. This gloss said it once, by copy-paste from the
     neighbouring branch.
 
-    The rule text is pinned from both sides: the framing that IS the point stays,
-    the overclaim stays out, and the one thing that may be said about width is
-    said as a share with a residual -- never a specific number, which is
-    run-dependent and belongs in the results section, not in a string that
-    reproduces on every read."""
+    It must claim NO MAGNITUDE AT ALL, not even a hedged one. A first attempt at
+    this fix said "most of M3j's gap is attributable to width", which was true of
+    the run that prompted it (82.6%) and is not gated on anything: the same string
+    reproduces on every future read, including one whose width share is below
+    half. A generic gloss cannot carry a run-dependent quantity, hedged or not --
+    the magnitude belongs in the run's report, where it can be derived from the
+    records it describes.
+
+    So the rule text is pinned from both sides: the framing that IS the point
+    stays, and every quantitative claim stays out."""
     rule = reading_contrast(_inputs()).rule
     assert "BY DEFAULT rather than by evidence" in rule
     assert "not the same as ruling one out" in rule
-    assert "most of M3j's k = 15 gap is attributable to width" in rule
-    assert "residual that is not zero" in rule
+    assert "belongs in the run's own report" in rule, (
+        "the gloss must say where the magnitude lives rather than asserting one"
+    )
     assert "was width" not in rule, "width EXPLAINS the gap is RECURRENT_AHEAD's claim"
     assert "%" not in rule, f"a run-dependent percentage in a generic gloss: {rule!r}"
+    for hedge in ("most of", "nearly all", "almost all", "the bulk of", "largely"):
+        assert hedge not in rule, (
+            f"{hedge!r} is a magnitude claim in a string that reproduces on every "
+            f"read, however hedged: {rule!r}"
+        )
 
 
 def test_recurrent_ahead_keeps_the_clause_the_indistinguishable_gloss_must_not_share():

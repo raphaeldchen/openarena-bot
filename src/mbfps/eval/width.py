@@ -506,10 +506,12 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
         status="INDISTINGUISHABLE",
         rule=(
             f"neither direction clears in {ARMS_REQUIRED} arms at k = {CONTRAST_K}; "
-            f"most of M3j's k = 15 gap is attributable to width, with a residual that "
-            f"is not zero, and the bottleneck lever stands alone BY DEFAULT rather "
-            f"than by evidence -- we could not tell the two blocks apart, which is "
-            f"not the same as ruling one out"
+            f"how much of M3j's k = {CONTRAST_K} gap width accounts for is a "
+            f"MAGNITUDE and belongs in the run's own report, not here -- this "
+            f"status says only "
+            f"that the bottleneck lever stands alone BY DEFAULT rather than by "
+            f"evidence: we could not tell the two blocks apart, which is not the "
+            f"same as ruling one out"
         ),
         arms_up=up, arms_down=down, base_failed=base_failed,
         anchors_broken=anchors_broken,

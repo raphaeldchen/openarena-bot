@@ -1940,7 +1940,7 @@ argument rested on. What survives (+0.00247) still points the same way — `two_
 | smoke (one cell, `runs/m3k_smoke/`) | 2026-09-30T03:31:44Z -> 03:37:26Z (**5 m 42 s**) |
 | measure (nine cells, `runs/m3k_width/`) | 2026-09-30T03:43:45Z -> 05:05:16Z (**81 m 31 s**) |
 | `read` exit | **0** |
-| artefacts | nine `width_<arm>_seed<n>.json` (~267 KB each), `width.txt` (**7,167 bytes**), `measure.log`, `read.log` |
+| artefacts | nine `width_<arm>_seed<n>.json` (~267 KB each), `width.txt` (**7,215 bytes**), `measure.log`, `read.log` |
 | `nonfinite` | `{}` on all nine |
 
 **The output directory is `runs/m3k_width`, not the brief's `runs/m3k_retention`.** That name was a
@@ -1954,12 +1954,18 @@ test fixture. A successor who follows the plan verbatim, or omits `--out`, now l
 and `cmp`. No checkpoint was written or altered and nothing under `runs/` was removed; the phase is
 evaluation only.
 
-**The verdict line was reworded at the final whole-branch review, and `width.txt` and `read.log` were
-regenerated** (they were 7,113 bytes; they are now 7,167). The first read's line said M3j's k = 15
-result "was width" — a claim `INDISTINGUISHABLE` does not license, and one that contradicted the same
-sentence's own "we could not tell the two blocks apart, which is not the same as ruling one out". It
-now says that *most* of M3j's k = 15 gap is attributable to width, with a residual that is not zero.
-**Line 78 — the verdict line — is the only line that differs** between the two files. The status
+**The verdict line was reworded TWICE at the final whole-branch review, and `width.txt` and
+`read.log` were regenerated each time** (7,113 bytes as first run, then 7,167, now **7,215**). The
+first read's line said M3j's k = 15 result "was width" — a claim `INDISTINGUISHABLE` does not
+license, and one that contradicted the same sentence's own "we could not tell the two blocks apart,
+which is not the same as ruling one out". The second attempt replaced it with "*most* of M3j's k = 15
+gap is attributable to width, with a residual that is not zero" — true of **this** run at 82.6%, but
+the gloss is a generic string that reproduces on every future `--phase read`, including one whose
+width share is below half. A hedged magnitude is still a magnitude. So the third and shipped wording
+claims **no quantity at all**: it says where the magnitude lives — this report, derived from the
+records it describes — and confines the status to what it licenses. A test pins every hedge out
+(`most of`, `nearly all`, `almost all`, `the bulk of`, `largely`) as well as the original clause.
+**Line 78 — the verdict line — is the only line that differs** across all three. The status
 (`INDISTINGUISHABLE`), the exit code (0), every table and every number are unchanged; the decision
 rule did not change either, and spec 3.3 records the reason. Re-verified after the regeneration with
 both `diff` and `cmp`, and `read` re-exited 0 (Python's status, taken from `PIPESTATUS`, not `tee`'s).
@@ -2080,7 +2086,7 @@ counts live in the caption, the anchors have their own line, and the verdict lin
      random_vit     +0.0108    -0.0083    +0.0298    1/3    0/3       no
   base control (enc(t) -> position, must clear r2 0.10): frozen_ssl r2=+0.682 3/3, pixel_ae r2=+0.704 3/3, random_vit r2=+0.660 3/3
   anchors (a pass's untouched rung must reproduce its shipped gain): down=ok, up=ok
-  verdict: INDISTINGUISHABLE -- decided by: neither direction clears in 2 arms at k = 15; most of M3j's k = 15 gap is attributable to width, with a residual that is not zero, and the bottleneck lever stands alone BY DEFAULT rather than by evidence -- we could not tell the two blocks apart, which is not the same as ruling one out
+  verdict: INDISTINGUISHABLE -- decided by: neither direction clears in 2 arms at k = 15; how much of M3j's k = 15 gap width accounts for is a MAGNITUDE and belongs in the run's own report, not here -- this status says only that the bottleneck lever stands alone BY DEFAULT rather than by evidence: we could not tell the two blocks apart, which is not the same as ruling one out
 ```
 
 Each row is `contrast_arm` over that arm's three `contrast.k15` dicts: `contrast` the seed mean,
