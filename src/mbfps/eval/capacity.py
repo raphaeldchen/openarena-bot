@@ -14,7 +14,10 @@ quantities. That is the property M3k lacked. Every win this project has had has
 been a level (the anchors, compared with `==` against a known value); every
 stall has been a difference.
 
-Pure: numpy only. No torch, no `Path`, no I/O, no record schema -- those live in
+Pure in its own code: numpy only, plus the shape constants it reads off
+`RSSMConfig` (which loads torch transitively -- deriving the ceiling rather than
+re-spelling it is the stronger constraint). No `Path`, no I/O, no record schema
+-- those live in
 `scripts/latent_capacity.py`.
 """
 from __future__ import annotations
@@ -98,14 +101,28 @@ def _require_distributions(probs: np.ndarray) -> np.ndarray:
 
 
 def bits_carried(probs: np.ndarray) -> float:
-    """`I(z ; h, enc(t))` in bits: the code's total information content.
+    """`Sum_j I(z_j ; h, enc(t))` in bits: the per-categorical informations summed.
+
+    AN UPPER BOUND ON THE CODE'S JOINT INFORMATION, not the joint information
+    itself, because redundancy ACROSS categoricals is counted once per
+    categorical. Measured: 32 categoricals that all copy one 5-bit variable read
+    160.0000 -- the full ceiling -- while carrying 5 bits jointly, a 32x
+    overstatement. An independent code of the same reading carries all 160.
+    Nothing here can tell those two apart.
+
+    What that does and does not license:
+      - A reading BELOW a cut is sound and conservative: if the upper bound is
+        below the cut, the joint information is too.
+      - A reading ABOVE a cut does NOT establish "the capacity is in use", since
+        a fully redundant code reads the ceiling while being almost entirely
+        idle. Any status resting on a high reading must say so.
 
     `H(marginal) - E_n H(row)`, summed over the categoricals. Exact from the
     distributions -- no sampling.
 
-    NOT "information about the frame": the posterior conditions on `h` AND
+    Nor is it "information about the frame": the posterior conditions on `h` AND
     `enc(t)`, and this measures how much the code varies across rows for any
-    reason. `frame_share` is what separates the two sources.
+    reason. `frame_share` is what separates those two sources.
     """
     probs = _require_distributions(probs)
     marginal = probs.mean(axis=0)
@@ -129,8 +146,12 @@ def floor_bits(probs: np.ndarray) -> float:
 
 
 def ceiling_bits(probs: np.ndarray) -> float:
-    """Every row replaced by a one-hot at its argmax: the most this code's
-    argmax pattern could carry. `argmax_marginal_bits` is the second route."""
+    """Every row replaced by a one-hot at its argmax: what this code's argmax
+    PATTERN carries. `argmax_marginal_bits` is the second route.
+
+    NOT an upper bound on `bits_carried`, and not to be refused on as one. A code
+    whose argmax never moves while its tail varies reads 7.5207 bits carried
+    against 0.0000 here. Its only job is the two-route routing check."""
     probs = _require_distributions(probs)
     onehot = np.zeros_like(probs)
     np.put_along_axis(onehot, probs.argmax(axis=-1)[..., None], 1.0, axis=-1)

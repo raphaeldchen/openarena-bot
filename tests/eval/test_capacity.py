@@ -157,7 +157,8 @@ def test_ceiling_bits_is_not_an_upper_bound_on_bits_carried():
     assert carried <= CEILING_BITS + 1e-9, "the real bound still holds"
 
 
-def test_a_code_that_ignores_its_input_carries_no_bits():
+@pytest.mark.parametrize("n", [300, 11000])
+def test_a_code_that_ignores_its_input_carries_no_bits(n):
     """The other end of the scale, and the posterior-collapse case: every row
     the SAME distribution means the code says nothing about which row it is.
 
@@ -165,7 +166,7 @@ def test_a_code_that_ignores_its_input_carries_no_bits():
     control. Measured on this fixture: -5.7e-14 at 300 rows and up to 8e-13 at
     11,000, so a 1e-12 tolerance leaves no headroom at a real cell's size."""
     one = _dirichlet(1, seed=4)[0]
-    probs = np.broadcast_to(one, (300, CATS, CLASSES)).copy()
+    probs = np.broadcast_to(one, (n, CATS, CLASSES)).copy()
     assert bits_carried(probs) == pytest.approx(0.0, abs=1e-9)
 
 
@@ -220,17 +221,56 @@ def test_the_interval_from_sufficient_statistics_matches_a_direct_resample():
     assert _bits_from_stats(stats, picked) == pytest.approx(direct, abs=1e-9)
 
 
-def test_the_interval_brackets_the_point_estimate_and_needs_two_episodes():
+def test_the_interval_is_the_percentile_bootstrap_it_claims_to_be():
+    """Rebuilt from the RAW ROWS under the same seed, not merely bracketed.
+
+    Bracketing the point estimate and asserting a nonzero width is far too weak:
+    measured, ALL of these mutants pass such a test --
+      - `np.quantile(draws, [1 - confidence, confidence])`, a 90% interval where
+        95% was asked for;
+      - `(draws.min(), draws.max())`, no percentile at all;
+      - `size=n_episodes // 2`, a half-size resample.
+    Only a 50% interval fails, and only incidentally, because the point estimate
+    falls outside it. This interval is what `SPARE_CAPACITY` compares against the
+    cut, so its LEVEL is load-bearing and has to be pinned, not its existence.
+
+    The reference arm draws from raw rows through `bits_carried`, so it shares no
+    code with `_bits_from_stats` -- a comparison whose two arms came from one
+    path could only detect nondeterminism, which has bitten this branch four
+    times."""
     probs = _dirichlet(400, seed=6)
     groups = np.random.default_rng(12).integers(0, 10, size=400)
     stats = episode_stats(probs, groups)
-    out = bits_interval(stats, resamples=200, confidence=CONFIDENCE, seed=0)
+    resamples = 200
+    out = bits_interval(stats, resamples=resamples, confidence=CONFIDENCE, seed=0)
+
+    n_episodes = int(np.unique(groups).size)
+    rng = np.random.default_rng(0)
+    index = np.arange(n_episodes)
+    draws = []
+    for _ in range(resamples):
+        picked = rng.choice(index, size=n_episodes, replace=True)
+        rows = np.concatenate([np.flatnonzero(groups == stats.labels[g]) for g in picked])
+        draws.append(bits_carried(probs[rows]))
+    tail = (1.0 - CONFIDENCE) / 2.0
+    low, high = np.quantile(draws, [tail, 1.0 - tail])
+
     assert out["bits"] == pytest.approx(bits_carried(probs), abs=1e-9)
-    assert out["ci_low"] <= out["bits"] <= out["ci_high"]
-    assert out["ci_low"] < out["ci_high"], "an interval with no width did not resample"
-    assert out["n_episodes"] == 10
+    assert out["ci_low"] == pytest.approx(float(low), abs=1e-9), (
+        "the lower bound is not the percentile of a same-seed raw-row bootstrap"
+    )
+    assert out["ci_high"] == pytest.approx(float(high), abs=1e-9), (
+        "the upper bound is not the percentile of a same-seed raw-row bootstrap"
+    )
+    assert out["ci_low"] < out["ci_high"]
+    assert out["n_episodes"] == n_episodes == 10
     assert out["confidence"] == CONFIDENCE
 
+
+def test_the_interval_needs_two_episodes():
+    """One resampling unit cannot produce an interval, and returning a
+    zero-width one would read as a precise measurement."""
+    probs = _dirichlet(400, seed=6)
     with pytest.raises(ValueError, match="at least two"):
         bits_interval(episode_stats(probs, np.zeros(400, dtype=int)),
                       resamples=10, confidence=CONFIDENCE, seed=0)

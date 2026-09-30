@@ -313,11 +313,21 @@ def test_the_two_ceiling_routes_agree():
     assert ceiling_bits(probs) == pytest.approx(argmax_marginal_bits(probs), abs=1e-9)
 
 
-def test_bits_carried_is_bracketed_by_zero_and_the_ceiling():
-    """The three inequalities the run refuses on."""
-    probs = _dirichlet(500, seed=3)
-    carried, ceiling = bits_carried(probs), ceiling_bits(probs)
-    assert 0.0 <= carried <= ceiling + 1e-9 <= CEILING_BITS + 1e-9
+def test_the_only_bound_on_bits_carried_is_the_derived_ceiling():
+    """THE TWO inequalities a refusal may rest on, both theorems:
+
+        -1e-9 <= bits_carried <= CEILING_BITS + 1e-9
+         0    <= ceiling_bits <= CEILING_BITS + 1e-9
+
+    `bits <= ceiling_bits` IS NOT ONE OF THEM. `ceiling_bits` is the information
+    content of the ARGMAX PATTERN, `bits_carried` that of the DISTRIBUTION, and a
+    code whose argmax never moves while its tail varies reads 7.5207 against
+    0.0000. Write the companion test that documents that counterexample, so the
+    refusal cannot be re-added."""
+    for n in (500, 2000, 11000):
+        probs = _dirichlet(n, seed=3)
+        assert -1e-9 <= bits_carried(probs) <= CEILING_BITS + 1e-9
+        assert 0.0 <= ceiling_bits(probs) <= CEILING_BITS + 1e-9
 
 
 def test_a_code_that_ignores_its_input_carries_no_bits():
@@ -1264,7 +1274,7 @@ def format_reading_capacity(reading: CapacityStatus, inputs: CapacityInputs) -> 
     )
     lines.append(
         "  estimator checks (floor exactly 0, two ceiling routes agreeing, the "
-        "three inequalities): " + ", ".join(
+        "two theorem inequalities): " + ", ".join(
             f"{a}={'ok' if inputs.controls[a] else 'BROKEN'}"
             for a in sorted(inputs.controls)
         )
@@ -1375,7 +1385,7 @@ def test_the_plan_is_refused_before_the_probe_not_after():
     script.require_readable_plan(list(script.ARMS), (0, 1, 2))  # does not raise
 ```
 
-Also write, in the same file: a test that `estimator_checks` returns False when `floor_bits` is nonzero, when the two ceiling routes disagree, and when any of the three inequalities is violated — each driven separately, each with a fixture that clears the other two; a test that the record's key set is pinned exactly and round-trips through the real `write_record`/`load_record`; and a test that every probe call gets the cell's own bootstrap seed (`Counter` over **all** calls, not the first — M3j shipped every cell sharing seed 0, which correlates the interval noise the agreement rule treats as independent).
+Also write, in the same file: a test that `estimator_checks` returns False when `floor_bits` is nonzero, when the two ceiling routes disagree, and when either of the **two theorem** inequalities is violated (`-1e-9 <= bits <= CEILING_BITS + 1e-9` and `0 <= ceiling <= CEILING_BITS + 1e-9`) — each driven separately, each with a fixture that clears the others. **There is no third inequality:** `bits <= ceiling_bits` is not a theorem, and `tests/eval/test_capacity.py::test_ceiling_bits_is_not_an_upper_bound_on_bits_carried` carries the counterexample. Drive that same fixture through `estimator_checks` and assert it is NOT refused; a test that the record's key set is pinned exactly and round-trips through the real `write_record`/`load_record`; and a test that every probe call gets the cell's own bootstrap seed (`Counter` over **all** calls, not the first — M3j shipped every cell sharing seed 0, which correlates the interval noise the agreement rule treats as independent).
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -1591,7 +1601,7 @@ diff <(.venv/bin/python scripts/latent_capacity.py --phase read --out runs/m3l_c
 
 Required, each with its cell count out of 9 and its exception named with its margin:
 
-- `bits_carried` per arm and per cell, against the 160-bit ceiling, as a **share** as well as a level
+- `bits_carried` per arm and per cell, against the 160-bit ceiling, as a **share** as well as a level — described as **the per-categorical informations summed, an upper bound on the code's joint information**, never as "the code carries N of 160 bits". Measured: 32 categoricals all copying one 5-bit variable read 160.0000 while carrying 5 bits jointly, a 32× overstatement. So a reading BELOW a cut is sound and conservative; a reading ABOVE one does **not** establish that the capacity is in use, and if the status rests on a high reading the write-up must say so in the same breath
 - `frame_share` per arm and per cell, and `live` out of 1024
 - `prior_bits` as the companion that decides nothing, with one sentence on what it says about M3g's finding that the prior is the failing stage
 - all three estimator checks on all nine cells
