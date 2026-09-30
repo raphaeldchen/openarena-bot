@@ -1,8 +1,11 @@
-"""M3k's script: three passes over one gather, and the anchors that gate them."""
+"""M3k's script: three passes over one gather, the anchors that gate them, and the
+read that pools nine records into Reading F."""
 
 import copy
 import importlib.util
 import inspect
+import json
+import re
 import types
 import weakref
 from collections import Counter
@@ -12,12 +15,14 @@ import numpy as np
 import pytest
 
 from mbfps.eval.retention import (
-    RESAMPLES, RUNGS, TARGETS, backward_rotation, backward_translation, rung_block,
+    ARMS_REQUIRED, BASE_R2_FLOOR, K_REPORTED, RESAMPLES, RETENTION_FAMILY, RUNGS,
+    SEEDS_REQUIRED, TARGETS, backward_rotation, backward_translation, rung_block,
     shifted_rows,
 )
+from mbfps.eval.retention import reading_retention as _reading_retention
 from mbfps.eval.width import (
     ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH, UP_WIDTH,
-    pass_block,
+    pass_block, reading_contrast,
 )
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "latent_width.py"
@@ -1538,3 +1543,1073 @@ def test_require_one_protocol_accepts_nine_records_that_agree():
 def test_require_one_protocol_refuses_an_empty_pool():
     with pytest.raises(SystemExit, match="no width record"):
         script.require_one_protocol({})
+
+
+# ---------------------------------------------------------------------------
+# read: the nine records pooled into Reading F
+# ---------------------------------------------------------------------------
+#
+# THE FIXTURE CARRIES NINE DISTINCT PAYLOADS. A record built from one template
+# with only the labels changed would let an implementation pair `frozen_ssl`
+# with `pixel_ae`'s seeds, collapse every arm onto seed 0, or read the wrong
+# horizon, and every test would still pass -- so every per-cell number below
+# (contrast, gain at every pass/target/horizon/rung, both base-control r2s)
+# is a function of the cell's `(arm, seed)`. What is DELIBERATELY equal across
+# cells is exactly what a real study holds fixed: the protocol, the windows,
+# the row counts and the cluster count.
+
+_ARM_ORDER = ("frozen_ssl", "pixel_ae", "random_vit", "fourth_arm")
+
+_QUIET = 0.002
+_HALF = 0.04
+_CLEAR = 0.08
+"""A gain clears when `ci_low = gain - _HALF` exceeds 0. `_QUIET` gains plus every
+offset and every bias below stay UNDER `_HALF` (checked by `test_the_quiet_...`),
+so a rung clears if and only if a test put it in `clearing` -- in particular the
+`up` pass, whose bias would otherwise make it clear on its own."""
+
+_BIAS = {
+    "translation": {"two_frame": 0.0, "deterministic": 0.0137,
+                    "stochastic": 0.0071, "full": 0.0093},
+    "rotation": {"two_frame": 0.0, "deterministic": 0.0041,
+                 "stochastic": 0.0023, "full": 0.0032},
+}
+"""`up - shipped` at `CONTRAST_K`, hand-typed. `two_frame` is `up`'s anchor, so its
+bias is exactly zero: the untouched rung."""
+_OFF_K = 0.01
+_ARM_STEP = 0.001
+_SEED_STEP = 0.0006
+_BROKEN_SHIFT = 0.0009
+
+
+def _rank(arm, seed):
+    return 10 * _ARM_ORDER.index(arm) + seed
+
+
+def _bias(target, k, rung, arm, seed):
+    if rung == ANCHOR["up"]:
+        return 0.0
+    return (
+        _BIAS[target][rung] + (0.0 if k == CONTRAST_K else _OFF_K)
+        + _ARM_STEP * _ARM_ORDER.index(arm) + _SEED_STEP * seed
+    )
+
+
+def _shipped_gain(target, rung, arm, seed, clearing):
+    value = _QUIET + 0.0001 * _rank(arm, seed) + 0.0002 * RUNGS.index(rung)
+    return value + (_CLEAR if ("shipped", target, rung) in clearing else 0.0)
+
+
+def _pass_gain(pass_name, target, k, rung, arm, seed, clearing, anchors):
+    """One cell's gain for one `(pass, target, k, rung)`.
+
+    An ANCHOR rung is bit-identical to the shipped pass while its anchor holds --
+    which is what a real record looks like -- so `clearing` cannot make a `down`
+    `deterministic` clear on its own: put it in `("shipped", ...)` and the anchor
+    carries it. A broken anchor shifts that rung instead, so a record that says
+    `up=BROKEN` also carries gains that show it.
+    """
+    shipped = _shipped_gain(target, rung, arm, seed, clearing)
+    if pass_name == "shipped":
+        return shipped
+    holds = anchors[0] if pass_name == "down" else anchors[1]
+    if rung == ANCHOR[pass_name]:
+        return shipped if holds else shipped + _BROKEN_SHIFT
+    gain = shipped + (
+        0.001 if pass_name == "down" else _bias(target, k, rung, arm, seed)
+    )
+    return gain + (_CLEAR if (pass_name, target, rung) in clearing else 0.0)
+
+
+def _gain_dict(gain):
+    return {"gain": gain, "ci_low": gain - _HALF, "ci_high": gain + _HALF,
+            "joint_r2": 0.05, "embedding_r2": 0.04, "confidence": 0.95,
+            "n_scored_windows": 48, "ridge_selected": True, "joint_ridge": 1e5,
+            "embedding_ridge": 1e5}
+
+
+def _record(arm, seed, *, clears=0.0, base_r2=0.65, anchors=(True, True),
+            clearing=frozenset(), base_spread=0.0004, r2=None):
+    """One cell's record, in the schema `measure_cell` writes.
+
+    `clears` shifts the k = 15 contrast (`+0.05` puts every seed's interval
+    above zero, `-0.05` below, `0.0` straddling it). `base_r2` is the POSITION
+    r2 the gate reads and `r2` the 4-column mean it does not (default 0.33 plus a
+    per-cell offset) -- deliberately different numbers so a read of the wrong one
+    is a different verdict, not the same one. `anchors` is `(down, up)`.
+    """
+    rank = _rank(arm, seed)
+    contrast = clears + 0.0003 * rank
+    passes = {
+        p: {t: {f"k{k}": {r: _gain_dict(_pass_gain(p, t, k, r, arm, seed, clearing, anchors))
+                          for r in RUNGS}
+                for k in K_REPORTED}
+            for t in TARGETS}
+        for p in PASSES
+    }
+    return {
+        "arm": arm, "seed": seed, "step": 20000, "device": "cpu",
+        "context": 5, "horizon": 45, "h_dim": RUNG_WIDTH["deterministic"],
+        "passes": passes,
+        "contrast": {f"k{CONTRAST_K}": {
+            "contrast": contrast, "ci_low": contrast - 0.01, "ci_high": contrast + 0.01,
+            "a_r2": 0.05, "b_r2": 0.04, "confidence": 0.95, "n_scored_windows": 48,
+            "a_ridge": 1e5, "b_ridge": 1e5, "ridge_selected": True,
+        }},
+        "rows": {"k1": 11221, "k4": 10534, "k15": 8015}, "clusters": 24,
+        "anchors": {"down": anchors[0], "up": anchors[1]},
+        "base_control": {
+            "r2": (0.33 + 0.001 * rank) if r2 is None else r2,
+            "position_r2": base_r2 + base_spread * rank,
+            "per_column_r2": [0.7, 0.7, 0.0, -0.05],
+            "ridge": 1e3, "ridge_selected": True, "rows": 11450,
+        },
+        "projection_seed": PROJECTION_SEED, "rung_width": dict(RUNG_WIDTH),
+        # PER GATHERED ROW, as a real record's lists are: 96 rows over 48 windows
+        # over 24 episodes, three different numbers a caption could confuse.
+        "windows": {"episode": [i // 4 for i in range(96)], "window": [i // 2 for i in range(96)]},
+        "self_check": {"ok": True}, "git_sha": "abc", "ks": list(K_REPORTED),
+        "torch_version": "2.13.0", "split_seed": 0, "record_git_sha": "ca3e140",
+        "episodes": {"fit": [], "select": [], "val": [f"e{i}" for i in range(24)]},
+    }
+
+
+def _records(arms=_ARM_ORDER[:3], seeds=(0, 1, 2), **kw):
+    return {(a, s): _record(a, s, **kw) for a in arms for s in seeds}
+
+
+def _write(directory, records):
+    for (arm, seed), record in records.items():
+        script.width_record_path(directory, arm, seed).write_text(json.dumps(record))
+
+
+def _main_read(*argv):
+    """`main(["--phase", "read", ...])` with the MEASURE half made unreachable.
+
+    THIS GUARD EXISTS BECAUSE ITS ABSENCE COST A REAL MEASURE. A mutation of
+    `main` that let `--phase read` fall into the measure branch did not fail a
+    test -- the read tests handed `main` a real `--source` default, so it loaded
+    the real checkpoints and ran a real cell on the GPU, ~7 minutes of it,
+    writing a record into pytest's tmp dir before it was killed. A regression of
+    that shape must be a loud, instant AssertionError, never a measurement."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("--phase read reached the measure phase")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(script, "measure_phase", forbidden)
+        patch.setattr(script, "ReplayBuffer", forbidden)
+        return script.main(list(argv))
+
+
+def _read(tmp_path, capsys, records, *extra):
+    """Write `records`, run the real `main --phase read`, return `(status, stdout)`."""
+    _write(tmp_path, records)
+    status = _main_read("--phase", "read", "--out", str(tmp_path), *extra)
+    return status, capsys.readouterr().out
+
+
+def _verdict_lines(text):
+    return [line.strip() for line in text.splitlines() if "verdict:" in line]
+
+
+def _set_contrast(record, contrast, half=0.01):
+    record["contrast"][KEY].update(
+        contrast=contrast, ci_low=contrast - half, ci_high=contrast + half,
+    )
+
+
+def test_the_fixture_carries_nine_distinct_payloads():
+    """Guards the FIXTURE, which is what every read test below stands on: nine
+    records that differed only in their labels would let a cross-arm pairing, a
+    seed collapse or a first-record-stands-for-all pass every test in this
+    section. Labels are dropped before comparing, so this is about payloads."""
+    records = _records()
+    payloads = {
+        json.dumps({k: v for k, v in r.items() if k not in ("arm", "seed")}, sort_keys=True)
+        for r in records.values()
+    }
+    assert len(payloads) == 9
+    for pick in (
+        lambda r: r["contrast"][KEY]["contrast"],
+        lambda r: r["base_control"]["position_r2"],
+        lambda r: r["base_control"]["r2"],
+        lambda r: r["passes"]["down"]["translation"]["k4"]["full"]["gain"],
+        lambda r: r["passes"]["up"]["rotation"][KEY]["stochastic"]["gain"],
+    ):
+        values = [pick(r) for r in records.values()]
+        assert len(set(values)) == 9, values
+
+
+def test_the_quiet_gains_never_clear_so_only_a_test_can_make_a_rung_clear():
+    """Every `up` bias, arm step and seed step stays under the interval's
+    half-width, at every horizon: a rung clears iff a test asked for it."""
+    for record in _records(arms=_ARM_ORDER, seeds=(0, 1, 2, 3)).values():
+        for pass_name in PASSES:
+            for target in TARGETS:
+                for key in (f"k{k}" for k in K_REPORTED):
+                    for rung in RUNGS:
+                        assert record["passes"][pass_name][target][key][rung]["ci_low"] < 0.0
+
+
+# ---- Reading F, end to end ------------------------------------------------
+
+
+@pytest.mark.parametrize("clears,expected", [
+    (+0.05, "PAST FRAME AHEAD"),
+    (-0.05, "RECURRENT AHEAD"),
+    (0.0, "INDISTINGUISHABLE"),
+])
+def test_read_reaches_every_decided_status(tmp_path, capsys, clears, expected):
+    status, printed = _read(tmp_path, capsys, _records(clears=clears))
+    assert f"verdict: {expected}" in printed
+    assert _verdict_lines(printed)[-1].startswith(f"verdict: {expected} -- decided by:"), (
+        "Reading F's verdict is the LAST line: evidence before the conclusion"
+    )
+    assert status == script.EXIT_OK
+    assert (tmp_path / "width.txt").read_bytes() == printed.encode()
+
+
+def test_read_exits_41_when_the_position_control_fails(tmp_path, capsys):
+    """The 4-column `r2` sits at 0.33 in every cell here -- above the floor -- so a
+    gate that read it would clear and exit 0. Only the POSITION r2 is below."""
+    status, printed = _read(tmp_path, capsys, _records(base_r2=BASE_R2_FLOOR - 0.05))
+    assert status == 41 == script.EXIT_BASE_UNRESOLVED
+    assert _verdict_lines(printed)[-1].startswith("verdict: UNRESOLVED BASE")
+
+
+def test_the_gate_reads_position_r2_and_ignores_the_four_column_mean(tmp_path, capsys):
+    """The converse: the 4-column `r2` is BELOW the floor everywhere and the
+    position r2 well above it. A gate on `r2` would exit 41 here."""
+    status, printed = _read(
+        tmp_path, capsys, _records(clears=+0.05, r2=BASE_R2_FLOOR - 0.05),
+    )
+    assert status == script.EXIT_OK
+    assert _verdict_lines(printed)[-1].startswith("verdict: PAST FRAME AHEAD")
+
+
+def test_a_position_r2_exactly_on_the_floor_does_not_clear_it(tmp_path, capsys):
+    """Strict `>`, as `retention`'s own read applies it. `base_spread=0.0` puts
+    EVERY cell exactly on the line; a `>=` would clear all nine and exit 0."""
+    status, _ = _read(
+        tmp_path, capsys, _records(base_r2=BASE_R2_FLOOR, base_spread=0.0),
+    )
+    assert status == script.EXIT_BASE_UNRESOLVED
+
+
+def _tally_pattern_records():
+    """Per-seed position r2 chosen so the ARM MEAN and the SEED TALLY disagree:
+    frozen_ssl (0.5, 0.05, 0.05) mean 0.20 tally 1; pixel_ae (0.05, 0.5, 0.5)
+    mean 0.35 tally 2; random_vit (0.05, 0.05, 0.11) mean 0.07 tally 1. Every
+    arm differs from the others in mean AND in which seed carries the clearing,
+    so a base-control loop that read seed 0 (or seed 2) three times, or one arm's
+    seeds under another's name, lands on a different tally for at least one arm.
+    """
+    records = _records(clears=+0.05)
+    pattern = {
+        "frozen_ssl": (0.5, 0.05, 0.05),
+        "pixel_ae": (0.05, 0.5, 0.5),
+        "random_vit": (0.05, 0.05, 0.11),
+    }
+    for arm, levels in pattern.items():
+        for seed, level in enumerate(levels):
+            records[(arm, seed)]["base_control"]["position_r2"] = level
+    return records
+
+
+def test_the_base_tally_is_per_seed_within_each_arm_not_a_mean_and_not_one_seed_repeated():
+    base = script.contrast_inputs(_tally_pattern_records()).base
+    assert {arm: control.seeds_clear for arm, control in base.items()} == {
+        "frozen_ssl": 1, "pixel_ae": 2, "random_vit": 1,
+    }
+    assert {arm: control.seeds_total for arm, control in base.items()} == {
+        "frozen_ssl": 3, "pixel_ae": 3, "random_vit": 3,
+    }
+    assert base["frozen_ssl"].r2 == pytest.approx(0.20)
+    assert base["pixel_ae"].r2 == pytest.approx(0.35)
+    assert base["random_vit"].r2 == pytest.approx(0.07)
+
+
+def test_the_base_gate_counts_seeds_not_an_arm_mean(tmp_path, capsys):
+    """Only pixel_ae holds 2 of 3 seeds, so 1 of 3 arms holds: UNRESOLVED_BASE. A
+    gate on the ARM MEAN would see frozen_ssl (0.20) and pixel_ae (0.35) clear and
+    read the comparison."""
+    status, printed = _read(tmp_path, capsys, _tally_pattern_records())
+    assert status == script.EXIT_BASE_UNRESOLVED
+    assert _verdict_lines(printed)[-1].startswith("verdict: UNRESOLVED BASE")
+
+
+def test_one_failing_arm_does_not_stop_the_reading_but_is_printed(tmp_path, capsys):
+    """Two of three arms hold, which is `ARMS_REQUIRED`: the reading goes on, and
+    the failing arm's tally is on the page rather than silently dropped."""
+    records = _records(clears=+0.05)
+    for seed, level in enumerate((0.04, 0.05, 0.06)):
+        records[("random_vit", seed)]["base_control"]["position_r2"] = level
+    status, printed = _read(tmp_path, capsys, records)
+    assert status == script.EXIT_OK
+    assert _verdict_lines(printed)[-1].startswith("verdict: PAST FRAME AHEAD")
+    assert "random_vit r2=+0.050 0/3" in printed
+    assert "frozen_ssl r2=+0.650 3/3" in printed
+
+
+def test_the_base_line_prints_the_position_r2_the_tally_was_read_from(tmp_path, capsys):
+    """THE M3h TRAP: a tally printed beside a number it was not read from. The
+    gate is `position_r2`, so the `r2=` figure on the base-control line must be
+    the arm's mean POSITION r2 -- 0.650 / 0.654 / 0.658 here -- and the
+    4-column mean (0.331 / 0.341 / 0.351) must appear NOWHERE. Reading E's own
+    base line is the same object, so each figure is printed twice, never with a
+    different number the second time."""
+    _, printed = _read(tmp_path, capsys, _records(clears=+0.05))
+    for arm, position, four_column in (
+        ("frozen_ssl", "+0.650", "+0.331"),
+        ("pixel_ae", "+0.654", "+0.341"),
+        ("random_vit", "+0.658", "+0.351"),
+    ):
+        assert printed.count(f"{arm} r2={position} 3/3") == 2, arm
+        assert four_column not in printed, (
+            f"the 4-column r2 {four_column} is printed; it is not what the gate reads"
+        )
+
+
+def test_read_exits_42_when_the_down_anchor_is_broken(tmp_path, capsys):
+    status, printed = _read(tmp_path, capsys, _records(anchors=(False, True)))
+    assert status == 42 == script.EXIT_ANCHOR_BROKEN
+    assert "down=BROKEN" in printed
+    assert _verdict_lines(printed)[-1].startswith("verdict: UNRESOLVED ANCHOR")
+
+
+def test_an_unresolved_base_outranks_a_broken_down_anchor(tmp_path, capsys):
+    status, printed = _read(
+        tmp_path, capsys,
+        _records(base_r2=BASE_R2_FLOOR - 0.05, anchors=(False, True)),
+    )
+    assert status == script.EXIT_BASE_UNRESOLVED
+    assert _verdict_lines(printed)[-1].startswith("verdict: UNRESOLVED BASE")
+
+
+@pytest.mark.parametrize("cell", sorted(_records()))
+@pytest.mark.parametrize("which", ["down", "up"])
+def test_one_broken_anchor_in_any_single_cell_breaks_the_pooled_anchor(cell, which):
+    """`all` over the nine cells, not the first, the last, or `any`. The broken cell
+    is each of the nine in turn, so a read that let one record stand for the set
+    would miss it for eight of them."""
+    records = _records()
+    records[cell]["anchors"][which] = False
+    anchors = script.contrast_inputs(records).anchors
+    assert anchors == {"down": which != "down", "up": which != "up"}
+
+
+def test_a_broken_up_anchor_is_reported_but_does_not_block_the_reading(tmp_path, capsys):
+    status, printed = _read(tmp_path, capsys, _records(clears=+0.05, anchors=(True, False)))
+    assert status == script.EXIT_OK
+    assert "verdict: PAST FRAME AHEAD" in printed
+    assert "up=BROKEN" in printed
+    assert "width bias" in printed and "unreadable" in printed
+
+
+# ---- the loader and the plan ------------------------------------------------
+
+
+def test_read_names_a_missing_record_and_exits_11(tmp_path, capsys):
+    records = _records()
+    del records[("pixel_ae", 1)]
+    status, printed = _read(tmp_path, capsys, records)
+    assert status == script.EXIT_NO_CHECKPOINTS == 11
+    assert "NO CELL:" in printed and "pixel_ae seed 1" in printed
+    assert not (tmp_path / "width.txt").exists()
+
+
+def test_a_record_that_disagrees_with_its_own_filename_is_refused_by_name(tmp_path):
+    """A swapped pair of files would pool one cell under the other's name with
+    every count still right."""
+    records = _records()
+    _write(tmp_path, records)
+    swapped = records[("pixel_ae", 1)]
+    script.width_record_path(tmp_path, "frozen_ssl", 2).write_text(json.dumps(swapped))
+    with pytest.raises(SystemExit, match=r"width_frozen_ssl_seed2\.json.*frozen_ssl seed 2.*pixel_ae"):
+        script.load_width(tmp_path, ["frozen_ssl", "pixel_ae", "random_vit"], [0, 1, 2])
+
+
+@pytest.mark.parametrize("extra", [
+    ["--arms", "frozen_ssl", "frozen_ssl"],
+    ["--arms", "frozen_ssl"],
+    ["--seeds", "0", "0", "0"],
+    ["--seeds", "1"],
+])
+def test_read_refuses_a_plan_too_narrow_before_touching_the_records(tmp_path, extra):
+    """`--arms frozen_ssl frozen_ssl` is TWO names and ONE arm, and `--seeds 0 0 0`
+    is three names and one seed: counting the argument lists would pass both and
+    the reading would raise deep inside `contrast_arm`. No record exists here, so
+    a refusal is provably made from the plan alone."""
+    with pytest.raises(SystemExit, match="cannot be read"):
+        _main_read("--phase", "read", "--out", str(tmp_path), *extra)
+
+
+def test_read_refuses_records_that_are_not_one_measurement_before_reading_anything(tmp_path, capsys):
+    """Nine records pooled into one reading must share a protocol. The comparison
+    itself is pinned field by field in `require_one_protocol`'s own tests; this is
+    the test that `read` CALLS it -- a `git_sha` that differs in one cell (two code
+    versions in one finding) must stop the read with the cell named, print
+    nothing, and write no artefact."""
+    records = _records(clears=+0.05)
+    records[("random_vit", 2)]["git_sha"] = "a-different-commit"
+    _write(tmp_path, records)
+    with pytest.raises(SystemExit, match=r"random_vit seed 2.*disagree on git_sha"):
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    assert not (tmp_path / "width.txt").exists()
+    assert capsys.readouterr().out == ""
+
+
+def test_read_takes_a_plan_of_duplicated_names_as_the_distinct_plan(tmp_path, capsys):
+    """Duplicates collapse rather than refuse when the distinct plan is readable:
+    the records dict is keyed by cell, so a name given twice is one cell."""
+    status, printed = _read(
+        tmp_path, capsys, _records(arms=_ARM_ORDER[:2], clears=+0.05),
+        "--arms", "pixel_ae", "frozen_ssl", "pixel_ae", "--seeds", "0", "1", "2", "1",
+    )
+    assert status == script.EXIT_OK
+    assert "verdict: PAST FRAME AHEAD" in printed
+
+
+# ---- what the builder hands the reading ----------------------------------------
+
+
+def test_contrast_inputs_pools_each_arm_from_its_own_seeds():
+    """Hand-typed. Per arm the contrast is the seed MEAN, `ci_low` the LEAST lower
+    bound and `ci_high` the GREATEST upper bound, and the tallies count seeds
+    whose OWN interval excludes zero -- three arms with three different
+    patterns, so pairing one arm with another's seeds changes a number."""
+    records = _records()
+    contrasts = {
+        "frozen_ssl": (0.030, 0.040, 0.050),      # up 3, down 0
+        "pixel_ae": (0.011, 0.020, -0.002),       # up 2, down 0
+        "random_vit": (-0.030, -0.040, 0.001),    # up 0, down 2
+    }
+    for arm, values in contrasts.items():
+        for seed, value in enumerate(values):
+            _set_contrast(records[(arm, seed)], value)
+    arms = script.contrast_inputs(records).arms
+    expected = {
+        #             contrast   ci_low  ci_high  up dn
+        "frozen_ssl": (0.040, 0.020, 0.060, 3, 0),
+        "pixel_ae": (0.029 / 3, -0.012, 0.030, 2, 0),
+        "random_vit": (-0.023, -0.050, 0.011, 0, 2),
+    }
+    assert set(arms) == set(expected)
+    for name, (contrast, low, high, up, down) in expected.items():
+        arm = arms[name]
+        assert arm.contrast == pytest.approx(contrast), name
+        assert arm.ci_low == pytest.approx(low), name
+        assert arm.ci_high == pytest.approx(high), name
+        assert (arm.seeds_up, arm.seeds_down, arm.seeds_total) == (up, down, 3), name
+    assert reading_contrast(script.contrast_inputs(records)).status == "PAST_FRAME_AHEAD"
+
+
+def test_contrast_inputs_reads_the_contrast_horizon_and_its_row_count():
+    """`rows` is the row count AT `CONTRAST_K` -- 8015 -- not `k4`'s 10534 (the
+    other reading's horizon) or `k1`'s 11221, which is the first key. And
+    `clusters` is the distinct-episode count, 24, not the 48 windows."""
+    inputs = script.contrast_inputs(_records())
+    assert inputs.rows == 8015
+    assert inputs.clusters == 24
+
+
+def test_the_script_never_reaches_for_the_other_readings_horizon():
+    """`retention.DECISION_K` is 4 and means a different horizon. Nothing here
+    imports it, so no line can read `k4` where `CONTRAST_K` was meant."""
+    assert not hasattr(script, "DECISION_K")
+    assert script.CONTRAST_K == 15
+
+
+def test_the_builder_satisfies_every_precondition_the_reading_enforces():
+    """`reading_contrast` raises on eight kinds of malformed input; the builder's
+    output for a well-formed study must clear all of them."""
+    inputs = script.contrast_inputs(_records())
+    assert len(inputs.arms) >= ARMS_REQUIRED
+    assert set(inputs.anchors) == set(ANCHOR)
+    assert set(inputs.base) == set(inputs.arms)
+    assert len({arm.seeds_total for arm in inputs.arms.values()}) == 1
+    assert inputs.arms["frozen_ssl"].seeds_total >= SEEDS_REQUIRED
+    reading_contrast(inputs)
+
+
+@pytest.mark.parametrize("field,value", [("clusters", 23), ("rows", {"k1": 11221, "k4": 10534, "k15": 8000})])
+def test_records_that_disagree_on_clusters_or_rows_are_refused_not_sampled(field, value):
+    """`ContrastInputs.clusters` and `.rows` are ONE number in a caption that
+    speaks for nine cells. Taking the first record's would print `8015 rows` over
+    a set whose members do not agree -- one member standing for the set. The
+    victim sorts LAST, so a builder that read the first record sees nothing."""
+    records = _records()
+    records[("random_vit", 2)][field] = value
+    with pytest.raises(SystemExit) as raised:
+        script.contrast_inputs(records)
+    message = str(raised.value)
+    assert field in message and "random_vit seed 2" in message
+
+
+@pytest.mark.parametrize("mutate,names", [
+    (lambda r: r["contrast"].pop(KEY), ("pixel_ae seed 1", f"contrast.{KEY}")),
+    (lambda r: r["anchors"].pop("down"), ("pixel_ae seed 1", "anchors.down")),
+    (lambda r: r["base_control"].pop("position_r2"), ("pixel_ae seed 1", "base_control.position_r2")),
+    (lambda r: r.pop("clusters"), ("pixel_ae seed 1", "clusters")),
+])
+def test_a_record_missing_a_field_the_reading_needs_is_a_named_refusal(mutate, names):
+    """SystemExit naming the cell and the path -- never a bare KeyError, which
+    would surface as a traceback after the reader had paid for the measure."""
+    records = _records()
+    mutate(records[("pixel_ae", 1)])
+    with pytest.raises(SystemExit) as raised:
+        script.contrast_inputs(records)
+    for name in names:
+        assert name in str(raised.value)
+
+
+def test_records_that_all_lack_the_contrast_horizons_rows_are_a_named_refusal():
+    """Every record without `rows.k15` -- as if `k15` had not been measured -- is a
+    refusal that names the path, distinct from the disagreement refusal above
+    (one record lacking it would DISAGREE with the rest and be refused as that)."""
+    records = _records()
+    for record in records.values():
+        del record["rows"][KEY]
+    with pytest.raises(SystemExit, match=rf"rows\.{KEY}"):
+        script.contrast_inputs(records)
+
+
+def test_a_non_boolean_anchor_is_refused_rather_than_read_as_truthy():
+    """`"false"` is truthy: passed through `all`, a hand-edited or damaged record
+    would read as an anchor that HELD."""
+    records = _records()
+    records[("random_vit", 0)]["anchors"]["down"] = "false"
+    with pytest.raises(SystemExit, match=r"random_vit seed 0.*anchors\.down"):
+        script.contrast_inputs(records)
+
+
+@pytest.mark.parametrize("key", ["contrast", "ci_low", "ci_high"])
+def test_a_non_finite_contrast_is_refused_by_arm_and_not_read_as_indistinguishable(key):
+    """NaN compares False both ways, so it would land on INDISTINGUISHABLE -- a
+    pre-registered finding asserted from a broken number."""
+    records = _records()
+    records[("pixel_ae", 2)]["contrast"][KEY][key] = float("nan")
+    with pytest.raises(SystemExit, match=r"pixel_ae.*non-finite"):
+        script.contrast_inputs(records)
+
+
+def test_a_non_finite_position_r2_is_refused_rather_than_counted_as_a_failed_control():
+    """`nan > BASE_R2_FLOOR` is False, so a NaN would silently count as a seed that
+    did NOT clear -- UNRESOLVED_BASE, from a measurement that never happened."""
+    records = _records()
+    records[("frozen_ssl", 1)]["base_control"]["position_r2"] = float("nan")
+    with pytest.raises(SystemExit, match=r"frozen_ssl seed 1.*position_r2"):
+        script.contrast_inputs(records)
+
+
+@pytest.mark.parametrize("build,needle", [
+    (lambda: {c: r for c, r in _records().items() if c[0] == "pixel_ae"}, r"cover 1 arm"),
+    (lambda: {c: r for c, r in _records().items() if c[1] == 0}, r"SEEDS_REQUIRED=2 seeds"),
+    (lambda: {c: r for c, r in _records().items() if c != ("random_vit", 2)},
+     r"do not share one seed count"),
+])
+def test_records_too_narrow_or_uneven_for_the_reading_are_a_named_refusal(build, needle):
+    """One arm; one seed per arm; and an arm one seed short of the others -- the
+    three shapes `reading_contrast` would raise a bare ValueError on. Each is
+    matched on the message of the check that owns it (the middle one is
+    `contrast_arm`'s, named by arm), so one refusal cannot stand in for another."""
+    with pytest.raises(SystemExit, match=needle):
+        script.contrast_inputs(build())
+
+
+# ---- refusals the READING owns, and where they sit relative to the gates -----
+
+
+def _both_ways_records(**kw):
+    """frozen_ssl clears UP in seeds 0-1 and DOWN in seeds 2-3: with four seeds
+    one arm clears both ways. The other two arms straddle zero."""
+    records = _records(seeds=(0, 1, 2, 3), **kw)
+    for seed, value in enumerate((+0.05, +0.05, -0.05, -0.05)):
+        _set_contrast(records[("frozen_ssl", seed)], value)
+    return records
+
+
+def test_an_arm_clearing_both_ways_is_a_named_refusal_and_writes_nothing(tmp_path, capsys):
+    """Past both gates a reading IS taken, and `reading_contrast` refuses this arm
+    rather than let if-order decide it. From `read` that is a SystemExit naming
+    the arm, not a ValueError traceback -- and no `width.txt`, since a refused
+    read has no artefact to leave."""
+    _write(tmp_path, _both_ways_records())
+    with pytest.raises(SystemExit, match=r"BOTH ways.*frozen_ssl"):
+        _main_read("--phase", "read", "--out", str(tmp_path), "--seeds", "0", "1", "2", "3")
+    assert not (tmp_path / "width.txt").exists()
+    assert capsys.readouterr().out == "", "a refused read prints no partial report"
+
+
+def test_the_both_ways_refusal_does_not_pre_empt_the_gates(tmp_path, capsys):
+    """The same incoherent arm inside a failed base or a broken down anchor is a
+    legitimate UNRESOLVED_* record, read normally -- refusing it in the builder
+    would turn each into a crash."""
+    for kw, status in (
+        ({"base_r2": BASE_R2_FLOOR - 0.05}, script.EXIT_BASE_UNRESOLVED),
+        ({"anchors": (False, True)}, script.EXIT_ANCHOR_BROKEN),
+    ):
+        directory = tmp_path / str(status)
+        directory.mkdir()
+        _write(directory, _both_ways_records(**kw))
+        got = _main_read(
+            "--phase", "read", "--out", str(directory), "--seeds", "0", "1", "2", "3",
+        )
+        assert got == status
+        assert "both?" in capsys.readouterr().out, "the table marks the arm, it does not vote it"
+
+
+def test_both_directions_clearing_at_the_bar_is_a_named_refusal(tmp_path, capsys):
+    """Four arms: two clear up in every seed, two clear down in every seed, every
+    arm perfectly one-sided. Each direction is at `ARMS_REQUIRED`, so if-order
+    would decide it. `read_phase` is called directly, since argparse's `choices`
+    admits only the study's three arms."""
+    arms = _ARM_ORDER
+    records = _records(arms=arms)
+    for (arm, seed), record in records.items():
+        _set_contrast(record, +0.05 if arm in arms[:2] else -0.05)
+    _write(tmp_path, records)
+    args = types.SimpleNamespace(out=tmp_path, arms=list(arms), seeds=[0, 1, 2])
+    with pytest.raises(SystemExit, match="ambiguous"):
+        script.read_phase(args)
+    assert not (tmp_path / "width.txt").exists()
+
+
+# ---- the companions ----------------------------------------------------------------
+
+
+def test_the_corrected_reading_e_uses_stochastic_only(monkeypatch, tmp_path, capsys):
+    """M3j's own results recorded that `full` is h + z and cannot attribute a
+    clearance to z. The companion must pass the corrected tuple rather than rely
+    on the module constant, which stays as M3j's records were taken under."""
+    seen = {}
+    real = script.reading_retention
+
+    def recording(inputs, **kwargs):
+        seen.update(kwargs)
+        return real(inputs, **kwargs)
+
+    monkeypatch.setattr(script, "reading_retention", recording)
+    _read(tmp_path, capsys, _records())
+    assert seen.get("z_bearing") == ("stochastic",)
+
+
+def test_the_companions_heading_names_the_pass_and_the_tuple_it_actually_ran(monkeypatch):
+    """A caption that says `('stochastic',)` over a call that passed something else
+    is the shipped-three-times defect. The heading is built from the same
+    constants the reading is taken with, so changing the tuple changes both -- and
+    the tuple the reading was CALLED with is watched, not assumed."""
+    records = _records()
+    heading = script.corrected_reading_e(records).splitlines()[0]
+    assert f"`{script.RETENTION_PASS}` pass" in heading
+    assert f"{DOWN_WIDTH} columns" in heading
+    assert str(("stochastic",)) in heading
+    seen = {}
+    real = script.reading_retention
+    monkeypatch.setattr(
+        script, "reading_retention",
+        lambda inputs, **kwargs: seen.update(kwargs) or real(inputs, **kwargs),
+    )
+    monkeypatch.setattr(script, "CORRECTED_Z_BEARING", ("full",))
+    heading = script.corrected_reading_e(records).splitlines()[0]
+    assert seen["z_bearing"] == ("full",)
+    assert str(("full",)) in heading and "stochastic" not in heading
+
+
+def test_the_corrected_tuple_changes_the_status_where_full_alone_carries_z(tmp_path, capsys):
+    """The spy above shows the keyword is PASSED; this shows it is not decorative.
+    `full` (h + z) and `deterministic` clear translation on the down pass and
+    `stochastic` does not. Under M3j's own rule that is MOTION_RETAINED, via
+    `full`; under the corrected one, BOTTLENECK_LOSS. A companion that omitted
+    the keyword, or passed `Z_BEARING_RUNGS`, prints the first."""
+    clearing = {("shipped", "translation", "deterministic"), ("down", "translation", "full")}
+    records = _records(clearing=clearing)
+    old_rule = _reading_retention(script.retention_inputs(records))
+    assert old_rule.status == "MOTION_RETAINED" and old_rule.surviving == "full"
+    _, printed = _read(tmp_path, capsys, records)
+    companion = _companion(printed)
+    assert "verdict: BOTTLENECK LOSS" in companion
+    assert "MOTION RETAINED" not in companion
+
+
+def _companion(text):
+    """The corrected-Reading-E block: from its heading to Reading F's table."""
+    start = text.index("Companion, decides nothing: Reading E")
+    return text[start:text.index("--- Reading F")]
+
+
+def test_the_corrected_reading_e_reads_the_down_pass_not_shipped_or_up(tmp_path, capsys):
+    """Only `stochastic` on the DOWN pass clears. The shipped pass reads
+    UNRESOLVED_MOTION on the same records, and the fixture is checked to
+    discriminate before the companion is: a builder over the wrong pass would
+    print a different verdict."""
+    records = _records(clearing={("down", "translation", "stochastic")})
+    statuses = {
+        p: _reading_retention(
+            script.retention_inputs(records, pass_name=p), z_bearing=("stochastic",),
+        ).status
+        for p in PASSES
+    }
+    assert statuses["down"] == "MOTION_RETAINED"
+    assert statuses["shipped"] != "MOTION_RETAINED" and statuses["up"] != "MOTION_RETAINED"
+    _, printed = _read(tmp_path, capsys, records)
+    assert "verdict: MOTION RETAINED" in _companion(printed)
+
+
+def test_retention_inputs_pairs_every_arm_with_its_own_seeds_on_the_down_pass():
+    """Every `(target, k, rung, arm)` cell of the ladder against the arm's own
+    three raw records, recomputed from the fixture: an arm-for-arm swap, a seed
+    collapse or a read of another horizon lands on a different number because
+    every cell's gain is distinct."""
+    records = _records()
+    inputs = script.retention_inputs(records)
+    assert inputs.clusters == 24
+    assert inputs.rows == {1: 11221, 4: 10534, 15: 8015}
+    for target in TARGETS:
+        for k in K_REPORTED:
+            for rung in RUNGS:
+                arms = inputs.ladder[target][k][rung]
+                assert set(arms) == {"frozen_ssl", "pixel_ae", "random_vit"}
+                assert len({a.gain for a in arms.values()}) == 3
+                for arm, summary in arms.items():
+                    raw = [
+                        records[(arm, s)]["passes"]["down"][target][f"k{k}"][rung]
+                        for s in (0, 1, 2)
+                    ]
+                    assert summary.gain == pytest.approx(np.mean([r["gain"] for r in raw]))
+                    assert summary.ci_low == pytest.approx(min(r["ci_low"] for r in raw))
+                    assert summary.ci_high == pytest.approx(max(r["ci_high"] for r in raw))
+                    assert summary.seeds_total == 3
+
+
+def test_the_corrected_reading_e_is_gated_on_the_same_base_control_as_reading_f():
+    """Both corrections are adopted (spec 2.5), so Reading E's base is the
+    position-gated one Reading F reads: the same `BaseControl` objects, not a
+    second gate on the 4-column mean beside the first."""
+    records = _tally_pattern_records()
+    assert script.retention_inputs(records).base == script.contrast_inputs(records).base
+
+
+def test_the_companion_says_it_is_unreadable_when_the_plan_has_too_few_arms(tmp_path, capsys):
+    """Two arms are a legitimate Reading F (`ARMS_REQUIRED`) and not a Reading E,
+    which is defined over `RETENTION_FAMILY`. The companion decides nothing, so it
+    says so on the page instead of vetoing the verdict or raising."""
+    status, printed = _read(
+        tmp_path, capsys, _records(arms=_ARM_ORDER[:2], clears=+0.05),
+        "--arms", "frozen_ssl", "pixel_ae",
+    )
+    assert status == script.EXIT_OK
+    assert "verdict: PAST FRAME AHEAD" in printed
+    companion = _companion(printed)
+    assert "unreadable" in companion and f"exactly {RETENTION_FAMILY} arms" in companion
+    assert "verdict:" not in companion and "--- Reading E" not in companion
+
+
+def test_the_companion_says_it_is_unreadable_when_a_horizon_was_not_measured(tmp_path, capsys):
+    """Reading E is a disjunction over `K_REPORTED`. Records that lack k = 1 can
+    still carry Reading F, which is taken at k = 15 alone."""
+    records = _records(clears=+0.05)
+    for record in records.values():
+        for target in TARGETS:
+            for pass_name in PASSES:
+                del record["passes"][pass_name][target]["k1"]
+        del record["rows"]["k1"]
+        record["ks"] = [4, CONTRAST_K]
+    status, printed = _read(tmp_path, capsys, records)
+    assert status == script.EXIT_OK
+    assert "verdict: PAST FRAME AHEAD" in printed
+    companion = _companion(printed)
+    assert "unreadable" in companion and "k = 1" in companion
+    assert "verdict:" not in companion
+
+
+def test_a_non_finite_gain_on_the_down_pass_is_a_named_refusal_not_a_traceback():
+    records = _records()
+    records[("pixel_ae", 1)]["passes"]["down"]["rotation"]["k4"]["full"]["gain"] = float("nan")
+    with pytest.raises(SystemExit, match=r"pixel_ae.*down pass.*rotation.*k = 4.*full"):
+        script.corrected_reading_e(records)
+
+
+# ---- the width-bias table ------------------------------------------------------------
+
+_BIAS_ROWS = [
+    # target, rung, frozen_ssl, pixel_ae, random_vit, all -- `up - shipped`, by hand:
+    # bias = D + 0.001 * arm_index + 0.0006 * seed, so an arm's mean over seeds
+    # 0..2 is D + 0.001 * arm_index + 0.0006, and the nine-cell mean D + 0.0016.
+    ("translation", "two_frame", "+0.0000", "+0.0000", "+0.0000", "+0.0000"),
+    ("translation", "deterministic", "+0.0143", "+0.0153", "+0.0163", "+0.0153"),
+    ("translation", "stochastic", "+0.0077", "+0.0087", "+0.0097", "+0.0087"),
+    ("translation", "full", "+0.0099", "+0.0109", "+0.0119", "+0.0109"),
+    ("rotation", "two_frame", "+0.0000", "+0.0000", "+0.0000", "+0.0000"),
+    ("rotation", "deterministic", "+0.0047", "+0.0057", "+0.0067", "+0.0057"),
+    ("rotation", "stochastic", "+0.0029", "+0.0039", "+0.0049", "+0.0039"),
+    ("rotation", "full", "+0.0038", "+0.0048", "+0.0058", "+0.0048"),
+]
+
+
+def _bias_rows(table):
+    """`{(target, rung): [values...]}` parsed off the printed rows."""
+    rows = {}
+    for line in table.splitlines():
+        cells = line.split()
+        if len(cells) == 7 and cells[0] in TARGETS:
+            rows[(cells[0], cells[1])] = cells[3:]
+    return rows
+
+
+def test_the_width_bias_table_is_up_minus_shipped_per_rung_target_and_arm():
+    """Every printed number, hand-typed. `up - shipped` (so a positive number is
+    what count alone bought, and swapping the two flips every sign), at
+    `CONTRAST_K` (the other horizons carry an extra +0.01 in this fixture), on
+    the `up` and `shipped` passes (the `down` pass carries +0.001 over shipped).
+    Three arms with three different columns, and seed steps that make seed 0
+    alone or seed 2 alone print differently from the mean."""
+    table = script.width_bias_table(_records())
+    rows = _bias_rows(table)
+    assert set(rows) == {(t, r) for t in TARGETS for r in RUNGS}
+    for target, rung, *values in _BIAS_ROWS:
+        assert rows[(target, rung)] == values, (target, rung)
+
+
+def test_the_width_bias_columns_are_the_arms_in_order_then_all():
+    table = script.width_bias_table(_records())
+    header = next(line for line in table.splitlines() if line.split()[:2] == ["target", "rung"])
+    assert header.split() == [
+        "target", "rung", "width", "frozen_ssl", "pixel_ae", "random_vit", "all",
+    ]
+
+
+def test_the_width_bias_table_prints_the_native_width_each_rung_was_lifted_from():
+    table = script.width_bias_table(_records())
+    widths = {
+        cells[1]: int(cells[2])
+        for cells in (line.split() for line in table.splitlines())
+        if len(cells) == 7 and cells[0] == "translation"
+    }
+    assert widths == {rung: RUNG_WIDTH[rung] for rung in RUNGS}
+
+
+def test_the_width_bias_caption_names_what_it_computes_from_the_constants_and_the_data():
+    """The caption's `2048`, `15` and cell count come from `UP_WIDTH`,
+    `CONTRAST_K` and the records -- a 12-cell run says 12."""
+    nine = script.width_bias_table(_records())
+    twelve = script.width_bias_table(_records(seeds=(0, 1, 2, 3)))
+    for text, cells in ((nine, 9), (twelve, 12)):
+        caption = text.splitlines()[0]
+        assert caption.startswith("--- The width bias")
+        assert f"lifted to {UP_WIDTH} columns" in caption
+        assert f"k = {CONTRAST_K}" in caption
+        assert f"over all {cells} cells" in caption
+        assert ANCHOR["up"] in caption
+
+
+def test_the_width_bias_table_follows_the_contrast_horizon_and_the_lift_width(monkeypatch):
+    """`CONTRAST_K` and `UP_WIDTH` are read at call time, and the caption and the
+    numbers move together: at k = 4 this fixture's bias carries an extra +0.01, so
+    a caption that said `k = 4` over k = 15's numbers (or the reverse) is caught
+    by the deterministic row alone."""
+    monkeypatch.setattr(script, "CONTRAST_K", 4)
+    monkeypatch.setattr(script, "UP_WIDTH", 4096)
+    table = script.width_bias_table(_records())
+    assert "at k = 4," in table.splitlines()[0]
+    assert "lifted to 4096 columns" in table.splitlines()[0]
+    # D + 0.01 + arm step * arm index + seed step * mean(seeds) = 0.0243 for frozen_ssl.
+    assert _bias_rows(table)[("translation", "deterministic")][0] == "+0.0243"
+
+
+def test_a_broken_up_anchor_replaces_every_number_in_the_table_with_unreadable():
+    """`two_frame` is `up`'s known-answer rung; broken in ONE cell, the lift is
+    not what it claims and calibrates nothing. Nothing numeric may print -- the
+    caption included."""
+    records = _records()
+    records[("pixel_ae", 1)]["anchors"]["up"] = False
+    table = script.width_bias_table(records)
+    assert "width bias" in table and "unreadable" in table
+    assert re.search(r"[+-]\d\.\d{4}", table) is None, table
+    assert "1 of 9 cells" in table
+
+
+def test_a_broken_down_anchor_does_not_suppress_the_width_bias_table():
+    """Only the `up` anchor gates the companion; `down` gates Reading F."""
+    records = _records(anchors=(False, True))
+    rows = _bias_rows(script.width_bias_table(records))
+    assert len(rows) == 8 and rows[("translation", "deterministic")][3] == "+0.0153"
+
+
+def test_a_non_finite_gain_in_the_width_bias_table_is_a_named_refusal():
+    records = _records()
+    records[("random_vit", 0)]["passes"]["up"]["translation"][KEY]["stochastic"]["gain"] = float("inf")
+    with pytest.raises(SystemExit, match=r"random_vit seed 0.*up.*translation.*stochastic"):
+        script.width_bias_table(records)
+
+
+# ---- width.txt -----------------------------------------------------------------------
+
+
+def test_width_txt_is_the_text_the_run_composed_and_stdout_is_the_same_bytes(tmp_path, capsys):
+    """Byte identity, on the REAL text. Exact equality of bytes, plus the two
+    endings a `rstrip()` or an extra `print` newline would change: exactly one
+    trailing newline, nothing after it."""
+    status, printed = _read(tmp_path, capsys, _records(clears=+0.05))
+    written = (tmp_path / "width.txt").read_bytes()
+    assert written == printed.encode()
+    assert written.endswith(b"\n") and not written.endswith(b"\n\n")
+    assert printed.isascii(), "byte identity should not depend on the platform's encoding"
+    assert len(printed.splitlines()) > 40
+
+
+def test_the_file_and_stdout_are_each_exactly_what_width_text_returned(monkeypatch, tmp_path, capsys):
+    """The real text ends in one clean newline, so on its own it cannot tell a
+    `write_text(text)` from `write_text(text.rstrip() + "\\n")`, nor `print(text,
+    end="")` from `print(text.rstrip())`. This text ends in trailing spaces and
+    THREE newlines: any strip, any added newline, and any normalisation on either
+    channel changes the bytes, and the two channels must still agree."""
+    sentinel = "first line  \nsecond line\t\n\n\n"
+    monkeypatch.setattr(script, "width_text", lambda *args, **kwargs: sentinel)
+    _, printed = _read(tmp_path, capsys, _records())
+    assert (tmp_path / "width.txt").read_bytes() == sentinel.encode()
+    assert printed == sentinel
+
+
+def test_a_second_read_prints_exactly_the_bytes_the_first_wrote(tmp_path, capsys):
+    """Exit criterion: `width.txt` is byte-identical to a second `--phase read`."""
+    _, first_printed = _read(tmp_path, capsys, _records(clears=-0.05))
+    first_file = (tmp_path / "width.txt").read_bytes()
+    status = _main_read("--phase", "read", "--out", str(tmp_path))
+    second_printed = capsys.readouterr().out
+    assert status == script.EXIT_OK
+    assert second_printed.encode() == first_file == first_printed.encode()
+    assert (tmp_path / "width.txt").read_bytes() == first_file
+
+
+def test_the_artefact_is_written_before_anything_is_printed(monkeypatch, tmp_path, capsys):
+    """`width.txt` gates the log: if the write fails, nothing was printed that a
+    reader could mistake for a recorded result."""
+    _write(tmp_path, _records())
+
+    def failing(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(script, "write_text", failing)
+    with pytest.raises(OSError):
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    assert capsys.readouterr().out == ""
+
+
+def test_width_text_orders_the_evidence_before_the_conclusion():
+    records = _records(clears=+0.05)
+    inputs = script.contrast_inputs(records)
+    reading = reading_contrast(inputs)
+    text = script.width_text(records, inputs, reading)
+    order = [
+        text.index("--- self-check per record"),
+        text.index("--- The width bias"),
+        text.index("Companion, decides nothing: Reading E"),
+        text.index("--- The ladder"),
+        text.index("--- Reading E:"),
+        text.index("--- Reading F"),
+        text.index("verdict: PAST FRAME AHEAD"),
+    ]
+    assert order == sorted(order), order
+    assert text.endswith("\n") and not text.endswith("\n\n")
+
+
+def test_the_self_check_table_has_one_row_per_cell_with_that_cells_own_values():
+    """Steps are made distinct per cell here (a real study has one), and one cell's
+    self-check fails, so a row paired with another cell's record shows up."""
+    records = _records()
+    for (arm, seed), record in records.items():
+        record["step"] = 20000 + _rank(arm, seed)
+    records[("pixel_ae", 1)]["self_check"]["ok"] = False
+    inputs = script.contrast_inputs(records)
+    text = script.width_text(records, inputs, reading_contrast(inputs))
+    rows = {}
+    for line in text.splitlines():
+        cells = line.split()
+        if len(cells) == 7 and cells[0] in _ARM_ORDER and cells[2].isdigit():
+            rows[(cells[0], int(cells[1]))] = cells[2:]
+    assert set(rows) == set(records)
+    for (arm, seed), cells in rows.items():
+        ok = "NO" if (arm, seed) == ("pixel_ae", 1) else "yes"
+        assert cells == [str(20000 + _rank(arm, seed)), "48", "96", "24", ok], (arm, seed)
+
+
+def test_the_self_check_table_counts_windows_and_gathered_rows_under_their_own_headers():
+    """A real record's `windows.episode` is 11,450 long over 229 windows. Printing
+    that length under `windows` (as `latent_retention`'s table does) is a caption
+    disagreeing with its column; here `windows` is distinct windows and the row
+    count is `gathered`. The fixture's three counts are all different -- 48, 96
+    and 24 -- so any two of the columns swapped, or `windows` taken as a length,
+    reads a different number."""
+    records = _records()
+    inputs = script.contrast_inputs(records)
+    text = script.width_text(records, inputs, reading_contrast(inputs))
+    header = next(line for line in text.splitlines() if line.split()[:2] == ["arm", "seed"])
+    assert header.split() == ["arm", "seed", "step", "windows", "gathered", "clusters", "ok"]
+    first = next(line for line in text.splitlines() if line.split()[:2] == ["frozen_ssl", "0"])
+    assert first.split()[3:6] == ["48", "96", "24"]
+
+
+# ---- main ------------------------------------------------------------------------------
+
+
+def _stub_main(monkeypatch, *, measure=script.EXIT_OK, read=script.EXIT_OK):
+    calls = []
+
+    def fake_buffer(*args, **kwargs):
+        calls.append(("buffer",))
+        return types.SimpleNamespace(episode_paths=lambda: ["p"])
+
+    monkeypatch.setattr(script, "ReplayBuffer", fake_buffer)
+    monkeypatch.setattr(script, "episode_split", lambda paths, val_fraction, seed: (["t"], ["v"]))
+    monkeypatch.setattr(script, "get_device", lambda prefer="mps": "cpu")
+    monkeypatch.setattr(
+        script, "measure_phase",
+        lambda args, cells, device, train, val, ks=None: (
+            calls.append(("measure", list(cells), ks)) or measure
+        ),
+    )
+    monkeypatch.setattr(
+        script, "read_phase", lambda args: (calls.append(("read",)) or read),
+    )
+    return calls
+
+
+@pytest.mark.parametrize("phase,expected", [
+    ("measure", ["buffer", "measure"]),
+    ("read", ["read"]),
+    ("all", ["buffer", "measure", "read"]),
+])
+def test_main_runs_the_phases_it_was_asked_for_and_read_needs_no_data(monkeypatch, phase, expected):
+    """`read` opens no replay buffer and splits no episodes: it pools records that
+    are already on disk, so it must run where the data directory does not exist."""
+    calls = _stub_main(monkeypatch)
+    assert script.main(["--phase", phase]) == script.EXIT_OK
+    assert [call[0] for call in calls] == expected
+
+
+def test_main_measures_each_distinct_cell_once_and_hands_over_the_ks(monkeypatch):
+    calls = _stub_main(monkeypatch)
+    script.main(["--phase", "measure", "--arms", "pixel_ae", "frozen_ssl", "pixel_ae",
+                 "--seeds", "1", "0", "1"])
+    (measure,) = [call for call in calls if call[0] == "measure"]
+    assert measure[1] == [("pixel_ae", 1), ("pixel_ae", 0), ("frozen_ssl", 1), ("frozen_ssl", 0)]
+    assert measure[2] == K_REPORTED
+    calls.clear()
+    script.main(["--phase", "measure"], ks=(CONTRAST_K,))
+    assert [c for c in calls if c[0] == "measure"][0][2] == (CONTRAST_K,)
+
+
+@pytest.mark.parametrize("failing", ["measure", "read"])
+def test_main_returns_the_first_phase_status_that_is_not_ok(monkeypatch, failing):
+    """A refused measure stops `all` before the read; a refused read is the run's
+    status. (`measure_phase` returns OK on a broken anchor -- 42 lives in `read`.)"""
+    kwargs = {failing: script.EXIT_ANCHOR_BROKEN if failing == "read" else script.EXIT_NO_CHECKPOINTS}
+    calls = _stub_main(monkeypatch, **kwargs)
+    status = script.main(["--phase", "all"])
+    assert status == kwargs[failing]
+    assert ("read",) in calls if failing == "read" else ("read",) not in calls
+
+
+def test_read_exits_map_exactly_the_two_refusals():
+    assert script.READ_EXITS == {"UNRESOLVED_BASE": 41, "UNRESOLVED_ANCHOR": 42}

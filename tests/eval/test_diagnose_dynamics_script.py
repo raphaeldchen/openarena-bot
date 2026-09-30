@@ -623,6 +623,27 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"latent_retention collides with {other} on {clash}"
 
+    width = statuses("latent_width")
+    reused_by_width = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in width.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_width, (
+        f"latent_width shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_width} is shared on purpose"
+    )
+    assert len(set(width.values())) == len(width), width
+    assert 1 not in width.values() and 2 not in width.values()
+    assert width["EXIT_BASE_UNRESOLVED"] == 41
+    assert width["EXIT_ANCHOR_BROKEN"] == 42
+    own = set(width.values()) - set(reused_by_width.values()) - {0}
+    assert own == {41, 42}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion",
+                  "latent_retention"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"latent_width collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys

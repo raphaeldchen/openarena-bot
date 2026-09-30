@@ -23,13 +23,17 @@ gathered once per cell and every pass reads the same three arrays.
 each projecting pass carries a free known-answer anchor -- `deterministic` is
 untouched in `down`, `two_frame` is untouched in `up` -- and each anchor's gain
 must be BIT-IDENTICAL to the shipped pass, not merely close. `anchor_check`
-reads that back and the record carries the result; `read` (Task 6) decides what
+reads that back and the record carries the result; `read` decides what
 a broken anchor means.
 
   measure   per shipped cell: the three passes over both targets and every
             reported k, the contrast Reading F is taken on, the position
             control, the anchors. One record per cell.
-  read      Task 6: pools these records into Reading F.
+  read      pools the nine records into Reading F -- the verdict -- and prints
+            two companions that decide nothing: the width-bias table (what
+            count alone is worth, `up` minus `shipped`) and Reading E re-run on
+            the `down` pass under the corrected z-bearing set. Writes
+            `width.txt`, byte for byte what it prints.
 
 LOADING IS `trust_horizon.py`'S, exactly as `scripts/latent_retention.py` loads
 it: `Cell`, `CellMissing`, `load_cell`, `self_check` and `prepare_cell` are
@@ -49,7 +53,8 @@ THE CHECKS, BY PHASE:
             EXIT_SELF_CHECK_FAILED (30) a fresh `reference_trajectories` pass
                                         does not reproduce the cell's
                                         diagnostic within the bound.
-  read:     EXIT_BASE_UNRESOLVED (41)  `enc(t)` -> absolute position did not
+  read:     EXIT_NO_CHECKPOINTS (11)   a requested cell has no width record.
+            EXIT_BASE_UNRESOLVED (41)  `enc(t)` -> absolute position did not
                                         clear `BASE_R2_FLOOR`.
             EXIT_ANCHOR_BROKEN (42)    the `down` anchor did not reproduce.
 
@@ -68,24 +73,37 @@ whenever a read will follow. A `--phase measure` run is NOT refused: Task 7's
 smoke is one cell, and a narrow plan is a legitimate thing to MEASURE.
 """
 
+import argparse
 import importlib.util
+import json
+import sys
 import types
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from mbfps.data.buffer import ReplayBuffer
+from mbfps.data.split import VAL_FRACTION, episode_split
+from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import reference_trajectories
 from mbfps.eval.probe import (
     GainSplit, apply_probe, contrast_from_blocks, fit_probe, gain_from_blocks,
     gather_probe_data, probe_r2,
 )
 from mbfps.eval.retention import (
-    ARMS_REQUIRED, CONFIDENCE, K_REPORTED, RESAMPLES, RUNGS, SEEDS_REQUIRED, TARGETS,
-    backward_rotation, backward_translation, rung_block, shifted_rows,
+    ARMS_REQUIRED, BASE_R2_FLOOR, CONFIDENCE, K_REPORTED, RESAMPLES, RETENTION_FAMILY,
+    RUNGS, SEEDS_REQUIRED, TARGETS, BaseControl, RetentionInputs, backward_rotation,
+    backward_translation, format_ladder, format_reading_retention, reading_retention,
+    rung_arm, rung_block, shifted_rows,
 )
-from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
-from mbfps.eval.width import ANCHOR, CONTRAST_K, PASSES, PROJECTION_SEED, RUNG_WIDTH, pass_block
+from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
+from mbfps.eval.width import (
+    ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH, UP_WIDTH,
+    ContrastInputs, contrast_arm, format_reading_contrast, pass_block, reading_contrast,
+)
+from mbfps.utils.config import ARMS
+from mbfps.utils.device import get_device
 
 
 def _sibling(name: str):
@@ -690,7 +708,7 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
     and returns the first non-`EXIT_OK` status or `EXIT_OK`.
 
     THE PLAN CHECK FIRES ONLY WHEN `args.phase == "all"`. `read` refuses its own
-    plan (Task 6), and `--phase measure` is allowed a plan `read` could not
+    plan, and `--phase measure` is allowed a plan `read` could not
     read: the smoke is one cell. Both are read off `cells` -- the distinct arms
     and the distinct seeds actually about to be measured.
 
@@ -794,8 +812,11 @@ def require_one_protocol(records: dict) -> None:
     record always carries them, and a record without them cannot say which
     matrices it used.
 
-    `clusters` and `rows` are NOT compared: they are print-only and gate nothing
-    downstream, so no reading can flip on them.
+    `clusters` and `rows` are NOT compared HERE, and they are not unguarded: they
+    are print-only (no reading can flip on them), but `contrast_inputs` takes ONE
+    value of each for a caption that speaks for nine cells, so it refuses a
+    disagreement itself, at the point where the pick is made, rather than
+    depending on this function having run first.
     """
     items = sorted(records.items())
     if not items:
@@ -814,3 +835,590 @@ def require_one_protocol(records: dict) -> None:
                     f"disagree on {field}{shown}; they are not one measurement and their "
                     "arms cannot be read against one bar"
                 )
+
+
+# ---------------------------------------------------------------------------
+# read: the nine records pooled into Reading F.
+# ---------------------------------------------------------------------------
+
+READ_EXITS = {
+    "UNRESOLVED_BASE": EXIT_BASE_UNRESOLVED,
+    "UNRESOLVED_ANCHOR": EXIT_ANCHOR_BROKEN,
+}
+"""Status -> exit code, for the two statuses that are refusals. Every other
+status is a reading and exits 0: a milestone that exited non-zero on a finding
+would make "the run worked" and "the news was good" the same signal."""
+
+RETENTION_PASS: str = "down"
+CORRECTED_Z_BEARING: tuple[str, ...] = ("stochastic",)
+"""The corrected Reading E: re-run on the pass where widths are matched, with the
+z-bearing set M3j's own results recorded as the right one. `full` is `h (+) z`, so
+a clearing `full` cannot attribute anything to `z`. Passed EXPLICITLY, and
+`retention.Z_BEARING_RUNGS` keeps its value: M3j's records read under the rule
+they were taken under."""
+
+SELF_CHECK_COLUMNS: tuple[str, ...] = (
+    "arm", "seed", "step", "windows", "gathered", "clusters", "ok",
+)
+SELF_CHECK_WIDTHS: tuple[str, ...] = ("<12", ">5", ">8", ">9", ">10", ">10", ">5")
+
+BIAS_COLUMNS: tuple[str, ...] = ("target", "rung", "width")
+BIAS_WIDTHS: tuple[int, ...] = (13, 15, 7)
+BIAS_VALUE_WIDTH: int = 13
+"""The width-bias table's leading columns and the width of every value column
+after them -- one per arm, then `all`. The arms are the run's, so the columns
+are built from the records rather than declared."""
+
+
+def _table_line(values, widths) -> str:
+    return "  " + "".join(
+        f"{value!s:{spec}}" for value, spec in zip(values, widths, strict=True)
+    )
+
+
+def _cell_name(cell: tuple[str, int]) -> str:
+    return f"{cell[0]} seed {cell[1]}"
+
+
+def _get(record: dict, cell: tuple[str, int], *path):
+    """`record[path[0]][path[1]]...`, or a refusal naming the cell and the path.
+
+    Every field the reading needs is read through here, so a record that lacks
+    one -- a smoke run that omitted `k15`, a record from before a field existed --
+    stops the read with the cell and the dotted path, rather than surfacing as a
+    bare `KeyError` after the reader has paid for the measure."""
+    value = record
+    for key in path:
+        try:
+            value = value[key]
+        except (KeyError, IndexError, TypeError):
+            raise SystemExit(
+                f"{_cell_name(cell)}: the record has no {'.'.join(str(p) for p in path)}; "
+                "it cannot be read as Reading F's input and must be re-measured "
+                "(--phase measure)"
+            ) from None
+    return value
+
+
+def _finite(record: dict, cell: tuple[str, int], *path) -> float:
+    """`_get`, coerced to float and refused if it is not finite. A NaN compares
+    False against every threshold, so it would read as "did not clear" AND "did
+    not fail" at once -- an error about the measurement, never a finding."""
+    raw = _get(record, cell, *path)
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        number = float("nan")
+    if not np.isfinite(number):
+        raise SystemExit(
+            f"{_cell_name(cell)}: {'.'.join(str(p) for p in path)} is {raw!r}, not a "
+            "finite number; that is an error about the measurement, not a reading"
+        )
+    return number
+
+
+def _cells_by_arm(records: dict) -> dict[str, list[tuple[str, int]]]:
+    """Each arm's cells, seeds ascending, arms in sorted order."""
+    grouped: dict[str, list[tuple[str, int]]] = {}
+    for cell in sorted(records):
+        grouped.setdefault(cell[0], []).append(cell)
+    return grouped
+
+
+def _one_value(records: dict, pick, what: str):
+    """The one value every record reports for `what`, or a refusal naming the
+    cells that differ.
+
+    For the fields a caption prints ONCE on behalf of nine cells. Taking the
+    first record's would be one member standing for the set: a caption saying
+    `8015 rows over 24 clusters` over records that do not agree on either."""
+    by_value: dict[str, list[tuple[str, int]]] = {}
+    values: dict[str, object] = {}
+    for cell, record in sorted(records.items()):
+        value = pick(record, cell)
+        # Canonical JSON, so two dicts with the same items in another insertion
+        # order are ONE value rather than a disagreement.
+        label = json.dumps(value, sort_keys=True)
+        by_value.setdefault(label, []).append(cell)
+        values[label] = value
+    if len(by_value) != 1:
+        detail = "; ".join(
+            f"{values[label]!r} in {', '.join(_cell_name(c) for c in cells)}"
+            for label, cells in by_value.items()
+        )
+        raise SystemExit(
+            f"the records disagree on {what}: {detail}. A caption prints one "
+            f"{what} for the whole set, so records that differ are not one "
+            "measurement"
+        )
+    return next(iter(values.values()))
+
+
+def pooled_anchors(records: dict) -> dict[str, bool]:
+    """Each projecting pass's anchor across ALL the cells: it held only if it held
+    in every one. `all`, not `any` and not one record standing for the set -- a
+    single cell whose anchor broke is a cell in which the projection machinery ran
+    where it should not.
+
+    A flag that is not a bool is refused: `"false"` is truthy, and a damaged
+    record would otherwise read as an anchor that HELD."""
+    pooled = {}
+    for name in ANCHOR:
+        flags = []
+        for cell, record in sorted(records.items()):
+            flag = _get(record, cell, "anchors", name)
+            if not isinstance(flag, bool):
+                raise SystemExit(
+                    f"{_cell_name(cell)}: anchors.{name} is {flag!r}, not a boolean; "
+                    "a non-boolean would be read as truthy and pass a broken anchor"
+                )
+            flags.append(flag)
+        pooled[name] = all(flags)
+    return pooled
+
+
+def base_controls(records: dict) -> dict[str, BaseControl]:
+    """Each arm's base control, GATED ON `position_r2`.
+
+    `BaseControl` carries one number called `r2` beside the seed tally, and
+    `format_reading_contrast` prints them together as `r2=+0.650 3/3`. This is
+    where they are made to be the same quantity: `r2` is the arm's mean POSITION
+    r2 and `seeds_clear` counts seeds whose POSITION r2 exceeds `BASE_R2_FLOOR`.
+    The record's other number, `base_control.r2` -- the 4-column mean over
+    position and heading that M3j gated on -- is read nowhere here and is printed
+    nowhere: a tally printed beside a figure it was not read from is how M3h
+    shipped an `up` tally beside a verdict read from `down`.
+
+    The tally is per SEED, then per arm (`BaseControl.clears`): it is not a
+    threshold on the arm's mean. `BASE_R2_FLOOR` stays 0.10 and is not re-chosen;
+    gated on position alone it is loose, and the spec records that rather than
+    correcting it. Strict `>`, as `retention` applies it."""
+    controls = {}
+    for arm, cells in _cells_by_arm(records).items():
+        levels = [_finite(records[c], c, "base_control", "position_r2") for c in cells]
+        controls[arm] = BaseControl(
+            r2=float(np.mean(levels)),
+            seeds_clear=sum(1 for level in levels if level > BASE_R2_FLOOR),
+            seeds_total=len(levels),
+        )
+    return controls
+
+
+def _pooled_shape(records: dict) -> tuple[int, dict[str, int]]:
+    """`(clusters, rows by k_key)` -- ONE of each, refused unless every cell agrees.
+
+    `clusters` and `rows` gate nothing: no verdict can flip on them. They are
+    still one caption's worth of numbers standing for nine cells, and a caption
+    that says `8015 rows over 24 clusters` must be true of every one."""
+    clusters = _one_value(
+        records, lambda r, c: int(_get(r, c, "clusters")), "clusters",
+    )
+    rows = _one_value(
+        records,
+        lambda r, c: {str(k): int(v) for k, v in _get(r, c, "rows").items()},
+        "rows",
+    )
+    return clusters, rows
+
+
+def _require_readable_records(by_arm: dict) -> None:
+    """Refuse a record set `reading_contrast` would raise on, by name.
+
+    Fewer than `ARMS_REQUIRED` arms, or arms with different seed counts (no true
+    "N of M seeds" rule) -- each asked of the RECORDS, so a direct caller of
+    `contrast_inputs` is refused the same way `read_phase` is.
+
+    An arm with fewer than `SEEDS_REQUIRED` seeds is NOT checked here:
+    `contrast_arm` refuses it, and `contrast_inputs` names the arm when it does.
+    A second check for it would be unreachable -- nothing could fail with it
+    removed -- which is the guard-that-subsumes-a-guard defect this file has
+    already been fixed for twice."""
+    counts = {arm: len(cells) for arm, cells in by_arm.items()}
+    if len(by_arm) < ARMS_REQUIRED:
+        raise SystemExit(
+            f"the records cover {len(by_arm)} arm(s) ({', '.join(sorted(by_arm))}); "
+            f"Reading F needs at least {ARMS_REQUIRED}"
+        )
+    if len(set(counts.values())) != 1:
+        raise SystemExit(
+            f"the arms do not share one seed count {counts}; the '{SEEDS_REQUIRED} of N "
+            "seeds' rule would be true of some rows and false of others"
+        )
+
+
+def contrast_inputs(records: dict) -> ContrastInputs:
+    """Pool the nine records into Reading F's input.
+
+    The seed tally comes from the per-seed intervals in the records, not from a
+    pooled estimate: R^2 is not a per-window quantity, so there is nothing to
+    pool the way a paired contrast pools. The agreement requirement IS the rule.
+
+    EVERY PRECONDITION `reading_contrast` ENFORCES IS ESTABLISHED HERE, as a
+    named refusal rather than a traceback out of the reading: at least
+    `ARMS_REQUIRED` arms; each arm with the same seed count, at least
+    `SEEDS_REQUIRED`; an `anchors` whose keys are exactly `ANCHOR`'s (built by
+    iterating it, so `shipped` and a stray key cannot appear, and `down` cannot
+    be missing); a `base` naming exactly the arms (built from the same records).
+    The two ambiguities that remain -- an arm clearing both ways, and both
+    directions at the bar -- are refused by the reading itself, and only past its
+    two gates; `read_phase` turns those into a named refusal too. They are NOT
+    checked here, because refusing them ahead of the gates would turn a
+    legitimate UNRESOLVED_BASE or UNRESOLVED_ANCHOR record into a crash.
+
+    `clusters` and `rows` are print-only, and each is ONE number for a caption
+    that speaks for nine cells, so a disagreement between records is refused
+    (`_pooled_shape`) rather than sampled from whichever record sorts first."""
+    key = k_key(CONTRAST_K)
+    by_arm = _cells_by_arm(records)
+    _require_readable_records(by_arm)
+    arms = {}
+    for arm, cells in by_arm.items():
+        seeds = [c[1] for c in cells]
+        try:
+            arms[arm] = contrast_arm([_get(records[c], c, "contrast", key) for c in cells])
+        except ValueError as error:
+            raise SystemExit(f"{arm} (seeds {seeds}): {error}") from error
+    clusters, rows = _pooled_shape(records)
+    try:
+        at_contrast_k = rows[key]
+    except KeyError:
+        raise SystemExit(
+            f"the records carry no rows.{key}; Reading F is taken at k = {CONTRAST_K}"
+        ) from None
+    return ContrastInputs(
+        arms=arms, base=base_controls(records), anchors=pooled_anchors(records),
+        clusters=clusters, rows=at_contrast_k,
+    )
+
+
+def _reading_e_unreadable(records: dict) -> str | None:
+    """Why Reading E cannot be taken from these records, or `None`.
+
+    Both are limits of the PLAN, not defects in a record: `reading_retention` is
+    defined over exactly `RETENTION_FAMILY` arms and over every `K_REPORTED`
+    horizon. Reading F needs neither -- two arms clear its bar, and it is taken at
+    k = 15 alone -- so the companion says it cannot be read instead of vetoing a
+    verdict that can."""
+    arms = sorted({arm for arm, _ in records})
+    if len(arms) != RETENTION_FAMILY:
+        return (
+            f"Reading E is defined over exactly {RETENTION_FAMILY} arms and these "
+            f"records carry {len(arms)} ({', '.join(arms)})"
+        )
+    missing = sorted({
+        k for record in records.values() for k in K_REPORTED
+        if any(
+            k_key(k) not in record.get("passes", {}).get(RETENTION_PASS, {}).get(target, {})
+            for target in TARGETS
+        )
+    })
+    if missing:
+        return (
+            f"Reading E is a disjunction over k = {', '.join(str(k) for k in K_REPORTED)} "
+            f"and these records lack k = {', '.join(str(k) for k in missing)}"
+        )
+    return None
+
+
+def retention_inputs(records: dict, *, pass_name: str = RETENTION_PASS) -> RetentionInputs:
+    """M3j's `RetentionInputs`, built from one pass of the width records.
+
+    `ladder[target][k][rung][arm]` is `rung_arm` over that arm's own seeds' gains
+    on `pass_name` -- the `down` pass by default, where every block is 512 wide.
+    The base is `base_controls` -- the SAME position-gated objects Reading F
+    reads, because both corrections M3j recorded are adopted (spec 2.5) and a
+    second gate on the 4-column mean beside the first would let the two readings
+    disagree about whether the instrument works.
+
+    `rung_arm` raises on a non-finite gain or bound, a missing key, an inverted
+    interval; that is an error about the measurement, and it is turned into a
+    refusal naming the cell of the ladder. Assumes `_reading_e_unreadable` is
+    `None`."""
+    by_arm = _cells_by_arm(records)
+    ladder: dict = {}
+    for target in TARGETS:
+        ladder[target] = {}
+        for k in K_REPORTED:
+            ladder[target][k] = {}
+            for rung in RUNGS:
+                ladder[target][k][rung] = {}
+                for arm, cells in by_arm.items():
+                    gains = [
+                        _get(records[c], c, "passes", pass_name, target, k_key(k), rung)
+                        for c in cells
+                    ]
+                    try:
+                        ladder[target][k][rung][arm] = rung_arm(gains)
+                    except ValueError as error:
+                        raise SystemExit(
+                            f"{arm} on the {pass_name} pass, {target} at k = {k}, rung "
+                            f"{rung} (seeds {[c[1] for c in cells]}): {error}"
+                        ) from error
+    clusters, rows = _pooled_shape(records)
+    return RetentionInputs(
+        ladder=ladder, base=base_controls(records), clusters=clusters,
+        rows={k: rows[k_key(k)] for k in K_REPORTED},
+    )
+
+
+def corrected_reading_e(records: dict) -> str:
+    """Reading E re-run on the `down` pass under `CORRECTED_Z_BEARING`, as the text
+    `width.txt` carries: its heading, the whole ladder, then Reading E.
+
+    A COMPANION THAT DECIDES NOTHING, and one owed to M3j: remove `full` from the
+    z-bearing set and M3j's MOTION_RETAINED hangs entirely on `stochastic`, so the
+    corrected, width-matched reading may differ from M3j's status. It would not
+    overturn it -- M3j's verdict was taken under its own rule -- it would mean the
+    two statuses differ for reasons documented before the numbers were seen.
+
+    The heading says which pass and which corrections, because `retention`'s own
+    formatter does not: its captions name neither."""
+    heading = (
+        f"--- Companion, decides nothing: Reading E re-run on the `{RETENTION_PASS}` pass "
+        f"(every block {DOWN_WIDTH} columns wide), with z-bearing rungs "
+        f"{CORRECTED_Z_BEARING} and the base control gated on position alone -- the two "
+        "corrections M3j's results recorded. M3j's own status was taken under its own "
+        "rule and stands as recorded; the two may differ, for reasons pre-registered "
+        "before the numbers were seen ---"
+    )
+    why = _reading_e_unreadable(records)
+    if why is not None:
+        return f"{heading}\n  unreadable: {why}"
+    inputs = retention_inputs(records)
+    reading = reading_retention(inputs, z_bearing=CORRECTED_Z_BEARING)
+    return "\n\n".join([heading, format_ladder(inputs), format_reading_retention(reading, inputs)])
+
+
+def width_bias_table(records: dict) -> str:
+    """What feature COUNT alone is worth: `up` minus `shipped`, per rung and target,
+    at `CONTRAST_K`.
+
+    A companion that decides nothing. `up` lifts every block to `UP_WIDTH` by a
+    fixed random matrix -- count matched, rank and information unchanged -- so
+    the difference is what a wider block buys with nothing added to it. Spec 1.1
+    measured about +0.0137 for `h` on two cells; this puts it on every cell and
+    every rung. Per arm (mean over its seeds) and over all cells.
+
+    THE `up` ANCHOR GATES IT. `two_frame` is already `UP_WIDTH` wide, so its `up`
+    gain must equal its shipped one exactly; if it did not, in any cell, the lift
+    is not what it claims and calibrates nothing, so NO number prints. The
+    decision is read off `pooled_anchors` -- the same object that prints `up=BROKEN`
+    beside Reading F -- so the table and the anchors line cannot disagree. The
+    `down` anchor does not gate this table: it gates Reading F.
+
+    `width` is the native width each rung was lifted FROM, read off the records
+    (which must agree) and not off `RUNG_WIDTH`: it is what was measured."""
+    key = k_key(CONTRAST_K)
+    arms = sorted({arm for arm, _ in records})
+    heading = (
+        f"--- The width bias: what feature count alone is worth. `up` (every block lifted "
+        f"to {UP_WIDTH} columns by a fixed random matrix: count matched, rank and "
+        f"information unchanged) minus `shipped` (native widths), gain over enc(t) at "
+        f"k = {CONTRAST_K}, mean over each arm's seeds and over all {len(records)} cells; "
+        f"decides nothing, and the {ANCHOR['up']} row is `up`'s anchor and reads exactly "
+        "zero while the lift is sound ---"
+    )
+    if not pooled_anchors(records)["up"]:
+        broken = sum(1 for cell, record in records.items() if not record["anchors"]["up"])
+        return (
+            f"{heading}\n  unreadable: the up pass's anchor ({ANCHOR['up']}) did not "
+            f"reproduce its shipped gain in {broken} of {len(records)} cells, so the lift "
+            "is not doing what it claims and calibrates nothing; Reading F is taken on "
+            "the down pass and is unaffected"
+        )
+    widths = _one_value(records, lambda r, c: dict(_get(r, c, "rung_width")), "rung_width")
+    columns = (*BIAS_WIDTHS, *([BIAS_VALUE_WIDTH] * (len(arms) + 1)))
+
+    def gain(cell, pass_name, target, rung) -> float:
+        return _finite(records[cell], cell, "passes", pass_name, target, key, rung, "gain")
+
+    lines = [heading, _table_line((*BIAS_COLUMNS, *arms, "all"), [f">{w}" for w in columns])]
+    for target in TARGETS:
+        for rung in RUNGS:
+            bias = {
+                cell: gain(cell, "up", target, rung) - gain(cell, "shipped", target, rung)
+                for cell in sorted(records)
+            }
+            per_arm = [
+                float(np.mean([bias[c] for c in cells]))
+                for cells in _cells_by_arm(records).values()
+            ]
+            lines.append(_table_line(
+                (target, rung, widths[rung],
+                 *(f"{v:+.4f}" for v in per_arm), f"{np.mean(list(bias.values())):+.4f}"),
+                [f">{w}" for w in columns],
+            ))
+    return "\n".join(lines)
+
+
+def _window_count(record: dict, cell: tuple[str, int]) -> int:
+    """Distinct `(episode, window)` pairs the record was scored on.
+
+    `windows.episode` and `windows.window` are PER GATHERED ROW, not per window --
+    a real record's lists are 11,450 long over 229 windows -- so their length is
+    a count of rows. `latent_retention`'s table prints that length under the
+    header `windows`, which is a caption disagreeing with its column; this table
+    counts what the header says, and prints the gathered rows under their own."""
+    episode = _get(record, cell, "windows", "episode")
+    window = _get(record, cell, "windows", "window")
+    return len(set(zip(episode, window, strict=True)))
+
+
+def _self_check_table(records: dict) -> str:
+    """What this script's own measure pass reproduced, per cell -- printed first,
+    so a reader meets the instrument before anything built on it."""
+    lines = [
+        "--- self-check per record: this script's measure pass against the cell's "
+        "diagnostic, and what it was scored on: distinct windows, gathered rows "
+        "(before any horizon's backward shift) and episode clusters ---",
+        _table_line(SELF_CHECK_COLUMNS, SELF_CHECK_WIDTHS),
+    ]
+    for (arm, seed), record in sorted(records.items()):
+        cell = (arm, seed)
+        lines.append(_table_line((
+            arm, int(seed), int(_get(record, cell, "step")),
+            _window_count(record, cell),
+            len(_get(record, cell, "windows", "episode")),
+            int(_get(record, cell, "clusters")),
+            "yes" if _get(record, cell, "self_check", "ok") else "NO",
+        ), SELF_CHECK_WIDTHS))
+    return "\n".join(lines)
+
+
+def width_text(records: dict, inputs: ContrastInputs, reading) -> str:
+    """Everything `read` prints, in the order a reader should meet it: the
+    self-check, the width bias, the corrected Reading E, then Reading F -- the
+    evidence before the conclusion -- written to `width.txt` and printed as the
+    same string."""
+    return "\n\n".join([
+        _self_check_table(records),
+        width_bias_table(records),
+        corrected_reading_e(records),
+        format_reading_contrast(reading, inputs),
+    ]) + "\n"
+
+
+def write_text(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def load_width(out_dir: Path, arms, seeds) -> dict:
+    """Every planned cell's record, keyed by `(arm, seed)` -- or `CellMissing`
+    naming the first that is not on disk.
+
+    Named, never skipped: a pool over the cells that happen to be present,
+    printed under the nine cells' names, is exactly the failure
+    `pooling.MissingCell` exists for. A record whose own `arm`/`seed` disagree
+    with the file it was read under is refused too -- a swapped pair of files
+    would pool one cell under another's name with every count still right."""
+    records: dict[tuple[str, int], dict] = {}
+    for arm in arms:
+        for seed in seeds:
+            path = width_record_path(out_dir, arm, int(seed))
+            if not path.exists():
+                raise CellMissing(
+                    f"{arm} seed {int(seed)}: no width record at {path}; "
+                    "run --phase measure first"
+                )
+            record = load_record(path)
+            if record.get("arm") != arm or int(record.get("seed", -1)) != int(seed):
+                raise SystemExit(
+                    f"{path.name} was read for {arm} seed {int(seed)} but its record says "
+                    f"arm={record.get('arm')!r} seed={record.get('seed')!r}"
+                )
+            records[(arm, int(seed))] = record
+    return records
+
+
+def _plan(args) -> tuple[list[str], list[int]]:
+    """The DISTINCT arms and seeds, in the order given. `--arms a a` is one arm and
+    `--seeds 0 0 0` one seed: counting the lists would let a plan through that the
+    records dict, keyed by cell, cannot honour -- and would measure a cell twice."""
+    return (
+        list(dict.fromkeys(args.arms)),
+        list(dict.fromkeys(int(s) for s in args.seeds)),
+    )
+
+
+def read_phase(args) -> int:
+    """Refuse a plan that cannot be read, pool every requested cell (11 names the
+    first missing), decide Reading F, write `width.txt`, print the same text, and
+    return `READ_EXITS.get(reading.status, EXIT_OK)` -- 0 for every reading, 41 or
+    42 for the two refusals.
+
+    `reading_contrast` raises two ValueErrors that no builder can pre-empt without
+    turning a legitimate UNRESOLVED_* record into a crash -- an arm clearing both
+    ways, and both directions at the bar -- and both arise only PAST its gates.
+    They become a SystemExit here, with the reading's own message, so the reader
+    gets a named refusal instead of a traceback, and NOTHING is written: a refused
+    read has no artefact.
+
+    THE ARTEFACT IS WRITTEN BEFORE ANYTHING IS PRINTED, so `width.txt` gates the
+    log."""
+    arms, seeds = _plan(args)
+    require_readable_plan(arms, seeds)
+    try:
+        records = load_width(args.out, arms, seeds)
+    except CellMissing as error:
+        print(f"NO CELL: {error}")
+        return EXIT_NO_CHECKPOINTS
+    require_one_protocol(records)
+    inputs = contrast_inputs(records)
+    try:
+        reading = reading_contrast(inputs)
+    except ValueError as error:
+        raise SystemExit(f"Reading F refuses these records: {error}") from error
+    text = width_text(records, inputs, reading)
+    write_text(args.out / "width.txt", text)
+    print(text, end="")
+    return READ_EXITS.get(reading.status, EXIT_OK)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="M3k: width-matched ladder -- measure the three passes, read Reading F",
+    )
+    parser.add_argument("--out", type=Path, default=Path("runs/m3k_retention"))
+    parser.add_argument("--source", type=Path, default=Path("runs/m3_study_v2"),
+                        help="the M3c study directory: the nine 20,000-step cells")
+    parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
+    parser.add_argument("--device", default="mps")
+    # None -> the cell's diagnostic says what it was written at; a value that
+    # disagrees is refused (`protocol_mismatch`, 14).
+    parser.add_argument("--context", type=int, default=None)
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
+    parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
+    parser.add_argument("--phase", choices=PHASES, default=PHASES[-1])
+    return parser
+
+
+def main(argv: list[str] | None = None, *, ks=K_REPORTED) -> int:
+    args = _parser().parse_args(argv)
+    args.arms, args.seeds = _plan(args)
+    if args.phase in ("measure", "all"):
+        device = get_device(prefer=args.device)
+        cells = [(arm, seed) for arm in args.arms for seed in args.seeds]
+        buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
+        train, val = episode_split(
+            buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=SPLIT_SEED,
+        )
+        status = measure_phase(args, cells, device, train, val, ks=ks)
+        if status != EXIT_OK:
+            return status
+    if args.phase in ("read", "all"):
+        status = read_phase(args)
+        if status != EXIT_OK:
+            return status
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
