@@ -102,12 +102,19 @@ the code path under test.
 
 | control | substitution | must read |
 |---|---|---|
-| `floor_bits` | every row's posterior replaced by `marginalⱼ` | **exactly 0.000 bits** |
+| `floor_bits` | every row's posterior replaced by `marginalⱼ` | **0.000 bits to 1e-9** |
 | `ceiling_bits` | every row's posterior replaced by a one-hot at its argmax | **exactly `Σⱼ H(marginal of argmaxⱼ)`** |
 
-`floor_bits` is identically zero by construction — `H(m) − mean_n H(m)` — so any
-nonzero reading is an arithmetic defect: a wrong log base, a missing
-normalisation, a mean over the wrong axis.
+`floor_bits` is identically zero by construction — `H(m) − mean_n H(m)` — so a
+reading away from zero is an arithmetic defect: a missing normalisation, or a
+mean over the wrong axis.
+
+**It is not bit-exact, and the tolerance is part of the check.** Measured:
++5.68e-14 at 500 rows, −1.42e-13 at 2,000, +5.40e-13 at the ~11,000 rows a real
+cell carries — float summation order. Every tolerance here is **1e-9**, four
+orders above the observed drift. Stated explicitly because this project has
+already paid for the other reading: an M3h sweep refused on an 8.527e-14
+mismatch that was summation order and not a defect.
 
 `ceiling_bits` is computed **twice by different routes** — once as
 `bits_carried` of the one-hot substitution, once as a histogram over the argmax
@@ -294,9 +301,9 @@ for the other eight when the host swapped. Watch free disk.
 
 - Reading G taken on nine records at one `git_sha`, or the run refused with a
   numbered status and the refusal recorded.
-- `floor_bits` reads **exactly 0.000** on all nine cells.
-- `ceiling_bits` matches its independently computed argmax-marginal entropy on
-  all nine cells, in bits.
+- `floor_bits` reads **within 1e-9 of 0** on all nine cells.
+- `ceiling_bits` matches its independently computed argmax-marginal entropy to
+  1e-9 on all nine cells.
 - `0 ≤ bits_carried ≤ ceiling_bits ≤ 160` on all nine cells.
 - Every pre-existing `gather_probe_data` key byte-identical to before the change,
   pinned by test; `gain_from_blocks`' ten-key golden output unchanged.
