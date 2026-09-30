@@ -120,12 +120,28 @@ class _TagEncoder(nn.Module):
         return obs[:, 0, 0, 0].to(torch.float32).unsqueeze(-1)
 
 
+class _StubCfg:
+    """The one `RSSMConfig` field `gather_probe_data` reads off `model.rssm.cfg`."""
+
+    sample_temperature = 1.0
+
+
 class _OracleRSSM(nn.Module):
-    """A perfect filter and a perfect dynamics model over the frame tag."""
+    """A perfect filter and a perfect dynamics model over the frame tag.
+
+    M3l: `gather_probe_data` also collects the posterior and prior logits and
+    reads the sampling temperature, so this stub -- which `test_windows.py`
+    drives through the real gather -- carries `cfg` and returns both. Uniform
+    over two classes, `(B, T, 1, 2)`; nothing that runs on this stub reads the
+    values."""
+
+    cfg = _StubCfg()
 
     def observe(self, embeddings, actions, state=None):
         tag = embeddings[..., :1]  # the posterior sees the frame, so it knows
-        return {"h": tag, "z": tag, "latent": torch.cat([tag, tag], dim=-1)}
+        logits = torch.zeros(*tag.shape[:2], 1, 2)
+        return {"h": tag, "z": tag, "latent": torch.cat([tag, tag], dim=-1),
+                "post_logits": logits, "prior_logits": logits}
 
     def imagine(self, actions, state):
         h0 = state[0]  # (B, 1): tag of the last observed frame
