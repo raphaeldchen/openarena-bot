@@ -2616,6 +2616,21 @@ def test_the_gather_reads_the_sampling_temperature_off_the_model(tmp_path):
     assert np.abs(tempered - plain).max() > 1e-3, "the fixture cannot tell the two apart"
     np.testing.assert_allclose(data["post_probs"], tempered, rtol=0.0, atol=1e-6)
 
+    # BOTH arrays, not just the posterior: applying the temperature to
+    # `post_logits` alone and leaving the prior at 1.0 passed this test while it
+    # asserted only `post_probs`. The prior gets the same temperature because it
+    # is the distribution `imagine` draws from, and a companion measured under a
+    # different temperature than the thing it companions is not a companion.
+    prior_tempered = torch.softmax(
+        torch.as_tensor(reference["prior_logits"]) / 0.5, dim=-1
+    ).numpy()
+    np.testing.assert_allclose(data["prior_probs"], prior_tempered, rtol=0.0, atol=1e-6)
+
+    # float32, which the brief specifies and which `.double()` would otherwise
+    # satisfy every other assertion in this file while doubling the record size.
+    for key in ("post_probs", "prior_probs"):
+        assert data[key].dtype == np.float32, f"{key} is {data[key].dtype}"
+
 
 @pytest.mark.parametrize("temperature", [0.0, 0.5, 1.0, 2.0])
 def test_the_sampling_probs_helper_mirrors_rssm_sample_at_every_temperature(temperature):
@@ -2629,17 +2644,24 @@ def test_the_sampling_probs_helper_mirrors_rssm_sample_at_every_temperature(temp
     with the wrong diagnosis ("logits handed in place of probabilities"): a
     loud failure blaming the caller for the helper's bug. Unreachable at the
     shipped 1.0, which is exactly why nothing else would catch it."""
-    from mbfps.eval.probe import _sampling_probs
-
-    logits = torch.tensor([[[2.0, 1.0, -1.0, 0.5]]])
+    # The argmax must NOT be index 0, and there must be more than one row with
+    # DIFFERENT argmaxes. With a single row whose max was already index 0, a
+    # point mass at index 0 -- or an argmax taken over the wrong dim, which
+    # returns 0 on a size-1 axis -- passed this test identically. Verified: with
+    # the old fixture, replacing the scatter with `onehot[..., 0] = 1.0` passed.
+    logits = torch.tensor([[[1.0, 2.0, -1.0, 0.5],
+                            [0.5, -1.0, 1.0, 3.0]]])
+    assert logits.argmax(-1).tolist() == [[1, 3]], "the fixture's whole premise"
     probs = _sampling_probs(logits, temperature)
     assert torch.isfinite(probs).all(), f"non-finite at temperature {temperature}"
     torch.testing.assert_close(probs.sum(-1), torch.ones_like(probs.sum(-1)))
 
     if temperature == 0.0:
-        expected = torch.zeros_like(logits)
-        expected[..., logits.argmax(-1)] = 1.0
+        expected = torch.nn.functional.one_hot(
+            logits.argmax(dim=-1), logits.shape[-1]
+        ).to(probs.dtype)
         torch.testing.assert_close(probs, expected)
+        assert probs[0, 0].argmax().item() == 1 and probs[0, 1].argmax().item() == 3
     elif temperature == 1.0:
         # Bitwise the plain softmax: no division is taken at the shipped value.
         assert (probs == torch.softmax(logits, dim=-1)).all()
@@ -2649,7 +2671,35 @@ def test_the_sampling_probs_helper_mirrors_rssm_sample_at_every_temperature(temp
 
 def test_the_sampling_probs_helper_refuses_a_negative_temperature():
     """`RSSM._sample` refuses it; a helper that claims to mirror it must too."""
-    from mbfps.eval.probe import _sampling_probs
-
     with pytest.raises(ValueError, match="must be >= 0"):
         _sampling_probs(torch.zeros(1, 1, 4), -1.0)
+
+
+def test_the_distributions_are_row_aligned_with_the_latent_they_came_from(tmp_path):
+    """Row alignment is by construction -- the same two `observe` calls, the
+    same axis, the same order -- but every later task's numbers rest on it, so
+    it gets an independent pin rather than only the oracle's.
+
+    At `sample_temperature = 0.0` the code `RSSM._sample` draws is exactly the
+    argmax of the posterior logits, so `post_probs.argmax` must equal `z.argmax`
+    ON EVERY ROW. That is what makes this a check of alignment rather than of
+    distribution: shifting the arrays by one row breaks it. At 1.0 an untrained
+    model is near-uniform, so no statistical check would be informative --
+    measured, the mean log-prob of the aligned pairing and of a one-row-shifted
+    pairing agree to three decimals."""
+    model = _RealRSSMModel(sample_temperature=0.0)
+    paths = _write_episodes(tmp_path, [20, 20])
+    data = gather_probe_data(model, paths, None, torch.device("cpu"),
+                             context=3, horizon=5, seed=7)
+
+    cats, classes = RSSMConfig.z_cats, RSSMConfig.z_classes
+    z = data["latent"][:, RSSMConfig.h_dim:].reshape(-1, cats, classes)
+    aligned = data["post_probs"].argmax(axis=-1)
+    np.testing.assert_array_equal(aligned, z.argmax(axis=-1))
+
+    assert data["post_probs"].shape[0] > 1, "a one-row gather cannot show a shift"
+    shifted = np.roll(z.argmax(axis=-1), 1, axis=0)
+    assert not np.array_equal(aligned, shifted), (
+        "a one-row shift is undetectable here, so this test cannot see a "
+        "misalignment either"
+    )
