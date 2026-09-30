@@ -85,6 +85,15 @@ on validation. A generalisation number, not a fit statistic. Ceiling 1.0.
 High `frame_share` means `z` is largely a re-encoding of the current frame —
 which is what the embedding loss asks for.
 
+The target is `post_probs` flattened to `z_cats × z_classes` = 1024 columns, and
+`R²` is the mean over columns. **Columns with zero variance across the scored rows
+are excluded from that mean**, because R² is undefined for them — this project has
+already refused a fixture for exactly that reason. Their count is reported as
+`live_classes` out of 1024 and is itself a saturation signal: a class that never
+wins and never varies is capacity the code is not using. It decides nothing, but a
+`CAPACITY_BOUND` verdict printed beside a low `live_classes` would be
+self-contradicting, so both appear in the table.
+
 ### 2.3 Two controls with exact known answers
 
 Both are substitutions into the **real pipeline on the real data**, not fixtures.
@@ -100,15 +109,25 @@ the code path under test.
 nonzero reading is an arithmetic defect: a wrong log base, a missing
 normalisation, a mean over the wrong axis.
 
-The two together also pin the **log base**, which one alone cannot. Summing
-entropies in nats where bits were meant inflates every figure by 1.4427 — a ratio
-that would look like a plausible number against a 160-bit ceiling rather than an
-obvious error. `floor_bits` reads 0 under either base; `ceiling_bits` matches its
-independently computed argmax-marginal entropy only in bits.
+`ceiling_bits` is computed **twice by different routes** — once as
+`bits_carried` of the one-hot substitution, once as a histogram over the argmax
+*indices* — and the two must agree. That pins the routing: a mean taken over the
+wrong axis, or a substitution that leaks a row's own distribution, breaks the
+agreement.
+
+**Neither control pins the log base, and a third check is needed for it.**
+Measured: in nats the floor still reads 0.000000 and the two ceiling routes still
+agree exactly (109.8100 both ways, against 158.4223 in bits). Nor does the
+`≤ 160` inequality catch it, because nats reads *lower* than the bits ceiling, not
+higher. The base is pinned only by a case with a known **absolute** value: a
+fixture whose posterior is a deterministic function of the row and whose argmax is
+uniform across the dataset must read exactly **`log₂(z_classes)` = 5.000 bits per
+categorical**, where nats would read 3.466. That fixture is the base check; the
+two controls above are the arithmetic and routing checks.
 
 `bits_carried` must satisfy `0 ≤ bits_carried ≤ ceiling_bits ≤ 160`. A violation
 of any of those three inequalities is an error about the measurement and refuses
-the reading.
+the reading. Note what this does **not** catch: see the log-base paragraph above.
 
 ### 2.4 A companion that decides nothing
 
@@ -312,8 +331,16 @@ milestone pulls.
 explains why the prior is a companion rather than a control — the earlier
 formulation of this design claimed the prior was a zero-answer control, which is
 false because the prior is a function of `h` and `h` encodes past frames. §2.3
-carries the two controls that *are* exact. The ceiling is 160 in §2.1 and derived
-from `RSSMConfig` in §5; no section hardcodes it.
+carries the two controls that *are* exact.
+
+An earlier formulation also claimed the two controls "together pin the log base."
+They do not — measured, nats gives floor 0.000000 and identical ceiling routes,
+and reads *below* the 160-bit ceiling so no inequality catches it. §2.3 now
+separates the three checks: floor for arithmetic, the two ceiling routes for
+routing, and a known-absolute-value fixture for the base.
+
+The ceiling is 160 in §2.1 and derived from `RSSMConfig` in §5; no section
+hardcodes it.
 
 **Scope.** One reading, two statistics, two controls, one companion, one script,
 one pure module. Comparable to M3j and smaller than M3k, which needed three
