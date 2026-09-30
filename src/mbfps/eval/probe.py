@@ -160,7 +160,25 @@ def _sampling_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     `sample_temperature = 1.0` path is bitwise the plain softmax, exactly as
     `RSSM._sample` does it -- M3h added the temperature and took the same care,
     and an unconditional `logits / 1.0` is not guaranteed bitwise identical.
+
+    Mirrors `_sample` at BOTH of its special cases, not just 1.0: it skips the
+    division at 0.0 as well, and at 0.0 it takes the argmax, so the distribution
+    it effectively draws from there is a point mass rather than the softmax.
+    Unreachable at the shipped 1.0, and written out because a future
+    temperature change should be reflected rather than silently mis-reported.
     """
+    if temperature < 0.0:
+        raise ValueError(f"sampling temperature must be >= 0, got {temperature}")
+    if temperature == 0.0:
+        # `_sample` draws from the untempered softmax at 0.0 and then DISCARDS
+        # the draw for the argmax, so the distribution it effectively samples
+        # from is a point mass -- which is what this has to report, not the
+        # softmax it happened to compute. Dividing here instead would give NaN,
+        # and the estimator's guard would then refuse it with the wrong
+        # diagnosis ("logits handed in place of probabilities").
+        onehot = torch.zeros_like(logits)
+        onehot.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        return onehot
     if temperature != 1.0:
         logits = logits / temperature
     return torch.softmax(logits, dim=-1)

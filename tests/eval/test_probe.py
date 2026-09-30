@@ -2615,3 +2615,41 @@ def test_the_gather_reads_the_sampling_temperature_off_the_model(tmp_path):
     plain = torch.softmax(post_logits, dim=-1).numpy()
     assert np.abs(tempered - plain).max() > 1e-3, "the fixture cannot tell the two apart"
     np.testing.assert_allclose(data["post_probs"], tempered, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.5, 1.0, 2.0])
+def test_the_sampling_probs_helper_mirrors_rssm_sample_at_every_temperature(temperature):
+    """The helper's docstring claims to mirror `RSSM._sample`'s temperature
+    handling, so it has to mirror BOTH of its special cases.
+
+    `_sample` skips the division at 0.0 as well as 1.0, and at 0.0 it discards
+    its draw for the argmax -- so the distribution it effectively samples from
+    there is a POINT MASS, not the softmax it happened to compute. Dividing at
+    0.0 instead yields NaN, and the estimator's own guard would then refuse it
+    with the wrong diagnosis ("logits handed in place of probabilities"): a
+    loud failure blaming the caller for the helper's bug. Unreachable at the
+    shipped 1.0, which is exactly why nothing else would catch it."""
+    from mbfps.eval.probe import _sampling_probs
+
+    logits = torch.tensor([[[2.0, 1.0, -1.0, 0.5]]])
+    probs = _sampling_probs(logits, temperature)
+    assert torch.isfinite(probs).all(), f"non-finite at temperature {temperature}"
+    torch.testing.assert_close(probs.sum(-1), torch.ones_like(probs.sum(-1)))
+
+    if temperature == 0.0:
+        expected = torch.zeros_like(logits)
+        expected[..., logits.argmax(-1)] = 1.0
+        torch.testing.assert_close(probs, expected)
+    elif temperature == 1.0:
+        # Bitwise the plain softmax: no division is taken at the shipped value.
+        assert (probs == torch.softmax(logits, dim=-1)).all()
+    else:
+        torch.testing.assert_close(probs, torch.softmax(logits / temperature, dim=-1))
+
+
+def test_the_sampling_probs_helper_refuses_a_negative_temperature():
+    """`RSSM._sample` refuses it; a helper that claims to mirror it must too."""
+    from mbfps.eval.probe import _sampling_probs
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _sampling_probs(torch.zeros(1, 1, 4), -1.0)
