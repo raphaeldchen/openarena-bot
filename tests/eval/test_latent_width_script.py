@@ -381,7 +381,7 @@ def _expected(data, target, k, rung, pass_name, h_dim=512):
     values, rows = builder(data["targets"], data["window"], data["step"], k)
     _, source = shifted_rows(data["window"], data["step"], k)
     native = rung_block(data, rung, rows=rows, source=source, h_dim=h_dim)
-    return data["encoder_embedding"][rows], pass_block(native, pass_name), values, rows
+    return data["encoder_embedding"][rows], pass_block(native, pass_name, seed=PROJECTION_SEED), values, rows
 
 
 def test_every_gain_gets_the_untouched_base_and_its_passs_projection_of_the_native_block(
@@ -646,6 +646,18 @@ def test_only_one_rungs_blocks_exist_at_a_time_when_no_contrast_is_pending(monke
     monkeypatch.setattr(script, "contrast_from_blocks", lambda *a, **k: {"contrast": 0.0})
     script.cell_passes(*_splits(enc=64, h_dim=16, z=32), h_dim=16, ks=(1,))
     assert len(seen) == len(PASSES) * len(TARGETS) * len(RUNGS) * 3
+    # The in-call assertion runs at the START of each fit, so it never checks
+    # the LAST rung's blocks -- an implementation that held the final rung's
+    # splits on the returned structure would pass every one of those and leave
+    # 250 MB resident per pass at production width. Checked here, after the
+    # return, where the only live reference could be one `cell_passes` kept.
+    import gc
+    gc.collect()
+    alive = [ref for ref in seen if ref() is not None]
+    assert not alive, (
+        f"{len(alive)} block(s) are still alive after cell_passes returned; the "
+        "last rung's splits were retained past their fit"
+    )
 
 
 def _dropping_builder(real, *, at_k: int):
@@ -1431,6 +1443,7 @@ def _protocol_records():
             "context": 5, "horizon": 45, "device": "mps",
             "ks": [1, 4, CONTRAST_K], "torch_version": "2.13.0", "git_sha": "abc123",
             "projection_seed": PROJECTION_SEED, "rung_width": dict(RUNG_WIDTH),
+            "h_dim": RUNG_WIDTH["deterministic"],
         }
         for arm in _ARMS for seed in (0, 1, 2)
     }
@@ -1454,12 +1467,13 @@ _PROTOCOL_FIELD_MUTATIONS = {
     "git_sha": lambda r: r.update(git_sha="def456"),
     "projection_seed": lambda r: r.update(projection_seed=PROJECTION_SEED + 1),
     "rung_width": lambda r: r["rung_width"].update(deterministic=RUNG_WIDTH["deterministic"] + 1),
+    "h_dim": lambda r: r.update(h_dim=int(r["h_dim"]) + 1),
 }
 
 
 _REQUIRED_PROTOCOL_FIELDS = {
     "windows.episode", "episodes.val", "context", "horizon", "device", "ks",
-    "torch_version", "git_sha", "projection_seed", "rung_width",
+    "torch_version", "git_sha", "projection_seed", "rung_width", "h_dim",
 }
 
 

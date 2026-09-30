@@ -244,11 +244,19 @@ def _target_rows(data: dict, target: str, k: int):
         )
     shifted, source = shifted_rows(data["window"], data["step"], k)
     if rows.size == shifted.size and not np.array_equal(rows, shifted):
-        # ONLY the equal-count case belongs here. A builder that drops rows
-        # falls through to `cell_passes`' row-count agreement check, which is
-        # the coarser guard and names both targets' counts; intercepting it here
-        # would shadow that check and leave its test unable to reach it. This is
-        # the finer one: same count, different ORDER, which no count can see.
+        # ONLY the equal-count case belongs here, DELIBERATELY. Dropping the
+        # condition would subsume the count guard outright -- both targets
+        # derive from the same `shifted_rows`, so a disagreement between them
+        # implies at least one differs from `shifted` -- and would leave that
+        # guard's test unable to reach it, which is the defect this file has
+        # already been fixed for twice. So the unequal-count case is covered in
+        # two places instead: `cell_passes`' count guard when the two targets
+        # DISAGREE (named, per target, before any fit), and `GainSplit.rows()`
+        # when they agree with each other but both differ from `shifted` -- that
+        # last one only because `rung_block` reads `two_frame` from `source`, a
+        # coupling this guard does not rely on for the equal-count half it owns.
+        # This is the finer half: same count, different ORDER, which no count
+        # can see and no length check can reach.
         raise ValueError(
             f"k={k}, target {target!r}: the builder's rows are not "
             "`shifted_rows`' rows, so row i of the target and row i of `source` "
@@ -744,12 +752,24 @@ _PROTOCOL_FIELDS = (
     ("git_sha", lambda r: str(r.get("git_sha", ""))),
     ("projection_seed", lambda r: int(r["projection_seed"])),
     ("rung_width", lambda r: dict(r["rung_width"])),
+    ("h_dim", lambda r: int(r["h_dim"])),
 )
 """Every field `require_one_protocol` compares, as `(name, pick)`, in one
 module-level table that the function ITERATES and a test reads -- so a field
 cannot be added to the comparison without the test noticing it has no
 disagreement case. While the tuple lived inside the function, no test could see
-it, and a check on the test's own literal compared that literal to itself."""
+it, and a check on the test's own literal compared that literal to itself.
+
+`h_dim` is here because it is the one width the record MEASURES -- read off the
+checkpoint -- while `projection_seed` and `rung_width` are written from module
+constants and so cannot vary between two records of one code version. Nine
+cells whose checkpoints disagreed on `h_dim` would go through DIFFERENT
+projection matrices while carrying identical `rung_width`, and would pool
+without a word: the only thing that would notice is the `down` anchor breaking,
+which the read phase reports as "the projection machinery ran where it should
+not" -- the wrong diagnosis, reached after the whole measure. An `embed_dim`
+disagreement breaks only the `up` anchor, which deliberately gates nothing, and
+a `z_dim` disagreement is invisible to every other check."""
 
 
 def require_one_protocol(records: dict) -> None:
