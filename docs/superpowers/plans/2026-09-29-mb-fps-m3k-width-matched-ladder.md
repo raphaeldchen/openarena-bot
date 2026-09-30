@@ -1902,3 +1902,352 @@ in Tasks 1, 5. `ContrastArm` carries `contrast, ci_low, ci_high, seeds_up,
 seeds_down, seeds_total` in Tasks 4, 6. `pass_block(block, pass_name)` in Tasks
 3, 5. `anchor_check(passes) -> dict[str, bool]` in Tasks 5, 6. `CONTRAST_K` never
 `DECISION_K`, pinned by a test in Task 3.
+
+---
+
+## Task 7 results
+
+**Reading F is `INDISTINGUISHABLE`.** At equal block width (512 columns), neither direction clears
+at k = 15 in the `ARMS_REQUIRED = 2` arms the rule needs: no arm clears in `SEEDS_REQUIRED = 2`
+seeds either way. `arms_up` and `arms_down` are both **empty**, `base_failed` empty,
+`anchors_broken` empty, and `read` exited **0**.
+
+**Spec 3.3's pre-registered consequence therefore applies as written: the bottleneck lever stands
+alone BY DEFAULT rather than by evidence.** "We could not tell the two blocks apart" is not "we
+ruled one out." M3j's objective-lever argument is neither confirmed nor refuted at equal width; it
+is unresolved, and the next milestone's choice of the bottleneck lever inherits that weakness
+explicitly rather than silently.
+
+The one-line summary of why: on the `down` pass at k = 15, `two_frame`'s mean gain is **+0.02318**
+and `deterministic`'s is **+0.02071** — a gap of **+0.00247**, against the **+0.01418** the same nine
+records measure on the `shipped` pass. Width-matching removes **83%** of the gap M3j's objective
+argument rested on. What survives (+0.00247) still points the same way — `two_frame` ahead in **6 of
+9 cells** — but no arm's intervals agree in 2 seeds, and the interval evidence actually leans the
+*other* way: **1 of 9 seeds** clears upward against **2 of 9** downward. That mixture is what
+`INDISTINGUISHABLE` names, and the status and the magnitudes agree about it (§10).
+
+### 1. Provenance
+
+| | |
+|---|---|
+| `git_sha` (all nine records) | `5a3b635` — equal to `runs/m3k_width/.head` |
+| `record_git_sha` (the M3c cells read) | `ca3e140` (one value across all nine) |
+| device / torch | `mps` / `2.13.0` (one value across all nine) |
+| protocol | `context` 5, `horizon` 45, `split_seed` 0, 24 val episodes, 20 fit + 20 select, `ks` (1, 4, 15), `CONTRAST_K` **15** |
+| `h_dim` (read off each checkpoint) | 512 on all nine — so all nine went through the same projection matrices |
+| `projection_seed` / `rung_width` | `0` / `{two_frame: 2048, deterministic: 512, stochastic: 1024, full: 1536}` — recorded on **every** record |
+| smoke (one cell, `runs/m3k_smoke/`) | 2026-09-30T03:31:44Z -> 03:37:26Z (**5 m 42 s**) |
+| measure (nine cells, `runs/m3k_width/`) | 2026-09-30T03:43:45Z -> 05:05:16Z (**81 m 31 s**) |
+| `read` exit | **0** |
+| artefacts | nine `width_<arm>_seed<n>.json` (~267 KB each), `width.txt` (**7,113 bytes**), `measure.log`, `read.log` |
+| `nonfinite` | `{}` on all nine |
+
+**The output directory is `runs/m3k_width`, not the brief's `runs/m3k_retention`.** That name was a
+copy-paste from M3j, which was a retention study; this is the width study. Changed in every command
+— the measure, the read and the byte-identity diff.
+
+`width.txt` is byte-identical to what a second `--phase read` prints, verified with **both** `diff`
+and `cmp`. No checkpoint was written or altered and nothing under `runs/` was removed; the phase is
+evaluation only.
+
+### 2. The suite
+
+`caffeinate -dimsu .venv/bin/python -m pytest -q` from the repo root: **2,232 passed in 1,920.80 s
+(32 m 00 s)**, 0 failures, 0 errors, **0 warnings** — no warnings-summary block in the output at all.
+Log kept at `.superpowers/sdd/suite-task7-m3k.txt`.
+
+### 3. The smoke agreed with the plan exactly, and pinned one number in advance
+
+One cell (`pixel_ae` seed 0), 5 m 42 s. All three of the brief's hand checks matched on the nose:
+
+| check | expected | measured |
+|---|---|---|
+| `clusters` | 24 | **24** |
+| `rows` | `{k1: 11221, k4: 10534, k15: 8015}` | **identical** |
+| `anchors` | `{down: true, up: true}` | **identical** |
+
+Also 11,450 gathered rows over 229 distinct windows, `self_check.ok` true, `nonfinite` empty.
+
+The smoke's `passes.up.translation.k15.deterministic.gain` minus the `shipped` one is **+0.01365** —
+the figure the accidental one-cell run on this branch had already measured for count alone, to five
+decimal places, from a separate invocation. Its wall clock also sized the real run correctly: 5 m 42 s
+x 9 = ~51 min, against the ~60 min the task budgeted and the 81 m 31 s actually taken (§4 says why).
+
+### 4. Acceptance
+
+M3j's checks plus this milestone's two, all read from the records rather than from an exit status —
+`measure_phase` returns `EXIT_OK` even when every anchor is broken, so `$?` was never consulted for
+the measure; the acceptance reads the printed `down=ok`/`up=ok` lines **and** the `anchors` field.
+
+| check | result |
+|---|---|
+| nine records, one `git_sha`, equal to `.head` | `5a3b635` — **pass** |
+| all `mps` | **pass** |
+| `self_check.ok` | **9/9** |
+| distinct windows / gathered rows / episode clusters | **229 / 11,450 / 24** on every cell |
+| `rows` exactly `{k1: 11221, k4: 10534, k15: 8015}` | **pass**, every cell |
+| `step` | 20000, every cell |
+| every gain, contrast and interval bound finite | **pass** (all 3 passes x 2 targets x 3 horizons x 4 rungs x 9 cells, plus the 9 contrasts) |
+| `nonfinite` empty | **pass** |
+| both anchors reproduce on all nine cells | **pass** — §5 |
+| `projection_seed` and `rung_width` on every record | **pass** — §1 |
+| base control holding | **3 of 3 arms**, 9 of 9 seeds — §6 |
+
+`self_check` also reports, across all nine cells, `reference_position_max_delta` at most
+**1.71e-13** and `persistence_position_max_delta` at most **1.42e-13**, against position magnitudes
+of **140.5–259.6**, with `windows_total_match` and `windows_episode_match` true on every cell — the
+fresh `reference_trajectories` pass reproduces each cell's diagnostic to ~15 significant figures.
+
+**Per-cell wall clock**, from the record mtimes: 6 m 16 s, 6 m 25 s, 7 m 25 s, 6 m 16 s, 6 m 29 s,
+6 m 24 s, 5 m 42 s, 8 m 10 s, **28 m 09 s**. Eight of nine cells ran in 5 m 42 s – 8 m 10 s. The
+ninth (`random_vit` seed 2) took 28 m because the machine went into heavy swap — 11.7 GB of 14 GB
+swap in use, 5,145 free pages, the process holding 3.1 GB RSS at 108% CPU throughout. That is a
+fact about the host, not about the cell: its record passes every check above and its numbers sit in
+the middle of its arm's range. **Anyone re-running this should budget ~85 min, not ~26.**
+
+### 5. The anchors — exact on all nine cells, and a third control nobody asked for
+
+**Both anchors reproduced bit-identically on all nine cells.** Re-derived independently of the
+`anchors` field, with `==` rather than `np.isclose`, over `passes.<pass>.<target>.k<k>.<rung>.gain`
+against `passes.shipped....gain`: **108 comparisons** (9 cells x 2 anchors x 2 targets x 3
+horizons), **0 mismatches**. The recorded `anchors` field agrees with that re-derivation on all
+nine. So `down`'s `deterministic` rung and `up`'s `two_frame` rung were each left untouched by the
+pass that already matched their native width, and `pooled_anchors` reads `{down: True, up: True}`.
+
+This matters twice over, because `deterministic` being `down`'s anchor means **all** of the change
+in the deciding gap comes from `two_frame`'s side. `passes.down...deterministic.gain` minus
+`passes.shipped...deterministic.gain` is `+0.00000000000000000000` in **9 of 9** cells.
+
+**And the whole `shipped` pass turns out to be a third known-answer control.** Compared per cell
+against M3j's own records in `runs/m3j_retention/` (`ladder.<target>.k<k>.<rung>.gain`, `git_sha`
+`8bd6f93`), every one of the **216** shipped-pass gains — 9 cells x 2 targets x 3 horizons x 4 rungs
+— is **bit-identical**, max absolute difference `0.00e+00` on every row. M3j's headline pair
+reproduces exactly: `two_frame` **+0.03489**, `deterministic` **+0.02071** at k = 15 on translation.
+The instrument reproduces the result it is testing before it changes anything.
+
+### 6. The base and position controls
+
+```
+  base control (enc(t) -> position, must clear r2 0.10):
+      frozen_ssl r2=+0.682 3/3,  pixel_ae r2=+0.704 3/3,  random_vit r2=+0.660 3/3
+```
+
+Gated on `base_control.position_r2` alone — spec 2.5's first correction — which reads **0.650–0.710**
+across the nine cells, clearing `BASE_R2_FLOOR = 0.10` in **9 of 9 seeds and 3 of 3 arms**.
+`base_failed` is empty, so `UNRESOLVED_BASE` was never in play.
+
+The record's other number, `base_control.r2` — the 4-column mean over `pos_x`, `pos_y`,
+`sin(angle)`, `cos(angle)` that M3j gated on — reads **0.316–0.345** across the nine cells and is
+printed nowhere in `width.txt` by design. `base_control.per_column_r2` says why the two differ:
+across the nine cells `pos_x` reads **+0.701 to +0.775** and `pos_y` **+0.579 to +0.646**, while
+`sin(angle)` reads **−0.024 to +0.013** and `cos(angle)` **−0.069 to −0.000** — both heading columns
+at or below zero in **7 of 9 cells**. Position reads well; heading does not read at all; the
+4-column mean is dragged down by the two heading columns. So gating on position alone is the
+**looser** of the two gates here — 0.65–0.71 against a floor of 0.10 — and spec 2.5 records that
+rather than re-choosing the floor. The gate was never close to binding either way.
+
+### 7. Reading F — the table, and every magnitude it rests on
+
+```
+            arm    contrast     ci_low    ci_high     up     dn   clears
+     frozen_ssl     -0.0040    -0.0206    +0.0158    0/3    1/3       no
+       pixel_ae     +0.0007    -0.0370    +0.0754    0/3    1/3       no
+     random_vit     +0.0108    -0.0083    +0.0298    1/3    0/3       no
+  anchors: down=ok, up=ok        8015 rows over 24 clusters
+  verdict: INDISTINGUISHABLE
+```
+
+Each row is `contrast_arm` over that arm's three `contrast.k15` dicts: `contrast` the seed mean,
+`ci_low` the least lower bound and `ci_high` the greatest upper bound across its seeds — the
+conservative summary each way, so no arm is credited with an interval only its luckiest seed
+reached. Full precision: `frozen_ssl` **-0.00404**, `pixel_ae` **+0.00067**, `random_vit`
+**+0.01078**.
+
+**The nine per-cell contrasts** (`contrast.k15.contrast`, with `ci_low`/`ci_high` from the same
+field), which is where the tallies come from:
+
+| cell | contrast | ci_low | ci_high | excludes 0 |
+|---|---|---|---|---|
+| `frozen_ssl` s0 | −0.01034 | −0.01991 | −0.00213 | **down** |
+| `frozen_ssl` s1 | −0.00814 | −0.02058 | +0.00188 | no |
+| `frozen_ssl` s2 | +0.00635 | −0.00281 | +0.01578 | no |
+| `pixel_ae` s0 | −0.01230 | −0.02054 | −0.00242 | **down** |
+| `pixel_ae` s1 | +0.00200 | −0.00768 | +0.01237 | no |
+| `pixel_ae` s2 | +0.01232 | −0.03703 | +0.07536 | no |
+| `random_vit` s0 | +0.02143 | +0.01103 | +0.02984 | **up** |
+| `random_vit` s1 | +0.00473 | −0.00829 | +0.01899 | no |
+| `random_vit` s2 | +0.00618 | −0.00200 | +0.01400 | no |
+
+**1 of 9 seeds** clears upward, **2 of 9** clears downward, and no arm reaches 2 either way. Each of
+the three arms is one seed short of clearing, in a direction that is not the same for all three:
+`frozen_ssl` and `pixel_ae` are one seed short **downward**, `random_vit` one seed short **upward**.
+That is not a near-miss on a single verdict; it is two arms leaning one way and one arm the other.
+
+**The deciding pair, as gains rather than as a contrast** — `passes.down.translation.k15.<rung>.gain`,
+mean over the nine cells:
+
+| | `two_frame` | `deterministic` | gap | `two_frame` ahead |
+|---|---|---|---|---|
+| `shipped` (native 2048 vs 512) | +0.03489 | +0.02071 | **+0.01418** | **8 of 9 cells** |
+| `down` (both 512) | **+0.02318** | **+0.02071** | **+0.00247** | **6 of 9 cells** |
+
+The `shipped` row's exception is `pixel_ae` seed 0, losing by **0.00082** — M3j reported the same
+cell losing by 0.0008. The three cells where `deterministic` leads on `down` are `frozen_ssl` s0 and
+s1 and `pixel_ae` s0.
+
+The gap arithmetic, checked twice because it surprised me: `gap_down − gap_shipped = −0.01171`,
+which equals `two_frame`'s projection loss
+(`passes.down...two_frame.gain − passes.shipped...two_frame.gain`, mean **−0.01171**, negative in
+**9 of 9** cells) to the last bit, exactly because `deterministic` is `down`'s anchor and contributes
+zero. So **83%** of the shipped gap is attributable to width; **+0.00247** survives.
+
+**k = 1 and k = 4 are reported and decide nothing** (`CONTRAST_K` is 15 and the rule is not a
+disjunction). On the `down` pass the gap is **−0.00685** at k = 1 and **−0.00824** at k = 4, with
+`two_frame` ahead in **1 of 9 cells** at each — i.e. `deterministic` leads clearly at the short
+horizons both before and after matching, as M3j already found on the shipped pass (**−0.00535** and
+**−0.00457**, `two_frame` ahead in 1 of 9 at each). Nothing in this section generalises from k = 15
+to the ladder, and nothing in the k = 15 rows generalises to k = 1 or k = 4.
+
+### 8. The width bias — `up` minus `shipped`, and whether it agrees with §1.1
+
+`passes.up.translation.k15.<rung>.gain` minus `passes.shipped....gain`, per arm (mean over its
+seeds) and over all nine cells. Verbatim from `width.txt`, translation at k = 15:
+
+```
+         target           rung  width   frozen_ssl     pixel_ae   random_vit          all
+    translation      two_frame   2048      +0.0000      +0.0000      +0.0000      +0.0000
+    translation  deterministic    512      +0.0152      +0.0146      +0.0155      +0.0151
+    translation     stochastic   1024      -0.0011      -0.0061      -0.0072      -0.0048
+    translation           full   1536      +0.0100      -0.0013      +0.0096      +0.0061
+```
+
+The `two_frame` row is `up`'s anchor and is **exactly 0.0 in 9 of 9 cells**, not merely rounded to
+it.
+
+**Does the nine-cell figure agree with §1.1's ~+0.0137? In sign and order of magnitude, yes, and it
+is if anything larger.** `deterministic`'s width bias is **+0.01510** over the nine cells,
+**positive in 9 of 9**, range **+0.01107 to +0.02197**. §1.1's two design-time cells sit inside that
+range and near its bottom, and this run reproduces them closely but not exactly — `pixel_ae` s0
+**+0.01365** against §1.1's +0.01355, `random_vit` s0 **+0.01440** against +0.01377. The design-time
+probe is not a pinned artefact, so a ~1e-4 to ~6e-4 difference is expected; what §1.1 claimed —
+that lifting `h` from 512 to 2048 columns with zero information added buys about +0.0137 — is
+**confirmed on all nine cells and understated by about 10%**.
+
+**Two caveats, stated here rather than in a section nobody reads.**
+
+First, **this is not the same number as the width cost measured the other way, and neither is "the"
+width bias.** Lifting `h` 512 -> 2048 (`up`: count matched, rank and information unchanged) buys
+**+0.01510**; projecting `two_frame` 2048 -> 512 (`down`: count *and* rank matched, information
+destroyed) costs **−0.01171**. They differ by **+0.00339** and they are different quantities, which
+is exactly why spec 2.4 runs both passes. Reading F rests on the second; §1.1's estimate is of the
+first.
+
+Second, **the `rotation`/`full` row of the printed table reads `+0.0000` under `all`, and that is a
+coincidence, not an anchor.** Its per-arm means are `frozen_ssl` **+0.01134**, `pixel_ae`
+**−0.01635**, `random_vit` **+0.00510**; the nine-cell mean is **+0.0000296**, positive in 6 of 9
+cells and negative in 3, and **exactly zero in 0 of 9**. Opposite-signed arms cancel. Only the
+`two_frame` rows are anchors.
+
+The other rows also say the lift is not a free gain in general: `stochastic`'s bias is **−0.0048**
+on translation (negative in **8 of 9** cells), so lifting a 1024-column block to 2048 makes its fit
+slightly *worse*. A wider block buys gain where the block carries something to spread; it does not
+buy gain unconditionally.
+
+### 9. The corrected Reading E — it **does** differ from M3j's `MOTION_RETAINED`, and only both corrections together flip it
+
+Reading E re-run on the `down` pass (every block 512 wide) with `z_bearing = ("stochastic",)` reads
+**`BOTTLENECK_LOSS`**, where M3j read `MOTION_RETAINED`:
+
+```
+  verdict: BOTTLENECK LOSS -- decided by: the deterministic rung adds displacement at
+  k = 1, k = 4, k = 15 but no z-bearing rung does; h carries motion and the 32x32
+  categorical bottleneck destroys it
+```
+
+**M3j's verdict is not overturned.** It was taken under its own pre-registered rule, on its own
+records, and spec 3.4 pre-registered this possibility before any number here was seen.
+`retention.Z_BEARING_RUNGS` is **unedited** — still `('stochastic', 'full')` — and §5 shows M3j's
+records still read `MOTION_RETAINED` because this run reproduces every one of their gains bit for
+bit.
+
+**Which of the two corrections does the work? Neither alone. Both together.** Running
+`reading_retention` over these same nine records, four ways:
+
+| pass | z-bearing set | status | surviving rung |
+|---|---|---|---|
+| `shipped` | `('stochastic', 'full')` — M3j's | `MOTION_RETAINED` | `stochastic` |
+| `shipped` | `('stochastic',)` — corrected | `MOTION_RETAINED` | `stochastic` |
+| `down` | `('stochastic', 'full')` — M3j's | `MOTION_RETAINED` | **`full`** |
+| `down` | `('stochastic',)` — corrected | **`BOTTLENECK_LOSS`** | `deterministic` |
+
+The z-bearing correction alone does not move it (M3j's own results already said so). The width
+matching alone does not move the *status* either — but it moves **which rung carries it**, from
+`stochastic` to `full`, and `full` is precisely the rung M3j recorded as unable to attribute
+anything, being `h (+) z`. So under the corrected set the width-matched reading has nothing left to
+stand on.
+
+What changed underneath is `stochastic`, exactly as spec 1.3 predicted. On translation
+(`passes.<pass>.translation.k<k>.stochastic.gain`, mean over nine cells, arms clearing one-sided):
+
+| k | `shipped` | `down` |
+|---|---|---|
+| 1 | +0.00066, clears 1/3 arms | **−0.00045, 0/3** |
+| 4 | +0.00091, clears 1/3 arms | **−0.00034, 0/3** |
+| 15 | +0.00033, clears **2/3** arms | **−0.00154, 0/3** |
+
+`stochastic` competed at 1024 columns against `deterministic`'s 512 — a handicap in `z`'s favour —
+and its 2-of-3-arm clear at k = 15, the single row that carried M3j's `MOTION_RETAINED`, does not
+survive removing that handicap. Note the direction: at equal width `z`'s mean contribution to
+translation is **negative at all three horizons**.
+
+### 10. Does the rule's status agree with the magnitudes?
+
+**Yes, and this is the one place the project has gone wrong three times, so it is worth being exact
+about what "agree" means here.**
+
+The rule returns `INDISTINGUISHABLE` because no arm clears in 2 seeds either way. The magnitudes
+say: the point estimate still favours `two_frame` (**+0.00247** mean, ahead in **6 of 9 cells**),
+while the interval evidence slightly favours `deterministic` (**2 of 9** seeds clearing downward
+against **1 of 9** upward). A point estimate pointing one way and the interval tallies the other,
+with every arm one seed short, is not a suppressed finding — **it is what being unable to tell two
+blocks apart looks like.** The status and the magnitudes are not in conflict, and no lever choice is
+licensed by either.
+
+Three things this section deliberately does **not** say. It does not say `deterministic` won: it
+leads in 3 of 9 cells and its arm-level tallies never reach the bar. It does not say `two_frame`
+won: it leads in 6 of 9 cells at k = 15 and in 1 of 9 at k = 1 and k = 4, and never reaches the bar
+either. And it does not say the shipped result was "all width": **83%** of the gap is attributable
+to width, which leaves +0.00247 unexplained and unresolved — "nearly all" is the honest word, and
+the residual is not zero.
+
+The three prior estimates of the width bias (§1.1's +0.01355 / +0.01377 and the accidental one-cell
+run's +0.01365, all ~+0.0137) were close enough to the +0.01418 shipped gap to make
+`RECURRENT_AHEAD` look likely before the run. **It did not happen.** `RECURRENT_AHEAD` requires
+`deterministic` to clear in 2 arms and it clears in none; the measured width bias on `up` is larger
+than those priors (+0.01510), and the width *cost* on `down` — the one the verdict rests on — is
+**smaller** (−0.01171). The priors were a good guide to the magnitude and a poor guide to the
+verdict.
+
+### 11. What this milestone does not support
+
+Spec 4, carried forward with the numbers now attached:
+
+- **A linear probe is a lower bound.** `INDISTINGUISHABLE` says no *linear* read-out of a
+  512-column `two_frame` beats a 512-column `h` at k = 15 by enough for two arms to agree. It does
+  not say the two blocks carry the same information under any decoder.
+- **A random projection destroys information**, so `two_frame` may have lost its +0.01171 to the
+  projection rather than to the comparison. That is exactly why `up` runs beside `down`, and why
+  `INDISTINGUISHABLE` licenses no positive claim in either direction.
+- **`up` matches count, not rank.** The +0.01510 it measures is the value of columns alone at fixed
+  rank; it is not a bound on what a genuinely 2048-dimensional block could add.
+- **Backward is not forward.** Everything measured is motion the posterior has already observed. No
+  status here is a statement about `gap_closed` or about whether the M3 gate can pass.
+- **The intervals hold the probes fixed across resamples** — an interval on the scored sample, not
+  on the fit/select/score pipeline. `_block_bootstrap_ci`'s own caveat, inherited.
+- **Nothing here changes the M3 gate, `aggregate.py`, `filtering_gain`'s recorded numbers,
+  `retention.Z_BEARING_RUNGS`, or any verdict or record M3b–M3j produced.** M3j's `MOTION_RETAINED`
+  stands as recorded; §9's `BOTTLENECK_LOSS` is a companion that decides nothing, under a corrected
+  rule, on a different pass.
+- **One cell ran 3.4x slower than its neighbours** because the host was swapping (§4). Its record
+  passes every check, but a re-run on a memory-constrained machine should expect the same and should
+  not read it as a hang.
