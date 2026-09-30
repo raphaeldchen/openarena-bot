@@ -81,6 +81,13 @@ def _require_distributions(probs: np.ndarray) -> np.ndarray:
             "probs carries a negative value, so it is not a distribution; "
             "logits were probably handed in place of probabilities"
         )
+    if probs.shape[0] == 0:
+        raise ValueError(
+            "probs has no rows: `bits_carried` would divide by zero and return "
+            "NaN with a warning, and NaN compares False against every cut, so a "
+            "gather that produced nothing would read as a clean null rather than "
+            "as the refusal it is"
+        )
     sums = probs.sum(axis=-1)
     if not np.allclose(sums, 1.0, atol=1e-5):
         raise ValueError(

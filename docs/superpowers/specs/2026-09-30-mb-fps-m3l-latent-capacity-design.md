@@ -132,9 +132,28 @@ uniform across the dataset must read exactly **`log₂(z_classes)` = 5.000 bits 
 categorical**, where nats would read 3.466. That fixture is the base check; the
 two controls above are the arithmetic and routing checks.
 
-`bits_carried` must satisfy `0 ≤ bits_carried ≤ ceiling_bits ≤ 160`. A violation
-of any of those three inequalities is an error about the measurement and refuses
-the reading. Note what this does **not** catch: see the log-base paragraph above.
+**Two inequalities may be refused on, and both are theorems:**
+
+```
+−1e-9 ≤ bits_carried ≤ 160 + 1e-9
+    0 ≤ ceiling_bits ≤ 160 + 1e-9
+```
+
+`bits = H(marginal) − E_n H(row) ≤ H(marginal) ≤ z_cats · log₂(z_classes)`, so
+the upper bound follows. The lower bound needs the tolerance rather than a bare
+`0 ≤`, by the same summation order as the floor.
+
+**`bits_carried ≤ ceiling_bits` is NOT a theorem and must not be refused on.** An
+earlier draft of this section asserted it. The two measure different things:
+`ceiling_bits` is the information content of the **argmax pattern**,
+`bits_carried` that of the **distribution**. Measured counterexample — 500 rows
+whose argmax is always class 0 with a varying tail carry **7.52 bits against a
+`ceiling_bits` of 0.00**. Refusing on it would reject valid readings precisely in
+the diffuse, low-information regime this milestone exists to investigate, which
+is the worst possible place for a spurious refusal. `ceiling_bits`' only job is
+the two-route routing check above.
+
+Note what none of this catches: see the log-base paragraph above.
 
 ### 2.4 A companion that decides nothing
 
@@ -304,7 +323,8 @@ for the other eight when the host swapped. Watch free disk.
 - `floor_bits` reads **within 1e-9 of 0** on all nine cells.
 - `ceiling_bits` matches its independently computed argmax-marginal entropy to
   1e-9 on all nine cells.
-- `0 ≤ bits_carried ≤ ceiling_bits ≤ 160` on all nine cells.
+- `−1e-9 ≤ bits_carried ≤ 160 + 1e-9` and `0 ≤ ceiling_bits ≤ 160 + 1e-9` on all
+  nine cells. **Not** `bits_carried ≤ ceiling_bits`, which is not a theorem.
 - Every pre-existing `gather_probe_data` key byte-identical to before the change,
   pinned by test; `gain_from_blocks`' ten-key golden output unchanged.
 - All five Reading G statuses reachable and driven end-to-end by a test.

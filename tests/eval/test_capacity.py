@@ -110,20 +110,51 @@ def test_the_two_ceiling_routes_agree():
     assert ceiling_bits(probs) == pytest.approx(argmax_marginal_bits(probs), abs=1e-9)
 
 
-def test_bits_carried_is_bracketed_by_zero_and_the_ceiling():
-    """The three inequalities the run refuses on.
+def test_the_only_bound_on_bits_carried_is_the_derived_ceiling():
+    """THE TWO inequalities a refusal may rest on, both theorems:
 
-    Two of the three are theorems and one is not, and a caller wiring this into
-    a refusal needs to know which. `bits <= CEILING_BITS` and `bits >= 0` hold
-    for every input -- but `bits >= 0` only to summation order: a collapsed code
-    reads -5.7e-14, so a refusal on it needs the 1e-9 tolerance, not `0.0 <=`.
-    `bits <= ceiling_bits` holds EMPIRICALLY for a code whose argmax varies, as
-    here; it is not a theorem. Measured counterexample: 500 rows whose argmax is
-    always class 0 (mode 0.5) with a varying tail carry 22.6 bits against a
-    `ceiling_bits` of 0.0."""
-    probs = _dirichlet(500, seed=3)
+        -1e-9 <= bits_carried <= CEILING_BITS + 1e-9
+         0    <= ceiling_bits <= CEILING_BITS + 1e-9
+
+    `bits = H(marginal) - E_n H(row) <= H(marginal) <= cats * log2(classes)`,
+    so the upper bound follows. The lower bound needs the TOLERANCE, not `0 <=`:
+    a collapsed code reads +4.3e-13 at 11,000 rows and can read negative by the
+    same summation order.
+
+    Both are checked at several row counts, because a bound that holds at 500
+    rows and not at 11,000 is the one that would bite on the real run."""
+    for n in (500, 2000, 11000):
+        probs = _dirichlet(n, seed=3)
+        assert -1e-9 <= bits_carried(probs) <= CEILING_BITS + 1e-9
+        assert 0.0 <= ceiling_bits(probs) <= CEILING_BITS + 1e-9
+
+
+def test_ceiling_bits_is_not_an_upper_bound_on_bits_carried():
+    """`bits_carried <= ceiling_bits` IS NOT A THEOREM, and an earlier draft of
+    the design asserted it as a refusal.
+
+    The two measure different things. `ceiling_bits` is the information content
+    of the ARGMAX PATTERN; `bits_carried` is that of the DISTRIBUTION. A code
+    whose argmax never moves while its tail varies carries real information with
+    an argmax pattern carrying none.
+
+    This test exists so nobody re-adds that refusal. It would have rejected
+    valid readings precisely in the diffuse, low-information regime this
+    milestone exists to investigate -- the most dangerous place for a spurious
+    refusal, because it is where the answer lives."""
+    rng = np.random.default_rng(0)
+    tail = rng.dirichlet(np.ones(CLASSES - 1), size=(500, CATS)) * 0.4
+    probs = np.concatenate([np.full((500, CATS, 1), 0.6), tail], axis=-1)
+    assert (probs.argmax(axis=-1) == 0).all(), "the premise: the argmax never moves"
+
     carried, ceiling = bits_carried(probs), ceiling_bits(probs)
-    assert 0.0 <= carried <= ceiling + 1e-9 <= CEILING_BITS + 1e-9
+    assert ceiling == pytest.approx(0.0, abs=1e-9), "an argmax that never moves"
+    assert carried > 1.0, "yet the distribution carries real information"
+    assert carried > ceiling, (
+        "the counterexample: bits_carried exceeds ceiling_bits, so a refusal on "
+        "`bits <= ceiling` would reject this valid reading"
+    )
+    assert carried <= CEILING_BITS + 1e-9, "the real bound still holds"
 
 
 def test_a_code_that_ignores_its_input_carries_no_bits():
@@ -223,3 +254,12 @@ def test_the_estimator_refuses_rows_that_are_not_distributions():
 
     with pytest.raises(ValueError, match="z_cats"):
         bits_carried(probs.reshape(50, CATS * CLASSES))
+
+
+def test_the_estimator_refuses_an_empty_gather():
+    """Zero rows made `bits_carried` divide by zero and return NaN with a
+    RuntimeWarning. NaN compares False against every cut, so an empty gather
+    would have read as a clean null in both senses at once -- the exact failure
+    mode the finiteness guards elsewhere in this project exist for."""
+    with pytest.raises(ValueError, match="no rows"):
+        bits_carried(np.zeros((0, CATS, CLASSES)))

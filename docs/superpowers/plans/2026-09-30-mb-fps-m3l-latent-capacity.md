@@ -1418,7 +1418,12 @@ def estimator_checks(probs) -> dict:
     M3h sweep once refused on an 8.527e-14 mismatch that was exactly that.
 
     `floor` must be within 1e-9 of 0; `routes` compares `ceiling_bits` against
-    `argmax_marginal_bits`; `bracket` is `0 <= bits <= ceiling <= CEILING_BITS`.
+    `argmax_marginal_bits`; `bracket` is the TWO THEOREMS -- `-1e-9 <= bits <= CEILING_BITS + 1e-9` and
+    `0 <= ceiling <= CEILING_BITS + 1e-9`. **NOT** `bits <= ceiling`, which is not
+    a theorem: `ceiling_bits` is the ARGMAX PATTERN's information content, and a
+    code whose argmax never moves while its tail varies reads 7.52 bits against a
+    `ceiling_bits` of 0.00. Refusing on it would reject valid readings in exactly
+    the diffuse regime this milestone investigates.
     Returns the three booleans AND the four numbers, because a check that
     reports only a boolean cannot be audited from the record.
     """
@@ -1550,7 +1555,7 @@ caffeinate -dimsu .venv/bin/python scripts/latent_capacity.py \
 echo "python exit: ${PIPESTATUS[0]}"
 ```
 
-**Read the printed lines and the record's `checks` field, never `$?`** — `measure_phase` returns `EXIT_OK` even when a check fails, because 43 lives in the read phase. Expected in the record: `clusters` 24, 229 windows, 11,450 rows, `floor` within 1e-9 of 0.0, the two ceiling routes agreeing to 1e-9, `0 <= bits <= ceiling <= 160`.
+**Read the printed lines and the record's `checks` field, never `$?`** — `measure_phase` returns `EXIT_OK` even when a check fails, because 43 lives in the read phase. Expected in the record: `clusters` 24, 229 windows, 11,450 rows, `floor` within 1e-9 of 0.0, the two ceiling routes agreeing to 1e-9, `-1e-9 <= bits <= 160 + 1e-9` and `0 <= ceiling <= 160 + 1e-9`.
 
 **If any of those disagree, STOP and report** rather than committing an hour to nine cells. M3j's smoke caught a bug that had silently discarded 17% of the evaluation data.
 
@@ -1568,7 +1573,7 @@ Budget **~30–45 minutes**, and do not conclude it has hung before that. M3k's 
 
 - [ ] **Step 4: Accept the run**
 
-Assert from the records, not from the log: nine records at **one** `git_sha` equal to `.head`; `abs(checks.floor) < 1e-9` on all nine; `checks.routes` agreeing on all nine; the three inequalities holding on all nine; one `clusters`/`rows`/`z_cats`/`z_classes` across all nine; `nonfinite` empty.
+Assert from the records, not from the log: nine records at **one** `git_sha` equal to `.head`; `abs(checks.floor) < 1e-9` on all nine; `checks.routes` agreeing on all nine; both theorem inequalities holding on all nine; one `clusters`/`rows`/`z_cats`/`z_classes` across all nine; `nonfinite` empty.
 
 - [ ] **Step 5: Read, and verify byte-identity**
 
@@ -1606,7 +1611,8 @@ Write the message to a file (the results contain apostrophes) and `git commit -F
 - `floor_bits` reads **within 1e-9 of 0.0** on all nine cells — zero up to float
   summation order, which is ~5e-13 at run scale, not bit-exact.
 - The two `ceiling_bits` routes agree on all nine cells.
-- `0 ≤ bits_carried ≤ ceiling_bits ≤ 160` on all nine cells.
+- `−1e-9 ≤ bits_carried ≤ 160 + 1e-9` and `0 ≤ ceiling_bits ≤ 160 + 1e-9` on all
+  nine cells. **Not** `bits_carried ≤ ceiling_bits`, which is not a theorem.
 - Every pre-existing `gather_probe_data` key byte-identical, pinned by test; `gain_from_blocks`' ten-key golden output unchanged.
 - All five Reading G statuses reachable and driven end-to-end by a test.
 - The whole suite passes with 0 failures and 0 warnings.
