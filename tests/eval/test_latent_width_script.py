@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import inspect
 import types
+import weakref
 from collections import Counter
 from pathlib import Path
 
@@ -11,7 +12,8 @@ import numpy as np
 import pytest
 
 from mbfps.eval.retention import (
-    RUNGS, TARGETS, backward_rotation, backward_translation, rung_block, shifted_rows,
+    RESAMPLES, RUNGS, TARGETS, backward_rotation, backward_translation, rung_block,
+    shifted_rows,
 )
 from mbfps.eval.width import (
     ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH, UP_WIDTH,
@@ -102,16 +104,62 @@ def _splits(seeds=(0, 1, 2), **kwargs):
 
 KEY = f"k{CONTRAST_K}"
 
+FEW_RESAMPLES = 20
+"""Bootstrap draws for a test that runs the REAL probe at production widths and
+asserts on no interval's width. `cell_passes` defaults to the protocol's
+`RESAMPLES`; a test may pay for fewer only if nothing it asserts depends on the
+draws -- never one that pins an interval bound to a side of zero by a small
+margin. Measured, and worth knowing before reaching for it: on this fixture a
+gain takes 1.43 s at 10 draws and 1.46 s at 1000, because ~96% of `cell_passes`
+is the ridge solve on 2560- to 4096-column designs. Fewer draws are honest but
+they are ~3% of the runtime, not the bulk of it."""
+
 
 @pytest.fixture(scope="module")
-def real_run():
+def _real_run_and_widths():
+    """The one real `cell_passes` run, and the `(block width, base width)` the
+    real probe was handed on every gain, in call order.
+
+    The recorder wraps `gain_from_blocks` for the duration of this run only (a
+    module-scoped fixture cannot use the function-scoped `monkeypatch`) and
+    passes every call straight through. Recording here rather than in a second
+    run of its own is what lets `test_the_down_pass_projects_every_rung_to_the_
+    same_width` keep the REAL ridge without paying for a second ~24 s of it.
+    """
+    seen = []
+    real = script.gain_from_blocks
+
+    def recording(fit, select, score, **kwargs):
+        seen.append((np.asarray(fit.block).shape[1], np.asarray(fit.base).shape[1]))
+        return real(fit, select, score, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(script, "gain_from_blocks", recording)
+        out = script.cell_passes(
+            *_splits(), h_dim=512, ks=(1, CONTRAST_K), resamples=FEW_RESAMPLES,
+        )
+    return out, seen
+
+
+@pytest.fixture(scope="module")
+def real_run(_real_run_and_widths):
     """One real `cell_passes` run at the production widths, shared by every test
     that asserts on its NUMBERS. Module-scoped, so it is built before any
     test's own `monkeypatch` can reach `gain_from_blocks`, and it is never
     mutated: a test that needs to break it deep-copies first.
 
+    Run at `FEW_RESAMPLES`: every assertion on it is on a gain, a joint R^2, a
+    window count, or an interval that is compared for EQUALITY against another
+    interval from the same draws (the anchors) or for sitting above zero by ~0.8
+    (`ci_low` of the contrast). None depends on the interval's width.
     """
-    return script.cell_passes(*_splits(), h_dim=512, ks=(1, CONTRAST_K))
+    return _real_run_and_widths[0]
+
+
+@pytest.fixture(scope="module")
+def real_run_widths(_real_run_and_widths):
+    """What the real probe was handed, per gain, during `real_run`'s run."""
+    return _real_run_and_widths[1]
 
 
 def _stub_blocks(monkeypatch):
@@ -371,28 +419,24 @@ def test_every_gain_gets_the_untouched_base_and_its_passs_projection_of_the_nati
     assert checked == len(ks) * len(TARGETS) * len(PASSES) * len(RUNGS) * 3
 
 
-def test_the_down_pass_projects_every_rung_to_the_same_width(monkeypatch):
+def test_the_down_pass_projects_every_rung_to_the_same_width(real_run_widths):
     """Matching means every rung's BLOCK is the same width; the base is left
     alone so gains stay on M3j's scale. Only a recorded width can catch a rung
     that silently kept its native size.
 
     Order-independent, because the loop nests k > target > pass > rung and a
-    positional slice would silently assume otherwise. Per target: `shipped`
-    contributes each native width once, `down` contributes 512 four times and
-    `up` contributes 2048 four times. This counts widths over the whole run and
-    cannot see WHICH pass or rung got which -- the label-aware test above does
-    that -- but it runs the real ridge, so it also proves the probe accepts every
-    block this script builds."""
-    seen = []
-    real = script.gain_from_blocks
+    positional slice would silently assume otherwise. Per target and horizon:
+    `shipped` contributes each native width once, `down` contributes 512 four
+    times and `up` contributes 2048 four times. This counts widths over the
+    whole run and cannot see WHICH pass or rung got which -- the label-aware test
+    above does that -- but it is recorded from the fixture's REAL ridge run, so
+    it also proves the probe accepts every block this script builds.
 
-    def recording(fit, select, score, **kwargs):
-        seen.append((np.asarray(fit.block).shape[1], np.asarray(fit.base).shape[1]))
-        return real(fit, select, score, **kwargs)
-
-    monkeypatch.setattr(script, "gain_from_blocks", recording)
-    script.cell_passes(*_splits(), h_dim=512, ks=(CONTRAST_K,))
-    assert Counter(width for width, _ in seen) == {2048: 10, 512: 10, 1024: 2, 1536: 2}
+    The run covers two horizons (`1` and `CONTRAST_K`), so every count is twice
+    what one horizon contributes."""
+    seen = real_run_widths
+    per_horizon = {2048: 10, 512: 10, 1024: 2, 1536: 2}
+    assert Counter(width for width, _ in seen) == {w: 2 * n for w, n in per_horizon.items()}
     assert {base for _, base in seen} == {RUNG_WIDTH["two_frame"]}, (
         "the base enc(t) is 2048 wide and is never projected, in any pass"
     )
@@ -528,6 +572,130 @@ def test_cell_passes_refuses_a_horizon_no_window_is_long_enough_for():
         script.cell_passes(
             *_splits(steps=6, enc=64, h_dim=16, z=32), h_dim=16, ks=(15,),
         )
+
+
+def test_resamples_defaults_to_the_protocols_and_reaches_every_probe_call(monkeypatch):
+    """`resamples` is the draw count of every interval this script reports, and
+    the protocol's figure is `retention.RESAMPLES`. The default must BE that
+    figure, and an explicit value must reach the contrast as well as the gains --
+    the contrast is the reading itself, and a parameter threaded only into
+    `gain_from_blocks` would leave its interval on the default while a test
+    believed it had lowered it."""
+    _stub_blocks(monkeypatch)
+
+    def draws(out):
+        return {
+            got["resamples"]
+            for by_target in out["passes"].values()
+            for by_k in by_target.values()
+            for by_rung in by_k.values()
+            for got in by_rung.values()
+        } | {got["resamples"] for got in out["contrast"].values()}
+
+    default = script.cell_passes(*_splits(), h_dim=512, ks=(CONTRAST_K,))
+    assert draws(default) == {RESAMPLES} and KEY in default["contrast"]
+    few = script.cell_passes(*_splits(), h_dim=512, ks=(CONTRAST_K,), resamples=7)
+    assert draws(few) == {7} and KEY in few["contrast"]
+
+
+def test_every_gain_at_one_target_and_horizon_shares_one_read_only_base(monkeypatch):
+    """The base is `enc(t)` on the target's rows and NO pass or rung touches it,
+    so it is materialised ONCE per `(target, k, split)` and every fit is handed
+    that one object -- not a copy per rung and per pass, which at the production
+    sizes was a fresh ~500 MB float64 array each time. Content equality cannot
+    see the difference (`test_every_gain_gets_the_untouched_base...` passes on
+    copies just as well), so this asks for IDENTITY, across all twelve gains and
+    the contrast.
+
+    Read-only, because twelve consumers hold it: one that wrote to it would
+    corrupt the other eleven, and would do so silently."""
+    _stub_blocks(monkeypatch)
+    out = script.cell_passes(*_splits(), h_dim=512, ks=(1, CONTRAST_K))
+    for target in TARGETS:
+        for k in ("k1", KEY):
+            fits = [
+                out["passes"][p][target][k][r]["splits"] for p in PASSES for r in RUNGS
+            ]
+            if k == KEY and target == "translation":
+                fits += [out["contrast"][KEY]["a"], out["contrast"][KEY]["b"]]
+            for i, name in enumerate(("fit", "select", "score")):
+                first = fits[0][i].base
+                assert all(f[i].base is first for f in fits), (target, k, name)
+                assert not first.flags.writeable, (target, k, name)
+
+
+def test_only_one_rungs_blocks_exist_at_a_time_when_no_contrast_is_pending(monkeypatch):
+    """A rung's splits are built, fit and let go before the next rung's are
+    built -- building all four first held ~1 GB of blocks the fits never needed
+    at once. The stub carries a weak reference to every block the probe has been
+    handed, and each new call asserts that ALL the earlier ones have been freed.
+
+    `ks=(1,)` so no contrast is pending: at `CONTRAST_K` the down pass's
+    `two_frame` and `deterministic` splits are deliberately kept for the
+    contrast, and `test_the_contrast_pairs...` pins that they are the right
+    ones."""
+    seen = []
+
+    def gain(fit, select, score, *, groups, resamples, confidence, seed):
+        alive = [ref for ref in seen if ref() is not None]
+        assert not alive, f"{len(alive)} block(s) from earlier fits are still alive"
+        seen.extend(weakref.ref(split.block) for split in (fit, select, score))
+        return {"gain": 0.0}
+
+    monkeypatch.setattr(script, "gain_from_blocks", gain)
+    monkeypatch.setattr(script, "contrast_from_blocks", lambda *a, **k: {"contrast": 0.0})
+    script.cell_passes(*_splits(enc=64, h_dim=16, z=32), h_dim=16, ks=(1,))
+    assert len(seen) == len(PASSES) * len(TARGETS) * len(RUNGS) * 3
+
+
+def _dropping_builder(real, *, at_k: int):
+    """A `TARGET_BUILDERS` entry with a row rule of its own: at `at_k` it drops
+    the first row `real` returns, and elsewhere it is `real`. `values` and `rows`
+    are shortened together, so what it hands back is internally consistent."""
+    def builder(targets, window, step, k):
+        values, rows = real(targets, window, step, k)
+        return (values[1:], rows[1:]) if k == at_k else (values, rows)
+    return builder
+
+
+@pytest.mark.parametrize("diverging", TARGETS)
+def test_cell_passes_refuses_targets_that_disagree_on_the_scored_row_count(
+    monkeypatch, diverging,
+):
+    """`rows` is the figure the record reports and Task 7 cites as its acceptance
+    number, and every target at one k is supposed to share one row set. A target
+    whose builder has a row rule of its own must be REFUSED, not have its count
+    quietly reported under the key the other target also writes -- which is what
+    happened while the assignment sat inside the target loop and the last write
+    won.
+
+    The probe is stubbed on purpose. `GainSplit.rows()` would incidentally
+    refuse a row-DROPPING builder, because `two_frame`'s block is read from
+    `shifted_rows`' `source` and no longer matches the shortened base -- but
+    with a message that names no target, only when that fit is reached, and
+    only while `rung_block` keeps that coupling. This guard must not lean
+    on it.
+
+    The divergence is at k = 4 only, and either target may be the odd one out:
+    the check is per horizon and symmetric in the targets. Every gain of the
+    agreeing k = 1 is taken, and none of k = 4's -- the refusal is made from the
+    row selections, before the first fit it would have wasted."""
+    probed = []
+    monkeypatch.setattr(script, "gain_from_blocks", lambda *a, **k: probed.append("gain"))
+    monkeypatch.setattr(
+        script, "contrast_from_blocks", lambda *a, **k: probed.append("contrast"),
+    )
+    monkeypatch.setitem(
+        script.TARGET_BUILDERS, diverging,
+        _dropping_builder(script.TARGET_BUILDERS[diverging], at_k=4),
+    )
+    with pytest.raises(ValueError, match=r"k=4: targets disagree on scored row count") as raised:
+        script.cell_passes(*_splits(enc=64, h_dim=16, z=32), h_dim=16, ks=(1, 4))
+    # 8 windows of 20 steps: 8 * (20 - 4) = 128 rows, and 127 for the one that dropped.
+    assert "128" in str(raised.value) and "127" in str(raised.value)
+    assert probed == ["gain"] * (len(PASSES) * len(TARGETS) * len(RUNGS)), (
+        "k = 1 agrees and is fully measured; nothing at k = 4 may be fit first"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +1082,10 @@ def test_measure_cell_gathers_once_and_records_all_three_passes(monkeypatch, tmp
 
     def spy(*args, **kwargs):
         seen.update(kwargs)
-        return real(*args, **kwargs)
+        # What `measure_cell` passed is recorded ABOVE; the draw count below is
+        # this test's own, layered on afterwards, so the assertion that
+        # `measure_cell` passes none is about production and not about the test.
+        return real(*args, **dict(kwargs, resamples=FEW_RESAMPLES))
 
     monkeypatch.setattr(script, "cell_passes", spy)
     train = [Path(f"t{i}.npz") for i in range(25)]
@@ -925,6 +1096,10 @@ def test_measure_cell_gathers_once_and_records_all_three_passes(monkeypatch, tmp
     assert status == script.EXIT_OK
     assert sorted(calls) == [3, 4, 5], "fit, score and select draws -- once each, per cell"
     assert seen["seed"] == 3 and seen["h_dim"] == 512
+    assert "resamples" not in seen, (
+        "measure_cell must leave the draw count to cell_passes' default, which "
+        "is the protocol's RESAMPLES -- a production run cannot depart from it"
+    )
     assert set(record) == {
         "arm", "seed", "step", "record_git_sha", "device", "context", "horizon",
         "h_dim", "ks", "split_seed", "torch_version", "passes", "contrast", "rows",
@@ -1157,6 +1332,34 @@ def test_measure_phase_all_takes_the_full_grid(monkeypatch, tmp_path):
     assert sorted(measured) == sorted(cells)
 
 
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("phase", [_ABSENT, None, "", "al", "ALL", "measures", "bogus"])
+def test_measure_phase_refuses_a_phase_that_is_not_one_of_the_known_ones(
+    monkeypatch, tmp_path, phase,
+):
+    """The plan check is made only for `--phase all`, so `args.phase` is what
+    decides whether a 1-arm plan is refused or run for ~25 minutes and lost to a
+    traceback. Read with a default, a MISSING phase looks exactly like `measure`
+    and the check is skipped without a word -- which is how it would regress if
+    a caller ever built its args without one, and every test above sets `phase`
+    explicitly, so none would notice.
+
+    The plan here is the full, readable 3 x 3 grid, so `require_readable_plan`
+    cannot be what refuses it: the only thing left to refuse is the phase. A
+    typo of `all` (`"al"`) is the case that hurts, since it looks intentional."""
+    loaded, measured, written = [], [], []
+    _stub_phase(monkeypatch, loaded=loaded, measured=measured, written=written)
+    args = types.SimpleNamespace(out=tmp_path / "out", source=tmp_path)
+    if phase is not _ABSENT:
+        args.phase = phase
+    cells = [(a, s) for a in ("frozen_ssl", "pixel_ae", "random_vit") for s in (0, 1, 2)]
+    with pytest.raises(SystemExit, match="unknown phase"):
+        script.measure_phase(args, cells, "cpu", [], [], ks=(1,))
+    assert loaded == [] and measured == [] and written == []
+
+
 # ---------------------------------------------------------------------------
 # require_one_protocol
 # ---------------------------------------------------------------------------
@@ -1201,13 +1404,52 @@ _PROTOCOL_FIELD_MUTATIONS = {
 }
 
 
+_REQUIRED_PROTOCOL_FIELDS = {
+    "windows.episode", "episodes.val", "context", "horizon", "device", "ks",
+    "torch_version", "git_sha", "projection_seed", "rung_width",
+}
+
+
 def test_the_protocol_table_names_every_field_the_check_compares():
-    """A field added to `require_one_protocol` without a row here would be a
-    comparison no test can watch."""
-    assert set(_PROTOCOL_FIELD_MUTATIONS) == {
-        "windows.episode", "episodes.val", "context", "horizon", "device", "ks",
-        "torch_version", "git_sha", "projection_seed", "rung_width",
-    }
+    """The fields the check compares are `script._PROTOCOL_FIELDS`, the table
+    `require_one_protocol` iterates -- so a field added to the comparison is a
+    row there, and this fails until it has a disagreement case above. (This
+    used to compare the mutation table to a literal copy of itself, which no
+    edit to the function could ever move.)
+
+    The second assertion is the other direction: a comparison REMOVED from both
+    the function and the table would leave them equal, so the ten this milestone
+    promised stay named here."""
+    compared = [field for field, _ in script._PROTOCOL_FIELDS]
+    assert len(compared) == len(set(compared)), f"a field is listed twice: {compared}"
+    assert set(compared) == set(_PROTOCOL_FIELD_MUTATIONS), (
+        f"compared but with no disagreement case: "
+        f"{sorted(set(compared) - set(_PROTOCOL_FIELD_MUTATIONS))}; "
+        f"has a case but is not compared: "
+        f"{sorted(set(_PROTOCOL_FIELD_MUTATIONS) - set(compared))}"
+    )
+    assert _REQUIRED_PROTOCOL_FIELDS <= set(compared), (
+        f"no longer compared: {sorted(_REQUIRED_PROTOCOL_FIELDS - set(compared))}"
+    )
+
+
+def test_require_one_protocol_compares_exactly_the_fields_it_publishes(monkeypatch):
+    """The table test above is only as good as the function's use of the table.
+    A function that kept a private copy of the tuple would leave
+    `_PROTOCOL_FIELDS` decorative -- the table test would pass while the real
+    comparison went unwatched. So append a field to the PUBLISHED table and
+    require the function to refuse a disagreement on it."""
+    monkeypatch.setattr(
+        script, "_PROTOCOL_FIELDS",
+        script._PROTOCOL_FIELDS + (("appended", lambda r: r["appended"]),),
+    )
+    records = _protocol_records()
+    for record in records.values():
+        record["appended"] = 0
+    script.require_one_protocol(records)
+    records[("pixel_ae", 1)]["appended"] = 1
+    with pytest.raises(SystemExit, match="disagree on appended"):
+        script.require_one_protocol(records)
 
 
 @pytest.mark.parametrize("field", sorted(_PROTOCOL_FIELD_MUTATIONS))

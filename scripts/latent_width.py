@@ -144,6 +144,12 @@ the `translation` target, which is where M3j's objective-lever claim lives. A
 contrast on the shipped pass would reproduce exactly the confound this milestone
 exists to remove."""
 
+CONTRAST_RUNGS: tuple[str, str] = ("two_frame", "deterministic")
+"""`(a, b)` of `contrast_from_blocks(a, b)`, which is `a - b`, so a positive
+contrast is `two_frame` ahead -- PAST_FRAME_AHEAD. These are the only two rungs
+whose splits must still exist when the contrast is taken; `cell_passes` keeps
+just these two alive past their own gain, and lets every other rung's go."""
+
 _SPLITS: tuple[str, ...] = ("fit", "select", "score")
 
 
@@ -172,6 +178,7 @@ assert set(TARGET_BUILDERS) == set(TARGETS), (
     f"{sorted(TARGETS)}"
 )
 assert CONTRAST_TARGET in TARGETS and CONTRAST_PASS in PASSES
+assert set(CONTRAST_RUNGS) <= set(RUNGS) and len(set(CONTRAST_RUNGS)) == 2
 
 
 def gather_three_splits(prepared, train, val, *, seed: int):
@@ -217,15 +224,15 @@ def gather_three_splits(prepared, train, val, *, seed: int):
     )
 
 
-def _split_for(data: dict, target: str, k: int, rung: str, pass_name: str, h_dim: int):
-    """One rung's `GainSplit` for one pass, and the rows it uses.
+def _target_rows(data: dict, target: str, k: int):
+    """One split's row selection for one `(target, k)`: `(values, rows, source)`.
 
-    The base is `enc(t)` on the target's rows and is NOT projected: matching
-    applies to the rung's block only, so every gain stays on M3j's scale and the
-    base R^2 is identical across passes by construction. It is read from
-    `encoder_embedding`, the raw encoder output -- never `embedding`, the
-    model's PREDICTED embedding, which would ask whether the latent beats its
-    own head's reconstruction.
+    `values` is the target on `rows`, and `source` is each row's partner `k`
+    steps earlier -- what `two_frame` reads. Nothing here depends on the pass or
+    on the rung, which is what lets `cell_passes` make this selection ONCE per
+    `(target, k, split)` and hand it to every pass and every rung: they all
+    describe the same rows because there is one selection, not because four
+    separate ones happened to agree.
     """
     values, rows = TARGET_BUILDERS[target](
         data["targets"], data["window"], data["step"], k,
@@ -236,16 +243,88 @@ def _split_for(data: dict, target: str, k: int, rung: str, pass_name: str, h_dim
             "a gain computed on zero rows would describe nothing"
         )
     _, source = shifted_rows(data["window"], data["step"], k)
+    return values, rows, source
+
+
+def _base_for(data: dict, rows) -> np.ndarray:
+    """`enc(t)` on `rows`: the base every rung, in every pass, is a gain against.
+
+    It is NOT projected: matching applies to the rung's block only, so every
+    gain stays on M3j's scale and the base R^2 is identical across passes by
+    construction. It is read from `encoder_embedding`, the raw encoder output --
+    never `embedding`, the model's PREDICTED embedding, which would ask whether
+    the latent beats its own head's reconstruction.
+
+    ONE ARRAY, SHARED BY EVERY GainSplit AT THIS `(target, k, split)` -- twelve
+    fits use it (three passes x four rungs). Re-materialising it per rung as this
+    used to did cost a fresh float64 copy of ~500 MB per rung per pass at the
+    production sizes, for an array `pass_block` never touches. It is marked
+    read-only for the reason `width.projection` marks its matrices: something
+    shared by twelve consumers must not be mutable by any one of them.
+    """
+    base = np.asarray(data["encoder_embedding"], dtype=np.float64)[rows]
+    base.flags.writeable = False
+    return base
+
+
+def _split_for(data: dict, selection, base: np.ndarray, rung: str, pass_name: str,
+               h_dim: int) -> GainSplit:
+    """One rung's `GainSplit` for one pass, on a selection and base built once."""
+    values, rows, source = selection
     block = rung_block(data, rung, rows=rows, source=source, h_dim=h_dim)
     return GainSplit(
-        base=np.asarray(data["encoder_embedding"], dtype=np.float64)[rows],
-        block=pass_block(block, pass_name, seed=PROJECTION_SEED),
+        base=base, block=pass_block(block, pass_name, seed=PROJECTION_SEED),
         target=values,
-    ), rows
+    )
+
+
+def _measure_target(gathers, selection, groups, *, k: int, target: str, h_dim: int,
+                    seed: int, resamples: int):
+    """Every pass's four gains for one `(k, target)`, and the contrast when it
+    is taken here. Returns `({pass: {rung: gain_dict}}, contrast_dict | None)`.
+
+    A function of its own so that everything it holds -- the shared base, every
+    block -- is released when it returns, before the next target's is built.
+
+    RUNG BY RUNG: a rung's splits are built, its gain is taken, and they are let
+    go, so at most one rung's blocks exist at a time -- except that the two
+    contrast rungs are kept until `contrast_from_blocks` has run. The probe is
+    called in exactly the order it always was (four gains in `RUNGS` order, then
+    the contrast), and every call draws its bootstrap from its own `seed`, so
+    nothing about the numbers depends on when a split was built.
+    """
+    bases = {name: _base_for(data, selection[name][1]) for name, data in gathers}
+    by_pass: dict = {}
+    contrast = None
+    for pass_name in PASSES:
+        takes_contrast = (
+            k == CONTRAST_K and target == CONTRAST_TARGET and pass_name == CONTRAST_PASS
+        )
+        gains, kept = {}, {}
+        for rung in RUNGS:
+            splits = {name: None for name in _SPLITS}    # only ever the select split
+            for name, data in gathers:
+                splits[name] = _split_for(
+                    data, selection[name], bases[name], rung, pass_name, h_dim,
+                )
+            gains[rung] = gain_from_blocks(
+                splits["fit"], splits["select"], splits["score"],
+                groups=groups, resamples=resamples, confidence=CONFIDENCE, seed=seed,
+            )
+            if takes_contrast and rung in CONTRAST_RUNGS:
+                kept[rung] = splits
+        by_pass[pass_name] = gains
+        if takes_contrast:
+            a, b = (tuple(kept[rung][name] for name in _SPLITS) for rung in CONTRAST_RUNGS)
+            contrast = contrast_from_blocks(
+                a, b, groups=groups, resamples=resamples, confidence=CONFIDENCE,
+                seed=seed,
+            )
+    return by_pass, contrast
 
 
 def cell_passes(fit: dict, select: dict | None, score: dict, *, h_dim: int,
-                seed: int = 0, ks=K_REPORTED) -> dict:
+                seed: int = 0, ks=K_REPORTED, resamples: int = RESAMPLES) -> dict:
     """Every `(pass, target, k, rung)` gain for one cell, plus the contrast.
 
     Returns `{"passes": {pass: {target: {k_key: {rung: gain_dict}}}},
@@ -253,9 +332,9 @@ def cell_passes(fit: dict, select: dict | None, score: dict, *, h_dim: int,
 
     THREE PASSES OVER ONE GATHER: the arguments are the three arrays a single
     `gather_three_splits` produced, and only the probe fits differ between
-    passes. Every rung at one `(target, k)` is handed a BYTE-IDENTICAL base
-    array, in every pass, which is what makes all twelve gains differences
-    against the same base level.
+    passes. Every rung at one `(target, k)` is handed the SAME base array -- one
+    object, read-only, in every pass -- which is what makes all twelve gains
+    differences against the same base level.
 
     THE CONTRAST is `two_frame - deterministic` on the `down` pass, the
     `translation` target and `CONTRAST_K` only. It is built from the very
@@ -277,49 +356,68 @@ def cell_passes(fit: dict, select: dict | None, score: dict, *, h_dim: int,
     bootstrap ONLY: the projection is one matrix per `(native, target)` drawn
     from `PROJECTION_SEED` and shared by all nine cells.
 
+    `resamples` is the bootstrap's draw count and defaults to the protocol's
+    `RESAMPLES`; `measure_cell` never passes it, so a production run cannot
+    depart from the pre-registered figure. It exists so a test that asserts on
+    no interval can pay for fewer draws. That saves little -- the bootstrap is
+    ~3% of a cell's time and the ridge solve is nearly all the rest -- so it is
+    not a way to make a real run cheaper.
+
     The bootstrap groups on `episode`, never `window`.
 
-    Every target and pass at one `k` shares one row set because `_split_for`
-    builds the target's rows and every rung's source from the same
-    `shifted_rows(window, step, k)`; a builder with a different rule would
-    hand `GainSplit` blocks and targets of different lengths and be refused
-    there, so `rows` needs no agreement check of its own.
+    EVERY TARGET AT ONE k MUST AGREE ON THE SCORED ROW COUNT, and this function
+    refuses a disagreement rather than choose one. `rows` is the figure the
+    record reports and Task 7 cites, one per k, and each `TARGET_BUILDERS` entry
+    is free to have a row rule of its own. Both current targets are built from
+    the same `shifted_rows(window, step, k)`, so they agree today; a third with
+    another rule would otherwise leave `rows` reporting whichever target was
+    written last under that one key.
+
+    `GainSplit.rows()` would incidentally refuse a row-DROPPING builder today --
+    `two_frame`'s block is read from `shifted_rows`' `source`, so it no longer
+    matches the shortened base -- but that refusal names no target, arrives at
+    whichever fit reaches it first, and holds only while `rung_block` keeps
+    reading `source`. This check leans on none of that: it is made from the row
+    selections alone, before a single fit is paid for.
+
+    The pass is not part of that check because it cannot be: `pass_block` is
+    handed the rung's block and nothing else, and the selection is made once
+    per `(target, k, split)` above the pass loop, so every pass reads the same
+    rows by construction.
     """
+    gathers = [
+        (name, data) for name, data in zip(_SPLITS, (fit, select, score))
+        if data is not None
+    ]
     passes: dict = {p: {t: {} for t in TARGETS} for p in PASSES}
     contrast: dict = {}
     rows_by_k: dict[str, int] = {}
     for k in ks:
+        selections = {
+            target: {name: _target_rows(data, target, k) for name, data in gathers}
+            for target in TARGETS
+        }
+        rows_by_target = {
+            target: int(selections[target]["score"][1].size) for target in TARGETS
+        }
+        counts = set(rows_by_target.values())
+        if len(counts) != 1:
+            raise ValueError(
+                f"k={k}: targets disagree on scored row count {rows_by_target}, but "
+                "every target at one k is supposed to share one row set"
+            )
+        rows_by_k[k_key(k)] = counts.pop()
         for target in TARGETS:
-            for pass_name in PASSES:
-                splits, scored = {}, None
-                for rung in RUNGS:
-                    splits[rung] = {}
-                    for name, data in zip(_SPLITS, (fit, select, score)):
-                        if data is None:          # only ever the select split
-                            splits[rung][name] = None
-                            continue
-                        split, rows = _split_for(data, target, k, rung, pass_name, h_dim)
-                        splits[rung][name] = split
-                        if name == "score":
-                            scored = rows
-                groups = np.asarray(score["episode"])[scored]
-                passes[pass_name][target][k_key(k)] = {
-                    rung: gain_from_blocks(
-                        splits[rung]["fit"], splits[rung]["select"], splits[rung]["score"],
-                        groups=groups, resamples=RESAMPLES, confidence=CONFIDENCE,
-                        seed=seed,
-                    )
-                    for rung in RUNGS
-                }
-                rows_by_k[k_key(k)] = int(scored.size)
-                if (k == CONTRAST_K and target == CONTRAST_TARGET
-                        and pass_name == CONTRAST_PASS):
-                    contrast[k_key(k)] = contrast_from_blocks(
-                        tuple(splits["two_frame"][n] for n in _SPLITS),
-                        tuple(splits["deterministic"][n] for n in _SPLITS),
-                        groups=groups, resamples=RESAMPLES, confidence=CONFIDENCE,
-                        seed=seed,
-                    )
+            selection = selections[target]
+            groups = np.asarray(score["episode"])[selection["score"][1]]
+            by_pass, taken = _measure_target(
+                gathers, selection, groups, k=k, target=target, h_dim=h_dim,
+                seed=seed, resamples=resamples,
+            )
+            for pass_name, gains in by_pass.items():
+                passes[pass_name][target][k_key(k)] = gains
+            if taken is not None:
+                contrast[k_key(k)] = taken
     return {"passes": passes, "contrast": contrast, "rows": rows_by_k}
 
 
@@ -571,6 +669,13 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
     read: the smoke is one cell. Both are read off `cells` -- the distinct arms
     and the distinct seeds actually about to be measured.
 
+    THAT MAKES `args.phase` LOAD-BEARING, so a phase that is not one of `PHASES`
+    -- absent, `None`, or a typo -- is REFUSED here. Read with a default, a
+    missing `phase` is indistinguishable from `measure`: the plan check is
+    skipped without a word and `--arms frozen_ssl` becomes ~25 minutes of GPU
+    work ending in a traceback, which is exactly what the check exists to
+    prevent.
+
     CELLS ARE LOADED FROM `args.source`, NOT `args.out`. `--out` is this
     script's own record directory -- where width records are WRITTEN, below --
     and the nine M3c checkpoints, study records and diagnostics live in the
@@ -578,7 +683,14 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
     files in a directory that starts out empty and fail before a single cell
     measured.
     """
-    if getattr(args, "phase", None) == "all":
+    phase = getattr(args, "phase", None)
+    if phase not in PHASES:
+        raise SystemExit(
+            f"unknown phase {phase!r}: expected one of {PHASES}. The plan check is "
+            "made only for --phase all, so a phase that is missing or misspelled "
+            "would skip it in silence"
+        )
+    if phase == "all":
         require_readable_plan(
             sorted({arm for arm, _ in cells}), sorted({seed for _, seed in cells}),
         )
@@ -602,6 +714,25 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
 # ---------------------------------------------------------------------------
 # read: what pooling these records requires.
 # ---------------------------------------------------------------------------
+
+
+_PROTOCOL_FIELDS = (
+    ("windows.episode", lambda r: list(r["windows"]["episode"])),
+    ("episodes.val", lambda r: list(r["episodes"]["val"])),
+    ("context", lambda r: int(r["context"])),
+    ("horizon", lambda r: int(r["horizon"])),
+    ("device", lambda r: str(r["device"])),
+    ("ks", lambda r: list(r.get("ks", []))),
+    ("torch_version", lambda r: str(r.get("torch_version", ""))),
+    ("git_sha", lambda r: str(r.get("git_sha", ""))),
+    ("projection_seed", lambda r: int(r["projection_seed"])),
+    ("rung_width", lambda r: dict(r["rung_width"])),
+)
+"""Every field `require_one_protocol` compares, as `(name, pick)`, in one
+module-level table that the function ITERATES and a test reads -- so a field
+cannot be added to the comparison without the test noticing it has no
+disagreement case. While the tuple lived inside the function, no test could see
+it, and a check on the test's own literal compared that literal to itself."""
 
 
 def require_one_protocol(records: dict) -> None:
@@ -634,18 +765,7 @@ def require_one_protocol(records: dict) -> None:
         raise SystemExit("no width record to read")
     (first_cell, first) = items[0]
     for cell, record in items[1:]:
-        for field, pick in (
-            ("windows.episode", lambda r: list(r["windows"]["episode"])),
-            ("episodes.val", lambda r: list(r["episodes"]["val"])),
-            ("context", lambda r: int(r["context"])),
-            ("horizon", lambda r: int(r["horizon"])),
-            ("device", lambda r: str(r["device"])),
-            ("ks", lambda r: list(r.get("ks", []))),
-            ("torch_version", lambda r: str(r.get("torch_version", ""))),
-            ("git_sha", lambda r: str(r.get("git_sha", ""))),
-            ("projection_seed", lambda r: int(r["projection_seed"])),
-            ("rung_width", lambda r: dict(r["rung_width"])),
-        ):
+        for field, pick in _PROTOCOL_FIELDS:
             mine, theirs = pick(record), pick(first)
             if mine != theirs:
                 shown = (
