@@ -658,6 +658,59 @@ def _dropping_builder(real, *, at_k: int):
     return builder
 
 
+def _permuting_builder(real, *, at_k: int):
+    """A `TARGET_BUILDERS` entry that keeps every row and reorders them: at
+    `at_k` it swaps the first two rows `real` returns, and elsewhere it is
+    `real`. `values` and `rows` move TOGETHER, so what it hands back is
+    internally consistent AND has the same count -- which is exactly why no
+    count can see it."""
+    def builder(targets, window, step, k):
+        values, rows = real(targets, window, step, k)
+        if k != at_k:
+            return values, rows
+        order = np.arange(rows.size)
+        order[0], order[1] = 1, 0
+        return values[order], rows[order]
+    return builder
+
+
+@pytest.mark.parametrize("permuting", TARGETS)
+def test_cell_passes_refuses_a_builder_whose_rows_are_reordered(monkeypatch, permuting):
+    """The finer half of the row-selection contract, and the one no count can
+    see. `source` -- each row's partner k steps earlier, which is what
+    `two_frame` reads -- is derived in `_target_rows` INDEPENDENTLY of the
+    builder. Pairing row i of the target with row i of `source` is only valid
+    while the two are the same selection in the SAME ORDER.
+
+    A builder that returns the same COUNT of rows permuted therefore clears the
+    row-count agreement check, leaves `rows` in the record untouched, and
+    silently misaligns `two_frame`'s block against its own target: a wrong
+    number in the arm this milestone decides on, with no refusal anywhere. It is
+    the same shape as the dropping case one column over, and the count guard
+    that catches the dropping case is blind to it.
+
+    The probe is stubbed: the refusal is made from the row selections, before
+    the first fit it would have wasted. k = 1 agrees and is fully measured."""
+    probed = []
+    monkeypatch.setattr(script, "gain_from_blocks", lambda *a, **k: probed.append("gain"))
+    monkeypatch.setattr(
+        script, "contrast_from_blocks", lambda *a, **k: probed.append("contrast"),
+    )
+    monkeypatch.setitem(
+        script.TARGET_BUILDERS, permuting,
+        _permuting_builder(script.TARGET_BUILDERS[permuting], at_k=4),
+    )
+    with pytest.raises(ValueError, match=r"k=4, target '" + permuting) as raised:
+        script.cell_passes(*_splits(enc=64, h_dim=16, z=32), h_dim=16, ks=(1, 4))
+    assert "not `shifted_rows`' rows" in str(raised.value)
+    assert "disagree on scored row count" not in str(raised.value), (
+        "the count guard cannot see a permutation; this must be the order guard"
+    )
+    assert probed == ["gain"] * (len(PASSES) * len(TARGETS) * len(RUNGS)), (
+        "k = 1 agrees and is fully measured; nothing at k = 4 may be fit first"
+    )
+
+
 @pytest.mark.parametrize("diverging", TARGETS)
 def test_cell_passes_refuses_targets_that_disagree_on_the_scored_row_count(
     monkeypatch, diverging,

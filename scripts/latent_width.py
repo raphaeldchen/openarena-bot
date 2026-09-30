@@ -242,7 +242,24 @@ def _target_rows(data: dict, target: str, k: int):
             f"k={k}: no window is long enough to carry a backward displacement; "
             "a gain computed on zero rows would describe nothing"
         )
-    _, source = shifted_rows(data["window"], data["step"], k)
+    shifted, source = shifted_rows(data["window"], data["step"], k)
+    if rows.size == shifted.size and not np.array_equal(rows, shifted):
+        # ONLY the equal-count case belongs here. A builder that drops rows
+        # falls through to `cell_passes`' row-count agreement check, which is
+        # the coarser guard and names both targets' counts; intercepting it here
+        # would shadow that check and leave its test unable to reach it. This is
+        # the finer one: same count, different ORDER, which no count can see.
+        raise ValueError(
+            f"k={k}, target {target!r}: the builder's rows are not "
+            "`shifted_rows`' rows, so row i of the target and row i of `source` "
+            "describe different windows. `source` is derived here INDEPENDENTLY "
+            "of the builder, and it is what `two_frame` reads -- pairing the two "
+            "is only valid while they are the same selection in the same order. "
+            "Such a builder passes the row-count agreement check, leaves "
+            "`rows` in the record untouched, and silently misaligns "
+            "`two_frame`'s block against its own target -- a wrong number in "
+            "the deciding arm with no refusal anywhere"
+        )
     return values, rows, source
 
 
