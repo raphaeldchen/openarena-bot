@@ -495,13 +495,21 @@ def reading_contrast(inputs: ContrastInputs) -> ContrastStatus:
             arms_up=up, arms_down=down, base_failed=base_failed,
             anchors_broken=anchors_broken,
         )
+    # This gloss says only what INDISTINGUISHABLE licenses. It must NOT say
+    # "was width" as RECURRENT_AHEAD's does: that claims width EXPLAINS the whole
+    # gap, which contradicts the clause that follows ("could not tell ... not the
+    # same as ruling one out") and which no result of this shape supports. The
+    # spec pre-registered the overclaiming wording at 3.3 while 4 said
+    # `INDISTINGUISHABLE` licenses no positive claim; 4 governs. Only this
+    # English changed -- not the rule, the thresholds or the precedence.
     return ContrastStatus(
         status="INDISTINGUISHABLE",
         rule=(
             f"neither direction clears in {ARMS_REQUIRED} arms at k = {CONTRAST_K}; "
-            f"M3j's k = 15 result was width, and the bottleneck lever stands alone BY "
-            f"DEFAULT rather than by evidence -- we could not tell the two blocks "
-            f"apart, which is not the same as ruling one out"
+            f"most of M3j's k = 15 gap is attributable to width, with a residual that "
+            f"is not zero, and the bottleneck lever stands alone BY DEFAULT rather "
+            f"than by evidence -- we could not tell the two blocks apart, which is "
+            f"not the same as ruling one out"
         ),
         arms_up=up, arms_down=down, base_failed=base_failed,
         anchors_broken=anchors_broken,

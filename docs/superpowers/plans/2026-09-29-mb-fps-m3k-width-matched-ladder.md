@@ -1808,11 +1808,11 @@ missed. Record the wall clock; the measure phase is sized from it.
 - [ ] **Step 4: Measure all nine cells**
 
 ```bash
-git rev-parse HEAD > runs/m3k_retention/.head
-date -u +%Y-%m-%dT%H:%M:%SZ > runs/m3k_retention/.started
+git rev-parse HEAD > runs/m3k_width/.head
+date -u +%Y-%m-%dT%H:%M:%SZ > runs/m3k_width/.started
 nohup caffeinate -dimsu .venv/bin/python scripts/latent_width.py \
-  --phase measure --source runs/m3_study_v2 --out runs/m3k_retention \
-  > runs/m3k_retention/measure.log 2>&1 &
+  --phase measure --source runs/m3_study_v2 --out runs/m3k_width \
+  > runs/m3k_width/measure.log 2>&1 &
 ```
 
 **Wait on the process, not on a file** — M3i lost time to a waiter that fired on
@@ -1829,11 +1829,12 @@ empty — **plus two**: both anchors reproduce on all nine cells, and
 - [ ] **Step 6: Read, and verify byte-identity**
 
 ```bash
-.venv/bin/python scripts/latent_width.py --phase read --out runs/m3k_retention \
-  2>&1 | tee runs/m3k_retention/read.log
-echo "exit: $?"
-diff <(.venv/bin/python scripts/latent_width.py --phase read --out runs/m3k_retention) \
-     runs/m3k_retention/width.txt && echo "byte-identical"
+.venv/bin/python scripts/latent_width.py --phase read --out runs/m3k_width \
+  2>&1 | tee runs/m3k_width/read.log
+# `$?` here would be tee's. Python's status is PIPESTATUS[0] (bash; in zsh: ${pipestatus[1]}).
+echo "exit: ${PIPESTATUS[0]}"
+diff <(.venv/bin/python scripts/latent_width.py --phase read --out runs/m3k_width) \
+     runs/m3k_width/width.txt && echo "byte-identical"
 ```
 
 - [ ] **Step 7: Write `## Task 7 results` into this plan**
@@ -1920,7 +1921,7 @@ explicitly rather than silently.
 
 The one-line summary of why: on the `down` pass at k = 15, `two_frame`'s mean gain is **+0.02318**
 and `deterministic`'s is **+0.02071** — a gap of **+0.00247**, against the **+0.01418** the same nine
-records measure on the `shipped` pass. Width-matching removes **83%** of the gap M3j's objective
+records measure on the `shipped` pass. Width-matching removes **82.6%** of the gap M3j's objective
 argument rested on. What survives (+0.00247) still points the same way — `two_frame` ahead in **6 of
 9 cells** — but no arm's intervals agree in 2 seeds, and the interval evidence actually leans the
 *other* way: **1 of 9 seeds** clears upward against **2 of 9** downward. That mixture is what
@@ -1939,22 +1940,42 @@ argument rested on. What survives (+0.00247) still points the same way — `two_
 | smoke (one cell, `runs/m3k_smoke/`) | 2026-09-30T03:31:44Z -> 03:37:26Z (**5 m 42 s**) |
 | measure (nine cells, `runs/m3k_width/`) | 2026-09-30T03:43:45Z -> 05:05:16Z (**81 m 31 s**) |
 | `read` exit | **0** |
-| artefacts | nine `width_<arm>_seed<n>.json` (~267 KB each), `width.txt` (**7,113 bytes**), `measure.log`, `read.log` |
+| artefacts | nine `width_<arm>_seed<n>.json` (~267 KB each), `width.txt` (**7,167 bytes**), `measure.log`, `read.log` |
 | `nonfinite` | `{}` on all nine |
 
 **The output directory is `runs/m3k_width`, not the brief's `runs/m3k_retention`.** That name was a
 copy-paste from M3j, which was a retention study; this is the width study. Changed in every command
-— the measure, the read and the byte-identity diff.
+— the measure, the read and the byte-identity diff — and, at the final whole-branch review, in the
+places that had not been: the script's `--out` default, this plan's Step 4 and Step 6 commands, and the
+test fixture. A successor who follows the plan verbatim, or omits `--out`, now lands in
+`runs/m3k_width` rather than in a directory named after M3j's retention study.
 
 `width.txt` is byte-identical to what a second `--phase read` prints, verified with **both** `diff`
 and `cmp`. No checkpoint was written or altered and nothing under `runs/` was removed; the phase is
 evaluation only.
 
+**The verdict line was reworded at the final whole-branch review, and `width.txt` and `read.log` were
+regenerated** (they were 7,113 bytes; they are now 7,167). The first read's line said M3j's k = 15
+result "was width" — a claim `INDISTINGUISHABLE` does not license, and one that contradicted the same
+sentence's own "we could not tell the two blocks apart, which is not the same as ruling one out". It
+now says that *most* of M3j's k = 15 gap is attributable to width, with a residual that is not zero.
+**Line 78 — the verdict line — is the only line that differs** between the two files. The status
+(`INDISTINGUISHABLE`), the exit code (0), every table and every number are unchanged; the decision
+rule did not change either, and spec 3.3 records the reason. Re-verified after the regeneration with
+both `diff` and `cmp`, and `read` re-exited 0 (Python's status, taken from `PIPESTATUS`, not `tee`'s).
+
 ### 2. The suite
 
 `caffeinate -dimsu .venv/bin/python -m pytest -q` from the repo root: **2,232 passed in 1,920.80 s
-(32 m 00 s)**, 0 failures, 0 errors, **0 warnings** — no warnings-summary block in the output at all.
-Log kept at `.superpowers/sdd/suite-task7-m3k.txt`.
+(32 m 00 s)**, 0 failures, 0 errors, **0 warnings** — no warnings-summary block in the output at all
+(the log, 32 lines, contains the word "warning" zero times). Its last three lines, inlined here
+because the log itself lives in a gitignored tree and this section is the permanent record:
+
+```
+........................................................................ [ 96%]
+........................................................................ [100%]
+2232 passed in 1920.80s (0:32:00)
+```
 
 ### 3. The smoke agreed with the plan exactly, and pinned one number in advance
 
@@ -2048,13 +2069,18 @@ rather than re-choosing the floor. The gate was never close to binding either wa
 
 ### 7. Reading F — the table, and every magnitude it rests on
 
+Verbatim from `width.txt` — Reading F's whole section, as the tool prints it (the row and cluster
+counts live in the caption, the anchors have their own line, and the verdict line is the last):
+
 ```
+--- Reading F: at EQUAL block width (512), does two_frame still beat deterministic on translation at k = 15? (difference of joint R^2; the shared base cancels; two-sided, clears when an interval excludes 0 in 2 of 3 seeds and 2 of 3 arms); 8015 rows over 24 clusters ---
             arm    contrast     ci_low    ci_high     up     dn   clears
      frozen_ssl     -0.0040    -0.0206    +0.0158    0/3    1/3       no
        pixel_ae     +0.0007    -0.0370    +0.0754    0/3    1/3       no
      random_vit     +0.0108    -0.0083    +0.0298    1/3    0/3       no
-  anchors: down=ok, up=ok        8015 rows over 24 clusters
-  verdict: INDISTINGUISHABLE
+  base control (enc(t) -> position, must clear r2 0.10): frozen_ssl r2=+0.682 3/3, pixel_ae r2=+0.704 3/3, random_vit r2=+0.660 3/3
+  anchors (a pass's untouched rung must reproduce its shipped gain): down=ok, up=ok
+  verdict: INDISTINGUISHABLE -- decided by: neither direction clears in 2 arms at k = 15; most of M3j's k = 15 gap is attributable to width, with a residual that is not zero, and the bottleneck lever stands alone BY DEFAULT rather than by evidence -- we could not tell the two blocks apart, which is not the same as ruling one out
 ```
 
 Each row is `contrast_arm` over that arm's three `contrast.k15` dicts: `contrast` the seed mean,
@@ -2083,13 +2109,22 @@ the three arms is one seed short of clearing, in a direction that is not the sam
 `frozen_ssl` and `pixel_ae` are one seed short **downward**, `random_vit` one seed short **upward**.
 That is not a near-miss on a single verdict; it is two arms leaning one way and one arm the other.
 
-**The deciding pair, as gains rather than as a contrast** — `passes.down.translation.k15.<rung>.gain`,
+**The deciding pair, as gains rather than as a contrast** — `passes.<pass>.translation.k15.<rung>.gain`,
 mean over the nine cells:
 
 | | `two_frame` | `deterministic` | gap | `two_frame` ahead |
 |---|---|---|---|---|
 | `shipped` (native 2048 vs 512) | +0.03489 | +0.02071 | **+0.01418** | **8 of 9 cells** |
 | `down` (both 512) | **+0.02318** | **+0.02071** | **+0.00247** | **6 of 9 cells** |
+| `up` (both 2048; count matched, **rank not**) | +0.03489 | +0.03581 | −0.00092 | 5 of 9 cells — `deterministic` ahead in **4 of 9** |
+
+**The `up` row licenses nothing.** `up` lifts `h` from 512 to 2048 columns by a fixed random matrix, so
+it matches *count* while `h`'s rank stays 512 (spec 2.4); it calibrates what columns alone are worth
+and is not the comparison Reading F is taken on. Its gap is arithmetic on rows already in this
+section: `two_frame` is `up`'s anchor (untouched, +0.03489 in both passes), so the `up` gap is the
+`shipped` gap less `deterministic`'s width bias of §8 — +0.01418 − 0.01510 = −0.00092. It is not a
+finding that `h` retains more than the past frame; `RECURRENT_AHEAD` is decided on `down`, and no arm
+reached it there.
 
 The `shipped` row's exception is `pixel_ae` seed 0, losing by **0.00082** — M3j reported the same
 cell losing by 0.0008. The three cells where `deterministic` leads on `down` are `frozen_ssl` s0 and
@@ -2099,7 +2134,7 @@ The gap arithmetic, checked twice because it surprised me: `gap_down − gap_shi
 which equals `two_frame`'s projection loss
 (`passes.down...two_frame.gain − passes.shipped...two_frame.gain`, mean **−0.01171**, negative in
 **9 of 9** cells) to the last bit, exactly because `deterministic` is `down`'s anchor and contributes
-zero. So **83%** of the shipped gap is attributable to width; **+0.00247** survives.
+zero. So **82.6%** of the shipped gap is attributable to width; **+0.00247** survives.
 
 **k = 1 and k = 4 are reported and decide nothing** (`CONTRAST_K` is 15 and the rule is not a
 disjunction). On the `down` pass the gap is **−0.00685** at k = 1 and **−0.00824** at k = 4, with
@@ -2216,8 +2251,8 @@ licensed by either.
 Three things this section deliberately does **not** say. It does not say `deterministic` won: it
 leads in 3 of 9 cells and its arm-level tallies never reach the bar. It does not say `two_frame`
 won: it leads in 6 of 9 cells at k = 15 and in 1 of 9 at k = 1 and k = 4, and never reaches the bar
-either. And it does not say the shipped result was "all width": **83%** of the gap is attributable
-to width, which leaves +0.00247 unexplained and unresolved — "nearly all" is the honest word, and
+either. And it does not say the shipped result was "all width": **82.6%** of the gap is attributable
+to width, which leaves +0.00247 unexplained and unresolved — "most" is the honest word, and
 the residual is not zero.
 
 The three prior estimates of the width bias (§1.1's +0.01355 / +0.01377 and the accidental one-cell

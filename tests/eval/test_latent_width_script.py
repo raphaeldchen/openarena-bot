@@ -22,7 +22,7 @@ from mbfps.eval.retention import (
 from mbfps.eval.retention import reading_retention as _reading_retention
 from mbfps.eval.width import (
     ANCHOR, CONTRAST_K, DOWN_WIDTH, PASSES, PROJECTION_SEED, RUNG_WIDTH, UP_WIDTH,
-    pass_block, reading_contrast,
+    format_reading_contrast, pass_block, reading_contrast,
 )
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "latent_width.py"
@@ -1027,7 +1027,7 @@ def test_gather_three_splits_refuses_an_empty_training_pool():
 # ---------------------------------------------------------------------------
 
 
-def _measure_args(source="runs/m3_study_v2", out="runs/m3k_retention", **extra):
+def _measure_args(source="runs/m3_study_v2", out="runs/m3k_width", **extra):
     """The attributes `measure_cell` reads off its args. `source` is the STUDY
     directory: `prepare_cell` loads the checkpoint from the `out` of the args it
     is handed, so passing this script's own `--out` through would hunt for the
@@ -1089,7 +1089,7 @@ def test_measure_cell_loads_the_checkpoint_from_source_not_out(monkeypatch):
         return script.EXIT_SELF_CHECK_FAILED, None
 
     monkeypatch.setattr(script, "prepare_cell", recording_prepare_cell)
-    args = _measure_args(source="runs/m3_study_v2", out="runs/m3k_retention")
+    args = _measure_args(source="runs/m3_study_v2", out="runs/m3k_width")
     args.context, args.horizon = 7, 9
     status, record = script.measure_cell(args, _cell(), "cpu", [], [])
 
@@ -1443,7 +1443,7 @@ def _protocol_records():
     cannot alias into the rest."""
     return {
         (arm, seed): {
-            "windows": {"episode": list(range(24))},
+            "windows": {"episode": list(range(24)), "window": list(range(24))},
             "episodes": {"val": [f"e{i}.npz" for i in range(24)]},
             "context": 5, "horizon": 45, "device": "mps",
             "ks": [1, 4, CONTRAST_K], "torch_version": "2.13.0", "git_sha": "abc123",
@@ -1458,11 +1458,17 @@ def _protocol_records():
 # it on one victim cell. Eight are `latent_retention`'s own, `git_sha` included
 # (an earlier version of that function compared five and would have pooled
 # records from different torch builds and code versions with no refusal); the
-# last two are this milestone's: nine cells measured through different random
+# rest are this milestone's: nine cells measured through different random
 # matrices, or at different native widths, are not one measurement and are
-# exactly what "one fixed Gaussian shared across all nine cells" forbids.
+# exactly what "one fixed Gaussian shared across all nine cells" forbids
+# (`projection_seed`, `rung_width`, `h_dim`), and `windows.window`, which
+# `_window_count` reads beside `windows.episode` to print the window count.
 _PROTOCOL_FIELD_MUTATIONS = {
     "windows.episode": lambda r: r["windows"].update(episode=list(range(5))),
+    # Same episode labels, different window indices within them: the pair
+    # `_window_count` derives its printed count from. `windows.episode` alone
+    # sees no disagreement here.
+    "windows.window": lambda r: r["windows"].update(window=list(range(1, 25))),
     "episodes.val": lambda r: r["episodes"].update(val=["different.npz"]),
     "context": lambda r: r.update(context=999),
     "horizon": lambda r: r.update(horizon=999),
@@ -1477,8 +1483,9 @@ _PROTOCOL_FIELD_MUTATIONS = {
 
 
 _REQUIRED_PROTOCOL_FIELDS = {
-    "windows.episode", "episodes.val", "context", "horizon", "device", "ks",
-    "torch_version", "git_sha", "projection_seed", "rung_width", "h_dim",
+    "windows.episode", "windows.window", "episodes.val", "context", "horizon",
+    "device", "ks", "torch_version", "git_sha", "projection_seed", "rung_width",
+    "h_dim",
 }
 
 
@@ -1490,8 +1497,8 @@ def test_the_protocol_table_names_every_field_the_check_compares():
     edit to the function could ever move.)
 
     The second assertion is the other direction: a comparison REMOVED from both
-    the function and the table would leave them equal, so the ten this milestone
-    promised stay named here."""
+    the function and the table would leave them equal, so every field named in
+    `_REQUIRED_PROTOCOL_FIELDS` stays named here."""
     compared = [field for field, _ in script._PROTOCOL_FIELDS]
     assert len(compared) == len(set(compared)), f"a field is listed twice: {compared}"
     assert set(compared) == set(_PROTOCOL_FIELD_MUTATIONS), (
@@ -2013,9 +2020,78 @@ def test_contrast_inputs_reads_the_contrast_horizon_and_its_row_count():
     assert inputs.clusters == 24
 
 
+@pytest.mark.parametrize("contrasts,clears,sign", [
+    ((-0.030, -0.040, +0.200), "down", +1),
+    ((+0.030, +0.040, -0.200), "up", -1),
+])
+def test_an_arms_mean_contrast_can_disagree_in_sign_with_its_clears_label(contrasts, clears, sign):
+    """At the ARM level `contrast` is the seed MEAN while `ci_low` and `ci_high`
+    are the min and the max over seeds, and `clears` is read from the per-seed
+    TALLIES -- so one large seed can carry the mean to one side of zero while two
+    smaller ones clear on the other, and the row prints a `+` contrast under
+    `clears = down`. This is deliberate and documented (`ContrastArm`: "Neither
+    decides: the tallies do"), and a mild instance is in the shipped data:
+    `pixel_ae` reads `+0.00067` with `0/3` up and `1/3` down. Pinned so a
+    'tidy-up' does not make the printed contrast agree with the label by
+    deriving one from the other -- the tallies would then be decided by a mean,
+    which is exactly what the seeds x arms rule exists to avoid."""
+    records = _records()
+    for seed, value in enumerate(contrasts):
+        _set_contrast(records[("frozen_ssl", seed)], value)
+    inputs = script.contrast_inputs(records)
+    arm = inputs.arms["frozen_ssl"]
+    assert (arm.seeds_up, arm.seeds_down) == ((1, 2) if clears == "down" else (2, 1))
+    assert np.sign(arm.contrast) == sign, "the mean sits on the OTHER side of zero"
+
+    reading = reading_contrast(inputs)
+    assert (reading.arms_down if clears == "down" else reading.arms_up) == ("frozen_ssl",)
+
+    rows = {
+        line.split()[0]: line.split()
+        for line in format_reading_contrast(reading, inputs).splitlines()
+        if line.split() and line.split()[0] in inputs.arms
+    }
+    name, contrast, _low, _high, up, down, label = rows["frozen_ssl"]
+    assert label == clears
+    assert (contrast.startswith("+") if sign > 0 else contrast.startswith("-")), contrast
+    assert (up, down) == (("1/3", "2/3") if clears == "down" else ("2/3", "1/3"))
+
+
+def test_a_window_list_pair_of_unequal_length_is_a_named_refusal_not_a_bare_zip_error():
+    """`windows.episode` and `windows.window` are one entry per gathered row. A
+    record whose two lists differ in length would hit `zip(strict=True)` as a
+    `ValueError` traceback naming neither the cell nor the paths; every other
+    index in the read half is a named `SystemExit`, and this one is too."""
+    record = _record("pixel_ae", 1)
+    record["windows"]["window"] = record["windows"]["window"][:-1]
+    with pytest.raises(SystemExit) as raised:
+        script._window_count(record, ("pixel_ae", 1))
+    message = str(raised.value)
+    for needle in ("pixel_ae seed 1", "windows.episode has 96", "windows.window has 95"):
+        assert needle in message, message
+
+
+def test_read_refuses_nine_records_whose_window_lists_are_all_of_unequal_length(tmp_path):
+    """All nine agree with EACH OTHER, so `require_one_protocol` passes them and it
+    is the self-check table that reaches the mismatch: the refusal has to come
+    from there, by name, before anything prints or is written."""
+    records = _records()
+    for record in records.values():
+        record["windows"]["window"] = record["windows"]["window"][:-1]
+    _write(tmp_path, records)
+    with pytest.raises(SystemExit, match=r"seed 0: windows\.episode has 96 entries but windows\.window has 95"):
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    assert not (tmp_path / "width.txt").exists()
+
+
 def test_the_script_never_reaches_for_the_other_readings_horizon():
-    """`retention.DECISION_K` is 4 and means a different horizon. Nothing here
-    imports it, so no line can read `k4` where `CONTRAST_K` was meant."""
+    """`retention.DECISION_K` is 4 and means a different horizon. What this pins
+    is narrower than "no line can read `k4`": the script does not import the name
+    (an `import DECISION_K` fails the `hasattr`), and `CONTRAST_K` has not drifted
+    from 15. A hardcoded `k_key(4)` would pass BOTH assertions -- that is caught
+    instead by the tests that read the row counts and the contrast at `k15`
+    (`test_contrast_inputs_reads_the_contrast_horizon_and_its_row_count` and its
+    neighbours), which see `k4`'s 10534 rows instead of 8015."""
     assert not hasattr(script, "DECISION_K")
     assert script.CONTRAST_K == 15
 
@@ -2613,6 +2689,14 @@ def test_main_returns_the_first_phase_status_that_is_not_ok(monkeypatch, failing
 
 def test_read_exits_map_exactly_the_two_refusals():
     assert script.READ_EXITS == {"UNRESOLVED_BASE": 41, "UNRESOLVED_ANCHOR": 42}
+
+
+def test_out_defaults_to_this_milestones_directory_not_the_previous_ones():
+    """`runs/m3k_retention` was a copy-paste from M3j, which was a retention
+    study; this one is the width study and its records live in `runs/m3k_width`.
+    A run that omitted `--out` would otherwise write 81 minutes of records into a
+    directory named after the previous milestone's."""
+    assert script._parser().parse_args([]).out == Path("runs/m3k_width")
 
 
 # ---------------------------------------------------------------------------

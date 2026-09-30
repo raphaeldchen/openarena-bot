@@ -190,9 +190,18 @@ failure in a companion that decides nothing block a verdict that does.
   reconstructs only the frame just seen).
 - **`RECURRENT_AHEAD`** — `h` retains *more* than the past frame at equal width, so M3j's objective
   argument is refuted and it **was** width. The bottleneck lever stands alone, on evidence.
-- **`INDISTINGUISHABLE`** — M3j's k = 15 result was width. The bottleneck lever stands alone **by
-  default rather than by evidence**, and the results must say so: "we could not tell them apart" is
-  not "we ruled one out."
+- **`INDISTINGUISHABLE`** — we could not tell the two blocks apart at equal width. Most of M3j's
+  k = 15 gap is attributable to width, with a residual that is not zero. The bottleneck lever stands
+  alone **by default rather than by evidence**, and the results must say so: "we could not tell them
+  apart" is not "we ruled one out."
+
+  *Revised at the final whole-branch review, after the run: **only this English gloss changed; the
+  decision rule did not** — the five statuses, their precedence, `SEEDS_REQUIRED`, `ARMS_REQUIRED`,
+  `BASE_R2_FLOOR`, `CONTRAST_K` and the thresholds are as pre-registered. As first written this
+  bullet said M3j's result "was width", which §4 forbids (`INDISTINGUISHABLE` "licenses no positive
+  claim") and which contradicted the bullet's own last sentence. The two statements were inconsistent
+  as written, before any data existed; §4 states the governing principle and this resolves the
+  inconsistency in its favour. "Was width" is `RECURRENT_AHEAD`'s clause, where it is licensed.*
 - **Either `UNRESOLVED_*`** — no lever is chosen and the next milestone is about the instrument.
 
 This is written down now so the consequence cannot be argued after the numbers are seen.

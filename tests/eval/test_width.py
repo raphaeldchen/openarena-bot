@@ -562,6 +562,42 @@ def test_reading_is_indistinguishable_when_neither_direction_clears():
     assert "could not" in reading.rule or "by default" in reading.rule
 
 
+def test_the_indistinguishable_gloss_claims_no_more_than_the_status_licenses():
+    """The verdict line of `width.txt` is the permanent artefact, and it is
+    printed by every future `--phase read`. `INDISTINGUISHABLE` licenses no
+    positive claim (spec 4), so its gloss cannot say M3j's result "was width":
+    that is `RECURRENT_AHEAD`'s clause, where it is licensed, and beside "we
+    could not tell the two blocks apart, which is not the same as ruling one out"
+    it contradicts itself. This gloss said it once, by copy-paste from the
+    neighbouring branch.
+
+    The rule text is pinned from both sides: the framing that IS the point stays,
+    the overclaim stays out, and the one thing that may be said about width is
+    said as a share with a residual -- never a specific number, which is
+    run-dependent and belongs in the results section, not in a string that
+    reproduces on every read."""
+    rule = reading_contrast(_inputs()).rule
+    assert "BY DEFAULT rather than by evidence" in rule
+    assert "not the same as ruling one out" in rule
+    assert "most of M3j's k = 15 gap is attributable to width" in rule
+    assert "residual that is not zero" in rule
+    assert "was width" not in rule, "width EXPLAINS the gap is RECURRENT_AHEAD's claim"
+    assert "%" not in rule, f"a run-dependent percentage in a generic gloss: {rule!r}"
+
+
+def test_recurrent_ahead_keeps_the_clause_the_indistinguishable_gloss_must_not_share():
+    """The other side of the copy-paste: `RECURRENT_AHEAD` is the branch where
+    "its k = 15 result was width" is LICENSED, because `h` clearing at equal
+    width is the positive finding the claim needs. Removing it from there
+    because it was removed from its neighbour would drop a true statement."""
+    reading = reading_contrast(_inputs({
+        "frozen_ssl": _arm(-0.06, -0.02), "pixel_ae": _arm(-0.07, -0.03),
+        "random_vit": _arm(-0.01, 0.01),
+    }))
+    assert reading.status == "RECURRENT_AHEAD"
+    assert "its k = 15 result was width" in reading.rule
+
+
 def test_up_and_down_cannot_both_clear_with_three_arms_of_three_seeds():
     """The two directions cannot both reach the bar -- but that takes TWO facts,
     and the arm-count one alone proves it only if the up and down sets are

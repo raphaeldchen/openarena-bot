@@ -1,5 +1,5 @@
 """M3k: is the past frame's advantage over the recurrent state information, or
-feature count? -- the measure phase.
+feature count? -- the measure and read phases.
 
 M3j found `two_frame` (the encoder's embedding of a past frame, 2048 columns)
 beating `deterministic` (the recurrent state `h`, 512 columns) at k = 15. That
@@ -387,15 +387,26 @@ def cell_passes(fit: dict, select: dict | None, score: dict, *, h_dim: int,
     not contain `CONTRAST_K` produces no contrast rather than a contrast at
     some other horizon.
 
-    `seed` IS THE CELL'S SEED, threaded into every `gain_from_blocks` and
+    `seed` IS THE CELL'S SEED INDEX (`cell.seed`: 0, 1 or 2, NOT a per-cell
+    unique value), threaded into every `gain_from_blocks` and
     `contrast_from_blocks` call's own bootstrap draw -- `filtering_gain`'s
-    convention exactly. A caller that left this at its default would hand every
-    cell the SAME bootstrap draw, which correlates the interval noise across
-    cells that the seeds x arms agreement rule treats as independent -- and that
-    rule carries this milestone's entire multiple-comparison burden. Common
-    random numbers across passes and rungs WITHIN one cell are intended (they
-    are what makes the anchors' intervals reproduce as well as their gains); it
-    is only across cells that the draws must differ. The seed is for the
+    convention exactly. What that achieves is narrower than "independent across
+    cells". The draw is a function of the seed index and the cluster structure
+    alone, and `episodes.val` and `windows.episode` are identical across all nine
+    records, so `frozen_ssl` s0, `pixel_ae` s0 and `random_vit` s0 resample THE
+    SAME CLUSTERS IN THE SAME ORDER. Only the across-SEED draws differ; the
+    across-ARM draws are common. The seeds x arms agreement rule therefore does
+    not see nine independent resamples, and its interval noise is correlated
+    across the three arms at one seed. A caller that left `seed` at its default
+    would make it worse, by handing all nine cells one draw.
+
+    The convention is kept anyway, and must not change, because it is
+    `scripts/latent_retention.py`'s (its `filtering_gain` call passes the same
+    `seed=cell.seed`) and matching it is why this milestone's 216 shipped-pass
+    gains reproduce M3j's bit for bit -- a different seed rule would move every
+    interval bound the two milestones share. Common random numbers across passes
+    and rungs WITHIN one cell are likewise intended (they are what makes the
+    anchors' intervals reproduce as well as their gains). The seed is for the
     bootstrap ONLY: the projection is one matrix per `(native, target)` drawn
     from `PROJECTION_SEED` and shared by all nine cells.
 
@@ -761,6 +772,7 @@ def measure_phase(args, cells, device, train, val, ks=K_REPORTED) -> int:
 
 _PROTOCOL_FIELDS = (
     ("windows.episode", lambda r: list(r["windows"]["episode"])),
+    ("windows.window", lambda r: list(r["windows"]["window"])),
     ("episodes.val", lambda r: list(r["episodes"]["val"])),
     ("context", lambda r: int(r["context"])),
     ("horizon", lambda r: int(r["horizon"])),
@@ -787,7 +799,12 @@ without a word: the only thing that would notice is the `down` anchor breaking,
 which the read phase reports as "the projection machinery ran where it should
 not" -- the wrong diagnosis, reached after the whole measure. An `embed_dim`
 disagreement breaks only the `up` anchor, which deliberately gates nothing, and
-a `z_dim` disagreement is invisible to every other check."""
+a `z_dim` disagreement is invisible to every other check.
+
+`windows.window` is here because `windows.episode` alone does not identify a
+row: `_window_count` derives the printed window count from the pair, so two
+records that agree on every episode label but differ on the window indices
+within them were scored on different rows and would pool with no refusal."""
 
 
 def require_one_protocol(records: dict) -> None:
@@ -1242,6 +1259,11 @@ def width_bias_table(records: dict) -> str:
     measured about +0.0137 for `h` on two cells; this puts it on every cell and
     every rung. Per arm (mean over its seeds) and over all cells.
 
+    The `all` column cannot discriminate a mean over cells from a mean of the arm
+    means: `--seeds` is global, so `_cells_by_arm` always yields equal-length
+    groups and the two quantities are provably equal. That is why no test asserts
+    it -- a test would assert a tautology.
+
     THE `up` ANCHOR GATES IT. `two_frame` is already `UP_WIDTH` wide, so its `up`
     gain must equal its shipped one exactly; if it did not, in any cell, the lift
     is not what it claims and calibrates nothing, so NO number prints. The
@@ -1301,9 +1323,22 @@ def _window_count(record: dict, cell: tuple[str, int]) -> int:
     a real record's lists are 11,450 long over 229 windows -- so their length is
     a count of rows. `latent_retention`'s table prints that length under the
     header `windows`, which is a caption disagreeing with its column; this table
-    counts what the header says, and prints the gathered rows under their own."""
+    counts what the header says, and prints the gathered rows under their own.
+
+    The two lists are one entry per gathered row, so they cannot differ in
+    length. A record whose lists do is refused BY NAME -- cell and both paths --
+    like every other index in the read half, which goes through `_get` or
+    `_finite`; a bare `zip(strict=True)` would surface as a `ValueError`
+    traceback naming neither, after the reader has paid for the measure."""
     episode = _get(record, cell, "windows", "episode")
     window = _get(record, cell, "windows", "window")
+    if len(episode) != len(window):
+        raise SystemExit(
+            f"{_cell_name(cell)}: windows.episode has {len(episode)} entries but "
+            f"windows.window has {len(window)}; both are one entry per gathered row "
+            "and cannot describe one set of rows, so the record cannot be read and "
+            "must be re-measured (--phase measure)"
+        )
     return len(set(zip(episode, window, strict=True)))
 
 
@@ -1428,7 +1463,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="M3k: width-matched ladder -- measure the three passes, read Reading F",
     )
-    parser.add_argument("--out", type=Path, default=Path("runs/m3k_retention"))
+    parser.add_argument("--out", type=Path, default=Path("runs/m3k_width"))
     parser.add_argument("--source", type=Path, default=Path("runs/m3_study_v2"),
                         help="the M3c study directory: the nine 20,000-step cells")
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
