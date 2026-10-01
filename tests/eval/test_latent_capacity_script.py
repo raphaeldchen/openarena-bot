@@ -2728,3 +2728,62 @@ def test_the_artefact_is_written_before_anything_is_printed(
     assert capsys.readouterr().out == "", (
         "the verdict reached stdout before the artefact reached disk"
     )
+
+
+def test_a_record_the_measure_half_really_built_is_readable_by_the_read_half(
+    monkeypatch, tmp_path, capsys,
+):
+    """THE BRIDGE BETWEEN THE TWO FIXTURES, and the last guard before the run.
+
+    `_record` (the measure half's fixture) and `_read_record` (the read half's)
+    are independent hand-built dicts. Every other test on either side uses one
+    of them, so a schema divergence between what `measure_cell` WRITES and what
+    `capacity_inputs` READS would be invisible until the nine-cell run had
+    already spent its GPU hours -- and the failure would surface at the read,
+    with the measure's artefact already on disk and no way to tell whether the
+    records or the reader were wrong.
+
+    So this drives a record built by the REAL `measure_cell` -- real
+    `cell_capacity`, `estimator_checks`, `base_control`, `frame_probe`, real
+    `write_record` -- through the REAL `capacity_inputs`, `reading_capacity` and
+    `capacity_text`. Only `prepare_cell`, the reference pass and
+    `gather_probe_data` are stubbed, exactly as the measure tests stub them.
+
+    It asserts the artefact is COMPLETE, not merely that nothing raised: a
+    reader that silently dropped a section would otherwise pass."""
+    _stub_measure(monkeypatch)
+    train, val = _paths("t", 45), _paths("v", 24)
+    status, built = script.measure_cell(
+        _measure_args(), _cell(arm="pixel_ae", seed=0), "cpu", train, val,
+    )
+    assert status == script.EXIT_OK, "the premise: the measure half produced a record"
+
+    # Nine cells from that one real record, relabelled -- the read path's own
+    # per-cell distinctness is pinned elsewhere; what is under test here is the
+    # SCHEMA agreeing across the two halves.
+    for arm in ARMS:
+        for seed in (0, 1, 2):
+            record = dict(built, arm=arm, seed=seed, git_sha="bridge")
+            script.write_record(script.capacity_record_path(tmp_path, arm, seed), record)
+
+    exit_code = _main_read("--phase", "read", "--out", str(tmp_path))
+    out = capsys.readouterr().out
+
+    assert exit_code in (script.EXIT_OK, script.EXIT_ESTIMATOR_BROKEN,
+                         script.EXIT_BASE_UNRESOLVED), f"unexpected exit {exit_code}"
+    for section in ("self-check per record", "Reading G", "base control",
+                    "estimator checks", "verdict:"):
+        assert section in out, f"the artefact is missing its {section!r} section"
+    # Scoped to the Reading G section: the arm name also heads one self-check
+    # row per cell, so an unscoped search finds seven lines and proves nothing
+    # about the reading's own table.
+    reading = out.split("Reading G", 1)[1]
+    for arm in ARMS:
+        rows = [ln for ln in reading.splitlines() if ln.split()[:1] == [arm]]
+        assert len(rows) == 1, f"expected one Reading G row for {arm}, got {len(rows)}"
+        # Every number the reading needs survived the round trip as a number.
+        from mbfps.eval.capacity import READING_COLUMNS
+
+        assert len(rows[0].split()) == len(READING_COLUMNS), rows[0]
+    written = (tmp_path / "capacity.txt").read_bytes()
+    assert written == out.encode(), "the artefact and stdout diverged"
