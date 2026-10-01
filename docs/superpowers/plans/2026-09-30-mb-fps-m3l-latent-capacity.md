@@ -1351,7 +1351,7 @@ Apply each mutation, confirm the named test fails, restore and clear `__pycache_
 
 ```bash
 git add src/mbfps/eval/capacity.py tests/eval/test_capacity.py
-git commit -m "feat: Reading G -- five statuses, mutually exclusive, and CAPACITY_BOUND is the fall-through"
+git commit -m "feat: Reading G -- five statuses, and CAPACITY_BOUND is the fall-through"
 ```
 
 ---

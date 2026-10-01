@@ -244,11 +244,26 @@ nothing.
 | `FRAME_REENCODING` | not spare, and `frame_share` interval entirely above 0.5 | **objective lever** |
 | `CAPACITY_BOUND` | not spare, and `frame_share` not above 0.5 | **bottleneck lever** |
 
-Precedence is the order of the table. The three readings are **mutually exclusive
-by construction** — the `bits_carried` cut partitions `SPARE_CAPACITY` from the
-other two, and `frame_share` partitions those two — so no arm can clear in two
-directions and the entire class of ambiguity refusal M3k required cannot arise
-here.
+Precedence is the order of the table.
+
+**The readings are NOT mutually exclusive, and an earlier draft of this section
+claimed they were.** The reasoning was wrong at its first step: the two tallies
+are on **different quantities**, so they do not partition anything. An arm whose
+bits interval sits below `SPARE_CUT` *and* whose `frame_share` interval sits
+above `FRAME_CUT` clears both — verified at runtime, and the table labels such an
+arm `spare+frame` rather than hiding it.
+
+So the precedence does settle that case by the order of its checks. **The
+consequence is benign, and this is the respect in which M3l differs from M3k:**
+`SPARE_CAPACITY` and `FRAME_REENCODING` both name the **objective lever**, so the
+decision this milestone exists to make is unaffected — the order settles which
+*explanation* is reported, not which *direction*. M3k's two statuses pointed at
+opposite levers, which is why it needed an outright refusal and this does not.
+
+What that licenses, precisely: a `SPARE_CAPACITY` verdict may be read as "the
+objective lever", never as "and the code is not a frame re-encoding" — the arms
+may be both, and `arms_spare` and `arms_frame` are both reported in every branch
+so a reader can see which.
 
 An arm clears a status in `SEEDS_REQUIRED` of its seeds; a status is read when
 `ARMS_REQUIRED` arms clear it. Both are imported from `retention`, not re-spelled.
