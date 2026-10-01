@@ -51,7 +51,7 @@ property M3k lacked, and the reason its statistic had effect/noise 0.22.
 Per cell, over the same validation rows M3j and M3k used, from the nine
 checkpoints already on disk. **No training. Evaluation only.**
 
-### 2.1 `bits_carried` — the code's information content
+### 2.1 `bits_carried` — the per-categorical informations, summed
 
 ```
 bits_carried = Σⱼ [ H(marginalⱼ) − E_n H(postⱼ(n)) ]        j = 1 .. z_cats
@@ -64,10 +64,12 @@ bits_carried = Σⱼ [ H(marginalⱼ) − E_n H(postⱼ(n)) ]        j = 1 .. z_
 **Ceiling: `z_cats × log₂(z_classes)` = 32 × 5 = 160 bits**, derived from
 `RSSMConfig`, never re-spelled.
 
-The statistic is properly `I(z ; h, enc(t))` — the code's *total* information
-content, not its information about the current frame. The posterior conditions on
-both `h` and `enc(t)`, and this measures how much the code varies across rows for
-any reason. §2.2 is what separates the two sources.
+The statistic is `Σⱼ I(zⱼ ; h, enc(t))` — the per-categorical informations
+*summed*, an **upper bound** on the code's joint information `I(z ; h, enc(t))`
+rather than that joint itself (§2.4: redundancy across categoricals is counted
+once per categorical), and not its information about the current frame. The
+posterior conditions on both `h` and `enc(t)`, and this measures how much the
+code varies across rows for any reason. §2.2 is what separates the two sources.
 
 The estimator uses the softmax the model **actually samples from**, i.e. with
 `cfg.sample_temperature` applied, because that is the distribution `z` is drawn
@@ -175,22 +177,45 @@ The consequence is asymmetric, and it is why this companion exists:
   idle.
 
 `redundancy_bits` is the mean pairwise mutual information between the
-categoricals' argmaxes, against a `PAIR_CEILING_BITS = log₂(z_classes)` = 5-bit
-per-pair ceiling. Near its floor the categoricals are independent, so the summed
-reading approximates the joint one and a high `bits_carried` does mean the
-capacity is in use. Far above it, the reading is inflated. 0.02 s for the 496
-pairs at 11,000 rows.
+categoricals' **distributions**, `I(z_j ; z_k)` of two values sampled from one
+row's distributions and averaged over rows —
+`joint[j,k,a,b] = (1/n) Σₙ pⱼ(a|n)·p_k(b|n)` — against a
+`PAIR_CEILING_BITS = log₂(z_classes)` = 5-bit per-pair ceiling. It is measured on
+the distributions rather than the argmaxes because `bits_carried` is, and an
+argmax basis cannot see redundancy that lives in the tails. Measured at 11,008
+rows: independent argmaxes (1.004× their floor, so an argmax basis reports
+nothing) with four per-row values shared across all 32 categoricals read
+`bits_carried` **98.32** — above the 80-bit cut, "capacity in use" — while the
+distribution-level redundancy sat at **12.55×** its floor. Near its floor the
+categoricals are pairwise independent, so the summed reading approximates the
+joint one and a high `bits_carried` does mean the capacity is in use. Far above
+it, the reading is inflated. **Pairwise only:** dependence among three or more
+categoricals that is absent from every pair is invisible to it, so a ratio near 1
+is evidence against redundancy rather than a proof of its absence. One `einsum`:
+0.040 s for the 496 pairs at 11,008 rows.
 
-**`redundancy_floor` is its own known answer, measured from the data.** Mutual
-information is biased upward at finite sample — an independent code reads 0.0644
-bits per pair at 11,008 rows, not 0 — so "near zero" is the wrong comparison and
-a fixed tolerance would be a guess about the sample size. The floor permutes each
-categorical's rows independently, destroying every real dependence while
-preserving the marginals and the row count exactly, so what the estimator then
-reads **is** the bias for this data at this size. Measured: an independent code
-sits at **1.00×** its floor; a duplicated one at **7.8× at n = 1280, 16.5× at
-2560, 77.9× at 11,008**, and the floor itself falls 0.638 → 0.304 → 0.064 as it
-must.
+**`redundancy_floor` is an empirical null, not a known answer.** `floor_bits` is
+zero by algebra; this is what the estimator reads once the dependence *between*
+categoricals has been destroyed, and it carries sampling noise of its own, so it
+takes a required `seed`. Mutual information is biased upward at finite sample —
+an independent code reads 0.0643 bits per pair at 11,008 rows, not 0, against
+Miller–Madow's independent `(K−1)²/(2n ln 2)` = 0.0630 — so "near zero" is the
+wrong comparison and a fixed tolerance would be a guess about the sample size.
+Each categorical's rows are **rolled circularly by its own random offset**, not
+permuted: this gather's rows are windows of consecutive frames, and a
+permutation also destroys each series' own autocorrelation, so independent
+categoricals that merely persist read as massively redundant. Measured on
+independent categoricals persisting within 50-row windows (persistence 0.95,
+5,000 rows): **10.74×** a permutation floor, **1.12×** the circular-shift floor;
+the review's fixture read 27.00× against 1.34×. Measured on iid codes: an independent code sits at 1.00× its floor, a
+duplicated one at 7.6× at n = 1280, 16.0× at 2560, 78.0× at 11,008.
+
+A fully collapsed code reads redundancy 0.0 and floor 0.0 — identically, since
+the roll of identical rows is the identity — so the naive ratio is exactly 1.0,
+"independent", for a code with nothing in it. `redundancy_ratio` returns **None**
+where the floor is below float noise (`RATIO_MIN_FLOOR = 1e-9`): a collapsed
+code, or one with a single live categorical. None, not NaN and not a refusal;
+a reader prints "not defined".
 
 It gates nothing. It is reported beside `bits_carried` so that a `CAPACITY_BOUND`
 verdict can be read against it: **that status resting on a high `bits_carried`
@@ -402,7 +427,9 @@ milestone pulls.
 
 **Placeholders.** None. Every threshold is derived in §3.2 or imported per §5.
 
-**Internal consistency.** §2.1's statistic is named `I(z ; h, enc(t))` and §2.4
+**Internal consistency.** §2.1's statistic is named `Σⱼ I(zⱼ ; h, enc(t))` — the
+summed per-categorical informations, an upper bound on the joint
+`I(z ; h, enc(t))` — and §2.4
 explains why the prior is a companion rather than a control — the earlier
 formulation of this design claimed the prior was a zero-answer control, which is
 false because the prior is a function of `h` and `h` encodes past frames. §2.3

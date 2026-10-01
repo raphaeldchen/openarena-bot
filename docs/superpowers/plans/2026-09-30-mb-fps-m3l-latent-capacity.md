@@ -4,7 +4,7 @@
 
 **Goal:** Decide whether the stochastic latent `z` is out of room or was never asked to carry motion, so the project can pick between the bottleneck lever and the objective lever on evidence rather than on a default.
 
-**Architecture:** Two statistics per cell from **one** gather over the nine existing checkpoints — `bits_carried`, the posterior code's information content against an exact `z_cats × log₂(z_classes)` = 160-bit ceiling, and `frame_share`, `R²(enc(t) → post_probs)` under the three-split discipline. Two substitution controls with answers known by construction, plus a fixture that pins the log base. `RSSM.observe` already returns `post_logits` and `prior_logits`, so the gather change adds no computation and consumes no randomness. No training.
+**Architecture:** Two statistics per cell from **one** gather over the nine existing checkpoints — `bits_carried`, the posterior code's per-categorical informations summed (an upper bound on its joint information) against an exact `z_cats × log₂(z_classes)` = 160-bit ceiling, and `frame_share`, `R²(enc(t) → post_probs)` under the three-split discipline. Two substitution controls with answers known by construction, plus a fixture that pins the log base. `RSSM.observe` already returns `post_logits` and `prior_logits`, so the gather change adds no computation and consumes no randomness. No training.
 
 **Tech Stack:** Python 3.12, numpy, torch (MPS), pytest. No new dependencies.
 
@@ -13,7 +13,7 @@
 Copied verbatim from `docs/superpowers/specs/2026-09-30-mb-fps-m3l-latent-capacity-design.md`. Every task's requirements implicitly include this section.
 
 - **Evaluation only.** No training, no checkpoint written or altered, nothing under `runs/` removed.
-- **`redundancy_bits` is reported beside `bits_carried`**, against a `redundancy_floor` measured from the data by permuting each categorical's rows. `bits_carried` sums the PER-CATEGORICAL informations, so it upper-bounds the joint: 32 categoricals copying one 5-bit variable read the full 160 while carrying 5. A reading below a cut is conservative; a reading above one does not establish "capacity in use" unless the redundancy sits near its floor.
+- **`redundancy_bits` is reported beside `bits_carried`**, against a `redundancy_floor`, an empirical null measured from the data by rolling each categorical's rows circularly by its own random offset (a permutation would also destroy the autocorrelation of this gather's clustered rows). Both are measured on the DISTRIBUTIONS, not the argmaxes. `bits_carried` sums the PER-CATEGORICAL informations, so it upper-bounds the joint: 32 categoricals copying one 5-bit variable read the full 160 while carrying 5. A reading below a cut is conservative; a reading above one does not establish "capacity in use" unless the redundancy sits near its floor. The ratio is `redundancy_ratio(redundancy, floor)`, which is None for a collapsed code (floor below `RATIO_MIN_FLOOR`). Both companions gate nothing.
 - **The ceiling is derived from `RSSMConfig`**, never hardcoded. `CEILING_BITS = RSSMConfig.z_cats * log2(RSSMConfig.z_classes)` = 160.0. A hardcoded 160 would silently disagree with the model if the latent shape changed.
 - **`gather_probe_data`'s change must be provably additive.** It feeds the research gate via `src/mbfps/eval/study.py` and `scripts/eval_rollout.py`. Every pre-existing key must be byte-identical, pinned by test. `gain_from_blocks`' ten-key golden output is pinned by `test_gain_from_splits_output_is_byte_identical_after_the_generalisation` — **that test's values are never re-recorded.**
 - **`BASE_R2_FLOOR` stays 0.10** and is not re-chosen, gated on **position alone**.
@@ -216,7 +216,9 @@ git commit -m "feat: the gather yields the posterior and prior distributions, ad
 
 **Interfaces:**
 - Consumes: `RSSMConfig.z_cats`, `RSSMConfig.z_classes`; `retention.CONFIDENCE`, `retention.RESAMPLES`.
-- Produces, used by Tasks 3, 4 and 5: `CEILING_BITS`, `SPARE_CUT`, `FRAME_CUT`, `entropy_bits(p)`, `bits_carried(probs)`, `floor_bits(probs)`, `ceiling_bits(probs)`, `argmax_marginal_bits(probs)`, `live_classes(probs)`, `PAIR_CEILING_BITS`, `redundancy_bits(probs)`, `redundancy_floor(probs, *, seed)`, `EpisodeStats`, `episode_stats(probs, groups)`, `bits_interval(stats, *, resamples, confidence, seed)`.
+- Produces, used by Tasks 3, 4 and 5: `CEILING_BITS`, `SPARE_CUT`, `FRAME_CUT`, `entropy_bits(p)`, `bits_carried(probs)`, `floor_bits(probs)`, `ceiling_bits(probs)`, `argmax_marginal_bits(probs)`, `live_classes(probs)`, `PAIR_CEILING_BITS`, `RATIO_MIN_FLOOR`, `redundancy_bits(probs)`, `redundancy_floor(probs, *, seed)` (seed REQUIRED), `redundancy_ratio(redundancy, floor)` (None where the floor is float noise), `EpisodeStats`, `episode_stats(probs, groups)`, `bits_interval(stats, *, resamples, confidence, seed)`.
+
+**The redundancy companion post-dates the code blocks below.** `PAIR_CEILING_BITS`, `RATIO_MIN_FLOOR`, `redundancy_bits`, `redundancy_floor` and `redundancy_ratio`, with their tests, were added afterwards and live in `src/mbfps/eval/capacity.py` and `tests/eval/test_capacity.py`; the blocks below do not carry them.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -521,7 +523,10 @@ def _require_distributions(probs: np.ndarray) -> np.ndarray:
 
 
 def bits_carried(probs: np.ndarray) -> float:
-    """`I(z ; h, enc(t))` in bits: the code's total information content.
+    """`Sum_j I(z_j ; h, enc(t))` in bits: the per-categorical informations summed.
+
+    AN UPPER BOUND on the code's joint information, not the joint itself:
+    redundancy across categoricals is counted once per categorical.
 
     `H(marginal) - E_n H(row)`, summed over the categoricals. Exact from the
     distributions -- no sampling.
@@ -703,7 +708,7 @@ git commit -m "feat: the bits estimator, its exact ceiling, and three checks tha
 
 **Interfaces:**
 - Consumes: Task 2's `CEILING_BITS`, `SPARE_CUT`, `FRAME_CUT`; `retention.ARMS_REQUIRED`, `SEEDS_REQUIRED`, `BASE_R2_FLOOR`, `BaseControl`.
-- Produces, used by Tasks 4 and 5: `CapacityArm` (fields `bits, bits_low, bits_high, frame_share, frame_low, frame_high, live, seeds_spare, seeds_frame, seeds_total`), `CapacityInputs` (`arms, base, controls, clusters, rows`), `CapacityStatus` (`status, rule, arms_spare, arms_frame, base_failed, controls_failed`), `capacity_arm(seeds)`, `reading_capacity(inputs)`, `READING_COLUMNS`, `READING_WIDTHS`, `format_reading_capacity(reading, inputs)`.
+- Produces, used by Tasks 4 and 5: `CapacityArm` (fields `bits, bits_low, bits_high, frame_share, frame_low, frame_high, live, redundancy_bits, redundancy_floor, seeds_spare, seeds_frame, seeds_total`; the two redundancy fields are seed means like `bits`, decide nothing, and the ratio is derived from them with `redundancy_ratio`), `CapacityInputs` (`arms, base, controls, clusters, rows`), `CapacityStatus` (`status, rule, arms_spare, arms_frame, base_failed, controls_failed`), `capacity_arm(seeds)`, `reading_capacity(inputs)`, `READING_COLUMNS`, `READING_WIDTHS`, `format_reading_capacity(reading, inputs)`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -731,6 +736,7 @@ FULL = {"bits": 150.0, "ci_low": 140.0, "ci_high": 158.0}
 
 
 def _arm(bits: dict, frame: tuple[float, float, float], *, live: int = 1024,
+         redundancy: tuple[float, float] = (0.065, 0.064),
          seeds_spare: int | None = None, seeds_frame: int | None = None,
          seeds_total: int = SEEDS_TOTAL) -> CapacityArm:
     """An arm whose bits interval is `bits` and frame interval is `frame`.
@@ -746,6 +752,7 @@ def _arm(bits: dict, frame: tuple[float, float, float], *, live: int = 1024,
     return CapacityArm(
         bits=bits["bits"], bits_low=bits["ci_low"], bits_high=bits["ci_high"],
         frame_share=share, frame_low=low, frame_high=high, live=live,
+        redundancy_bits=redundancy[0], redundancy_floor=redundancy[1],
         seeds_spare=spare if seeds_spare is None else seeds_spare,
         seeds_frame=framey if seeds_frame is None else seeds_frame,
         seeds_total=seeds_total,
@@ -887,19 +894,47 @@ def test_capacity_arm_refuses_a_measurement_it_cannot_read():
     comparison against NaN is False. `retention.rung_arm` refuses the same
     three for the same reason."""
     ok = {"bits": 40.0, "ci_low": 30.0, "ci_high": 50.0,
-          "frame_share": 0.2, "frame_low": 0.1, "frame_high": 0.3, "live": 1024}
+          "frame_share": 0.2, "frame_low": 0.1, "frame_high": 0.3, "live": 1024,
+          "redundancy_bits": 0.065, "redundancy_floor": 0.064}
     assert capacity_arm([ok] * SEEDS_REQUIRED).seeds_total == SEEDS_REQUIRED
 
     for field, value, match in (
         ("bits", float("nan"), "non-finite"),
         ("ci_low", 60.0, "inverted"),
         ("bits", 90.0, "outside its own interval"),
+        ("redundancy_floor", float("nan"), "non-finite"),
     ):
         with pytest.raises(ValueError, match=match):
             capacity_arm([ok, {**ok, field: value}, ok])
 
     with pytest.raises(ValueError, match="at least"):
         capacity_arm([ok])
+
+    missing = {k: v for k, v in ok.items() if k != "redundancy_bits"}
+    with pytest.raises(ValueError, match="missing redundancy_bits"):
+        capacity_arm([ok, missing, ok])
+
+
+def test_the_arm_carries_the_redundancy_companion_and_it_gates_nothing():
+    """Task 6 must report the ratio beside `CAPACITY_BOUND`, derived from the
+    records, so the arm has to carry both numbers -- as the seed MEANS, like
+    `bits`. And they are a companion: wild values change no status."""
+    import dataclasses
+
+    ok = {"bits": 40.0, "ci_low": 30.0, "ci_high": 50.0, "frame_share": 0.2,
+          "frame_low": 0.1, "frame_high": 0.3, "live": 1024}
+    arm = capacity_arm([
+        {**ok, "redundancy_bits": 0.10, "redundancy_floor": 0.05},
+        {**ok, "redundancy_bits": 0.30, "redundancy_floor": 0.07},
+        {**ok, "redundancy_bits": 0.20, "redundancy_floor": 0.06},
+    ])
+    assert arm.redundancy_bits == pytest.approx(0.20)
+    assert arm.redundancy_floor == pytest.approx(0.06)
+
+    base = _inputs()
+    wild = _inputs({a: dataclasses.replace(x, redundancy_bits=9.0, redundancy_floor=0.0)
+                    for a, x in base.arms.items()})
+    assert reading_capacity(wild) == reading_capacity(base)
 
 
 def test_the_table_pins_every_column_to_the_arm_it_came_from():
@@ -1022,6 +1057,8 @@ class CapacityArm:
     frame_low: float
     frame_high: float
     live: int
+    redundancy_bits: float   # seed mean; a companion that decides nothing
+    redundancy_floor: float  # seed mean of the circular-shift null
     seeds_spare: int
     seeds_frame: int
     seeds_total: int
@@ -1078,7 +1115,8 @@ def capacity_arm(seeds: list[dict]) -> CapacityArm:
             f"read, got {len(seeds)}: an arm with fewer can never satisfy the "
             "bar, so it would read as a null rather than as the refusal it is"
         )
-    fields = ("bits", "ci_low", "ci_high", "frame_share", "frame_low", "frame_high")
+    fields = ("bits", "ci_low", "ci_high", "frame_share", "frame_low", "frame_high",
+              "redundancy_bits", "redundancy_floor")
     for i, seed in enumerate(seeds):
         for key in (*fields, "live"):
             if key not in seed:
@@ -1109,6 +1147,8 @@ def capacity_arm(seeds: list[dict]) -> CapacityArm:
         frame_low=float(min(s["frame_low"] for s in seeds)),
         frame_high=float(max(s["frame_high"] for s in seeds)),
         live=int(min(s["live"] for s in seeds)),
+        redundancy_bits=float(np.mean([s["redundancy_bits"] for s in seeds])),
+        redundancy_floor=float(np.mean([s["redundancy_floor"] for s in seeds])),
         seeds_spare=sum(1 for s in seeds if float(s["ci_high"]) < SPARE_CUT),
         seeds_frame=sum(1 for s in seeds if float(s["frame_low"]) > FRAME_CUT),
         seeds_total=len(seeds),
@@ -1323,7 +1363,7 @@ git commit -m "feat: Reading G -- five statuses, mutually exclusive, and CAPACIT
 - Test: `tests/eval/test_latent_capacity_script.py`
 
 **Interfaces:**
-- Consumes: Task 1's `"post_probs"` / `"prior_probs"`; Task 2's `bits_carried`, `floor_bits`, `ceiling_bits`, `argmax_marginal_bits`, `live_classes`, `episode_stats`, `bits_interval`, `CEILING_BITS`; `probe.filtering_gain`-style splits, `probe.GainSplit`, `probe.fit_probe`; `retention.TARGETS`, `CONFIDENCE`, `RESAMPLES`.
+- Consumes: Task 1's `"post_probs"` / `"prior_probs"`; Task 2's `bits_carried`, `floor_bits`, `ceiling_bits`, `argmax_marginal_bits`, `live_classes`, `redundancy_bits`, `redundancy_floor`, `episode_stats`, `bits_interval`, `CEILING_BITS`; `probe.filtering_gain`-style splits, `probe.GainSplit`, `probe.fit_probe`; `retention.TARGETS`, `CONFIDENCE`, `RESAMPLES`.
 - Produces, used by Task 5: `EXIT_ESTIMATOR_BROKEN = 43`, `EXIT_BASE_UNRESOLVED = 44`, `PHASES`, `capacity_record_path`, `write_record`, `load_record`, `_cell_args`, `gather_once`, `cell_capacity`, `base_control`, `estimator_checks`, `measure_cell`, `measure_phase`, `require_readable_plan`, `require_one_protocol`, `_PROTOCOL_FIELDS`.
 
 **Read `scripts/latent_width.py` first.** It is the direct precedent for every part of this task, and four recorded blockers were paid for there.
@@ -1386,7 +1426,7 @@ def test_the_plan_is_refused_before_the_probe_not_after():
     script.require_readable_plan(list(script.ARMS), (0, 1, 2))  # does not raise
 ```
 
-Also write, in the same file: a test that `estimator_checks` returns False when `floor_bits` is nonzero, when the two ceiling routes disagree, and when either of the **two theorem** inequalities is violated (`-1e-9 <= bits <= CEILING_BITS + 1e-9` and `0 <= ceiling <= CEILING_BITS + 1e-9`) — each driven separately, each with a fixture that clears the others. **There is no third inequality:** `bits <= ceiling_bits` is not a theorem, and `tests/eval/test_capacity.py::test_ceiling_bits_is_not_an_upper_bound_on_bits_carried` carries the counterexample. Drive that same fixture through `estimator_checks` and assert it is NOT refused; a test that the record's key set is pinned exactly and round-trips through the real `write_record`/`load_record`; and a test that every probe call gets the cell's own bootstrap seed (`Counter` over **all** calls, not the first — M3j shipped every cell sharing seed 0, which correlates the interval noise the agreement rule treats as independent).
+Also write, in the same file: a test that `estimator_checks` returns False when `floor_bits` is nonzero, when the two ceiling routes disagree, and when either of the **two theorem** inequalities is violated (`-1e-9 <= bits <= CEILING_BITS + 1e-9` and `0 <= ceiling <= CEILING_BITS + 1e-9`) — each driven separately, each with a fixture that clears the others. **There is no third inequality:** `bits <= ceiling_bits` is not a theorem, and `tests/eval/test_capacity.py::test_ceiling_bits_is_not_an_upper_bound_on_bits_carried` carries the counterexample. Drive that same fixture through `estimator_checks` and assert it is NOT refused; a test that the record's key set is pinned exactly -- `redundancy_bits` and `redundancy_floor` among its keys, beside `bits` -- and round-trips through the real `write_record`/`load_record`; and a test that every probe call gets the cell's own bootstrap seed (`Counter` over **all** calls, not the first — M3j shipped every cell sharing seed 0, which correlates the interval noise the agreement rule treats as independent), and the same `Counter` over every `redundancy_floor` call, which must receive the cell's own seed.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -1441,7 +1481,14 @@ def estimator_checks(probs) -> dict:
 
 
 def cell_capacity(gathered, *, seed: int) -> dict:
-    """One cell's `bits`, interval, `frame_share`, `live` and the three checks.
+    """One cell's `bits`, interval, `frame_share`, `live`, `redundancy_bits`,
+    `redundancy_floor` and the three checks.
+
+    `redundancy_floor(probs, seed=seed)` takes the CELL'S OWN seed, never a
+    default: a defaulted seed is how M3j shipped every cell sharing one. Both
+    redundancy numbers ship on the record as plain floats -- the ratio is derived
+    at read time by `redundancy_ratio`, which is None for a collapsed code -- and
+    they gate nothing: no check, status or refusal depends on them.
 
     `frame_share` is `R2(enc(t) -> post_probs)` on the flattened 1024 columns,
     ZERO-VARIANCE COLUMNS EXCLUDED -- R^2 is undefined for them and this project
@@ -1521,7 +1568,7 @@ def capacity_text(records, inputs, reading) -> str:
     conclusion -- written to `capacity.txt` and printed as the SAME string."""
 ```
 
-Every field the reading needs is read through a `_get(record, cell, *path)` that names the cell and the dotted path on a miss, as `latent_width.py` does. `clusters` and `rows` go through a `_one_value` that **refuses a disagreement naming the cells** rather than picking the first record's.
+Every field the reading needs is read through a `_get(record, cell, *path)` that names the cell and the dotted path on a miss, as `latent_width.py` does -- including `redundancy_bits` and `redundancy_floor`, which `capacity_inputs` threads into each per-seed dict for `capacity_arm`. `capacity_text` prints, per arm, both numbers and `redundancy_ratio(arm.redundancy_bits, arm.redundancy_floor)` beside the verdict in EVERY status (`n/a` where it is None), and a test drives a collapsed cell through it. `clusters` and `rows` go through a `_one_value` that **refuses a disagreement naming the cells** rather than picking the first record's.
 
 - [ ] **Step 4: Run them to verify they pass**
 
@@ -1604,7 +1651,7 @@ Required, each with its cell count out of 9 and its exception named with its mar
 
 - `bits_carried` per arm and per cell, against the 160-bit ceiling, as a **share** as well as a level — described as **the per-categorical informations summed, an upper bound on the code's joint information**, never as "the code carries N of 160 bits". Measured: 32 categoricals all copying one 5-bit variable read 160.0000 while carrying 5 bits jointly, a 32× overstatement. So a reading BELOW a cut is sound and conservative; a reading ABOVE one does **not** establish that the capacity is in use, and if the status rests on a high reading the write-up must say so in the same breath
 - `frame_share` per arm and per cell, and `live` out of 1024
-- **`redundancy_bits` against `redundancy_floor`** per cell, and what the ratio licenses: near the floor means the categoricals are independent, so the summed `bits_carried` approximates the joint information and a high reading does mean the capacity is in use; far above it means the reading is inflated and a high value establishes nothing. **A `CAPACITY_BOUND` verdict must be reported beside this ratio**, because it means nothing unless the redundancy sits near its floor
+- **`redundancy_bits` against `redundancy_floor`** per cell, the ratio taken from the records' two fields with `redundancy_ratio` ("not defined" where it is None, a collapsed code), and what the ratio licenses: near the floor means the categoricals are independent, so the summed `bits_carried` approximates the joint information and a high reading does mean the capacity is in use; far above it means the reading is inflated and a high value establishes nothing. **A `CAPACITY_BOUND` verdict must be reported beside this ratio**, because it means nothing unless the redundancy sits near its floor
 - `prior_bits` as the companion that decides nothing, with one sentence on what it says about M3g's finding that the prior is the failing stage
 - all three estimator checks on all nine cells
 - **Reading G's status under the rule as written** — and if the magnitudes suggest another, report both, say plainly that they disagree, and leave the lever to the human
@@ -1633,11 +1680,11 @@ Write the message to a file (the results contain apostrophes) and `git commit -F
 
 ## Plan self-review (writing-plans)
 
-**Spec coverage.** §1 → Task 6 Step 6. §2.1 → Task 2. §2.2 → Task 4 (`cell_capacity`). §2.3 → Task 2 Steps 1, 3, 5. §2.4 → Task 4 (`prior_bits` on the record) and Task 6 Step 6. §3.1 → Task 3. §3.2 → Task 2 (`SPARE_CUT`'s docstring) and Task 3. §3.3 → Task 3's `CAPACITY_BOUND` rule text and Task 6 Step 6. §4 → the File Structure table. §4.1 → Task 1. §4.2 → Task 4 (`gather_once`). §5 → Global Constraints. §6 → Task 6 Steps 2–3. §7 → Exit criteria. §8 → Task 6 Step 6. No gaps.
+**Spec coverage.** §1 → Task 6 Step 6. §2.1 → Task 2. §2.2 → Task 4 (`cell_capacity`). §2.3 → Task 2 Steps 1, 3, 5. §2.4 → Tasks 2 and 3 (`redundancy_*`, `CapacityArm`), Task 4 (`prior_bits`, `redundancy_bits` and `redundancy_floor` on the record) and Task 6 Step 6. §3.1 → Task 3. §3.2 → Task 2 (`SPARE_CUT`'s docstring) and Task 3. §3.3 → Task 3's `CAPACITY_BOUND` rule text and Task 6 Step 6. §4 → the File Structure table. §4.1 → Task 1. §4.2 → Task 4 (`gather_once`). §5 → Global Constraints. §6 → Task 6 Steps 2–3. §7 → Exit criteria. §8 → Task 6 Step 6. No gaps.
 
 **Placeholder scan.** Tasks 1–3 carry complete code. Tasks 4 and 5 give the signatures, the docstrings that state each decision, and the tests by the defect each exists for, and name `scripts/latent_width.py` as the precedent to mirror section for section — deliberately, because reproducing 800 lines of a sibling script here would be a copy for the implementer to diverge from rather than a file to follow. **If that is too thin for a fresh implementer, those two tasks should be split before execution.**
 
-**Type consistency.** `CapacityArm`'s ten fields are spelled identically in Task 3's `_arm` helper, its dataclass, `capacity_arm`'s constructor and `format_reading_capacity`'s row. `CapacityInputs(arms, base, controls, clusters, rows)` in Tasks 3 and 5. `episode_stats(probs, groups) -> EpisodeStats` and `bits_interval(stats, *, resamples, confidence, seed)` in Tasks 2 and 4. `estimator_checks(probs) -> dict` with keys `floor`, `routes`, `bracket` in Tasks 4 and 5. `SPARE_CUT` is half `CEILING_BITS` in one place only.
+**Type consistency.** `CapacityArm`'s twelve fields are spelled identically in Task 3's `_arm` helper, its dataclass, `capacity_arm`'s constructor and `format_reading_capacity`'s row. `CapacityInputs(arms, base, controls, clusters, rows)` in Tasks 3 and 5. `episode_stats(probs, groups) -> EpisodeStats` and `bits_interval(stats, *, resamples, confidence, seed)` in Tasks 2 and 4. `estimator_checks(probs) -> dict` with keys `floor`, `routes`, `bracket` in Tasks 4 and 5. `SPARE_CUT` is half `CEILING_BITS` in one place only.
 
 **Five defects found in this plan's own code and fixed inline.** The last two were
 found by *executing* the plan's estimator and fixtures before writing them down,
