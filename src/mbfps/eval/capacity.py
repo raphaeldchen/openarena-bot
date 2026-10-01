@@ -27,7 +27,9 @@ import math
 
 import numpy as np
 
-from mbfps.eval.retention import CONFIDENCE, RESAMPLES
+from mbfps.eval.retention import (
+    ARMS_REQUIRED, BASE_R2_FLOOR, CONFIDENCE, RESAMPLES, SEEDS_REQUIRED, BaseControl,
+)
 from mbfps.models.rssm import RSSMConfig
 
 CEILING_BITS: float = RSSMConfig.z_cats * math.log2(RSSMConfig.z_classes)
@@ -431,3 +433,378 @@ def bits_interval(
         "confidence": confidence,
         "n_episodes": int(n_episodes),
     }
+
+
+READING_COLUMNS: tuple[str, ...] = (
+    "arm", "bits", "ci_low", "ci_high", "frame", "live", "red_ratio", "clears",
+)
+"""The columns of Reading G's table, in order.
+
+`live` and `red_ratio` are the two COMPANIONS, and they are in the table rather
+than only in the records because `bits_carried` sums per-categorical
+informations: it upper-bounds the code's joint information, so a high reading
+does not establish "the capacity is in use". A `CAPACITY_BOUND` verdict printed
+beside a `red_ratio` far above 1, or beside a low `live`, contradicts itself, and
+a reader can only see that if both are on the page beside the verdict."""
+
+READING_WIDTHS: tuple[int, ...] = (13, 10, 10, 10, 8, 7, 11, 13)
+"""One width per column, each wider than the widest value the column can carry.
+
+The cells are right-aligned and unseparated, so a value as wide as its column
+butts against its neighbour and a wider one shifts the whole row. The widest
+cells are `undefined` (9) in `red_ratio` and `spare+frame` (11) in `clears`."""
+
+
+@dataclasses.dataclass(frozen=True)
+class CapacityArm:
+    """One arm's reading, summarised across its seeds.
+
+    The intervals are the CONSERVATIVE hull -- the lowest low and the highest
+    high across the arm's seeds -- so an arm is never credited with a bound only
+    its luckiest seed reached. `bits`, `frame_share` and both redundancy figures
+    are the seed means; `live` is the lowest count.
+
+    Neither point estimate decides anything: the two `seeds_*` tallies do, and
+    they are counted per seed against the cuts before ever being averaged. The
+    two redundancy figures decide nothing either. They are carried so the table
+    can print `redundancy_ratio` beside the verdict, which is the only thing that
+    makes a high `bits` readable.
+    """
+
+    bits: float
+    bits_low: float
+    bits_high: float
+    frame_share: float
+    frame_low: float
+    frame_high: float
+    live: int
+    redundancy_bits: float   # seed mean; a companion that decides nothing
+    redundancy_floor: float  # seed mean of the circular-shift null
+    seeds_spare: int
+    seeds_frame: int
+    seeds_total: int
+
+    def clears_spare(self) -> bool:
+        """`SEEDS_REQUIRED` seeds whose whole bits interval sits below the cut."""
+        return self.seeds_spare >= SEEDS_REQUIRED
+
+    def clears_frame(self) -> bool:
+        """`SEEDS_REQUIRED` seeds whose whole frame interval sits above the cut."""
+        return self.seeds_frame >= SEEDS_REQUIRED
+
+
+@dataclasses.dataclass(frozen=True)
+class CapacityInputs:
+    """Reading G's inputs: the arms, their base controls, their estimator checks.
+
+    `controls` is per arm and True when every one of that arm's seeds passed the
+    floor, two-route and inequality checks. `clusters` and `rows` are caption
+    figures and decide nothing.
+    """
+
+    arms: dict[str, CapacityArm]
+    base: dict[str, BaseControl]
+    controls: dict[str, bool]
+    clusters: int
+    rows: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CapacityStatus:
+    status: str
+    rule: str
+    arms_spare: tuple[str, ...]
+    arms_frame: tuple[str, ...]
+    base_failed: tuple[str, ...]
+    controls_failed: tuple[str, ...]
+
+
+def capacity_arm(seeds: list[dict]) -> CapacityArm:
+    """One arm's `CapacityArm` from its per-seed measurement dicts.
+
+    THE REFUSALS LIVE HERE, and they raise. A non-finite bound makes every
+    comparison False, so one bad cell would read "does not clear" in both
+    senses at once -- a verdict moved toward the wrong status while looking like
+    a clean null. An inverted interval, a point estimate outside its own
+    interval, and fewer than `SEEDS_REQUIRED` seeds are refused for the same
+    reason: each would otherwise pass silently and read as a null.
+    `retention.rung_arm` refuses the same three.
+
+    The tallies are made HERE, per seed, against the interval's own end: a seed
+    is spare when ITS `ci_high` is strictly below `SPARE_CUT` and framey when ITS
+    `frame_low` is strictly above `FRAME_CUT`. Never the point estimate, which
+    can sit on the clearing side of a cut while its interval straddles it, and
+    never the hull, which one unlucky seed widens past a cut the others clear.
+    """
+    if len(seeds) < SEEDS_REQUIRED:
+        raise ValueError(
+            f"an arm needs at least SEEDS_REQUIRED={SEEDS_REQUIRED} seeds to "
+            f"read, got {len(seeds)}: an arm with fewer can never satisfy the "
+            "bar, so it would read as a null rather than as the refusal it is"
+        )
+    fields = ("bits", "ci_low", "ci_high", "frame_share", "frame_low", "frame_high",
+              "redundancy_bits", "redundancy_floor")
+    for i, seed in enumerate(seeds):
+        for key in (*fields, "live"):
+            if key not in seed:
+                raise ValueError(f"seed index {i} is missing {key}")
+        values = {k: float(seed[k]) for k in fields}
+        if not all(math.isfinite(v) for v in values.values()):
+            raise ValueError(
+                f"seed index {i} carries a non-finite value {values}: that is an "
+                "error about the measurement, never a statement about the code"
+            )
+        for lo, mid, hi in (("ci_low", "bits", "ci_high"),
+                            ("frame_low", "frame_share", "frame_high")):
+            if values[lo] > values[hi]:
+                raise ValueError(
+                    f"seed index {i} has an inverted interval "
+                    f"[{values[lo]}, {values[hi]}]"
+                )
+            if not values[lo] <= values[mid] <= values[hi]:
+                raise ValueError(
+                    f"seed index {i} has {mid}={values[mid]} outside its own "
+                    f"interval [{values[lo]}, {values[hi]}]"
+                )
+    return CapacityArm(
+        bits=float(np.mean([s["bits"] for s in seeds])),
+        bits_low=float(min(s["ci_low"] for s in seeds)),
+        bits_high=float(max(s["ci_high"] for s in seeds)),
+        frame_share=float(np.mean([s["frame_share"] for s in seeds])),
+        frame_low=float(min(s["frame_low"] for s in seeds)),
+        frame_high=float(max(s["frame_high"] for s in seeds)),
+        live=int(min(s["live"] for s in seeds)),
+        redundancy_bits=float(np.mean([s["redundancy_bits"] for s in seeds])),
+        redundancy_floor=float(np.mean([s["redundancy_floor"] for s in seeds])),
+        seeds_spare=sum(1 for s in seeds if float(s["ci_high"]) < SPARE_CUT),
+        seeds_frame=sum(1 for s in seeds if float(s["frame_low"]) > FRAME_CUT),
+        seeds_total=len(seeds),
+    )
+
+
+def reading_capacity(inputs: CapacityInputs) -> CapacityStatus:
+    """Reading G: is `z` out of room, or was it never asked?
+
+    Precedence. `UNRESOLVED_ESTIMATOR` outranks everything: a reading taken from
+    an estimator that missed a known answer is not a weaker reading, it is not a
+    reading. Then `UNRESOLVED_BASE`, as in M3j and M3k -- a claim about the code
+    means nothing if the current frame cannot say where it is. Then
+    `SPARE_CAPACITY`, then `FRAME_REENCODING`, then the fall-through.
+
+    THE TWO READINGS CAN BOTH CLEAR, and that is not an ambiguity. They are
+    tallies on two different quantities -- how many bits, and how much of the
+    code's variance enc(t) explains -- so one arm can sit in both lists: a code
+    that carries little, and of that little mostly the frame. The cuts do not
+    make them exclusive. What makes the status unambiguous is that precedence
+    says which label wins (`SPARE_CAPACITY`, "not spare" being the other's
+    condition) and that BOTH labels send the next milestone to the same lever,
+    so the order decides a label and not a direction -- which is why M3k's
+    refusal of an arm clearing opposite ways has no counterpart here. Both tuples
+    are reported, so the record shows the overlap and the table labels it.
+
+    `CAPACITY_BOUND` IS THE FALL-THROUGH. Both objective-lever statuses must
+    clear an interval; this one is what remains. So the rule makes the lever
+    M3j's h-vs-z evidence already favours the EASIEST status to reach, which is
+    backwards, and the rule text says so in the words M3k used for
+    INDISTINGUISHABLE: by default rather than by evidence.
+
+    It also does not establish that the capacity is in use, which is the one
+    positive claim the bottleneck lever rests on. `bits_carried` sums the
+    per-categorical informations and so upper-bounds the joint, so a reading
+    BELOW a cut is sound and a reading above one is not evidence of use. The
+    rule sends the reader to the two columns that make it readable, `red_ratio`
+    and `live`. It cannot carry their VALUES: they decide nothing, and
+    `CapacityStatus` is compared whole to prove it.
+
+    All four tuples are reported in every branch where a reading is taken, and
+    the two UNRESOLVED branches report the failures that decided them while
+    leaving the arms empty, because no arm votes there. `ARMS_REQUIRED` arms
+    holding is enough to proceed, so one arm can fail its base control while its
+    measurement still votes -- the record must say so rather than read "nothing
+    failed". M3k shipped exactly that hole and it survived 82 tests.
+    """
+    if len(inputs.arms) < ARMS_REQUIRED:
+        raise ValueError(
+            f"Reading G needs at least ARMS_REQUIRED={ARMS_REQUIRED} arms to "
+            f"read, got {len(inputs.arms)}"
+        )
+    if set(inputs.base) != set(inputs.arms) or set(inputs.controls) != set(inputs.arms):
+        raise ValueError(
+            "inputs.base and inputs.controls must name exactly inputs.arms; got "
+            f"arms {sorted(inputs.arms)}, base {sorted(inputs.base)}, "
+            f"controls {sorted(inputs.controls)}: an arm with no base control or "
+            "no estimator check would vote with nothing gating it"
+        )
+    controls_failed = tuple(sorted(a for a, ok in inputs.controls.items() if not ok))
+    base_failed = tuple(
+        sorted(a for a, control in inputs.base.items() if not control.clears())
+    )
+    spare = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_spare()))
+    frame = tuple(sorted(a for a, arm in inputs.arms.items() if arm.clears_frame()))
+    n_arms = len(inputs.arms)
+
+    if controls_failed:
+        return CapacityStatus(
+            status="UNRESOLVED_ESTIMATOR",
+            rule=(
+                f"the estimator missed a known answer in {', '.join(controls_failed)}; "
+                "a reading taken from an estimator that failed its own floor, "
+                "two-route or inequality check is not a weaker reading, it is not "
+                "a reading"
+            ),
+            arms_spare=(), arms_frame=(), base_failed=base_failed,
+            controls_failed=controls_failed,
+        )
+    if n_arms - len(base_failed) < ARMS_REQUIRED:
+        return CapacityStatus(
+            status="UNRESOLVED_BASE",
+            rule=(
+                f"only {n_arms - len(base_failed)} of {n_arms} arms clear "
+                f"enc(t) -> position at r2 {BASE_R2_FLOOR:.2f} "
+                f"({', '.join(base_failed)} failed); a claim about what the code "
+                "carries means nothing where the frame cannot say where it is"
+            ),
+            arms_spare=(), arms_frame=(), base_failed=base_failed,
+            controls_failed=controls_failed,
+        )
+    if len(spare) >= ARMS_REQUIRED:
+        return CapacityStatus(
+            status="SPARE_CAPACITY",
+            rule=(
+                f"the whole bits interval sits below {SPARE_CUT:.0f} of the "
+                f"{CEILING_BITS:.0f}-bit ceiling in {len(spare)} of {n_arms} arms "
+                f"({', '.join(spare)}), each in at least {SEEDS_REQUIRED} seeds; "
+                "bits is an upper bound on the code's joint information, so that "
+                "is below the cut too: most of the capacity is idle, adding "
+                "capacity cannot be what limits the model, and the OBJECTIVE "
+                "lever is where the next milestone goes"
+            ),
+            arms_spare=spare, arms_frame=frame, base_failed=base_failed,
+            controls_failed=controls_failed,
+        )
+    if len(frame) >= ARMS_REQUIRED:
+        return CapacityStatus(
+            status="FRAME_REENCODING",
+            rule=(
+                f"the whole interval on the share of the code's variance that "
+                f"enc(t) alone explains sits above {FRAME_CUT:.2f} in {len(frame)} "
+                f"of {n_arms} arms ({', '.join(frame)}), each in at least "
+                f"{SEEDS_REQUIRED} seeds, and spare capacity did not clear first; "
+                "most of the code is the current frame re-encoded, which is "
+                "exactly what the embedding loss asks for -- the OBJECTIVE lever "
+                "is where the next milestone goes"
+            ),
+            arms_spare=spare, arms_frame=frame, base_failed=base_failed,
+            controls_failed=controls_failed,
+        )
+    return CapacityStatus(
+        status="CAPACITY_BOUND",
+        rule=(
+            f"neither objective-lever status clears in {ARMS_REQUIRED} arms: the "
+            "code could not be shown to be mostly idle and could not be shown to "
+            "be mostly a re-encoding of the frame, so what limits it is "
+            "consistent with capacity -- but this status is the FALL-THROUGH, not "
+            "a bar that was cleared, so the bottleneck lever stands BY DEFAULT "
+            "rather than by evidence. Nor does it establish that the capacity is "
+            "in use: bits is an upper bound on the joint information, so a high "
+            "reading means that only where red_ratio sits near 1 (the "
+            "categoricals independent) and live is high, and a verdict beside a "
+            "red_ratio well above 1 or a low live count contradicts itself. How "
+            "much capacity would be enough is a magnitude and belongs in the "
+            "run's own report, not here"
+        ),
+        arms_spare=spare, arms_frame=frame, base_failed=base_failed,
+        controls_failed=controls_failed,
+    )
+
+
+def _row(values, widths) -> str:
+    return "  " + "".join(f"{v:>{w}}" for v, w in zip(values, widths, strict=True))
+
+
+def _clears_label(arm: CapacityArm) -> str:
+    """Which cut(s) an arm's own seeds cleared, as the table's `clears` column.
+
+    BOTH is a label of its own. The two senses are different quantities, so an
+    arm can clear both, and a column printing only `spare` would read, beside the
+    reading's `arms_frame`, as an arm that did not clear the frame cut."""
+    spare, frame = arm.clears_spare(), arm.clears_frame()
+    if spare and frame:
+        return "spare+frame"
+    return "spare" if spare else ("frame" if frame else "no")
+
+
+def format_reading_capacity(reading: CapacityStatus, inputs: CapacityInputs) -> str:
+    """Reading G as `capacity.txt` carries it, byte for byte.
+
+    Every number in the caption and legend is interpolated, never a literal: the
+    ceiling, both cuts and the ratio's tolerance from the module, the arm count
+    from `inputs.arms`, the seed count from the arms' common `seeds_total`, the
+    shape from `inputs` and `RSSMConfig`. This project has shipped a caption
+    disagreeing with its own columns three times.
+
+    `red_ratio` is `redundancy_ratio` of the arm's two seed means, and prints
+    `undefined` where that is None. Never a bare 1.0: a collapsed code reads its
+    redundancy equal to its floor, and 1.0 is the one value that says
+    "independent, so the capacity is in use".
+
+    `clears` is printed for every arm under every verdict, as the width table
+    does, including the UNRESOLVED ones where no arm votes; the legend says the
+    gates and the arm bar are the verdict's, not the column's.
+    """
+    counts = {arm.seeds_total for arm in inputs.arms.values()}
+    if len(counts) != 1:
+        raise ValueError(
+            "the arms must share one seeds_total for the caption's "
+            f"'{SEEDS_REQUIRED} of N seeds' to be true of every row, got "
+            f"{ {a: arm.seeds_total for a, arm in sorted(inputs.arms.items())} }"
+        )
+    (seeds_total,) = counts
+    lines = [
+        f"--- Reading G: how many of the {CEILING_BITS:.0f} bits does the posterior "
+        f"code carry, and is it a re-encoding of enc(t)? (spare when the whole bits "
+        f"interval is below {SPARE_CUT:.0f}; frame when the whole share interval is "
+        f"above {FRAME_CUT:.2f}; both in {SEEDS_REQUIRED} of {seeds_total} seeds and "
+        f"{ARMS_REQUIRED} of {len(inputs.arms)} arms); "
+        f"{inputs.rows} rows over {inputs.clusters} clusters ---",
+        _row(READING_COLUMNS, READING_WIDTHS),
+    ]
+    for name, arm in sorted(inputs.arms.items()):
+        ratio = redundancy_ratio(arm.redundancy_bits, arm.redundancy_floor)
+        lines.append(_row(
+            (name, f"{arm.bits:.4f}", f"{arm.bits_low:.4f}", f"{arm.bits_high:.4f}",
+             f"{arm.frame_share:.4f}", str(arm.live),
+             "undefined" if ratio is None else f"{ratio:.3f}", _clears_label(arm)),
+            READING_WIDTHS,
+        ))
+    lines.append(
+        "  red_ratio = redundancy / its circular-shift floor, a companion that "
+        "gates nothing: near 1 the categoricals are independent and bits is close "
+        "to the code's joint information; well above 1 bits overstates it "
+        f"('undefined' where the floor is below {RATIO_MIN_FLOOR:g}: no pair of "
+        "categoricals varies)"
+    )
+    lines.append(
+        f"  live = columns of {RSSMConfig.z_cats * RSSMConfig.z_classes} that vary "
+        "across rows; clears = the cut an arm's own seeds cleared, before the "
+        f"gates and the {ARMS_REQUIRED}-arm bar that the verdict applies"
+    )
+    lines.append(
+        "  base control (enc(t) -> position, must clear r2 "
+        f"{BASE_R2_FLOOR:.2f}): " + ", ".join(
+            f"{a} r2={inputs.base[a].r2:+.3f} "
+            f"{inputs.base[a].seeds_clear}/{inputs.base[a].seeds_total}"
+            for a in sorted(inputs.base)
+        )
+    )
+    lines.append(
+        "  estimator checks (floor exactly 0, two ceiling routes agreeing, the "
+        "two theorem inequalities): " + ", ".join(
+            f"{a}={'ok' if inputs.controls[a] else 'BROKEN'}"
+            for a in sorted(inputs.controls)
+        )
+    )
+    lines.append(
+        f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}"
+    )
+    return "\n".join(lines)
