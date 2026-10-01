@@ -25,7 +25,9 @@ from mbfps.eval.capacity import (
     CEILING_BITS, bits_carried, floor_bits, live_classes,
 )
 from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
-from mbfps.eval.retention import ARMS_REQUIRED, SEEDS_REQUIRED
+from mbfps.eval.retention import (
+    ARMS_REQUIRED, CONFIDENCE, RESAMPLES, SEEDS_REQUIRED,
+)
 from mbfps.eval.study import load_record
 from mbfps.models.rssm import RSSMConfig
 from mbfps.utils.config import ARMS
@@ -357,8 +359,11 @@ def test_gather_once_takes_the_filtering_gain_draws(monkeypatch):
     ]
     assert select["seed"] == 9
     assert score["paths"] == val and score["seed"] == 8
-    assert fit["limit"] == script.FIT_EPISODES
-    assert select["limit"] == script.SELECT_EPISODES
+    # `limit` is `len(paths)` for EVERY gather: the slices above are the cap and
+    # the argument never binds, so there is not a second number that could
+    # disagree with them (`gather_once` says why).
+    assert fit["limit"] == len(fit["paths"]) == script.FIT_EPISODES
+    assert select["limit"] == len(select["paths"]) == script.SELECT_EPISODES
     assert score["limit"] == len(val) != script.FIT_EPISODES
     assert all(c["model"] is prepared.model for c in calls)
     assert {c["backbone"] for c in calls} == {"the-backbone"}
@@ -752,10 +757,42 @@ def test_estimator_checks_pass_on_a_plausible_posterior():
     }
 
 
-def test_estimator_checks_report_the_numbers_not_only_the_booleans():
+def test_estimator_checks_report_the_numbers_not_only_the_booleans(monkeypatch):
     """A check that reports only a boolean cannot be audited from the record:
     the reader of `capacity.txt` must be able to see HOW far the floor drifted
-    and WHERE the two ceiling routes landed."""
+    and WHERE the two ceiling routes landed.
+
+    WHAT THIS ESTABLISHES, AND WHAT IT DOES NOT. The four estimators are each
+    stubbed to a DIFFERENT sentinel, so every key is pinned to its own source:
+    a transposed assignment -- `"bits"` and `"floor"` swapped, or `"ceiling"` and
+    `"argmax_marginal"` swapped -- fails here. The earlier form of this test
+    compared each key to the very function that fills it on the real fixture:
+    one code path, which caught `bits`/`floor` swapped and could not catch
+    `ceiling`/`argmax_marginal` swapped, because `ceiling_bits` and
+    `argmax_marginal_bits` are two routes to ONE number and agree on real data.
+    It does NOT establish that any estimator is RIGHT on real data --
+    `tests/eval/test_capacity.py` owns that -- nor that a flag is computed from
+    the right number: the flag tests above stub the estimators for that."""
+    sentinels = {
+        "bits_carried": 12.5, "floor_bits": 0.0625,
+        "ceiling_bits": 7.25, "argmax_marginal_bits": 3.75,
+    }
+    assert len(set(sentinels.values())) == len(sentinels), "the stubs must differ"
+    for name, value in sentinels.items():
+        monkeypatch.setattr(script, name, lambda probs, _v=value: _v)
+    checks = script.estimator_checks(_probs())
+    assert (
+        checks["bits"], checks["floor"], checks["ceiling"], checks["argmax_marginal"],
+    ) == (12.5, 0.0625, 7.25, 3.75)
+    assert all(type(checks[k]) is float for k in
+               ("bits", "floor", "ceiling", "argmax_marginal"))
+
+
+def test_estimator_checks_report_the_real_estimators_numbers_on_a_real_posterior():
+    """The other half: on the fixture's own posterior the numbers on the record
+    are the estimators' own, finite, and inside the derived ceiling's range.
+    `test_estimator_checks_report_the_numbers_not_only_the_booleans` pins which
+    key holds which estimator; this pins that the figures are not placeholders."""
     probs = _probs()
     checks = script.estimator_checks(probs)
     assert checks["bits"] == pytest.approx(bits_carried(probs))
@@ -886,7 +923,8 @@ def test_the_check_flags_are_exactly_the_three_booleans():
 
 CAPACITY_KEYS = {
     "bits", "ci_low", "ci_high", "confidence", "n_episodes",
-    "frame_share", "frame_low", "frame_high", "frame_ridge", "frame_ridge_selected",
+    "frame_share", "frame_low", "frame_high", "frame_confidence", "frame_resamples",
+    "frame_ridge", "frame_ridge_selected",
     "live", "prior_bits", "redundancy_bits", "redundancy_floor", "checks", "rows",
 }
 
@@ -1074,22 +1112,190 @@ def test_the_frame_interval_bounds_are_measurements_and_not_float_debris():
     """A per-draw denominator makes this interval explode, and the explosion is
     silent: `capacity_arm` accepts any finite bound.
 
-    `post_probs` spans 33 orders of magnitude, so a softmax column sitting at
-    1e-33 is `max > min` live and has a healthy full-sample variance only
+    `post_probs` spans 32 orders of magnitude, so a softmax column sitting at
+    7e-33 is `max > min` live and has a healthy full-sample variance only
     because it is large in SOME episodes. A bootstrap draw that misses those
-    episodes leaves it effectively constant -- SST 7e-21 against an SSE of order
-    1 -- and its R^2 reads -3e16. MEASURED ON THIS FIXTURE: one draw in 200 read
-    -3.8e14 for the mean over 1024 columns, with 733 of them past -1000, and the
-    degenerate columns' draw-to-full SST ratios (5.6e-18 to 8.2e-4) overlap the
-    healthy ones, so no tolerance separates them.
+    episodes leaves it effectively constant. MEASURED ON THIS FIXTURE, with the
+    denominator recomputed per draw as `probe._block_bootstrap_ci` does, over
+    this test's own draws (200, `seed=0`): the worst column-draw has SST 4.1e-32
+    against an SSE of 1.9e-4 and reads R^2 -4.6e27; 77 of the 200 draws read a
+    mean below -1000, the worst -4.7e24, with 790 of the 1024 columns past -1000
+    in that draw. The draw-to-full SST ratios of the degenerate columns (4.9e-30
+    to 1.0e-3) overlap the healthy ones' (8.2e-6 to 4.5), so no tolerance
+    separates them. The figures depend on the draw sequence; the conclusion does
+    not.
 
     So `_r2_stats` holds the denominator at the full sample's variance, and the
     bound this asserts is the one that regression would destroy. The window is
     deliberately loose -- this fixture has 6 clusters and a genuinely wide
-    interval -- because the defect it catches is 14 orders of magnitude away."""
+    interval -- because the defect it catches is more than 20 orders of
+    magnitude away."""
     cell = script.cell_capacity(_splits(), seed=0, resamples=200)
     assert -5.0 < cell["frame_low"] <= cell["frame_share"] <= cell["frame_high"] < 5.0
     assert cell["frame_low"] < cell["frame_high"], "a collapsed interval is not one"
+
+
+def _frame_inputs():
+    """The arguments `frame_probe` takes, built the way `cell_capacity` builds
+    them: the scored split's own varying columns and episode labels."""
+    fit, select, score = _splits()
+    columns = script._varying_columns(np.asarray(score["post_probs"], dtype=np.float64))
+    return fit, select, score, columns, np.asarray(score["episode"])
+
+
+SEED_TEST_RESAMPLES = 50
+"""Draws for the seed test -- NOT the protocol's `RESAMPLES`, and on purpose.
+
+Measured on this fixture, `frame_low` at seeds 0 / 1 / 2:
+
+    50 draws      -0.3083  -0.4114  -0.8526     (seeds 1 and 2 are 0.441 apart)
+    1000 draws    -0.5460  -0.6109  -0.6018     (seeds 1 and 2 are 0.009 apart)
+
+A percentile bound's sampling noise falls with the draw count, so the seed's
+footprint on the interval is largest where draws are few. At the protocol's 1000
+the seeds read 0.009 apart, and a test there would have to claim a margin its own
+measurement does not support. 50 draws is where the effect is plainly visible,
+and the call costs ~0.03 s."""
+
+SEED_TEST_MARGIN = 0.1
+"""Chosen from the measurement above: a quarter of the 0.441 that seeds 1 and 2
+are measured apart at `SEED_TEST_RESAMPLES`. An implementation that ignores its
+seed reads a gap of EXACTLY 0.0, so any margin up to the measured gap tells the
+two apart; this one is wide enough that float debris cannot pass for a moved
+interval and narrow enough to leave the measurement 4x of room."""
+
+
+def test_the_frame_intervals_seed_is_used_and_not_merely_passed():
+    """THE SEED IS DRAWN FROM, not just handed over.
+
+    A STANDING HAZARD, NAMED: A TEST THAT ASSERTS A VALUE WAS PASSED RATHER THAN
+    USED. Asserting a call's arguments proves the HAND-OFF, never the behaviour.
+    `test_every_estimator_call_gets_the_cells_own_bootstrap_seed` wraps
+    `frame_probe` and reads `kwargs["seed"]`, so a `frame_probe` whose body says
+    `default_rng(0)` receives the cell's seed, satisfies the Counter, and passes
+    -- which a text-mutated copy of this file did, with all 88 tests green. An
+    earlier milestone shipped every cell sharing one bootstrap seed, which
+    correlates the interval noise the seeds x arms agreement rule treats as
+    independent; the Counter pins that no caller defaults the seed, and this
+    pins that the callee does not either.
+
+    `frame_share` IS IDENTICAL ACROSS THE TWO SEEDS, and that identity is what
+    makes this a test of the INTERVAL'S seed rather than of the measurement: the
+    point estimate has no randomness in it (`_r2_from_stats` at every episode
+    once), so a `frame_low` that moves while `frame_share` does not can only have
+    moved because the DRAWS did. Were the point estimate seed-dependent, a moving
+    bound could be the measurement and the test would be asserting nothing about
+    the bootstrap.
+
+    Measured at `SEED_TEST_RESAMPLES` draws on this fixture: frame_share 0.2615
+    at every seed; frame_low -0.3083 / -0.4114 / -0.8526 at seeds 0 / 1 / 2.
+    Seeds 1 and 2 are 0.441 apart and `SEED_TEST_MARGIN` is a quarter of that.
+
+    WHAT WRONG IMPLEMENTATION EACH ASSERTION CATCHES. The gap catches a constant
+    or ignored seed (`default_rng(0)`): the gap is exactly 0.0. The repeat
+    catches an UNSEEDED generator (`default_rng()`), which would pass the gap
+    and make every record unreproducible."""
+    splits = _splits()
+    one = script.cell_capacity(splits, seed=1, resamples=SEED_TEST_RESAMPLES)
+    two = script.cell_capacity(splits, seed=2, resamples=SEED_TEST_RESAMPLES)
+    again = script.cell_capacity(splits, seed=1, resamples=SEED_TEST_RESAMPLES)
+
+    assert one["frame_share"] == two["frame_share"], (
+        "the point estimate must not depend on the seed, or a moving frame_low "
+        "is not evidence about the interval's draws"
+    )
+    gap = abs(one["frame_low"] - two["frame_low"])
+    assert gap > SEED_TEST_MARGIN, (
+        f"seeds 1 and 2 put frame_low {gap:.4f} apart; this fixture measures "
+        f"0.441 at {SEED_TEST_RESAMPLES} draws and the margin is "
+        f"{SEED_TEST_MARGIN}. The frame interval is not drawing from its seed"
+    )
+    assert (again["frame_low"], again["frame_high"]) == (
+        one["frame_low"], one["frame_high"],
+    ), "the same seed twice must give the same interval"
+
+
+def test_the_record_says_what_level_and_how_many_draws_the_frame_interval_took():
+    """`confidence` on the record is `bits_interval`'s and describes the `bits`
+    interval ONLY; a reader taking it to describe the frame interval too would
+    be assuming the project's standard bootstrap, which the frame interval
+    deliberately is not (its denominator is held at the full sample). So the
+    frame interval carries its own level and draw count.
+
+    The values are asserted, not merely the keys. Each is compared to a number
+    this test did not take from the code under test: `CONFIDENCE` and
+    `RESAMPLES` are the protocol's own constants, and `FEW_RESAMPLES` is chosen
+    to differ from `RESAMPLES`, so an implementation that hardcodes the draw
+    count (or ignores the argument) fails at the first call, and one that halves
+    the confidence fails at the second.
+
+    A RECORDED VALUE IS AN ECHO, so the bounds are ALSO compared to a direct
+    `frame_probe` call at the protocol's level and the stated draws: a
+    `cell_capacity` that recorded `CONFIDENCE` while handing `frame_probe`
+    something else would read the right keys beside the wrong interval."""
+    splits = _splits()
+    cell = script.cell_capacity(splits, seed=0, resamples=FEW_RESAMPLES)
+    assert type(cell["frame_confidence"]) is float
+    assert cell["frame_confidence"] == CONFIDENCE
+    assert type(cell["frame_resamples"]) is int
+    assert cell["frame_resamples"] == FEW_RESAMPLES != RESAMPLES
+
+    fit, select, score, columns, groups = _frame_inputs()
+    direct = script.frame_probe(
+        fit, select, score, columns=columns, groups=groups,
+        resamples=FEW_RESAMPLES, confidence=CONFIDENCE, seed=0,
+    )
+    assert (cell["frame_low"], cell["frame_high"]) == (
+        direct["frame_low"], direct["frame_high"],
+    ), "cell_capacity's frame interval is not the one the protocol's level gives"
+
+    # The production call: `measure_cell` never passes `resamples`.
+    production = script.cell_capacity(splits, seed=0)
+    assert production["frame_resamples"] == RESAMPLES
+    assert production["frame_confidence"] == CONFIDENCE
+
+
+def test_the_frame_interval_is_taken_at_the_confidence_it_records():
+    """`frame_confidence` is only evidence if the interval was TAKEN at it --
+    the same hazard as the seed: a `frame_probe` that echoed its argument while
+    cutting the tails at a hardcoded 2.5% would record 0.5 beside a 95%
+    interval. Same seed, same draws, so a 50% interval must sit strictly inside
+    the 95% one at BOTH ends; an ignored `confidence` makes them identical."""
+    fit, select, score, columns, groups = _frame_inputs()
+
+    def at(confidence):
+        return script.frame_probe(
+            fit, select, score, columns=columns, groups=groups,
+            resamples=FEW_RESAMPLES, confidence=confidence, seed=0,
+        )
+
+    wide, narrow = at(0.95), at(0.50)
+    assert (wide["frame_confidence"], narrow["frame_confidence"]) == (0.95, 0.50)
+    assert wide["frame_low"] < narrow["frame_low"] <= narrow["frame_high"] < wide["frame_high"]
+
+
+def test_the_frame_interval_takes_the_number_of_draws_it_records(monkeypatch):
+    """`frame_resamples` is only evidence if that many draws were taken. Counted
+    as a DIFFERENCE between two runs, so the one extra evaluation that produces
+    the point estimate drops out and the test does not depend on how it is
+    computed: 30 draws must cost exactly 20 more bootstrap evaluations than 10.
+    A loop of a hardcoded length costs 0 more."""
+    fit, select, score, columns, groups = _frame_inputs()
+    real, calls = script._r2_from_stats, []
+    monkeypatch.setattr(
+        script, "_r2_from_stats", lambda *a: calls.append(1) or real(*a),
+    )
+
+    def evaluations(resamples):
+        calls.clear()
+        out = script.frame_probe(
+            fit, select, score, columns=columns, groups=groups,
+            resamples=resamples, seed=0,
+        )
+        assert out["frame_resamples"] == resamples
+        return len(calls)
+
+    assert evaluations(30) - evaluations(10) == 20
 
 
 def test_frame_probe_refuses_columns_that_do_not_vary_on_the_scored_rows():

@@ -224,18 +224,27 @@ def gather_once(prepared, train, val, *, seed: int):
         raise ValueError("no training episodes to fit the capacity probe on")
     select_paths = used[FIT_EPISODES:FIT_EPISODES + SELECT_EPISODES]
 
-    def gather(paths, draw: int, limit: int):
+    def gather(paths, draw: int):
+        # `limit=len(paths)`: THE SLICES ABOVE ARE THE CAP, and this argument
+        # never is. The `used[...]` slices bind because they also PARTITION the
+        # pool -- `select_paths` starts exactly where `fit_paths` ends -- and
+        # because `measure_cell` records the same slices as `episodes.fit` and
+        # `episodes.select`. A second cap here (`limit=FIT_EPISODES`) could only
+        # ever agree with the slice, and the day it did not it would silently
+        # drop episodes the record says were used. `probe.filtering_gain`
+        # gathers its fit and select splits the same way. The scored split has
+        # no slice, so `len(scored)` is what takes every validation episode.
         return gather_probe_data(
             prepared.model, paths,
             prepared.common["feature_backbone"], prepared.common["device"],
             context=prepared.context, horizon=prepared.horizon,
-            limit=limit, seed=draw,
+            limit=len(paths), seed=draw,
         )
 
     return (
-        gather(fit_paths, seed, FIT_EPISODES),
-        gather(select_paths, seed + 2, SELECT_EPISODES) if select_paths else None,
-        gather(scored, seed + 1, len(scored)),
+        gather(fit_paths, seed),
+        gather(select_paths, seed + 2) if select_paths else None,
+        gather(scored, seed + 1),
     )
 
 
@@ -386,6 +395,9 @@ def _flat_probs(data: dict) -> np.ndarray:
 def _varying_columns(probs: np.ndarray) -> np.ndarray:
     """Which of the flattened columns vary across the rows: `max > min`.
 
+    `probs` is `(N, z_cats, z_classes)`, as every caller passes it, and the
+    result is one boolean per FLATTENED column, `z_cats * z_classes` of them.
+
     `capacity.live_classes`' rule exactly, and for its reason: the standard
     deviation of identical float64 values is rounding noise rather than zero
     (measured, a fully collapsed code read 1013 of 1024 columns live at 300
@@ -395,7 +407,7 @@ def _varying_columns(probs: np.ndarray) -> np.ndarray:
     `cell_capacity` cross-checks the count against `live_classes` so the printed
     saturation signal cannot describe a different set of columns from the
     `frame_share` beside it."""
-    flat = probs.reshape(probs.shape[0], -1) if probs.ndim == 3 else probs
+    flat = probs.reshape(probs.shape[0], -1)
     return flat.max(axis=0) > flat.min(axis=0)
 
 
@@ -413,18 +425,29 @@ def _r2_stats(predicted: np.ndarray, targets: np.ndarray, groups: np.ndarray) ->
     ci`, which recomputes `_mean_r2` -- numerator AND denominator -- on each
     draw's rows. It has to, and here is the measurement that says so.
 
-    `post_probs` spans 33 orders of magnitude: a softmax column whose
-    probability sits at 1e-33 is `max > min` live, and its full-sample `SST` is
-    a healthy 1e-3 only because the column is large in SOME episodes. Draw a
-    bootstrap sample that happens to miss those episodes and the column is
-    effectively constant inside the draw -- `SST` 7e-21 against an `SSE` of
-    order 1 -- so its R^2 reads -3e16 and the mean over 1024 columns reads
-    -3.8e14. Measured on this file's own fixture at 6 clusters, in 1 draw of
-    200: 733 of 1024 columns past -1000. And there is NO clean threshold that
-    separates them: the degenerate columns' draw-to-full `SST` ratios run from
-    5.6e-18 up to 8.2e-4, overlapping the healthy ones, so excluding them by
-    tolerance is a guess rather than a rule. A lower bound of -3.8e14 is not a
-    measurement, and `capacity_arm` would accept it as one.
+    `post_probs` spans 32 orders of magnitude: a softmax column whose
+    probability sits at 7e-33 is `max > min` live, and its full-sample `SST` is
+    a healthy 1e-3 or more (the smallest of the 1024 is 7.9e-4) only because the
+    column is large in SOME episodes. Draw a bootstrap sample that happens to
+    miss those episodes and the column is effectively constant inside the draw.
+    Measured on this file's own fixture -- 6 clusters, `frame_probe`'s own
+    draw sequence at `seed=0`, 200 draws, the denominator recomputed per draw
+    the way `probe._block_bootstrap_ci` does it: the worst column-draw has `SST`
+    4.1e-32 against an `SSE` of 1.9e-4, so its R^2 reads -4.6e27; 77 of the 200
+    draws read a mean R^2 below -1000 and the worst reads -4.7e24; the worst
+    draw has 790 of the 1024 columns past -1000. And there is NO clean
+    threshold that separates them: the draw-to-full `SST` ratio of the columns
+    past -1000 runs from 4.9e-30 up to 1.0e-3, and that of the columns NOT past
+    -1000 from 8.2e-6 up to 4.5, so the two ranges overlap by two orders of
+    magnitude and excluding the degenerate columns by tolerance is a guess
+    rather than a rule. A lower bound of -4.7e24 is not a measurement, and
+    `capacity_arm` would accept it as one.
+
+    THE FIGURES DEPEND ON THE DRAW SEQUENCE and the conclusion does not: at
+    seeds 1, 2 and 3 of the same 200 draws, 66, 73 and 52 draws fall below
+    -1000 with worst means of -1.3e24, -1.7e37 and -6.0e24. (`rng.choice` and the
+    precedent's `integers` draw the same indices, so `seed=0` reads identically
+    through either.)
 
     So each draw's R^2 compares the draw's MEAN squared residual against the
     column's full-sample variance:
@@ -507,6 +530,20 @@ def frame_probe(fit: dict, select: dict | None, score: dict, *, columns: np.ndar
     The bootstrap groups on EPISODES, never windows: several non-overlapping
     windows cut from one trajectory are not independent observations, and every
     reading from M3e onward clusters on episodes.
+
+    THIS INTERVAL IS NOT THE PROJECT'S STANDARD BOOTSTRAP, and the return value
+    says what it IS. `_r2_stats` holds each column's R^2 DENOMINATOR at the full
+    sample's variance rather than resampling it, as `probe._block_bootstrap_ci`
+    does, because resampling it puts the mean R^2 below -1000 in 77 of 200
+    draws on the file's own fixture (worst -4.7e24). `frame_confidence` and
+    `frame_resamples` are the level and the draw count the interval was
+    ACTUALLY TAKEN AT -- the arguments this function used, not a claim made by
+    its caller -- so a reader of the record does not take `bits`' `confidence`
+    to describe it.
+
+    Returns `frame_share`, `frame_low`, `frame_high`, `frame_confidence`,
+    `frame_resamples`, `frame_ridge` and `frame_ridge_selected`. Only
+    `frame_low` is compared to a cut downstream.
     """
     if not np.any(columns):
         raise ValueError(
@@ -558,6 +595,8 @@ def frame_probe(fit: dict, select: dict | None, score: dict, *, columns: np.ndar
         "frame_share": _r2_from_stats(stats, index),
         "frame_low": float(low),
         "frame_high": float(high),
+        "frame_confidence": float(confidence),
+        "frame_resamples": int(resamples),
         "frame_ridge": probe["ridge"],
         "frame_ridge_selected": select is not None,
     }
@@ -587,6 +626,19 @@ def cell_capacity(gathered, *, seed: int, resamples: int = RESAMPLES) -> dict:
     `resamples` defaults to the protocol's `RESAMPLES` and `measure_cell` never
     passes it, so a production run cannot depart from the pre-registered figure.
     It exists so a test that asserts on no interval width can pay for fewer.
+
+    TWO INTERVALS, TWO METHODS, AND THE RECORD SAYS WHICH IS WHICH. `confidence`
+    and `n_episodes` come from `bits_interval` and describe the `bits` interval
+    ONLY. The frame interval carries its own `frame_confidence` and
+    `frame_resamples`, because a reader taking the one `confidence` to describe
+    both would be assuming the frame interval is the project's standard
+    bootstrap -- and it deliberately is not: `frame_probe` HOLDS THE R^2
+    DENOMINATOR AT THE FULL SAMPLE instead of resampling it, as
+    `probe._block_bootstrap_ci` does (see `_r2_stats` for the measurement that
+    forces it). That makes the frame interval slightly NARROWER than a
+    fully-resampled one, and `frame_low` -- the only frame number Reading G
+    compares to a cut -- inherits it. `bits_interval` does not record its draw
+    count; `cell_capacity` hands both the same `resamples`.
 
     THE SCORED ROWS MUST BE IN TEMPORAL ORDER (`require_temporal_order`),
     checked first, before anything is paid for.
