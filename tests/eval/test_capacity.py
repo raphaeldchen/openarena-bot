@@ -11,9 +11,9 @@ import numpy as np
 import pytest
 
 from mbfps.eval.capacity import (
-    CEILING_BITS, FRAME_CUT, PAIR_CEILING_BITS, RATIO_MIN_FLOOR, READING_COLUMNS,
-    READING_WIDTHS, SPARE_CUT, CapacityArm, CapacityInputs, _pair_mutual_information,
-    argmax_marginal_bits, bits_carried, bits_interval, capacity_arm, ceiling_bits,
+    CEILING_BITS, FRAME_CUT, PAIR_CEILING_BITS, RATIO_MIN_FLOOR, RATIO_SHOWN_MAX,
+    READING_COLUMNS, READING_WIDTHS, SPARE_CUT, CapacityArm, CapacityInputs,
+    _pair_mutual_information, _ratio_cell, argmax_marginal_bits, bits_carried, bits_interval, capacity_arm, ceiling_bits,
     entropy_bits, episode_stats, floor_bits, format_reading_capacity, live_classes,
     reading_capacity, redundancy_bits, redundancy_floor, redundancy_ratio,
 )
@@ -943,13 +943,13 @@ def test_the_capacity_bound_rule_sends_the_reader_to_both_companions():
     not establish "the capacity is in use" -- the one positive claim this status
     rests on. A CAPACITY_BOUND verdict beside a redundancy ratio far above 1, or
     beside a low `live` count, contradicts itself, so the rule has to name the
-    two columns that make a reading interpretable, and they have to be columns
-    the table actually prints."""
+    two columns that make a reading interpretable. (That they are columns the
+    table actually prints is pinned by the literal in
+    `test_reading_columns_and_widths_stay_the_same_length`.)"""
     reading = reading_capacity(_inputs())
     assert reading.status == "CAPACITY_BOUND"
     for column in ("red_ratio", "live"):
         assert column in reading.rule, f"the rule never names {column}"
-        assert column in READING_COLUMNS, f"{column} is not a column of the table"
     assert "upper bound" in reading.rule
 
 
@@ -1252,6 +1252,69 @@ def test_reading_g_refuses_inputs_that_cannot_support_a_reading():
             whole, controls={**whole.controls, "stray": True}))
 
 
+def test_reading_g_refuses_a_seed_count_below_seeds_required():
+    """A shared `seeds_total` under `SEEDS_REQUIRED` makes BOTH objective-lever
+    statuses structurally unreachable -- no arm can clear in seeds it does not
+    have -- so the reading falls through to CAPACITY_BOUND. That is a DIRECTIONAL
+    verdict that stands by default, so a run too small to clear either bar read
+    the bottleneck lever "by default", under a caption of "2 of 1 seeds". (The
+    sibling `width.reading_contrast` refuses the same input; its fall-through is
+    the non-directional INDISTINGUISHABLE, and this one is worse.)
+
+    The fixture is the case where it is most wrong: every arm's ONE seed cleared
+    the spare cut, and the arm still cannot vote. Unreachable through
+    `capacity_arm`, which refuses an under-seeded arm, so it only bites a
+    hand-built `CapacityArm`. It clears every guard ahead of it: three arms
+    (>= ARMS_REQUIRED), and a base and controls naming exactly those arms, with
+    ONE shared `seeds_total` so it is the low bound that fires and not the
+    mixed-count refusal. Exactly `SEEDS_REQUIRED` seeds is read, so the bound is
+    not over-tight."""
+    assert SEEDS_REQUIRED > 1
+    one_seed = _inputs({a: _arm(SPARE, UNFRAMEY, seeds_total=1) for a in ARMS})
+    lone = one_seed.arms[ARMS[0]]
+    assert lone.seeds_spare == lone.seeds_total == 1 and not lone.clears_spare(), (
+        "premise: the arm's only seed cleared and the arm still cannot vote"
+    )
+    with pytest.raises(ValueError, match="below SEEDS_REQUIRED"):
+        reading_capacity(one_seed)
+
+    # Refused before ANY status, the UNRESOLVED ones included: a reading handed
+    # back and only refused at print time is the verdict a caller acted on.
+    broken = dataclasses.replace(one_seed, controls={**one_seed.controls, ARMS[0]: False})
+    with pytest.raises(ValueError, match="below SEEDS_REQUIRED"):
+        reading_capacity(broken)
+
+    at_bar = _inputs({a: _arm(SPARE, UNFRAMEY, seeds_total=SEEDS_REQUIRED) for a in ARMS})
+    assert reading_capacity(at_bar).status == "SPARE_CAPACITY"
+    full_at_bar = _inputs({a: _arm(FULL, UNFRAMEY, seeds_total=SEEDS_REQUIRED) for a in ARMS})
+    assert reading_capacity(full_at_bar).status == "CAPACITY_BOUND"
+
+
+def test_reading_g_refuses_arms_that_disagree_on_their_seed_count():
+    """A mixed table has no true "N of M seeds" caption -- M is different per
+    row. Refused at the READING, not only at the printing: the reading used to
+    accept this and return SPARE_CAPACITY, and only `format_reading_capacity`
+    then raised, so a caller had already acted on a verdict (and an exit code)
+    the formatter would not print. (The formatter's own guard is pinned
+    separately, by handing it mixed arms alone.)
+
+    Every count is at or above `SEEDS_REQUIRED`, so it is the mixed-count
+    refusal that fires and not the low bound, and every arm clears the spare cut
+    so that, unrefused, the reading has a status to hand back. The fixture clears
+    the guards ahead of it: three arms, and a base and controls naming exactly
+    those arms."""
+    mixed = _inputs({
+        "frozen_ssl": _arm(SPARE, UNFRAMEY, seeds_total=3),
+        "pixel_ae": _arm(SPARE, UNFRAMEY, seeds_total=3),
+        "random_vit": _arm(SPARE, UNFRAMEY, seeds_total=5),
+    })
+    assert all(a.seeds_total >= SEEDS_REQUIRED for a in mixed.arms.values())
+    assert all(a.clears_spare() for a in mixed.arms.values())
+    with pytest.raises(ValueError, match="must share one seeds_total") as excinfo:
+        reading_capacity(mixed)
+    assert "'random_vit': 5" in str(excinfo.value), "the refusal names the arm that differs"
+
+
 def test_the_cut_is_on_the_interval_not_the_point_estimate():
     """A point estimate on the clearing side of the cut whose interval straddles
     it must NOT clear. Half the capacity idle is a claim, and a claim needs an
@@ -1362,9 +1425,21 @@ def test_capacity_arm_refuses_a_measurement_it_cannot_read():
         ("frame_share", 0.05, "outside its own interval"),
         ("redundancy_floor", float("nan"), "non-finite"),
         ("redundancy_bits", float("inf"), "non-finite"),
+        # `live` is a count of the CATS * CLASSES columns. `inf` used to raise an
+        # OverflowError out of `int()` and a negative went straight through.
+        ("live", float("inf"), "non-finite"),
+        ("live", float("nan"), "non-finite"),
+        ("live", -1, "not a count"),
+        ("live", CATS * CLASSES + 1, "not a count"),
+        ("live", 3.5, "not a count"),
     ):
         with pytest.raises(ValueError, match=rf"seed index 1\b.*{match}"):
             capacity_arm([ok, {**ok, field: value}, ok])
+
+    # Both ends of the range are LEGAL: zero is a fully collapsed code, a real
+    # outcome of this milestone, and the full column count is a code using all of it.
+    for live in (0, CATS * CLASSES):
+        assert capacity_arm([_seed(live=live)] * SEEDS_REQUIRED).live == live
 
     with pytest.raises(ValueError, match="at least"):
         capacity_arm([ok] * (SEEDS_REQUIRED - 1))
@@ -1484,6 +1559,27 @@ def test_the_bars_follow_retention_when_retention_changes(monkeypatch):
     with pytest.raises(ValueError, match="ARMS_REQUIRED=3"):
         fresh.reading_capacity(inputs({"a": arm(3), "b": arm(3)}))
 
+    # The seed-count guard is a third reader of `SEEDS_REQUIRED`: two seeds per arm
+    # clears the shipped bar (2) and not this one (3).
+    two_seeds = {a: dataclasses.replace(x, seeds_total=2) for a, x in three_of_three.items()}
+    with pytest.raises(ValueError, match="SEEDS_REQUIRED=3"):
+        fresh.reading_capacity(inputs(two_seeds))
+
+    # ...and the table's `clears` column is a fourth, which nothing above reaches:
+    # it never calls the formatter. At the shipped bar a column written `>= 2`
+    # (the literal re-spelled) agrees with the import, and so does one written
+    # `> 0` for any tally of 0 or all 3. Tallies of 2 -- ON the shipped bar, one
+    # under the new one -- are what tell the import from a literal.
+    four = {"w": arm(2, 2), "x": arm(3, 2), "y": arm(2, 3), "z": arm(3, 3)}
+    table = fresh.format_reading_capacity(
+        fresh.reading_capacity(inputs(four)), inputs(four)
+    )
+    assert {a: _parse_row(_table_line(table, a))["clears"] for a in four} == {
+        "w": "no", "x": "spare", "y": "frame", "z": "spare+frame"}, (
+        "the clears column must follow the imported SEEDS_REQUIRED (3 here), "
+        "not a literal 2 and not 'any seed at all'"
+    )
+
 
 def test_the_table_pins_every_column_to_the_arm_it_came_from():
     """This project has shipped a table whose caption disagreed with its
@@ -1577,6 +1673,124 @@ def test_an_arm_that_clears_both_senses_is_labelled_so_in_the_table():
     # ...and each label agrees with the tuple the reading reports for that sense.
     assert {a for a, c in clears.items() if "spare" in c} == set(reading.arms_spare)
     assert {a for a, c in clears.items() if "frame" in c} == set(reading.arms_frame)
+
+
+def test_the_clears_column_sits_on_the_bar_not_on_any_non_zero_tally():
+    """Every other formatted fixture has a tally of 0 or ALL its seeds, so a column
+    written `seeds > 0` printed the right label in every one: an arm with ONE
+    clearing seed printed `spare` beside a CAPACITY_BOUND verdict and an empty
+    `arms_spare`, one tally printed beside a verdict read from a different bar.
+    The existing cross-check could not see it, because both of its sides come from
+    the one `clears_spare()` predicate, so it detects two call sites disagreeing
+    and never a wrong bar in both.
+
+    A threshold is only pinned by a fixture sitting ON it. Four arms, each
+    sense at `SEEDS_REQUIRED - 1` and at `SEEDS_REQUIRED` -- and the expected
+    labels are spelled out below, never computed from the predicate. At the
+    shipped bar of 2 of 3: `> 0` fails the one-short arms, `>= seeds_total` and
+    `> SEEDS_REQUIRED` fail the at-bar ones, and an interval-based column fails
+    all four (every interval here clears). A literal `>= 2` agrees at the shipped
+    value and is caught under a re-barred module, in
+    `test_the_bars_follow_retention_when_retention_changes`."""
+    bar = SEEDS_REQUIRED
+    assert 0 < bar - 1 and bar < SEEDS_TOTAL, "room for a non-zero tally below the bar"
+    arms = {
+        "frozen_ssl": _arm(SPARE, FRAMEY, seeds_spare=bar - 1, seeds_frame=bar - 1),
+        "pixel_ae": _arm(SPARE, FRAMEY, seeds_spare=bar, seeds_frame=bar - 1),
+        "random_vit": _arm(SPARE, FRAMEY, seeds_spare=bar - 1, seeds_frame=bar),
+        "clip": _arm(SPARE, FRAMEY, seeds_spare=bar, seeds_frame=bar),
+    }
+    inputs = _inputs(arms)
+    text = format_reading_capacity(reading_capacity(inputs), inputs)
+    assert {a: _parse_row(_table_line(text, a))["clears"] for a in arms} == {
+        "frozen_ssl": "no", "pixel_ae": "spare", "random_vit": "frame",
+        "clip": "spare+frame",
+    }
+
+
+@pytest.mark.parametrize("status, base_r2, controls", [
+    ("UNRESOLVED_ESTIMATOR", BASE_HOLDS,
+     {"frozen_ssl": True, "pixel_ae": False, "random_vit": True}),
+    ("UNRESOLVED_BASE", dict.fromkeys(ARMS, BASE_FAILS), None),
+])
+def test_the_clears_column_is_each_arms_own_even_under_a_verdict_that_takes_no_reading(
+    status, base_r2, controls,
+):
+    """The `clears` column is computed BEFORE the gates, so under an UNRESOLVED
+    verdict -- where `reading.arms_*` are empty because no arm votes -- it still
+    prints what each arm's own seeds cleared. That is the widest the column and
+    the verdict ever disagree, and the legend says so; the divergence this
+    project has shipped three times is a column disagreeing with a verdict
+    UNANNOUNCED. Pinned in both UNRESOLVED branches, on arms that clear `spare`,
+    `frame` and both, so a column read from `reading.arms_*` (all `no` here), or
+    one blanked out under UNRESOLVED, is caught, and so is a legend that stops
+    saying the column is pre-gate."""
+    arms = {"frozen_ssl": _arm(SPARE, FRAMEY), "pixel_ae": _arm(SPARE, UNFRAMEY),
+            "random_vit": _arm(FULL, FRAMEY)}
+    inputs = _inputs(arms, base_r2=base_r2, controls=controls)
+    reading = reading_capacity(inputs)
+    assert reading.status == status
+    assert reading.arms_spare == () and reading.arms_frame == (), "no arm votes here"
+
+    text = format_reading_capacity(reading, inputs)
+    assert {a: _parse_row(_table_line(text, a))["clears"] for a in ARMS} == {
+        "frozen_ssl": "spare+frame", "pixel_ae": "spare", "random_vit": "frame"}
+    (legend,) = [ln for ln in text.splitlines() if ln.split()[:1] == ["live"]]
+    assert "before the gates" in legend
+    assert text.splitlines()[-1].startswith(f"  verdict: {status.replace('_', ' ')} --")
+
+
+def test_a_huge_ratio_cannot_shift_the_row_it_sits_in():
+    """`redundancy_ratio` is unbounded above: `RATIO_MIN_FLOOR` is 1e-9, so a floor
+    of 2e-9 and a redundancy of 5 bits make a ratio of 2.5e9, which printed
+    fixed-point is a 14-character cell in an 11-wide column. Measured, the row
+    read `live` as `10242500000000.000` and `clears` as `000        sp` -- the two
+    cells a reader checks a CAPACITY_BOUND verdict against, unparseable.
+
+    Every row must stay as long as the header and keep `live` and `clears`
+    intact, at both signs (a hand-built arm can carry a negative redundancy) and at
+    overflow to infinity. `live` is 777, not the default 1024, so it is not a
+    string that merely looks like the fused one."""
+    arms = {
+        "frozen_ssl": _arm(SPARE, FRAMEY, live=777, redundancy=(5.0, 2e-9)),
+        "pixel_ae": _arm(FULL, UNFRAMEY, live=777, redundancy=(-5.0, 2e-9)),
+        "random_vit": _arm(FULL, UNFRAMEY, live=777, redundancy=(1e308, 1e-9)),
+        "clip": _arm(FULL, UNFRAMEY, live=777, redundancy=(0.065, 0.064)),
+    }
+    inputs = _inputs(arms)
+    text = format_reading_capacity(reading_capacity(inputs), inputs)
+    header = _table_line(text, "arm")
+    expected = {"frozen_ssl": (">9999", "spare+frame"), "pixel_ae": ("<-9999", "no"),
+                "random_vit": (">9999", "no"), "clip": ("1.016", "no")}
+    for name, (ratio, clears) in expected.items():
+        line = _table_line(text, name)
+        assert len(line) == len(header), f"{name}'s row is {len(line)} wide, not {len(header)}"
+        row = _parse_row(line)
+        assert (row["live"], row["red_ratio"], row["clears"]) == ("777", ratio, clears)
+
+    # The cap is ON the boundary, in both directions: a ratio AT it is a number, one
+    # past it is the sentinel -- `abs(ratio) > cap` and not `>=`, and not a literal.
+    assert _ratio_cell(RATIO_SHOWN_MAX) == f"{RATIO_SHOWN_MAX:.3f}" == "9999.000"
+    assert _ratio_cell(-RATIO_SHOWN_MAX) == "-9999.000"
+    assert _ratio_cell(RATIO_SHOWN_MAX + 0.5) == ">9999"
+    assert _ratio_cell(-RATIO_SHOWN_MAX - 0.5) == "<-9999"
+
+
+def test_the_ratio_cap_and_its_legend_follow_the_module_constant():
+    """A literal 9999 in the cell or the legend reads right at the shipped value and
+    wrong everywhere else; the same discipline as every number in the caption."""
+    import mbfps.eval.capacity as capacity
+
+    arms = {"frozen_ssl": _arm(FULL, UNFRAMEY, redundancy=(6.0, 0.1)),
+            "pixel_ae": _arm(FULL, UNFRAMEY, redundancy=(4.0, 0.1)),
+            "random_vit": _arm(FULL, UNFRAMEY, redundancy=(0.065, 0.064))}
+    inputs = _inputs(arms)
+    with patch.object(capacity, "RATIO_SHOWN_MAX", 50.0):
+        text = format_reading_capacity(reading_capacity(inputs), inputs)
+    assert [_parse_row(_table_line(text, a))["red_ratio"] for a in sorted(arms)] == [
+        ">50", "40.000", "1.016"]
+    (legend,) = [ln for ln in text.splitlines() if ln.split()[:1] == ["red_ratio"]]
+    assert "'>50'" in legend and "9999" not in legend
 
 
 def test_the_base_and_estimator_lines_report_each_arm_as_it_was_given():
@@ -1704,17 +1918,29 @@ def test_the_caption_uses_the_inputs_and_the_derived_ceiling_not_literals():
     assert "the 3-arm bar" in text, "the legend's bar is ARMS_REQUIRED, not a literal"
 
 
-def test_arms_that_disagree_on_the_seed_count_have_no_true_caption():
-    """'2 of N seeds' would be true of some rows and false of others."""
-    arms = {"frozen_ssl": _arm(FULL, UNFRAMEY, seeds_total=3),
-            "pixel_ae": _arm(FULL, UNFRAMEY, seeds_total=3),
-            "random_vit": _arm(FULL, UNFRAMEY, seeds_total=5)}
-    inputs = CapacityInputs(
-        arms=arms, base={a: _base(BASE_HOLDS, arms[a].seeds_total) for a in arms},
-        controls=dict.fromkeys(arms, True), clusters=24, rows=11221,
-    )
+def test_the_formatter_refuses_arms_that_have_no_true_caption():
+    """'2 of N seeds' would be true of some rows and false of others, and a caption
+    of '2 of 1 seeds' is a rule no row can satisfy; an arm-less input has no common
+    count to print either.
+
+    The reading is built from a LEGAL input and only the formatter is handed the
+    bad arms: `reading_capacity` refuses them itself, so feeding it the bad input
+    would test the reading's guard and not this one."""
+    legal = _inputs()
+    reading = reading_capacity(legal)
+
+    mixed = _inputs({"frozen_ssl": _arm(FULL, UNFRAMEY, seeds_total=3),
+                     "pixel_ae": _arm(FULL, UNFRAMEY, seeds_total=3),
+                     "random_vit": _arm(FULL, UNFRAMEY, seeds_total=5)})
     with pytest.raises(ValueError, match="share one seeds_total"):
-        format_reading_capacity(reading_capacity(inputs), inputs)
+        format_reading_capacity(reading, mixed)
+
+    one_seed = _inputs({a: _arm(FULL, UNFRAMEY, seeds_total=1) for a in ARMS})
+    with pytest.raises(ValueError, match="below SEEDS_REQUIRED"):
+        format_reading_capacity(reading, one_seed)
+
+    with pytest.raises(ValueError, match="no arms"):
+        format_reading_capacity(reading, _inputs({}))
 
 
 def test_reading_columns_and_widths_stay_the_same_length():
@@ -1726,10 +1952,20 @@ def test_reading_columns_and_widths_stay_the_same_length():
 def test_every_column_is_wider_than_the_widest_thing_it_prints():
     """The cells are right-aligned and UNSEPARATED, so a value as wide as its
     column butts against its neighbour. The widest value each column can carry:
-    the full ceiling in `bits`, 1024 live columns, `undefined`, `spare+frame`."""
+    the full ceiling in `bits`, 1024 live columns, `spare+frame`, and in
+    `red_ratio` the widest of `undefined` and every number or sentinel
+    `RATIO_SHOWN_MAX` lets through -- which used to be unbounded, so this entry
+    said `undefined` while a ratio of 2.5e9 printed 14 characters."""
+    widest_ratio = max(
+        (_ratio_cell(r) for r in (None, RATIO_SHOWN_MAX, -RATIO_SHOWN_MAX,
+                                  RATIO_SHOWN_MAX * 2, -RATIO_SHOWN_MAX * 2,
+                                  math.inf, -math.inf, 2.5e9, -2.5e9)),
+        key=len,
+    )
+    assert widest_ratio in ("undefined", "-9999.000"), widest_ratio
     widest = {"arm": "random_vit", "bits": f"{160.0:.4f}", "ci_low": f"{160.0:.4f}",
               "ci_high": f"{160.0:.4f}", "frame": f"{1.0:.4f}", "live": "1024",
-              "red_ratio": "undefined", "clears": "spare+frame"}
+              "red_ratio": widest_ratio, "clears": "spare+frame"}
     for name, width in zip(READING_COLUMNS, READING_WIDTHS, strict=True):
         assert len(widest[name]) < width, f"{name} needs more than {width}"
         assert len(name) < width

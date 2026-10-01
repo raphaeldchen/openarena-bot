@@ -1568,7 +1568,7 @@ def capacity_text(records, inputs, reading) -> str:
     conclusion -- written to `capacity.txt` and printed as the SAME string."""
 ```
 
-Every field the reading needs is read through a `_get(record, cell, *path)` that names the cell and the dotted path on a miss, as `latent_width.py` does -- including `redundancy_bits` and `redundancy_floor`, which `capacity_inputs` threads into each per-seed dict for `capacity_arm`. `capacity_text` prints, per arm, both numbers and `redundancy_ratio(arm.redundancy_bits, arm.redundancy_floor)` beside the verdict in EVERY status (`n/a` where it is None), and a test drives a collapsed cell through it. `clusters` and `rows` go through a `_one_value` that **refuses a disagreement naming the cells** rather than picking the first record's.
+Every field the reading needs is read through a `_get(record, cell, *path)` that names the cell and the dotted path on a miss, as `latent_width.py` does -- including `redundancy_bits` and `redundancy_floor`, which `capacity_inputs` threads into each per-seed dict for `capacity_arm`. `capacity_text` prints, per arm, both numbers and `redundancy_ratio(arm.redundancy_bits, arm.redundancy_floor)` beside the verdict in EVERY status (`undefined` where it is None), and a test drives a collapsed cell through it. `clusters` and `rows` go through a `_one_value` that **refuses a disagreement naming the cells** rather than picking the first record's.
 
 - [ ] **Step 4: Run them to verify they pass**
 

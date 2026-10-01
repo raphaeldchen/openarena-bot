@@ -452,7 +452,37 @@ READING_WIDTHS: tuple[int, ...] = (13, 10, 10, 10, 8, 7, 11, 13)
 
 The cells are right-aligned and unseparated, so a value as wide as its column
 butts against its neighbour and a wider one shifts the whole row. The widest
-cells are `undefined` (9) in `red_ratio` and `spare+frame` (11) in `clears`."""
+cells are `undefined` and `-9999.000` (both 9) in `red_ratio` -- which is only
+true because `RATIO_SHOWN_MAX` bounds it -- and `spare+frame` (11) in `clears`."""
+
+RATIO_SHOWN_MAX: float = 9999.0
+"""The largest `|red_ratio|` the table prints as a number; past it, a sentinel.
+
+`redundancy_ratio` is unbounded above: `RATIO_MIN_FLOOR` is 1e-9, so a floor just
+over it and a redundancy of a few bits give a ratio near 1e9. Printed fixed-point
+that is a 14-character cell in an 11-wide column, which shifts every cell to its
+right. Measured: `live` and `clears` fuse into one unparseable run, and those
+are the two cells a reader checks a `CAPACITY_BOUND` verdict against.
+
+CAPPED WITH A SENTINEL rather than switched to `{:.3g}`: the fixed-point form is
+what every other ratio in the table, the legend and the tests are written in
+(`1.000`, which has to stay distinguishable from `undefined`), and a ratio past
+this says nothing a smaller one does not. The ratio's job is "near 1, or far
+above it", and 32 fully duplicated categoricals read 78x at 11,000 rows. So it
+prints `>9999`: a bound a reader can use, and visibly not a measurement."""
+
+
+def _ratio_cell(ratio: float | None) -> str:
+    """`red_ratio` as the table prints it, in at most 9 characters.
+
+    `undefined` for None, never a bare 1.0 (see `redundancy_ratio`); a sentinel
+    past `RATIO_SHOWN_MAX` in either direction, since a hand-built arm can carry
+    a negative redundancy; otherwise fixed-point."""
+    if ratio is None:
+        return "undefined"
+    if abs(ratio) > RATIO_SHOWN_MAX:
+        return f"{'>' if ratio > 0 else '<-'}{RATIO_SHOWN_MAX:g}"
+    return f"{ratio:.3f}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -530,6 +560,14 @@ def capacity_arm(seeds: list[dict]) -> CapacityArm:
     reason: each would otherwise pass silently and read as a null.
     `retention.rung_arm` refuses the same three.
 
+    `live` is a COUNT of the `z_cats * z_classes` columns, so it is refused when
+    it is not finite, not a whole number, negative, or more than the columns
+    there are. It decides nothing, but it prints beside the verdict and the
+    legend states its range: left unchecked, `inf` raised an `OverflowError` out
+    of `int()` rather than the refusal this function owes, and a negative count
+    went through and printed. Zero is legal -- a fully collapsed code is a real
+    outcome of this milestone.
+
     The tallies are made HERE, per seed, against the interval's own end: a seed
     is spare when ITS `ci_high` is strictly below `SPARE_CUT` and framey when ITS
     `frame_low` is strictly above `FRAME_CUT`. Never the point estimate, which
@@ -544,15 +582,22 @@ def capacity_arm(seeds: list[dict]) -> CapacityArm:
         )
     fields = ("bits", "ci_low", "ci_high", "frame_share", "frame_low", "frame_high",
               "redundancy_bits", "redundancy_floor")
+    columns = RSSMConfig.z_cats * RSSMConfig.z_classes
     for i, seed in enumerate(seeds):
         for key in (*fields, "live"):
             if key not in seed:
                 raise ValueError(f"seed index {i} is missing {key}")
-        values = {k: float(seed[k]) for k in fields}
+        values = {k: float(seed[k]) for k in (*fields, "live")}
         if not all(math.isfinite(v) for v in values.values()):
             raise ValueError(
                 f"seed index {i} carries a non-finite value {values}: that is an "
                 "error about the measurement, never a statement about the code"
+            )
+        if values["live"] != int(values["live"]) or not 0 <= values["live"] <= columns:
+            raise ValueError(
+                f"seed index {i} has live={seed['live']}, which is not a count of "
+                f"the {columns} columns (a whole number from 0 to {columns}): that "
+                "is an error about the measurement, never a statement about the code"
             )
         for lo, mid, hi in (("ci_low", "bits", "ci_high"),
                             ("frame_low", "frame_share", "frame_high")):
@@ -580,6 +625,53 @@ def capacity_arm(seeds: list[dict]) -> CapacityArm:
         seeds_frame=sum(1 for s in seeds if float(s["frame_low"]) > FRAME_CUT),
         seeds_total=len(seeds),
     )
+
+
+def _common_seeds_total(arms: dict) -> int:
+    """The arms' one shared `seeds_total`, or a refusal.
+
+    Arms that disagree on it are refused rather than reconciled: the caption's
+    "N of M seeds" would be true of some rows and false of others, and picking
+    one silently would print a rule the table does not follow.
+
+    A shared `seeds_total` BELOW `SEEDS_REQUIRED` is refused too. No arm could
+    then clear in `SEEDS_REQUIRED` seeds, so BOTH objective-lever statuses would
+    be structurally unreachable and the reading would fall through to
+    CAPACITY_BOUND. That is worse here than in `width.reading_contrast`, which
+    refuses the same two things for the same reason but falls through to the
+    non-directional INDISTINGUISHABLE: this fall-through is a DIRECTIONAL verdict
+    that stands by default, so a run too small to clear either bar would read the
+    bottleneck lever under a caption of "2 of 1 seeds". (`capacity_arm` already
+    refuses an under-seeded arm one level down, so only a hand-built `CapacityArm`
+    reaches here; the guard is kept anyway, exactly as `reading_contrast` keeps
+    its own.) There is deliberately NO upper bound: a run with more seeds is a
+    legitimate run.
+
+    Shared by `reading_capacity` and `format_reading_capacity`, so a reading
+    cannot return a status the formatter then refuses to print.
+    """
+    if not arms:
+        raise ValueError(
+            "there are no arms, so there is no common seeds_total to read a "
+            "verdict or print a caption from"
+        )
+    counts = {arm.seeds_total for arm in arms.values()}
+    if len(counts) != 1:
+        per_arm = {name: arm.seeds_total for name, arm in sorted(arms.items())}
+        raise ValueError(
+            "the arms must share one seeds_total for the "
+            f"'{SEEDS_REQUIRED} of N seeds' rule to be true of every row, "
+            f"got {per_arm}"
+        )
+    (total,) = counts
+    if total < SEEDS_REQUIRED:
+        raise ValueError(
+            f"seeds_total={total} is below SEEDS_REQUIRED={SEEDS_REQUIRED}: no arm "
+            "could clear in that many seeds, so CAPACITY_BOUND would be the "
+            "bottleneck lever read by default from a run too small to clear "
+            "either objective-lever bar"
+        )
+    return total
 
 
 def reading_capacity(inputs: CapacityInputs) -> CapacityStatus:
@@ -622,6 +714,18 @@ def reading_capacity(inputs: CapacityInputs) -> CapacityStatus:
     holding is enough to proceed, so one arm can fail its base control while its
     measurement still votes -- the record must say so rather than read "nothing
     failed". M3k shipped exactly that hole and it survived 82 tests.
+
+    REFUSES (raises) inputs that cannot support a reading at all, rather than
+    reading them: fewer than `ARMS_REQUIRED` arms would read CAPACITY_BOUND from
+    nothing; a `base` or `controls` that does not name exactly the arms would let
+    an arm vote with nothing gating it; and arms that disagree on `seeds_total`,
+    or share one below `SEEDS_REQUIRED`, have no true "N of M seeds" rule (see
+    `_common_seeds_total`: the under-seeded case is the one that makes
+    CAPACITY_BOUND the wrong verdict rather than merely an unprintable one;
+    mixed counts hand back a status the formatter then refuses). These precede EVERY
+    status, the UNRESOLVED ones included: a reading handed back under seed counts
+    the formatter then refuses would be the verdict a caller acted on before it
+    crashed at print time.
     """
     if len(inputs.arms) < ARMS_REQUIRED:
         raise ValueError(
@@ -635,6 +739,7 @@ def reading_capacity(inputs: CapacityInputs) -> CapacityStatus:
             f"controls {sorted(inputs.controls)}: an arm with no base control or "
             "no estimator check would vote with nothing gating it"
         )
+    _common_seeds_total(inputs.arms)  # for its refusals only; the total is unused here
     controls_failed = tuple(sorted(a for a, ok in inputs.controls.items() if not ok))
     base_failed = tuple(
         sorted(a for a, control in inputs.base.items() if not control.clears())
@@ -743,23 +848,21 @@ def format_reading_capacity(reading: CapacityStatus, inputs: CapacityInputs) -> 
     shape from `inputs` and `RSSMConfig`. This project has shipped a caption
     disagreeing with its own columns three times.
 
+    The seed count is the arms' COMMON `seeds_total`, from the same
+    `_common_seeds_total` the reading uses: arms that disagree on it, or share one
+    below `SEEDS_REQUIRED`, have no true caption.
+
     `red_ratio` is `redundancy_ratio` of the arm's two seed means, and prints
     `undefined` where that is None. Never a bare 1.0: a collapsed code reads its
     redundancy equal to its floor, and 1.0 is the one value that says
-    "independent, so the capacity is in use".
+    "independent, so the capacity is in use". Past `RATIO_SHOWN_MAX` it prints a
+    sentinel, so no cell can be wider than its column.
 
     `clears` is printed for every arm under every verdict, as the width table
     does, including the UNRESOLVED ones where no arm votes; the legend says the
     gates and the arm bar are the verdict's, not the column's.
     """
-    counts = {arm.seeds_total for arm in inputs.arms.values()}
-    if len(counts) != 1:
-        raise ValueError(
-            "the arms must share one seeds_total for the caption's "
-            f"'{SEEDS_REQUIRED} of N seeds' to be true of every row, got "
-            f"{ {a: arm.seeds_total for a, arm in sorted(inputs.arms.items())} }"
-        )
-    (seeds_total,) = counts
+    seeds_total = _common_seeds_total(inputs.arms)
     lines = [
         f"--- Reading G: how many of the {CEILING_BITS:.0f} bits does the posterior "
         f"code carry, and is it a re-encoding of enc(t)? (spare when the whole bits "
@@ -773,8 +876,8 @@ def format_reading_capacity(reading: CapacityStatus, inputs: CapacityInputs) -> 
         ratio = redundancy_ratio(arm.redundancy_bits, arm.redundancy_floor)
         lines.append(_row(
             (name, f"{arm.bits:.4f}", f"{arm.bits_low:.4f}", f"{arm.bits_high:.4f}",
-             f"{arm.frame_share:.4f}", str(arm.live),
-             "undefined" if ratio is None else f"{ratio:.3f}", _clears_label(arm)),
+             f"{arm.frame_share:.4f}", str(arm.live), _ratio_cell(ratio),
+             _clears_label(arm)),
             READING_WIDTHS,
         ))
     lines.append(
@@ -782,7 +885,8 @@ def format_reading_capacity(reading: CapacityStatus, inputs: CapacityInputs) -> 
         "gates nothing: near 1 the categoricals are independent and bits is close "
         "to the code's joint information; well above 1 bits overstates it "
         f"('undefined' where the floor is below {RATIO_MIN_FLOOR:g}: no pair of "
-        "categoricals varies)"
+        f"categoricals varies; '>{RATIO_SHOWN_MAX:g}' where the ratio is over "
+        "range)"
     )
     lines.append(
         f"  live = columns of {RSSMConfig.z_cats * RSSMConfig.z_classes} that vary "
