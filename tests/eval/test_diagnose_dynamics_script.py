@@ -644,6 +644,31 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"latent_width collides with {other} on {clash}"
 
+    capacity = statuses("latent_capacity")
+    reused_by_capacity = {**reused, "EXIT_SELF_CHECK_FAILED": 30}
+    shared_with_trust = {
+        name: value for name, value in capacity.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_capacity, (
+        f"latent_capacity shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_capacity} is shared on purpose"
+    )
+    assert len(set(capacity.values())) == len(capacity), capacity
+    assert 1 not in capacity.values() and 2 not in capacity.values()
+    assert capacity["EXIT_ESTIMATOR_BROKEN"] == 43
+    assert capacity["EXIT_BASE_UNRESOLVED"] == 44
+    own = set(capacity.values()) - set(reused_by_capacity.values()) - {0}
+    assert own == {43, 44}
+    # 38 is M3i, 39-40 M3j, 41-42 M3k, and 42 is the highest that existed before
+    # this one: 43 and 44 are the next two free numbers, and the eleven sibling
+    # scripts below are every other tool a wrapper reads `$?` from.
+    assert own == {max(set(width.values()) - {0}) + 1, max(set(width.values()) - {0}) + 2}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion",
+                  "latent_retention", "latent_width", "trust_horizon"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"latent_capacity collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys

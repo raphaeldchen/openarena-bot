@@ -22,11 +22,12 @@ import numpy as np
 import pytest
 
 from mbfps.eval.capacity import (
-    CEILING_BITS, bits_carried, floor_bits, live_classes,
+    CEILING_BITS, bits_carried, floor_bits, live_classes, reading_capacity,
+    redundancy_ratio,
 )
 from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
 from mbfps.eval.retention import (
-    ARMS_REQUIRED, CONFIDENCE, RESAMPLES, SEEDS_REQUIRED,
+    ARMS_REQUIRED, BASE_R2_FLOOR, CONFIDENCE, RESAMPLES, SEEDS_REQUIRED,
 )
 from mbfps.eval.study import load_record
 from mbfps.models.rssm import RSSMConfig
@@ -1712,4 +1713,1018 @@ def test_load_capacity_returns_nine_distinct_payloads_keyed_by_cell(tmp_path):
         "the fixture's nine records are not nine distinct payloads once the "
         "labels are dropped, so nothing here could catch an arm paired with "
         "another arm's seeds"
+    )
+
+
+# ---------------------------------------------------------------------------
+# read: the fixture the whole section stands on
+# ---------------------------------------------------------------------------
+
+READ_CLUSTERS: int = 3
+READ_WINDOWS: int = 6
+READ_STEPS: int = 5
+READ_ROWS: int = READ_WINDOWS * READ_STEPS
+
+_WINDOW_LABELS = [w for w in range(READ_WINDOWS) for _ in range(READ_STEPS)]
+_EPISODE_LABELS = [
+    w % READ_CLUSTERS for w in range(READ_WINDOWS) for _ in range(READ_STEPS)
+]
+"""One label per gathered row, IDENTICAL in every record: `windows.episode` and
+`windows.window` are compared by `require_one_protocol`, so the per-cell rank
+cannot live there. It lives in every MEASURED number instead."""
+
+
+def _rank(arm, seed) -> int:
+    """A distinct 0..8 per cell, threaded through every measured number."""
+    return list(ARMS).index(arm) * 3 + int(seed)
+
+
+def _position_r2(arm, seed, *, base=True) -> float:
+    """The GATED figure: `enc(t)` -> position, per cell.
+
+    TWO OF EACH ARM'S THREE SEEDS CLEAR `BASE_R2_FLOOR` and the third does not,
+    on purpose. A base-control loop that collapsed onto any ONE seed would read
+    a tally of 0 or 3, and both differ from the 2 this shape requires -- which
+    is what makes the collapse visible in the TALLY rather than only in a
+    cross-arm distinctness check it can walk straight past."""
+    rank = _rank(arm, seed)
+    if not base:
+        return 0.01 + rank / 1000.0
+    return 0.02 + rank / 1000.0 if int(seed) == 2 else 0.60 + rank / 100.0
+
+
+def _four_column_r2(arm, seed) -> float:
+    """The record's key literally named `r2`: the 4-column mean over pos_x,
+    pos_y, sin(angle) and cos(angle) that M3j gated on and this reading does NOT.
+
+    Separated from `_position_r2` by more than a whole unit of r2, and on the
+    OTHER side of `BASE_R2_FLOOR`, so a read that takes the obvious key prints a
+    figure below the floor beside a tally that says the floor was cleared."""
+    return -1.50 - _rank(arm, seed) / 100.0
+
+
+def _read_record(arm, seed, *, spare=False, framey=False, base=True,
+                 collapsed=False, broken_flags=(), clusters=READ_CLUSTERS,
+                 rows=READ_ROWS) -> dict:
+    """One capacity record, every measured number a function of `(arm, seed)`.
+
+    NINE DISTINCT PAYLOADS, never one template with the labels changed: M3j
+    shipped a fixture whose nine records serialised to ONE payload once the
+    labels were dropped, so an implementation pairing `frozen_ssl` with
+    `pixel_ae`'s seeds passed every test in its read section."""
+    rank = _rank(arm, seed)
+    bits = (
+        {"bits": 40.0 + rank, "ci_low": 30.0 + rank, "ci_high": 50.0 + rank} if spare
+        else {"bits": 150.0 - rank / 10.0, "ci_low": 140.0 - rank / 10.0,
+              "ci_high": 158.0 - rank / 10.0}
+    )
+    frame = (
+        {"frame_share": 0.80 - rank / 100.0, "frame_low": 0.70 - rank / 100.0,
+         "frame_high": 0.90 - rank / 100.0} if framey
+        else {"frame_share": 0.20 + rank / 100.0, "frame_low": 0.10 + rank / 100.0,
+              "frame_high": 0.30 + rank / 100.0}
+    )
+    redundancy = (
+        {"redundancy_bits": 0.0, "redundancy_floor": 0.0} if collapsed
+        else {"redundancy_bits": 0.10 + rank / 1000.0,
+              "redundancy_floor": 0.05 + rank / 1000.0}
+    )
+    return {
+        "arm": arm, "seed": int(seed), "step": 20000 + rank,
+        "record_git_sha": "ca3e140", "device": "cpu", "context": 8, "horizon": 15,
+        "z_cats": CATS, "z_classes": CLASSES, "ceiling_bits": CEILING_BITS,
+        "split_seed": 1234, "torch_version": "2.4.0", "git_sha": "deadbeef",
+        "capacity": {
+            **bits, **frame, **redundancy,
+            "confidence": CONFIDENCE, "n_episodes": clusters,
+            "frame_confidence": CONFIDENCE, "frame_resamples": RESAMPLES,
+            "live": COLUMNS - rank, "prior_bits": 5.0 + rank,
+            "checks": {
+                flag: flag not in broken_flags for flag in script.CHECK_FLAGS
+            },
+            "rows": rows,
+        },
+        "base_control": {
+            "r2": _four_column_r2(arm, seed),
+            "position_r2": _position_r2(arm, seed, base=base),
+            "per_column_r2": [0.1 + rank / 100.0] * 4,
+            "ridge": 1000.0, "ridge_selected": True, "rows": rows,
+        },
+        "clusters": clusters,
+        "rows": rows,
+        "windows": {"episode": list(_EPISODE_LABELS), "window": list(_WINDOW_LABELS)},
+        "self_check": {"ok": True},
+        "episodes": {"fit": [], "select": [], "val": [f"e{i}" for i in range(24)]},
+    }
+
+
+def _pool(knobs=None, *, broken=None) -> dict:
+    """The nine cells, keyed by `(arm, seed)`.
+
+    `knobs` maps an ARM to the keyword overrides shared by its three records;
+    `broken` maps a CELL to the `CHECK_FLAGS` it reports False."""
+    knobs, broken = knobs or {}, broken or {}
+    return {
+        (arm, seed): _read_record(
+            arm, seed, broken_flags=broken.get((arm, seed), ()), **knobs.get(arm, {}),
+        )
+        for arm in ARMS for seed in (0, 1, 2)
+    }
+
+
+def _write_pool(directory, records) -> None:
+    for (arm, seed), record in records.items():
+        script.write_record(script.capacity_record_path(directory, arm, seed), record)
+
+
+def _main_read(*argv):
+    """`main([...])` with the MEASURE half made unreachable.
+
+    A mutation of `main` that let `--phase read` fall into the measure branch
+    would otherwise load the real checkpoints from `--source`'s default and run a
+    real cell on the GPU inside pytest. That must be a loud, instant
+    AssertionError, never a measurement -- the guard `scripts/latent_width.py`'s
+    suite grew after its absence cost a real 7-minute measure."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("--phase read reached the measure phase")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(script, "measure_phase", forbidden)
+        patch.setattr(script, "ReplayBuffer", forbidden)
+        patch.setattr(script, "get_device", forbidden)
+        return script.main(list(argv))
+
+
+def _read(tmp_path, capsys, records, *extra):
+    """Write `records`, run the real read phase, return `(status, stdout)`."""
+    _write_pool(tmp_path, records)
+    status = _main_read("--phase", "read", "--out", str(tmp_path), *extra)
+    return status, capsys.readouterr().out
+
+
+def _section(text: str, fragment: str) -> str:
+    """The one block of `capacity_text` whose heading carries `fragment`.
+
+    `capacity_text` joins its sections with a blank line, so a section is a
+    block. Selected by fragment and asserted UNIQUE: a per-cell row and a
+    self-check row both begin with an arm and a seed, so a line picked by its
+    first two tokens alone would be ambiguous between two tables."""
+    blocks = [block for block in text.split("\n\n") if fragment in block]
+    assert len(blocks) == 1, f"{fragment!r} matched {len(blocks)} blocks"
+    return blocks[0]
+
+
+def _line_with(text: str, fragment: str) -> str:
+    lines = [line for line in text.splitlines() if fragment in line]
+    assert len(lines) == 1, f"{fragment!r} matched {len(lines)} lines: {lines}"
+    return lines[0]
+
+
+def _row_for(table: str, *tokens) -> str:
+    """The one row of `table` whose leading whitespace-separated tokens are
+    `tokens`.
+
+    By TOKEN, never by substring: every prose line in these sections also
+    contains every arm name, and `158.0000` contains `8.0000`, so a row picked
+    by `fragment in line` is ambiguous in both tables at once."""
+    wanted = [str(token) for token in tokens]
+    rows = [
+        line for line in table.splitlines()
+        if line.split()[: len(wanted)] == wanted
+    ]
+    assert len(rows) == 1, f"{wanted} matched {len(rows)} rows: {rows}"
+    return rows[0]
+
+
+def _mean(records, cells, *path) -> float:
+    values = []
+    for cell in cells:
+        value = records[cell]
+        for key in path:
+            value = value[key]
+        values.append(float(value))
+    return float(np.mean(values))
+
+
+def _cells_of(arm) -> list[tuple[str, int]]:
+    return [(arm, seed) for seed in (0, 1, 2)]
+
+
+def test_the_read_fixture_carries_nine_distinct_payloads():
+    """Guards the FIXTURE every read test below stands on. Nine records that
+    differed only in their labels would let a cross-arm pairing, a seed collapse
+    or a first-record-stands-for-all pass every one of them -- M3j shipped
+    exactly that, so the labels are DROPPED before the payloads are compared."""
+    records = _pool()
+    payloads = {
+        json.dumps(
+            {k: v for k, v in record.items() if k not in ("arm", "seed")},
+            sort_keys=True,
+        )
+        for record in records.values()
+    }
+    assert len(payloads) == 9, "the nine records are not nine distinct payloads"
+    for name, pick in (
+        ("bits", lambda r: r["capacity"]["bits"]),
+        ("ci_low", lambda r: r["capacity"]["ci_low"]),
+        ("ci_high", lambda r: r["capacity"]["ci_high"]),
+        ("frame_share", lambda r: r["capacity"]["frame_share"]),
+        ("frame_low", lambda r: r["capacity"]["frame_low"]),
+        ("live", lambda r: r["capacity"]["live"]),
+        ("prior_bits", lambda r: r["capacity"]["prior_bits"]),
+        ("redundancy_bits", lambda r: r["capacity"]["redundancy_bits"]),
+        ("redundancy_floor", lambda r: r["capacity"]["redundancy_floor"]),
+        ("position_r2", lambda r: r["base_control"]["position_r2"]),
+        ("r2", lambda r: r["base_control"]["r2"]),
+    ):
+        assert len({pick(r) for r in records.values()}) == 9, (
+            f"{name} is not distinct in all nine cells, so nothing below could "
+            "catch one cell's number printed in another cell's row"
+        )
+
+
+# ---------------------------------------------------------------------------
+# READ_EXITS: keyed on exactly the two refusal statuses
+# ---------------------------------------------------------------------------
+
+
+def test_read_exits_is_keyed_on_exactly_the_two_refusal_statuses():
+    """`reading_capacity` returns five statuses and only two are refusals. A
+    third key would exit non-zero on a FINDING, which makes "the run worked" and
+    "the news was good" the same signal; a missing one exits 0 on a reading that
+    is not a reading."""
+    assert script.READ_EXITS == {
+        "UNRESOLVED_ESTIMATOR": script.EXIT_ESTIMATOR_BROKEN,
+        "UNRESOLVED_BASE": script.EXIT_BASE_UNRESOLVED,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The five statuses, end to end through `main --phase read`
+# ---------------------------------------------------------------------------
+
+_SPARE = {arm: {"spare": True} for arm in ARMS}
+_FRAMEY = {arm: {"framey": True} for arm in ARMS}
+_BASE_FAILS = {arm: {"base": False} for arm in list(ARMS)[:2]}
+_BROKEN_CELL = ("random_vit", 1)
+
+STATUS_POOLS = {
+    "UNRESOLVED_ESTIMATOR": ({}, {_BROKEN_CELL: ("floor_ok",)}),
+    "UNRESOLVED_BASE": (_BASE_FAILS, {}),
+    "SPARE_CAPACITY": (_SPARE, {}),
+    "FRAME_REENCODING": (_FRAMEY, {}),
+    "CAPACITY_BOUND": ({}, {}),
+}
+"""One `(knobs, broken)` pair per status `reading_capacity` can return.
+
+M3k's formatter was exercised on ONE status of five: its `verdict:` line could be
+deleted and its `ok`/`BROKEN` inverted with all 65 tests still passing. So every
+one of the five is driven end to end below."""
+
+STATUS_EXITS = {
+    "UNRESOLVED_ESTIMATOR": 43,
+    "UNRESOLVED_BASE": 44,
+    "SPARE_CAPACITY": 0,
+    "FRAME_REENCODING": 0,
+    "CAPACITY_BOUND": 0,
+}
+
+
+def test_the_five_status_pools_are_the_five_statuses_the_reading_can_return():
+    """A pool that drifted onto another status would silently stop exercising
+    the branch it is named for, which is how a five-way parametrisation becomes
+    one case repeated five times."""
+    assert set(STATUS_POOLS) == set(STATUS_EXITS)
+    assert set(STATUS_POOLS) >= set(script.READ_EXITS)
+    reached = set()
+    for status, (knobs, broken) in STATUS_POOLS.items():
+        inputs = script.capacity_inputs(_pool(knobs, broken=broken))
+        reached.add(reading_capacity(inputs).status)
+    assert reached == set(STATUS_POOLS), f"the pools reach only {sorted(reached)}"
+
+
+@pytest.mark.parametrize("status", sorted(STATUS_POOLS))
+def test_every_status_is_driven_end_to_end_and_prints_its_own_verdict(
+    tmp_path, capsys, status,
+):
+    """All five statuses through `main --phase read`: the exit code, the
+    `verdict:` line naming THAT status, and the estimator-checks line's
+    `ok`/`BROKEN` matching the records cell by cell.
+
+    M3k's `verdict:` line could be DELETED and its `ok`/`BROKEN` INVERTED with
+    all 65 of its tests passing, because its formatter was exercised on one
+    status of five. Each of those two mutations must fail this test for every
+    status."""
+    knobs, broken = STATUS_POOLS[status]
+    records = _pool(knobs, broken=broken)
+    code, out = _read(tmp_path, capsys, records)
+
+    assert code == STATUS_EXITS[status]
+    assert code == script.READ_EXITS.get(status, script.EXIT_OK)
+
+    verdict = _line_with(out, "verdict:")
+    assert f"verdict: {status.replace('_', ' ')} --" in verdict, verdict
+    for other in STATUS_POOLS:
+        if other != status:
+            assert other.replace("_", " ") not in verdict, (
+                f"the {status} verdict line also names {other}"
+            )
+
+    checks = _line_with(out, "estimator checks (")
+    for arm in ARMS:
+        every_flag_held = all(
+            records[cell]["capacity"]["checks"][flag]
+            for cell in _cells_of(arm) for flag in script.CHECK_FLAGS
+        )
+        assert f"{arm}={'ok' if every_flag_held else 'BROKEN'}" in checks, checks
+        assert f"{arm}={'BROKEN' if every_flag_held else 'ok'}" not in checks, checks
+
+    companion = _section(out, "redundancy companion")
+    for arm in ARMS:
+        assert f"{arm}: redundancy_bits" in companion, (
+            "both redundancy numbers and their ratio print in EVERY status, "
+            "because they are the only thing that makes a high bits readable"
+        )
+
+
+def test_the_fall_through_says_it_stands_by_default_rather_than_by_evidence():
+    """`CAPACITY_BOUND` is what remains when neither objective-lever status
+    clears an interval, so the lever M3j's evidence already favours is the
+    EASIEST status to reach. The rule text has to say so."""
+    inputs = script.capacity_inputs(_pool())
+    reading = reading_capacity(inputs)
+    assert reading.status == "CAPACITY_BOUND"
+    assert "BY DEFAULT rather than by evidence" in reading.rule
+
+
+def test_an_arm_can_clear_both_cuts_and_the_table_says_spare_plus_frame(
+    tmp_path, capsys,
+):
+    """The two readings are NOT mutually exclusive: they are tallies on two
+    different quantities, so a code that carries little and of that little
+    mostly the frame clears both. Precedence picks the label; the column must
+    still report the overlap, or a reader comparing it with `arms_frame` would
+    read an arm that did not clear the frame cut."""
+    knobs = {arm: {"spare": True, "framey": True} for arm in ARMS}
+    records = _pool(knobs)
+    code, out = _read(tmp_path, capsys, records)
+    assert code == script.EXIT_OK
+    assert "verdict: SPARE CAPACITY --" in out
+    table = _section(out, "--- Reading G:")
+    for arm in ARMS:
+        row = _row_for(table, arm)
+        assert "spare+frame" in row, row
+
+
+# ---------------------------------------------------------------------------
+# base_controls: the `r2` name collision, and the per-seed tally
+# ---------------------------------------------------------------------------
+
+
+def test_the_printed_base_r2_is_the_position_mean_and_never_the_four_column_one(
+    tmp_path, capsys,
+):
+    """THE defect this task exists to avoid. `BaseControl` has a field named
+    `r2`; the RECORD has a key named `r2` too, and the record's is the 4-COLUMN
+    mean over position and heading that M3j gated on and this reading does NOT.
+    `format_reading_capacity` prints `inputs.base[a].r2` immediately beside
+    `seeds_clear/seeds_total`, so taking the obvious key prints the ungated
+    figure beside the tally the whole reading is gated on -- the "one tally
+    beside a verdict read from the other" defect this project has shipped three
+    times. `base_control`'s own docstring warns of it and nothing enforces it.
+    """
+    records = _pool()
+    controls = script.base_controls(records)
+    assert set(controls) == set(ARMS)
+    for arm in ARMS:
+        cells = _cells_of(arm)
+        position = _mean(records, cells, "base_control", "position_r2")
+        four = _mean(records, cells, "base_control", "r2")
+        assert abs(position - four) > 1.0, (
+            "the fixture must separate the two means by more than a whole unit "
+            "of r2, or the swap would not be unmistakable in a +.3f cell"
+        )
+        assert position > BASE_R2_FLOOR > four, (
+            "the two means must also sit on OPPOSITE sides of the floor, so the "
+            "swap prints a figure below the gate beside a tally that cleared it"
+        )
+        assert controls[arm].r2 == pytest.approx(position)
+        assert controls[arm].r2 != pytest.approx(four)
+
+    code, out = _read(tmp_path, capsys, records)
+    assert code == script.EXIT_OK
+    line = _line_with(out, "base control (enc(t)")
+    for arm in ARMS:
+        cells = _cells_of(arm)
+        position = _mean(records, cells, "base_control", "position_r2")
+        four = _mean(records, cells, "base_control", "r2")
+        clear = controls[arm].seeds_clear
+        assert f"{arm} r2={position:+.3f} {clear}/3" in line, line
+        assert f"{four:+.3f}" not in out, (
+            "the 4-column mean is the ungated figure and prints NOWHERE: it is "
+            "kept on the record to bridge to M3j's and nothing more"
+        )
+
+
+def test_the_base_control_tally_is_counted_per_seed_and_cannot_collapse(tmp_path):
+    """A seed collapse in the BASE-CONTROL loop specifically -- the worst place
+    for one, because the base control is a GATE.
+
+    The dangerous variant is every arm reporting its OWN seed 2 three times: the
+    three arms' r2 values still all differ, so a cross-arm DISTINCTNESS check
+    walks straight past it. What catches it is the TALLY: two of each arm's three
+    seeds clear the floor and the third does not, so a collapse onto any single
+    seed reads 0 or 3 and never 2."""
+    records = _pool()
+    controls = script.base_controls(records)
+    for arm in ARMS:
+        levels = [
+            float(records[cell]["base_control"]["position_r2"])
+            for cell in _cells_of(arm)
+        ]
+        expected = sum(1 for level in levels if level > BASE_R2_FLOOR)
+        assert 0 < expected < 3, (
+            "the fixture must mix clearing and non-clearing seeds INSIDE each "
+            "arm, or a collapse onto one seed would still read the right tally"
+        )
+        assert controls[arm].seeds_total == 3
+        assert controls[arm].seeds_clear == expected
+        assert controls[arm].r2 == pytest.approx(float(np.mean(levels)))
+    assert len({controls[arm].r2 for arm in ARMS}) == 3, (
+        "the arms' means must differ too, which is the weaker check the tally "
+        "above exists to back up"
+    )
+
+
+def test_the_base_control_gate_is_strict_and_stays_at_the_imported_floor():
+    """`BASE_R2_FLOOR` is 0.10, applied with a strict `>` per seed, and imported
+    from `retention` rather than re-spelled. A seed exactly ON the floor does not
+    clear."""
+    assert script.BASE_R2_FLOOR is BASE_R2_FLOOR
+    assert BASE_R2_FLOOR == 0.10
+    records = _pool()
+    for cell in records:
+        records[cell]["base_control"]["position_r2"] = BASE_R2_FLOOR
+    controls = script.base_controls(records)
+    assert all(controls[arm].seeds_clear == 0 for arm in ARMS)
+
+
+def test_the_base_control_refuses_a_non_finite_position_r2():
+    """A NaN compares False against every threshold, so it would read as "did
+    not clear" AND "did not fail" at once -- an error about the measurement."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    records[victim]["base_control"]["position_r2"] = None
+    with pytest.raises(SystemExit, match="random_vit seed 2"):
+        script.base_controls(records)
+
+
+# ---------------------------------------------------------------------------
+# control_flags: every seed, every flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", list(script.CHECK_FLAGS))
+def test_one_broken_flag_in_one_seed_breaks_that_arm_and_only_that_arm(flag):
+    """`control_flags` is `all` over every one of an arm's seeds and every one of
+    `CHECK_FLAGS` -- iterated, never re-spelled, so a fourth check cannot be
+    added without a consumer. `any` would let a broken estimator vote; reading
+    one flag of three would let two of them break in silence."""
+    records = _pool(broken={_BROKEN_CELL: (flag,)})
+    flags = script.control_flags(records)
+    assert set(flags) == set(ARMS)
+    assert flags[_BROKEN_CELL[0]] is False
+    assert all(flags[arm] is True for arm in ARMS if arm != _BROKEN_CELL[0])
+
+
+def test_control_flags_hold_when_every_seed_passes_every_check():
+    assert script.control_flags(_pool()) == dict.fromkeys(ARMS, True)
+
+
+def test_control_flags_refuse_a_check_that_is_not_a_boolean():
+    """`"false"` is truthy, so a damaged record would otherwise read as a check
+    that PASSED -- and `UNRESOLVED_ESTIMATOR` outranks every other status."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    records[victim]["capacity"]["checks"]["routes_ok"] = "false"
+    with pytest.raises(SystemExit, match="random_vit seed 2"):
+        script.control_flags(records)
+
+
+# ---------------------------------------------------------------------------
+# capacity_inputs: named refusals where the reading would raise
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_inputs_summarises_each_arm_over_its_own_seeds(tmp_path):
+    """A cross-arm pairing leaves every count right. The arm's `bits` is the mean
+    of ITS OWN three cells and nothing else's."""
+    records = _pool()
+    inputs = script.capacity_inputs(records)
+    assert set(inputs.arms) == set(ARMS)
+    assert set(inputs.base) == set(ARMS) and set(inputs.controls) == set(ARMS)
+    for arm in ARMS:
+        cells = _cells_of(arm)
+        arm_reading = inputs.arms[arm]
+        assert arm_reading.seeds_total == 3
+        assert arm_reading.bits == pytest.approx(_mean(records, cells, "capacity", "bits"))
+        assert arm_reading.frame_share == pytest.approx(
+            _mean(records, cells, "capacity", "frame_share")
+        )
+        assert arm_reading.bits_low == pytest.approx(
+            min(records[c]["capacity"]["ci_low"] for c in cells)
+        )
+        assert arm_reading.bits_high == pytest.approx(
+            max(records[c]["capacity"]["ci_high"] for c in cells)
+        )
+        assert arm_reading.live == min(records[c]["capacity"]["live"] for c in cells)
+        assert arm_reading.redundancy_bits == pytest.approx(
+            _mean(records, cells, "capacity", "redundancy_bits")
+        )
+        assert arm_reading.redundancy_floor == pytest.approx(
+            _mean(records, cells, "capacity", "redundancy_floor")
+        )
+    assert len({inputs.arms[arm].bits for arm in ARMS}) == 3
+
+
+@pytest.mark.parametrize("path", [
+    ("capacity", "bits"),
+    ("capacity", "ci_low"),
+    ("capacity", "frame_low"),
+    ("capacity", "live"),
+    ("capacity", "redundancy_bits"),
+    ("capacity", "redundancy_floor"),
+    ("base_control", "position_r2"),
+    ("capacity", "checks"),
+    ("clusters",),
+    ("rows",),
+])
+def test_a_missing_field_is_refused_by_cell_and_by_dotted_path(path):
+    """Every field the reading needs goes through `_get`, so a record that lacks
+    one stops the read with the CELL and the DOTTED PATH rather than surfacing
+    as a bare `KeyError` after the reader has paid for the measure.
+    `redundancy_bits` and `redundancy_floor` are among them: they are threaded
+    into each per-seed dict for `capacity_arm`."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    container = records[victim]
+    for key in path[:-1]:
+        container = container[key]
+    del container[path[-1]]
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    message = str(raised.value)
+    assert "random_vit seed 2" in message, message
+    assert ".".join(path) in message, message
+
+
+def test_capacity_inputs_refuses_too_few_arms_by_name():
+    """`reading_capacity` raises on fewer than `ARMS_REQUIRED` arms INSIDE the
+    reading. Asked here it is a named refusal; asked there it is a traceback
+    after every gather and every fit."""
+    records = {
+        cell: record for cell, record in _pool().items() if cell[0] == list(ARMS)[0]
+    }
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    assert str(ARMS_REQUIRED) in str(raised.value)
+
+
+def test_capacity_inputs_refuses_arms_that_do_not_share_a_seed_count():
+    """Arms that disagree on `seeds_total` have no true "N of M seeds" rule, and
+    `reading_capacity` hands back a status the formatter then refuses to print --
+    the verdict a caller would act on before it crashed at print time."""
+    records = _pool()
+    del records[(list(ARMS)[0], 2)]
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    assert "seed count" in str(raised.value)
+
+
+def test_capacity_inputs_refuses_a_seed_count_below_the_bar_naming_the_arm():
+    """A shared `seeds_total` below `SEEDS_REQUIRED` makes BOTH objective-lever
+    statuses structurally unreachable, so the reading would fall through to
+    `CAPACITY_BOUND` -- a DIRECTIONAL verdict read from a run too small to clear
+    either bar."""
+    records = {
+        cell: record for cell, record in _pool().items() if cell[1] == 0
+    }
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    message = str(raised.value)
+    assert str(SEEDS_REQUIRED) in message, message
+    assert any(arm in message for arm in ARMS), message
+
+
+def test_capacity_inputs_names_the_arm_when_a_seed_is_not_a_measurement():
+    """`capacity_arm`'s refusals -- a non-finite value, an inverted interval, a
+    point estimate outside its own interval -- are errors about the measurement,
+    and they become a refusal naming the arm and its seeds."""
+    records = _pool()
+    records[("frozen_ssl", 1)]["capacity"]["ci_low"] = 999.0
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    message = str(raised.value)
+    assert "frozen_ssl" in message and "[0, 1, 2]" in message, message
+
+
+@pytest.mark.parametrize("field", ["clusters", "rows"])
+def test_a_caption_figure_the_records_disagree_on_is_refused_naming_the_cells(field):
+    """`clusters` and `rows` are SINGLE caption figures speaking for nine cells,
+    and `require_one_protocol` deliberately does not compare them. The victim
+    sorts LAST, so an implementation that took the FIRST record's value would see
+    nothing at all and print a caption true of eight cells out of nine."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    assert victim == ("random_vit", 2), "the victim must sort last"
+    records[victim][field] = records[victim][field] + 1
+    with pytest.raises(SystemExit) as raised:
+        script.capacity_inputs(records)
+    message = str(raised.value)
+    assert field in message, message
+    assert "random_vit seed 2" in message, message
+
+
+def test_the_caption_figures_come_from_the_records_and_reach_the_caption(
+    tmp_path, capsys,
+):
+    records = _pool()
+    inputs = script.capacity_inputs(records)
+    assert (inputs.clusters, inputs.rows) == (READ_CLUSTERS, READ_ROWS)
+    _, out = _read(tmp_path, capsys, records)
+    assert f"{READ_ROWS} rows over {READ_CLUSTERS} clusters" in out
+
+
+# ---------------------------------------------------------------------------
+# capacity_text
+# ---------------------------------------------------------------------------
+
+
+def test_the_evidence_is_printed_before_the_conclusion(tmp_path, capsys):
+    """The self-check, then the per-cell table, then Reading G: a reader meets
+    the instrument and the numbers before the verdict, `motion.txt`'s order."""
+    _, out = _read(tmp_path, capsys, _pool())
+    order = [
+        out.index("self-check per record"),
+        out.index("per cell:"),
+        out.index("redundancy companion"),
+        out.index("--- Reading G:"),
+        out.index("verdict:"),
+    ]
+    assert order == sorted(order), out
+
+
+def test_every_cell_s_numbers_land_in_its_own_row(tmp_path, capsys):
+    """One cell's number printed in another cell's row is this project's
+    recurring table defect. Every number here is a function of `(arm, seed)`, so
+    a row carrying a neighbour's value is visible."""
+    records = _pool()
+    _, out = _read(tmp_path, capsys, records)
+    table = _section(out, "per cell:")
+    header, *rows = [line for line in table.splitlines() if "---" not in line]
+    assert len(rows) == 9
+    for (arm, seed), record in sorted(records.items()):
+        capacity = record["capacity"]
+        row = _row_for(table, arm, seed)
+        assert f"{capacity['prior_bits']:.4f}" in row
+        assert f"{capacity['bits']:.4f}" in row
+        assert f"{capacity['ci_low']:.4f}" in row
+        assert f"{capacity['ci_high']:.4f}" in row
+        assert f"{capacity['frame_share']:.4f}" in row
+        assert f"{capacity['frame_low']:.4f}" in row
+        assert str(capacity["live"]) in row
+        assert f"{record['base_control']['position_r2']:+.4f}" in row
+        assert len(row) == len(header), (
+            "a value as wide as its column butts against its neighbour and a "
+            "wider one shifts the whole row"
+        )
+
+
+def test_the_read_table_spells_a_broken_check_the_way_the_measure_line_does(
+    tmp_path, capsys,
+):
+    """`checks BROKEN(floor)` is the spelling a long log is grepped for. The
+    measure line and the read table must not drift apart on it."""
+    records = _pool(broken={_BROKEN_CELL: ("floor_ok", "bracket_ok")})
+    _, out = _read(tmp_path, capsys, records)
+    table = _section(out, "per cell:")
+    broken_row = _row_for(table, *_BROKEN_CELL)
+    assert "BROKEN(floor,bracket)" in broken_row, broken_row
+    assert _line_with(table, "BROKEN(") == broken_row
+    measure_line = script._cell_line(records[_BROKEN_CELL], Path("somewhere.json"))
+    assert "BROKEN(floor,bracket)" in measure_line, measure_line
+    assert sum(1 for line in table.splitlines() if "BROKEN(" in line) == 1
+    assert sum(1 for line in table.splitlines() if " ok" in line) == 8
+
+
+def test_the_redundancy_companion_prints_undefined_for_a_collapsed_code(
+    tmp_path, capsys,
+):
+    """A collapsed code reads its redundancy EXACTLY equal to its floor -- every
+    row identical makes the circular shift the identity -- so the naive ratio is
+    exactly 1.0, the single value that says "independent, so the capacity is in
+    use", for a code with nothing in it. `redundancy_ratio` returns None and the
+    table must print `undefined`: not `n/a`, and never a bare 1.0."""
+    arm = "pixel_ae"
+    records = _pool({arm: {"collapsed": True}})
+    code, out = _read(tmp_path, capsys, records)
+    assert code == script.EXIT_OK
+    line = _line_with(_section(out, "redundancy companion"), f"{arm}: redundancy_bits")
+    assert "undefined" in line, line
+    assert "1.000" not in line and "n/a" not in line, line
+    row = _row_for(_section(out, "--- Reading G:"), arm)
+    assert "undefined" in row, row
+    for other in ARMS:
+        if other == arm:
+            continue
+        ratio = redundancy_ratio(
+            _mean(records, _cells_of(other), "capacity", "redundancy_bits"),
+            _mean(records, _cells_of(other), "capacity", "redundancy_floor"),
+        )
+        other_line = _line_with(
+            _section(out, "redundancy companion"), f"{other}: redundancy_bits",
+        )
+        assert f"{ratio:.3f}" in other_line, other_line
+        assert "undefined" not in other_line, other_line
+
+
+def test_the_redundancy_companion_prints_both_numbers_not_only_the_ratio(
+    tmp_path, capsys,
+):
+    """The ratio alone cannot be audited: a reader has to see how many bits per
+    pair the categoricals duplicate and where the circular-shift null landed."""
+    records = _pool()
+    _, out = _read(tmp_path, capsys, records)
+    companion = _section(out, "redundancy companion")
+    for arm in ARMS:
+        cells = _cells_of(arm)
+        bits = _mean(records, cells, "capacity", "redundancy_bits")
+        floor = _mean(records, cells, "capacity", "redundancy_floor")
+        line = _line_with(companion, f"{arm}: redundancy_bits")
+        assert f"{bits:.4f}" in line and f"{floor:.4f}" in line, line
+
+
+def test_the_self_check_table_reports_what_each_cell_was_scored_on(
+    tmp_path, capsys,
+):
+    records = _pool()
+    _, out = _read(tmp_path, capsys, records)
+    table = _section(out, "self-check per record")
+    assert len([line for line in table.splitlines() if "---" not in line]) == 10
+    for (arm, seed), record in sorted(records.items()):
+        # Selected by the cell's own `step`, which is unique per cell: an arm
+        # name matches three rows and a seed matches three more.
+        row = _row_for(table, arm, seed)
+        assert str(record["step"]) in row, row
+    for marker in (str(READ_WINDOWS), str(READ_ROWS), str(READ_CLUSTERS), "yes"):
+        assert marker in table, marker
+
+
+def test_the_self_check_table_refuses_window_lists_of_different_lengths():
+    """Both lists are one entry per gathered row and cannot describe one set of
+    rows if they differ, so the record is refused BY NAME rather than through a
+    bare `zip(strict=True)` traceback naming neither."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    records[victim]["windows"]["window"] = records[victim]["windows"]["window"][:-1]
+    with pytest.raises(SystemExit, match="random_vit seed 2"):
+        script.capacity_text(
+            records, script.capacity_inputs(records),
+            reading_capacity(script.capacity_inputs(records)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# capacity.txt is byte for byte what is printed
+# ---------------------------------------------------------------------------
+
+BYTE_SENTINEL = "verdict: SENTINEL\t   \n\n\n"
+"""A text whose tail is exactly what a `rstrip()` destroys: trailing spaces, a
+tab and three trailing newlines.
+
+Both of this project's previous byte-identity tests were satisfied by
+`path.write_text(text.rstrip())`, because both compared texts that had no
+trailing whitespace to lose. Nothing weaker than this catches it."""
+
+
+def test_the_sentinel_still_carries_what_it_is_for():
+    """The sentinel IS the test. A drifted constant would turn the byte-identity
+    assertion below into one `write_text(text.rstrip())` satisfies again."""
+    assert BYTE_SENTINEL.endswith("\n\n\n")
+    assert "\t" in BYTE_SENTINEL
+    assert BYTE_SENTINEL[:-3].endswith(" ")
+    assert BYTE_SENTINEL.rstrip() != BYTE_SENTINEL
+
+
+def test_capacity_txt_is_byte_identical_to_stdout(monkeypatch, tmp_path, capsys):
+    """`capacity.txt` is the artefact and stdout is the log, and they must be ONE
+    string. Driven with `capacity_text` substituted by a sentinel whose trailing
+    whitespace a `rstrip()` would eat."""
+    _write_pool(tmp_path, _pool())
+    monkeypatch.setattr(script, "capacity_text", lambda *a, **k: BYTE_SENTINEL)
+    code = _main_read("--phase", "read", "--out", str(tmp_path))
+    printed = capsys.readouterr().out
+    written = (tmp_path / "capacity.txt").read_bytes()
+    assert code == script.EXIT_OK
+    assert written == BYTE_SENTINEL.encode(), (
+        "capacity.txt is not byte for byte the text; a `write_text(text.rstrip())` "
+        "would pass every weaker comparison"
+    )
+    assert printed == BYTE_SENTINEL
+    assert written.decode() == printed
+
+
+def test_the_real_text_is_written_and_printed_as_one_string(tmp_path, capsys):
+    """The sentinel pins the WRITE; this pins the two against the real text, so
+    a formatter change cannot be written one way and printed another."""
+    records = _pool()
+    _, out = _read(tmp_path, capsys, records)
+    written = (tmp_path / "capacity.txt").read_bytes()
+    assert written.decode() == out
+    inputs = script.capacity_inputs(records)
+    assert out == script.capacity_text(records, inputs, reading_capacity(inputs))
+
+
+def test_a_second_read_phase_reproduces_capacity_txt_byte_for_byte(
+    tmp_path, capsys,
+):
+    """The artefact has to be reproducible from the records alone: a second
+    `--phase read` over the same nine records writes the same bytes."""
+    records = _pool()
+    first_code, first_out = _read(tmp_path, capsys, records)
+    first = (tmp_path / "capacity.txt").read_bytes()
+    second_code = _main_read("--phase", "read", "--out", str(tmp_path))
+    second_out = capsys.readouterr().out
+    assert (first_code, second_code) == (script.EXIT_OK, script.EXIT_OK)
+    assert (tmp_path / "capacity.txt").read_bytes() == first
+    assert second_out == first_out
+
+
+def test_a_refused_read_writes_no_artefact(tmp_path, capsys):
+    """A refused read has no artefact: `capacity.txt` must not be left holding
+    the previous run's verdict under a refusal."""
+    records = _pool()
+    records[sorted(records)[-1]]["clusters"] += 1
+    _write_pool(tmp_path, records)
+    with pytest.raises(SystemExit):
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    capsys.readouterr()
+    assert not (tmp_path / "capacity.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# read_phase and main
+# ---------------------------------------------------------------------------
+
+
+def test_read_phase_names_the_first_missing_cell_and_exits_eleven(tmp_path, capsys):
+    records = _pool()
+    del records[("random_vit", 2)]
+    _write_pool(tmp_path, records)
+    code = _main_read("--phase", "read", "--out", str(tmp_path))
+    out = capsys.readouterr().out
+    assert code == script.EXIT_NO_CHECKPOINTS
+    assert "NO CELL" in out and "random_vit seed 2" in out
+    assert not (tmp_path / "capacity.txt").exists()
+
+
+def test_read_phase_refuses_a_plan_it_cannot_read_before_loading_anything(tmp_path):
+    """`--arms frozen_ssl` cannot be read at all, and the refusal must come
+    before the records are even looked for."""
+    with pytest.raises(SystemExit) as raised:
+        _main_read("--phase", "read", "--out", str(tmp_path), "--arms", "frozen_ssl")
+    assert str(ARMS_REQUIRED) in str(raised.value)
+    with pytest.raises(SystemExit) as raised:
+        _main_read("--phase", "read", "--out", str(tmp_path), "--seeds", "0")
+    assert str(SEEDS_REQUIRED) in str(raised.value)
+
+
+def test_read_phase_counts_distinct_arms_and_seeds_not_the_lists(tmp_path, capsys):
+    """`--arms a a a` is ONE arm and `--seeds 0 0` one seed: counting the lists
+    would let a plan through that the records dict, keyed by cell, cannot
+    honour."""
+    with pytest.raises(SystemExit):
+        _main_read(
+            "--phase", "read", "--out", str(tmp_path),
+            "--arms", "pixel_ae", "pixel_ae", "pixel_ae",
+        )
+    records = _pool()
+    _write_pool(tmp_path, records)
+    code = _main_read(
+        "--phase", "read", "--out", str(tmp_path),
+        "--arms", *ARMS, *ARMS, "--seeds", "0", "1", "2", "0",
+    )
+    out = capsys.readouterr().out
+    assert code == script.EXIT_OK
+    assert len(_section(out, "per cell:").splitlines()) == 11
+
+
+def test_the_default_phase_is_read_and_the_parser_names_the_three():
+    """A default of `measure` would make a bare invocation pay for the whole
+    gather and print no reading."""
+    args = script._parser().parse_args([])
+    assert args.phase == "read"
+    assert script.PHASES == ("all", "measure", "read")
+    assert args.out == Path("runs/m3l_capacity")
+    assert args.source == Path("runs/m3_study_v2")
+
+
+def test_main_exits_zero_having_read_a_reading(tmp_path, capsys):
+    _write_pool(tmp_path, _pool())
+    assert _main_read("--phase", "read", "--out", str(tmp_path)) == script.EXIT_OK
+    assert "verdict:" in capsys.readouterr().out
+
+
+def test_every_phase_read_test_routes_through_the_measure_guard():
+    """`_main_read` is what keeps the measure half unreachable, and until this
+    test nothing made using it MECHANICAL -- a future test calling
+    `script.main(["--phase", "read", ...])` directly would load the real
+    checkpoints from `--source`'s default and run a real cell on the GPU inside
+    pytest."""
+    # Built at runtime so this scan's own source line cannot match itself.
+    call = "script" + ".main("
+    phase = '"' + "read" + '"'
+    offenders = [
+        line.strip() for line in Path(__file__).read_text().splitlines()
+        if call in line and phase in line
+        and not line.lstrip().startswith(("`", "#", '"'))
+    ]
+    assert not offenders, (
+        "call `_main_read(...)` instead of `script.main([...])` so the measure "
+        f"half stays unreachable: {offenders}"
+    )
+
+
+def _main_phase(monkeypatch, phase, out, *, measure_status=None):
+    """`main` on `phase` with the measure half stubbed out.
+
+    Returns `(status, phases_run)`. The measure half is the expensive one and the
+    read half is the one under test, so what this pins is the WIRING: which half
+    runs, in which order, and whether a failed measure stops the read."""
+    ran = []
+
+    def fake_measure_phase(args, cells, device, train, val):
+        ran.append("measure")
+        return script.EXIT_OK if measure_status is None else measure_status
+
+    def fake_read_phase(args):
+        ran.append("read")
+        return script.EXIT_OK
+
+    monkeypatch.setattr(script, "measure_phase", fake_measure_phase)
+    monkeypatch.setattr(script, "read_phase", fake_read_phase)
+    monkeypatch.setattr(script, "get_device", lambda prefer=None: "cpu")
+    monkeypatch.setattr(
+        script, "ReplayBuffer",
+        lambda data, **kw: types.SimpleNamespace(episode_paths=lambda: []),
+    )
+    monkeypatch.setattr(script, "episode_split", lambda paths, **kw: ([], []))
+    status = script.main(["--phase", phase, "--out", str(out)])
+    return status, ran
+
+
+@pytest.mark.parametrize("phase, expected", [
+    ("measure", ["measure"]),
+    ("read", ["read"]),
+    ("all", ["measure", "read"]),
+])
+def test_main_runs_exactly_the_halves_its_phase_names(
+    monkeypatch, tmp_path, phase, expected,
+):
+    """`--phase measure` must not read (there may be nothing to read yet) and
+    `--phase read` must not measure (that is ~13.5 GPU-hours)."""
+    status, ran = _main_phase(monkeypatch, phase, tmp_path)
+    assert (status, ran) == (script.EXIT_OK, expected)
+
+
+def test_a_failed_measure_stops_before_the_read_and_returns_its_own_status(
+    monkeypatch, tmp_path,
+):
+    """A read over records the measure refused to finish writing would pool a
+    partial grid -- or, worse, the PREVIOUS run's records -- under this run's
+    verdict."""
+    status, ran = _main_phase(
+        monkeypatch, "all", tmp_path, measure_status=script.EXIT_SELF_CHECK_FAILED,
+    )
+    assert status == script.EXIT_SELF_CHECK_FAILED
+    assert ran == ["measure"], "the read phase ran after a refused measure"
+
+
+def test_the_artefact_is_written_before_anything_is_printed(
+    monkeypatch, tmp_path, capsys,
+):
+    """`capacity.txt` GATES THE LOG, which is a claim `read_phase`'s docstring
+    makes and nothing else could falsify. A read whose artefact could not be
+    written -- a full disk, a read-only output directory -- must not first print
+    a verdict a reader would then go looking for in a file that is not there."""
+    _write_pool(tmp_path, _pool())
+
+    def refuse(path, text):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(script, "write_text", refuse)
+    with pytest.raises(OSError, match="no space left"):
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    assert capsys.readouterr().out == "", (
+        "the verdict reached stdout before the artefact reached disk"
     )
