@@ -684,7 +684,7 @@ def cell_capacity(gathered, *, seed: int, resamples: int = RESAMPLES) -> dict:
     returned, so it costs nothing. NOT a known-answer control: the prior is a
     function of `h`, `h` encodes past frames, so its distribution genuinely
     varies across rows and the reading is positive. It decides nothing, and spec
-    3.3 requires it per cell.
+    2.4 requires it per cell.
 
     Both redundancy numbers ship as PLAIN FLOATS. The ratio is derived at read
     time by `redundancy_ratio`, which returns None for a collapsed code -- a
@@ -1067,7 +1067,18 @@ refusal.
 compared. The first two are written from module constants and so cannot vary
 between two records of one code version -- comparing them is the tautology this
 table exists to avoid -- and a failed check is a FINDING the read phase turns
-into 43, not a protocol disagreement."""
+into 43, not a protocol disagreement.
+
+`capacity.confidence`, `capacity.resamples`, `capacity.frame_confidence` and
+`capacity.frame_resamples` -- the level and the draw count each interval was
+taken at -- are deliberately NOT compared either, and no `capacity.*` entry
+belongs in this table. A record written before one of them existed does not
+carry it (the nine shipped records predate `capacity.resamples`), so comparing
+the field would refuse a mixed old/new pool that is in fact sound: one cell
+re-measured after the field was added, beside eight that were not. A
+`.get(...)` default does not rescue it, because the absent field then becomes a
+second value for the present one to disagree with.
+`test_read_phase_reads_a_pool_where_only_some_records_carry_resamples` pins it."""
 
 
 def require_one_protocol(records: dict) -> None:

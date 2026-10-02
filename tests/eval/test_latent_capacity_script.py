@@ -982,7 +982,7 @@ def test_every_measured_value_is_a_plain_python_scalar():
 
 
 def test_cell_capacity_reads_the_prior_from_prior_probs_not_the_posterior():
-    """Spec 3.3 requires `prior_bits` per cell as a companion that decides
+    """Spec 2.4 requires `prior_bits` per cell as a companion that decides
     nothing: it is free from the same forward pass and speaks to M3g's finding
     that the prior is the failing stage.
 

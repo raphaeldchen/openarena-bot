@@ -643,13 +643,25 @@ def _bits_from_stats(stats: EpisodeStats, picked: np.ndarray) -> float:
 
 def bits_interval(
     stats: EpisodeStats, *, resamples: int = RESAMPLES,
-    confidence: float = CONFIDENCE, seed: int = 0,
+    confidence: float = CONFIDENCE, seed: int,
 ) -> dict:
     """`bits_carried` with an episode-clustered percentile interval.
 
     Episodes, not windows: windows are cut non-overlapping but several windows
     from one trajectory are not independent observations, and every reading from
     M3e onward clusters on episodes.
+
+    `seed` HAS NO DEFAULT, for `redundancy_floor`'s reason: a defaulted seed is
+    how a previous milestone shipped every cell drawing from seed 0, which
+    correlates the interval noise the seeds x arms agreement rule treats as
+    independent. A caller that forgets it is a `TypeError`, not a silent
+    collapse onto one bootstrap.
+
+    `confidence` and `resamples` are the level and the draw count the interval
+    was ACTUALLY TAKEN AT -- the arguments this function used, not a claim made
+    by its caller -- so the permanent record can be audited for both. `ci_high`
+    is the bound Reading G compares to `SPARE_CUT`, and a narrower interval
+    makes `SPARE_CAPACITY` easier to clear, so neither may go unrecorded.
     """
     n_episodes = stats.labels.size
     if n_episodes < 2:
@@ -670,6 +682,7 @@ def bits_interval(
         "ci_low": float(low),
         "ci_high": float(high),
         "confidence": confidence,
+        "resamples": int(resamples),
         "n_episodes": int(n_episodes),
     }
 ```
@@ -1864,7 +1877,7 @@ In absolute terms both redundancy figures are tiny: 0.0006–0.0035 bits per pai
 
 From `capacity.prior_bits`: `pixel_ae` 1.0283 / 0.7378 / 1.0499 (mean **0.9386**), `frozen_ssl` 0.8320 / 0.6453 / 1.3667 (mean **0.9480**), `random_vit` 1.3762 / 1.5897 / 1.3530 (mean **1.4396**). Pooled mean **1.1088**, min 0.6453, max 1.5897. It gates nothing: no status, check or refusal in this run depends on it.
 
-The posterior reading exceeds the prior reading in **9 of 9 cells**, by +0.1518 to +0.9864 bits. On M3g's finding that the prior is the failing stage — a verdict that was `PREDICT FAILS` in 2 of 3 arms (`frozen_ssl`, `random_vit`) and `ENCODE FAILS` in `pixel_ae`, not 3 of 3 — this is consistent in direction and almost worthless in strength: the information the prior's distribution carries through `h` alone is, as a summed upper bound, between 0.65 and 1.59 of 160 bits, less than the posterior does in every cell. These are **one-step-ahead priors under teacher forcing, not the distribution a rollout runs on**: `probe.gather_probe_data` takes them from two `observe` calls (`src/mbfps/eval/probe.py:317–332`), where `h` is advanced on **posterior**-drawn `z`, while a rollout uses `imagine` and advances `h` on **prior**-drawn `z`. The spec (§2.4) and `cell_capacity`'s docstring both describe it as "the information the prior's distribution carries through `h` alone", and that is the claim the figures support. It is one more reading on a scale where everything is near zero, and it separates no hypothesis. It is reported because §2.4 requires it per cell, and it decides nothing.
+The posterior reading exceeds the prior reading in **9 of 9 cells**, by +0.1518 to +0.9864 bits. On M3g's finding that the prior is the failing stage — a verdict that was `PREDICT FAILS` in 2 of 3 arms (`frozen_ssl`, `random_vit`) and `ENCODE FAILS` in `pixel_ae`, not 3 of 3 — this is consistent in direction and almost worthless in strength: the information the prior's distribution carries through `h` alone is, as a summed upper bound, between 0.65 and 1.59 of 160 bits, less than the posterior does in every cell. These are **one-step-ahead priors under teacher forcing, not the distribution a rollout runs on**: `probe.gather_probe_data` takes them from two `observe` calls (`src/mbfps/eval/probe.py:317–332`), where `h` is advanced on **posterior**-drawn `z`, while a rollout uses `imagine` and advances `h` on **prior**-drawn `z`. The spec (§2.4) and the module docstring of `scripts/latent_capacity.py` both describe it as "the information the prior's distribution carries through `h` alone", and that is the claim the figures support. It is one more reading on a scale where everything is near zero, and it separates no hypothesis. It is reported because §2.4 requires it per cell, and it decides nothing.
 
 ### Does the rule's status agree with the magnitudes?
 
