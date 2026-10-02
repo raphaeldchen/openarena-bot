@@ -1,4 +1,4 @@
-"""M3m: does the one-step map predict motion, or did it never learn it? -- measure.
+"""M3m: does the one-step map predict motion, or did it never learn it? -- measure and read.
 
 M3l refuted the bottleneck lever and left the objective lever standing by
 elimination, but the hypothesis it inherited -- "the loss never asks for motion"
@@ -36,17 +36,34 @@ PER CELL, THE RECORD CARRIES:
                   constants. M3l shipped a headline interval whose draw count the
                   permanent artefact could not be audited for.
 
-NOTHING HERE DECIDES ANYTHING. Reading H is the read phase's, from the pooled
-records. A control that missed its known answer is RECORDED, not raised, and the
-run carries on: the records are the artefact, and a measure that raised would
-discard the evidence of which cell broke. 45 and 46 are raised by the read phase
-from `reading_burden`'s two refusal statuses and never here; the numbered exits
-report what was found in the data, and 45/46 are in no other tool's range (39/40
+NOTHING IN THE MEASURE PHASE DECIDES ANYTHING. Reading H is the read phase's, from
+the pooled records. A control that missed its known answer is RECORDED, not
+raised, and the run carries on: the records are the artefact, and a measure that
+raised would discard the evidence of which cell broke. 45 and 46 are returned by
+the read phase from `reading_burden`'s two refusal statuses and never by the
+measure; the numbered exits report what was found in the data, and 45/46 are in
+no other tool's range (39/40
 M3j, 41/42 M3k, 43/44 M3l, 38 M3i, run_study 1/3-6/23, report_study 7-10, diagnose
 11-17, pool 18-22, trust 30, split_gap 31, ladder 32-33, stages 34, sharper_latent
 35-37, argparse 2, a traceback 1). 0 / 11 / 12 / 14 are `trust_horizon.py`'s, on
 purpose: `prepare_cell` refuses a cell for the same reasons in the same words as
 every other diagnostic.
+
+THE READ PHASE (`--phase read`) pools the nine records and prints Reading H, from
+the records alone and with no GPU. It refuses what it cannot read, in three
+different ways that are kept apart on purpose:
+
+  * BY NAME, with no number (`SystemExit` carrying the message, status 1): a plan
+    narrower than `ARMS_REQUIRED` arms, records that disagree on any
+    `_PROTOCOL_FIELDS` entry (`git_sha` among them), a record filed under another
+    cell's name. These are the operator's, not the data's.
+  * BY NUMBER: 45 when a control with a known answer was missed, 46 when the data
+    cannot be read (a cell where the agent barely moved, an arm short of
+    `SEEDS_MINIMUM` seeds). 11 names a cell whose record is missing.
+  * BY TRACEBACK: `reading_burden`'s two `ValueError`s, which are shape errors and
+    are never caught into a status or an exit.
+
+`burden.txt` is written only for a reading, and is the same bytes stdout carries.
 
 THE ONE ALIGNMENT RISK. `regrounding_sweep` retains its per-window rows in the
 order IT walked, and `baseline_rows` walks the validation episodes in a second,
@@ -97,13 +114,14 @@ from mbfps.data.episode import load_episode
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.burden import (
-    CONFIDENCE, DECISION_H, IDENTITY_TOLERANCE, REPORTED_H, RESAMPLES, burden,
-    compounding, identity_residual, margin_interval, one_step_persistence,
+    ARMS_REQUIRED, CONFIDENCE, DECISION_H, IDENTITY_TOLERANCE, REPORTED_H, RESAMPLES,
+    BurdenArm, BurdenInputs, burden, compounding, format_reading_burden, identity_residual,
+    margin_interval, one_step_persistence, reading_burden,
 )
 from mbfps.eval.diagnostics import REGROUNDING_KS, regrounding_sweep
 from mbfps.eval.probe import probe_targets
 from mbfps.eval.rollout import RolloutResult
-from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.eval.windows import window_starts
 from mbfps.utils.config import ARMS
 from mbfps.utils.device import get_device
@@ -137,12 +155,20 @@ here: the measure phase records the control and carries on."""
 
 EXIT_UNREADABLE: int = 46
 """The reading cannot be taken from this data: a cell where the agent barely
-moved, a protocol disagreement, or an arm short of SEEDS_MINIMUM seeds.
+moved, or an arm short of SEEDS_MINIMUM seeds.
 
-Also raised in the read phase."""
+RETURNED BY THE READ PHASE from `reading_burden`'s `UNREADABLE`, never here.
+Two refusals look like it and are NOT it: records that disagree on the protocol
+and a plan narrower than ARMS_REQUIRED arms are raised BY NAME (a `SystemExit`
+carrying the message, so status 1) and have no number of their own. The numbered
+exits report what was found in the DATA; those two are the operator's."""
 
-PHASES: tuple[str, ...] = ("measure",)
-"""The phases this script runs. The read phase extends it."""
+PHASES: tuple[str, ...] = ("all", "measure", "read")
+"""The phases this script runs. `all` is `measure` and then `read`.
+
+THE DEFAULT IS THE LAST, `read`: it spends no GPU time, and without records it
+refuses by name (11). A default of `measure` would make a bare invocation pay for
+nine cells."""
 
 
 def burden_record_path(out_dir: Path, arm: str, seed: int) -> Path:
@@ -370,16 +396,6 @@ def measure_cell(
     }
 
 
-def _plan(args) -> tuple[list[str], list[int]]:
-    """The DISTINCT arms and seeds, in the order given. `--arms a a` is one arm
-    and `--seeds 0 0 0` one seed: measuring from the lists as given would
-    measure a cell twice and write its record twice."""
-    return (
-        list(dict.fromkeys(args.arms)),
-        list(dict.fromkeys(int(s) for s in args.seeds)),
-    )
-
-
 def _cell_line(record: dict, path: Path) -> str:
     """One line per measured cell: the margin at the decision horizon with its
     interval, the burden at the last rung, and the identity residual.
@@ -453,6 +469,281 @@ def measure_phase(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# read: what pooling these records requires, and Reading H.
+# ---------------------------------------------------------------------------
+
+
+_PROTOCOL_FIELDS = (
+    ("git_sha", lambda r: str(r["git_sha"])),
+    ("torch_version", lambda r: str(r["torch_version"])),
+    ("device", lambda r: str(r["device"])),
+    ("step", lambda r: int(r["step"])),
+    ("context", lambda r: int(r["context"])),
+    ("horizon", lambda r: int(r["horizon"])),
+    ("split_seed", lambda r: int(r["split_seed"])),
+    ("ks", lambda r: [int(k) for k in r["ks"]]),
+    ("decision_h", lambda r: int(r["decision_h"])),
+    ("reported_h", lambda r: [int(h) for h in r["reported_h"]]),
+    ("confidence", lambda r: float(r["confidence"])),
+    ("resamples", lambda r: int(r["resamples"])),
+    ("identity_tolerance", lambda r: float(r["identity_tolerance"])),
+    ("episodes.val", lambda r: list(r["episodes"]["val"])),
+    ("windows.episode", lambda r: list(r["windows"]["episode"])),
+)
+"""Every field `require_one_protocol` compares, as `(name, pick)`, in one
+module-level table that the function ITERATES and a test reads -- so a field
+cannot be added to the comparison without the test noticing it has no
+disagreement case, and one cannot be dropped without it noticing the required
+set shrank.
+
+`git_sha` IS NOT OPTIONAL. `latent_capacity.require_one_protocol`'s docstring
+records that an earlier version without it let records from different torch
+builds and code versions pool into one finding with no refusal at all.
+`torch_version` is the other half of that sentence.
+
+`step`, `context`, `horizon` and `split_seed` say WHICH checkpoints, over which
+windows, on which split; `ks`, `decision_h`, `reported_h` say what was read off
+them; `confidence`, `resamples` and `identity_tolerance` are what each interval
+and control was taken at. All are written from the measure phase's own
+constants, so two records of one code version cannot disagree on them and a
+disagreement is a mixed pool. `episodes.val` and `windows.episode` say the rows
+were the same: nine cells pooled into one reading must describe the same
+windows, and two that differ were scored on a union nothing measured.
+
+NOT COMPARED, on purpose: `kl_rate_above_free_bits`, `kl_dyn_max` and
+`record_git_sha`. They are properties of each CELL'S TRAINING, which differ
+between cells by construction, and they are carried for the reader, not for the
+verdict.
+
+A record WITHOUT a field is refused by name (`_pick`), not defaulted: a default
+would make a record that merely lacks the field pass for one that agrees."""
+
+
+def _pick(cell, field: str, pick, record: dict):
+    """`pick(record)`, or the named refusal for a record that lacks `field`.
+
+    Every record here was written by `measure_cell`, so a missing field is a
+    file that is not one -- a bare `KeyError` would not say which."""
+    try:
+        return pick(record)
+    except (KeyError, TypeError) as error:
+        raise SystemExit(
+            f"{cell[0]} seed {cell[1]} lacks {field}: it is not a burden record "
+            "this script wrote"
+        ) from error
+
+
+def _brief(value) -> str:
+    text = repr(value)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _require_agreement(records: dict, fields) -> list:
+    """The sorted `(cell, record)` pairs, after refusing any two that disagree on
+    one of `fields` -- named by cell and field.
+
+    EVERY record is compared with the first, not only the second, so a record
+    that sorts last is held to the same value as one that sorts second."""
+    items = sorted(records.items())
+    if not items:
+        raise SystemExit("no burden record to read")
+    (first_cell, first), rest = items[0], items[1:]
+    picks = dict(_PROTOCOL_FIELDS)
+    for field in fields:
+        reference = _pick(first_cell, field, picks[field], first)
+        for cell, record in rest:
+            mine = _pick(cell, field, picks[field], record)
+            if mine != reference:
+                raise SystemExit(
+                    f"{cell[0]} seed {cell[1]} and {first_cell[0]} seed "
+                    f"{first_cell[1]} disagree on {field}: {_brief(mine)} vs "
+                    f"{_brief(reference)}; they are not one measurement and "
+                    "cannot be read as one"
+                )
+    return items
+
+
+def require_one_protocol(records: dict) -> None:
+    """Every record reports the same protocol on the same windows, or the two that
+    disagree are named with the field.
+
+    Nine cells pooled into one reading must describe the same rows: two
+    protocols pooled as one would be a reading over a union nothing measured.
+    Mirrors `scripts/latent_capacity.py`'s namesake, and `git_sha` is among the
+    fields for the reason that docstring gives."""
+    _require_agreement(records, [name for name, _ in _PROTOCOL_FIELDS])
+
+
+def require_readable_plan(arms) -> None:
+    """Refuse a plan with fewer than `ARMS_REQUIRED` DISTINCT arms.
+
+    Reading H needs `ARMS_REQUIRED` arms to reach a decisive status, and with
+    fewer `reading_burden` does not refuse: it falls through to INDETERMINATE
+    under a sentence about "0 of 1 arms", a status the PLAN produced and the data
+    did not. That is the distinction M3j's `require_readable_plan` introduced,
+    after a run printed `clears = up` beside a verdict of NO DIFFERENCE. Asked
+    here it costs nothing; asked after `--phase all` it is nine cells of GPU time.
+
+    THE SEED COUNT IS NOT CHECKED HERE, deliberately. An arm carrying fewer than
+    `SEEDS_MINIMUM` seeds is `reading_burden`'s own refusal, and comes back as
+    `UNREADABLE` (46) naming the arm: a plan check on seeds would stand in front
+    of it and make that status unreachable from the read phase.
+
+    The caller passes the DISTINCT arms (`_plan`): `--arms a a a` is one arm."""
+    if len(arms) < ARMS_REQUIRED:
+        raise SystemExit(
+            f"a plan of {len(arms)} arm(s) cannot be read: Reading H needs "
+            f"ARMS_REQUIRED={ARMS_REQUIRED} arms to reach a decisive status, and "
+            "would otherwise print INDETERMINATE for a reason the data did not give"
+        )
+
+
+def load_burden(out_dir: Path, arms, seeds) -> dict:
+    """Every planned cell's record, keyed by `(arm, seed)` -- or `CellMissing`
+    naming the first that is not on disk.
+
+    Named, never skipped: a pool over the cells that happen to be present,
+    printed under the nine cells' names, is exactly the failure
+    `pooling.MissingCell` exists for. A record whose own `arm`/`seed` disagree
+    with the file it was read under is refused too -- a swapped pair of files
+    would pool one cell under another's name with every count still right."""
+    records: dict[tuple[str, int], dict] = {}
+    for arm in arms:
+        for seed in seeds:
+            path = burden_record_path(out_dir, arm, int(seed))
+            if not path.exists():
+                raise CellMissing(
+                    f"{arm} seed {int(seed)}: no burden record at {path}; "
+                    "run --phase measure first"
+                )
+            record = load_record(path)
+            if record.get("arm") != arm or int(record.get("seed", -1)) != int(seed):
+                raise SystemExit(
+                    f"{path.name} was read for {arm} seed {int(seed)} but its "
+                    f"record says arm={record.get('arm')!r} seed={record.get('seed')!r}"
+                )
+            records[(arm, int(seed))] = record
+    return records
+
+
+def burden_inputs(records: dict) -> BurdenInputs:
+    """The pooled records as `BurdenInputs`, every cell at ONE decision horizon on
+    ONE ladder.
+
+    The decision horizon and the ladder are the two values `BurdenInputs` holds
+    once for nine cells, so a disagreement on either is refused HERE, at the point
+    the pick is made, rather than depending on `require_one_protocol` having run
+    first: a first-record pick would otherwise read every other cell at a horizon
+    its own record does not name.
+
+    Each cell's margin is read at the decision horizon and each rung at the
+    decision horizon's step -- `[h - 1]`, because the curves are 0-indexed and
+    the horizon is counted from 1 (`burden.at_horizon`). The record's keys are
+    strings, the form JSON gives them back in; `BurdenArm` takes integer rungs.
+    `clusters` is the number of distinct episodes the windows were cut from and
+    `rows` the number of windows; neither is read by the verdict."""
+    items = _require_agreement(records, ("decision_h", "ks"))
+    decision_h = int(items[0][1]["decision_h"])
+    ks = tuple(int(k) for k in items[0][1]["ks"])
+    cells = {}
+    for (arm, seed), record in items:
+        margin = record["margin"][str(decision_h)]
+        controls, base = record["controls"], record["base_control"]
+        cells[(arm, seed)] = BurdenArm(
+            arm=arm, seed=seed,
+            margin=float(margin["point"]),
+            margin_low=float(margin["ci_low"]),
+            margin_high=float(margin["ci_high"]),
+            burden_by_k={
+                k: float(record["burden_by_k"][str(k)][decision_h - 1]) for k in ks
+            },
+            compounding_by_k={
+                k: float(record["compounding_by_k"][str(k)][decision_h - 1]) for k in ks
+            },
+            identity_residual=float(controls["identity_residual"]),
+            open_loop_divergence=float(controls["open_loop_divergence"]),
+            k_one_is_floor=bool(controls["k_one_is_floor"]),
+            displacement_median=float(base["displacement_median"]),
+            floor_median=float(base["floor_median"]),
+            clusters=len(set(record["windows"]["episode"])),
+            rows=int(record["windows"]["total"]),
+        )
+    return BurdenInputs(cells=cells, decision_h=decision_h, ks=ks)
+
+
+READ_EXITS: dict[str, int] = {
+    "UNRESOLVED_CONTROL": EXIT_CONTROL_BROKEN,
+    "UNREADABLE": EXIT_UNREADABLE,
+}
+"""Reading H's two refusal statuses, each to its own exit.
+
+Keyed on exactly the two refusal statuses `reading_burden` returns; every other
+status falls through to `EXIT_OK`. `PREDICTS_MOTION`, `COPIES` and
+`INDETERMINATE` are READINGS, and a milestone that exited non-zero on a finding
+would make "the run worked" and "the news was good" the same signal.
+
+The numbered statuses report what was found in the DATA. A narrowed plan is the
+operator asking for something no data can answer, so it raises rather than
+adding a status -- the distinction M3j's `require_readable_plan` introduced."""
+
+
+def _plan(args) -> tuple[list[str], list[int]]:
+    """The DISTINCT arms and seeds, in the order given. `--arms a a` is one arm
+    and `--seeds 0 0 0` one seed: counting the lists would let a plan through
+    that the records dict, keyed by cell, cannot honour -- and measuring from the
+    lists as given would measure a cell twice and write its record twice."""
+    return (
+        list(dict.fromkeys(args.arms)),
+        list(dict.fromkeys(int(s) for s in args.seeds)),
+    )
+
+
+def read_phase(args) -> int:
+    """Refuse a plan that cannot be read, pool every requested cell (11 names the
+    first missing), refuse records that are not one measurement, decide Reading H,
+    and return `READ_EXITS.get(reading.status, EXIT_OK)`: 0 for every reading, 45
+    or 46 for the two refusals.
+
+    A READING IS WRITTEN AND PRINTED AS ONE STRING: `burden.txt` is the artefact
+    and stdout the log, `format_reading_burden` already ends its text in a
+    newline, and this function prints it with `end=""`. `print(text)` would put
+    a second newline on stdout and none in the file. The text is written as it
+    is -- never `rstrip()`ped.
+
+    A REFUSAL WRITES NOTHING. Its status and the rule that names the offending
+    cells are printed, and no `burden.txt` is created, so there is no file to be
+    mistaken for a reading.
+
+    NOTHING CATCHES `reading_burden` HERE, and that is deliberate. It raises
+    `ValueError` for an empty cell set and for two decisive statuses that both
+    reach the bar; neither is something found in the data, and a `try` would turn
+    an arm count that has outgrown the bar into an exit number. The first is
+    unreachable from here (the plan check refuses before any record is read); the
+    second is reachable only with four or more arms."""
+    arms, seeds = _plan(args)
+    require_readable_plan(arms)
+    try:
+        records = load_burden(args.out, arms, seeds)
+    except CellMissing as error:
+        print(f"NO CELL: {error}")
+        return EXIT_NO_CHECKPOINTS
+    require_one_protocol(records)
+    inputs = burden_inputs(records)
+    reading = reading_burden(inputs)
+    code = READ_EXITS.get(reading.status, EXIT_OK)
+    if code != EXIT_OK:
+        print(
+            f"{reading.status}: {reading.rule}\n"
+            "no reading was taken, so no burden.txt was written"
+        )
+        return code
+    text = format_reading_burden(reading, inputs)
+    (Path(args.out) / "burden.txt").write_text(text)
+    print(text, end="")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -461,7 +752,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "M3m: does the one-step map predict motion, or did it never learn it? "
-            "-- measure the nine cells"
+            "-- measure the nine cells, read Reading H"
         ),
     )
     parser.add_argument("--out", type=Path, default=Path("runs/m3m_burden"))
@@ -475,13 +766,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
-    parser.add_argument("--phase", choices=PHASES, default=PHASES[0])
+    parser.add_argument("--phase", choices=PHASES, default=PHASES[-1])
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """`measure`, `read`, or `all` -- the measure and then the read, which does
+    not run when the measure stopped with a status: a cell that was refused wrote
+    no record, and a read after it would be over a pool missing that cell.
+
+    `--phase all` REFUSES A PLAN `read` COULD NOT READ before any cell is
+    measured; `--phase measure` is allowed one, because the milestone's smoke is
+    one cell."""
     args = _parser().parse_args(argv)
-    return measure_phase(args)
+    if args.phase == "all":
+        require_readable_plan(_plan(args)[0])
+    if args.phase in ("measure", "all"):
+        status = measure_phase(args)
+        if status != EXIT_OK:
+            return status
+    if args.phase in ("read", "all"):
+        return read_phase(args)
+    return EXIT_OK
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ THE RIG IS CHOSEN SO THAT NO ASSERTION IS DECIDED BY THE FIXTURE.
     a 2.5/97.5 percentile interval is just the smaller and larger episode mean.
 """
 
+import copy
 import importlib.util
 import types
 from dataclasses import replace
@@ -52,7 +53,7 @@ from mbfps.eval.diagnostics import (
 )
 from mbfps.eval.probe import apply_probe, fit_probe, probe_targets
 from mbfps.eval.rollout import evaluate_rollout
-from mbfps.eval.study import SPLIT_SEED, git_sha, load_record
+from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
     KEYS, STEP, DriftingModel, OracleModel, _OracleRSSM, oracle_probe, synthetic_episode,
@@ -1264,3 +1265,659 @@ def test_main_takes_its_cells_and_directories_from_the_command_line(tmp_path, mo
     ])
     assert status == script.EXIT_OK
     assert [p.name for p in args.out.iterdir()] == ["burden_frozen_ssl_seed2.json"]
+
+
+# ---------------------------------------------------------------------------
+# The read phase: nine records pooled into Reading H.
+#
+# THE POOL IS THE REAL RECORD, RELABELLED. Every cell starts as a deep copy of
+# the record `measure_cell` writes (`record`), so the schema is the writer's own,
+# and only the fields the read phase READS are then overwritten, each from a
+# formula in the cell's index `c`. Nothing the reading reads is shared between
+# two cells, and the expected `BurdenInputs` is built from the same formulas --
+# never from the records, and never through `script.burden_inputs`.
+#
+#   * Three arms x seeds 0, 1, 2: nine cells, no two alike in any number read.
+#     The arms are given in `ARMS` order, whose index is NOT `sorted()` order
+#     (`frozen_ssl` sorts first), so a read that sorts or enumerates differently
+#     reads another cell's numbers.
+#   * `burden_by_k[k][j]` and `compounding_by_k[k][j]` hold a value that depends
+#     on the cell, the rung AND the step, so a read at the wrong step, the wrong
+#     rung, the wrong cell, or from the other array is a different number.
+#   * The margin at every reported horizon but the decision horizon is a decoy
+#     (about a thousand), so a read at the wrong horizon is not a plausible one.
+#   * The decision horizon is also read at 30 and 20, not only 45: at 45 the
+#     step index is the LAST one, where `[h - 1]` and `[-1]` are one element.
+# ---------------------------------------------------------------------------
+
+
+READ_ARMS = ("pixel_ae", "frozen_ssl", "random_vit")
+READ_SEEDS = (0, 1, 2)
+FIRST_CELL, SECOND_CELL, LAST_CELL = ("frozen_ssl", 0), ("frozen_ssl", 1), ("random_vit", 2)
+"""`sorted()` order of the nine cells -- the order `require_one_protocol` walks.
+The LAST sorts after every other cell, so a check that looks at only the first
+record or the first two sees nothing wrong with it."""
+
+KINDS = {
+    # what each arm's three seeds clear at the decision horizon, in seed order:
+    # "up" = the whole interval above 0, "down" = at or below 0, "straddle" = neither
+    "PREDICTS_MOTION": {
+        "pixel_ae": ("up", "up", "up"),
+        "frozen_ssl": ("up", "straddle", "up"),
+        "random_vit": ("down", "straddle", "down"),
+    },
+    "COPIES": {
+        "pixel_ae": ("down", "down", "straddle"),
+        "frozen_ssl": ("up", "up", "straddle"),
+        "random_vit": ("down", "down", "down"),
+    },
+    "INDETERMINATE": {
+        "pixel_ae": ("up", "up", "straddle"),
+        "frozen_ssl": ("down", "down", "up"),
+        "random_vit": ("straddle", "straddle", "up"),
+    },
+}
+BROKEN_CONTROLS = {"identity_residual": 1e-3, "open_loop_divergence": 0.25, "k_one_is_floor": True}
+
+
+def _margin_triple(kind: str, c: int) -> tuple[float, float, float]:
+    """`(point, ci_low, ci_high)`, binary fractions, a different one in every cell."""
+    if kind == "up":
+        point = 0.5 + c / 16.0
+        return point, 0.125 + c / 32.0, point + 0.25
+    if kind == "down":
+        point = -0.5 - c / 16.0
+        return point, point - 0.25, -0.125 - c / 32.0
+    point = (c - 4) / 32.0
+    return point, point - 0.25, point + 0.25
+
+
+def _burden_value(c: int, k: int, h: int) -> float:
+    return 100.0 * c + k + h / 64.0
+
+
+def _compounding_value(c: int, k: int, h: int) -> float:
+    return c / 4.0 + k / 8.0 + h / 256.0
+
+
+def _spec(kinds_by_arm, *, broken=None, stationary=None) -> dict:
+    """The numbers the reading reads, per cell, from nothing but the cell's index.
+
+    `broken=(cell, control)` misses one known answer in one cell and
+    `stationary=cell` makes one cell's agent move less than the readout's error."""
+    spec = {}
+    for a, (arm, kinds) in enumerate(kinds_by_arm.items()):
+        for seed, kind in zip(READ_SEEDS, kinds, strict=True):
+            c = a * len(READ_SEEDS) + seed
+            floor = 3.0 + c / 16.0
+            point, low, high = _margin_triple(kind, c)
+            spec[(arm, seed)] = {
+                "c": c, "point": point, "low": low, "high": high,
+                "identity_residual": (c + 1) * 2.0 ** -50,
+                "open_loop_divergence": 0.0, "k_one_is_floor": False,
+                "displacement_median": floor + 5.0 + c / 8.0, "floor_median": floor,
+            }
+    if broken is not None:
+        cell, control = broken
+        spec[cell][control] = BROKEN_CONTROLS[control]
+    if stationary is not None:
+        spec[stationary]["displacement_median"] = spec[stationary]["floor_median"] - 0.5
+    return spec
+
+
+def _scenario(status: str, **over) -> dict:
+    """A spec that `burden.reading_burden` reads as `status`. The two refusals
+    sit on top of a pool that would otherwise read PREDICTS_MOTION, which is what
+    makes them refusals and not readings."""
+    if status == "UNRESOLVED_CONTROL":
+        over.setdefault("broken", (LAST_CELL, "identity_residual"))
+    elif status == "UNREADABLE":
+        over.setdefault("stationary", LAST_CELL)
+    kinds = KINDS["PREDICTS_MOTION" if status in ("UNRESOLVED_CONTROL", "UNREADABLE") else status]
+    return _spec(kinds, **over)
+
+
+def _records_from(base, spec, *, decision_h=burden.DECISION_H, ks=REGROUNDING_KS) -> dict:
+    records = {}
+    for (arm, seed), cell in spec.items():
+        c = cell["c"]
+        record = copy.deepcopy(base)
+        record.update(arm=arm, seed=seed, decision_h=decision_h, ks=list(ks))
+        record["margin"] = {
+            str(h): (
+                {"point": cell["point"], "ci_low": cell["low"], "ci_high": cell["high"]}
+                if h == decision_h
+                else {"point": 1000.0 + h, "ci_low": 999.0 + h, "ci_high": 1001.0 + h}
+            )
+            for h in burden.REPORTED_H
+        }
+        steps = range(1, HORIZON + 1)
+        record["burden_by_k"] = {str(k): [_burden_value(c, k, h) for h in steps] for k in ks}
+        record["compounding_by_k"] = {
+            str(k): [_compounding_value(c, k, h) for h in steps] for k in ks
+        }
+        record["controls"] = {
+            **record["controls"],
+            "identity_residual": cell["identity_residual"],
+            "open_loop_divergence": cell["open_loop_divergence"],
+            "k_one_is_floor": cell["k_one_is_floor"],
+        }
+        record["base_control"] = {
+            "displacement_median": cell["displacement_median"],
+            "floor_median": cell["floor_median"],
+        }
+        records[(arm, seed)] = record
+    return records
+
+
+def _expected_inputs(spec, *, decision_h=burden.DECISION_H, ks=REGROUNDING_KS):
+    """What `burden_inputs` must return, built from the spec alone. The window
+    counts are the rig's own (`EXPECTED_WINDOWS`), not read back off a record."""
+    return burden.BurdenInputs(
+        cells={
+            cell: burden.BurdenArm(
+                arm=cell[0], seed=cell[1], margin=s["point"], margin_low=s["low"],
+                margin_high=s["high"],
+                burden_by_k={k: _burden_value(s["c"], k, decision_h) for k in ks},
+                compounding_by_k={k: _compounding_value(s["c"], k, decision_h) for k in ks},
+                identity_residual=s["identity_residual"],
+                open_loop_divergence=s["open_loop_divergence"],
+                k_one_is_floor=s["k_one_is_floor"],
+                displacement_median=s["displacement_median"], floor_median=s["floor_median"],
+                clusters=sum(1 for n in EXPECTED_WINDOWS if n), rows=sum(EXPECTED_WINDOWS),
+            )
+            for cell, s in spec.items()
+        },
+        decision_h=decision_h, ks=tuple(ks),
+    )
+
+
+def _read_args(tmp_path, records, *, arms=READ_ARMS, seeds=READ_SEEDS):
+    """Write `records` under their file names -- spelled out here, not taken from
+    `burden_record_path` -- and return the args `read_phase` takes."""
+    out = Path(tmp_path) / "burden_out"
+    out.mkdir(parents=True)
+    for (arm, seed), record in records.items():
+        write_record(out / f"burden_{arm}_seed{seed}.json", record)
+    return types.SimpleNamespace(out=out, arms=list(arms), seeds=list(seeds))
+
+
+def _named_cells(message: str, cells) -> set:
+    return {(arm, seed) for arm, seed in cells if f"{arm} seed {seed}" in message}
+
+
+STATUSES = ("PREDICTS_MOTION", "COPIES", "INDETERMINATE", "UNRESOLVED_CONTROL", "UNREADABLE")
+
+
+def test_the_read_fixtures_reach_the_status_they_are_named_for_and_sort_as_stated(record):
+    """The fixtures' own check, taken from `reading_burden` over inputs built
+    from the spec alone: a pool that read some other status than its name would
+    make every exit-code test below test the wrong thing."""
+    for status in STATUSES:
+        spec = _scenario(status)
+        assert burden.reading_burden(_expected_inputs(spec)).status == status, status
+    # The refusals sit on a pool that decides on its own.
+    assert burden.reading_burden(
+        _expected_inputs(_spec(KINDS["PREDICTS_MOTION"]))
+    ).status == "PREDICTS_MOTION"
+    cells = sorted(_records_from(record, _scenario("COPIES")))
+    assert (cells[0], cells[1], cells[-1]) == (FIRST_CELL, SECOND_CELL, LAST_CELL)
+    assert cells != [(a, s) for a in READ_ARMS for s in READ_SEEDS], "ARMS order must not be sorted()"
+    assert sum(1 for n in EXPECTED_WINDOWS if n) == 8 and sum(EXPECTED_WINDOWS) == 13
+
+
+# --- READ_EXITS --------------------------------------------------------------
+
+
+def test_read_exits_are_the_two_refusal_statuses_each_to_its_own_number():
+    """THE MUTATION THIS EXISTS FOR: swapping 45 and 46, which would report a
+    broken estimator as an unreadable plan. The numbers are literals here rather
+    than `script.EXIT_*`, so a swap of the two CONSTANTS' own definitions is
+    caught as well as a swap of the two values in the table."""
+    assert script.READ_EXITS == {"UNRESOLVED_CONTROL": 45, "UNREADABLE": 46}
+    assert script.READ_EXITS == {
+        "UNRESOLVED_CONTROL": script.EXIT_CONTROL_BROKEN,
+        "UNREADABLE": script.EXIT_UNREADABLE,
+    }
+
+
+@pytest.mark.parametrize(
+    "status, code",
+    [("PREDICTS_MOTION", 0), ("COPIES", 0), ("INDETERMINATE", 0),
+     ("UNRESOLVED_CONTROL", 45), ("UNREADABLE", 46)],
+)
+def test_read_phase_returns_the_exit_of_the_status_the_records_read(
+    record, tmp_path, capsys, status, code,
+):
+    """Every status from real records through the real read phase. A decisive
+    status is a READING and exits 0 (a milestone that exited non-zero on a
+    finding would make "the run worked" and "the news was good" one signal); the
+    refusals exit with their own number, and the output says WHICH status
+    produced it, so a swapped pair is a different line and not only a different
+    number."""
+    records = _records_from(record, _scenario(status))
+    args = _read_args(tmp_path, records)
+    assert script.read_phase(args) == code
+    out = capsys.readouterr().out
+    written = sorted(p.name for p in args.out.iterdir())
+    if code == 0:
+        assert f"verdict: {status.replace('_', ' ')} -- decided by:" in out, out
+        assert written == sorted(
+            [f"burden_{arm}_seed{seed}.json" for arm, seed in records] + ["burden.txt"]
+        )
+    else:
+        assert status in out, out
+        assert "verdict:" not in out, "a refusal is not a reading"
+        assert "burden.txt" not in written
+
+
+@pytest.mark.parametrize("control", sorted(BROKEN_CONTROLS))
+def test_each_missed_control_alone_is_a_broken_control_that_names_its_cell(
+    record, tmp_path, capsys, control,
+):
+    """Each of the three known answers, missed ALONE in the cell that sorts last
+    of nine. Three controls and one `UNRESOLVED_CONTROL`: a record read with one
+    control taken from another's key, or a flag defaulted, passes the two tests
+    above and fails here. The refusal names that cell and no other."""
+    spec = _scenario("PREDICTS_MOTION", broken=(LAST_CELL, control))
+    args = _read_args(tmp_path, _records_from(record, spec))
+    assert script.read_phase(args) == 45
+    out = capsys.readouterr().out
+    assert _named_cells(out, spec) == {LAST_CELL}, out
+    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
+
+
+def test_a_stationary_cell_is_unreadable_and_named(record, tmp_path, capsys):
+    spec = _scenario("PREDICTS_MOTION", stationary=SECOND_CELL)
+    args = _read_args(tmp_path, _records_from(record, spec))
+    assert script.read_phase(args) == 46
+    out = capsys.readouterr().out
+    assert _named_cells(out, spec) == {SECOND_CELL}, out
+    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
+
+
+@pytest.mark.parametrize("seeds", [(0, 1), (1, 2), (2,)])
+def test_an_arm_short_of_the_minimum_seeds_is_unreadable_not_a_raise(
+    record, tmp_path, capsys, seeds,
+):
+    """A narrowed SEED plan is `reading_burden`'s business and comes back as
+    `UNREADABLE`, naming each short arm with its count; it does not raise. The
+    pool itself is sound -- every cell clears, none is stationary, no control is
+    missed -- so the only thing that can produce 46 here is the seed count, and
+    the three arms are named, not one."""
+    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")), seeds=seeds)
+    assert script.read_phase(args) == 46
+    out = capsys.readouterr().out
+    for arm in READ_ARMS:
+        assert f"{arm} carries {len(seeds)} seed(s), fewer than {burden.SEEDS_MINIMUM}" in out, out
+    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
+
+
+def test_read_phase_writes_nothing_when_it_refuses(record, tmp_path, capsys):
+    """A refusal must leave no burden.txt behind to be mistaken for a reading.
+
+    THE MUTATION THIS EXISTS FOR: writing `burden.txt` before the status is
+    checked. Asked of BOTH refusals, with the exit code asserted so the file is
+    absent because the refusal was reached and not because something else
+    stopped first."""
+    for index, status in enumerate(("UNRESOLVED_CONTROL", "UNREADABLE")):
+        args = _read_args(tmp_path / status, _records_from(record, _scenario(status)))
+        assert script.read_phase(args) == script.READ_EXITS[status], status
+        assert not (args.out / "burden.txt").exists(), status
+        capsys.readouterr()
+
+
+def test_a_contradiction_between_the_decisive_statuses_propagates_and_writes_nothing(
+    record, tmp_path,
+):
+    """`reading_burden` raises when two arms clear motion and two clear copies,
+    and that is an arm count that has outgrown the bar -- an operator or shape
+    error, not something found in the data. It must come out of `read_phase` as
+    the ValueError it is: not caught into a status, not an exit number.
+
+    THE MUTATION THIS EXISTS FOR: a `try/except ValueError` around the reading
+    that returns `EXIT_UNREADABLE`. Four arms, which `read_phase` does not
+    forbid -- it takes its arms from the command line and does not check them
+    against `ARMS`."""
+    four = {
+        "pixel_ae": ("up", "up", "up"), "frozen_ssl": ("up", "up", "up"),
+        "random_vit": ("down", "down", "down"), "fourth_arm": ("down", "down", "down"),
+    }
+    args = _read_args(tmp_path, _records_from(record, _spec(four)), arms=tuple(four))
+    with pytest.raises(ValueError, match="contradict"):
+        script.read_phase(args)
+    assert not (args.out / "burden.txt").exists()
+
+
+# --- require_one_protocol ----------------------------------------------------
+
+
+DISAGREEMENTS = {
+    "git_sha": lambda r: r.__setitem__("git_sha", "0" * 40),
+    "torch_version": lambda r: r.__setitem__("torch_version", r["torch_version"] + "+other"),
+    "device": lambda r: r.__setitem__("device", "mps"),
+    "step": lambda r: r.__setitem__("step", r["step"] + 1),
+    "context": lambda r: r.__setitem__("context", r["context"] + 1),
+    "horizon": lambda r: r.__setitem__("horizon", r["horizon"] + 1),
+    "split_seed": lambda r: r.__setitem__("split_seed", r["split_seed"] + 1),
+    "ks": lambda r: r.__setitem__("ks", r["ks"][:-1] + [r["ks"][-1] + 1]),
+    "decision_h": lambda r: r.__setitem__("decision_h", r["decision_h"] - 1),
+    "reported_h": lambda r: r.__setitem__("reported_h", r["reported_h"][:-1]),
+    "confidence": lambda r: r.__setitem__("confidence", 0.9),
+    "resamples": lambda r: r.__setitem__("resamples", r["resamples"] + 1),
+    "identity_tolerance": lambda r: r.__setitem__("identity_tolerance", r["identity_tolerance"] * 10),
+    "episodes.val": lambda r: r["episodes"].__setitem__("val", r["episodes"]["val"][::-1]),
+    "windows.episode": lambda r: r["windows"]["episode"].__setitem__(
+        -1, r["windows"]["episode"][-1] + 1
+    ),
+}
+"""One way for a record to disagree with the others, per protocol field."""
+
+REQUIRED_PROTOCOL_FIELDS = {
+    "git_sha", "step", "context", "horizon", "ks", "decision_h", "reported_h",
+    "confidence", "resamples", "identity_tolerance", "split_seed", "device",
+}
+
+
+def test_the_protocol_table_names_every_required_field_and_each_has_a_disagreement_case():
+    """The table is a module-level tuple the function ITERATES and this test
+    READS, so a field cannot be added to the comparison without this noticing it
+    has no disagreement case below, and one cannot be dropped without the
+    required set noticing. `git_sha` is in the required set because an earlier
+    version of M3l's check omitted it and let records from different torch
+    builds and code versions pool into one finding with no refusal at all."""
+    names = [name for name, _ in script._PROTOCOL_FIELDS]
+    assert len(names) == len(set(names))
+    assert REQUIRED_PROTOCOL_FIELDS <= set(names)
+    assert set(names) == set(DISAGREEMENTS)
+
+
+@pytest.mark.parametrize("victim", [FIRST_CELL, SECOND_CELL, LAST_CELL], ids=["first", "second", "last"])
+@pytest.mark.parametrize("field", sorted(DISAGREEMENTS))
+def test_one_record_that_disagrees_on_any_protocol_field_is_refused_naming_it(
+    record, field, victim,
+):
+    """Every field in the table, with the odd record at the front, second and
+    last of the sorted nine. Last is the one a first-record-only check misses;
+    second is the one a loop that starts one record too late misses. The message
+    names the field AND the odd cell, and it names exactly two cells -- a message
+    listing all nine would satisfy `victim in message` for any victim at all."""
+    records = _records_from(record, _scenario("COPIES"))
+    DISAGREEMENTS[field](records[victim])
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert f"disagree on {field}:" in message, message
+    named = _named_cells(message, records)
+    assert victim in named and len(named) == 2, (named, message)
+
+
+def test_a_pool_that_agrees_on_the_protocol_is_accepted_whatever_else_differs(record):
+    """Nothing but the table is compared. The per-cell numbers, the cell's own
+    training provenance and its label all differ between cells by construction;
+    comparing any of them would refuse the real nine."""
+    records = _records_from(record, _scenario("COPIES"))
+    for index, cell in enumerate(sorted(records)):
+        records[cell]["record_git_sha"] = f"trained-at-{index}"
+        records[cell]["kl_dyn_max"] = 1.0 + index
+        records[cell]["kl_rate_above_free_bits"] = 0.5 + index / 32.0
+    assert script.require_one_protocol(records) is None
+
+
+@pytest.mark.parametrize("victim", [FIRST_CELL, LAST_CELL], ids=["first", "last"])
+def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(record, victim):
+    records = _records_from(record, _scenario("COPIES"))
+    del records[victim]["git_sha"]
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert f"{victim[0]} seed {victim[1]}" in message and "git_sha" in message, message
+
+
+def test_an_empty_pool_is_refused_by_name():
+    for call in (script.require_one_protocol, script.burden_inputs):
+        with pytest.raises(SystemExit, match="no burden record"):
+            call({})
+
+
+def test_read_phase_refuses_records_that_disagree_on_the_protocol(record, tmp_path, capsys):
+    """THE WIRING, not the function: `require_one_protocol` is tested above in
+    isolation, and deleting its one call from `read_phase` leaves every one of
+    those green. `git_sha` is the field the check once omitted: the records
+    below differ in nothing else, so no other comparison -- `burden_inputs`'s
+    own, `reading_burden`'s -- can refuse them in its place.
+
+    THE MUTATIONS THIS EXISTS FOR: deleting the `require_one_protocol(records)`
+    call from `read_phase`, and dropping `git_sha` from `_PROTOCOL_FIELDS`. The
+    victim sorts LAST, so a first-record-only check sees nothing; and nothing is
+    written, because a pool that cannot be read must leave no artefact claiming
+    it was."""
+    records = _records_from(record, _scenario("PREDICTS_MOTION"))
+    victim = sorted(records)[-1]
+    assert victim == LAST_CELL
+    records[victim]["git_sha"] = "0" * 40
+    args = _read_args(tmp_path, records)
+    with pytest.raises(SystemExit) as caught:
+        script.read_phase(args)
+    message = str(caught.value)
+    assert "random_vit seed 2" in message and "git_sha" in message, message
+    assert not (args.out / "burden.txt").exists()
+    assert "verdict:" not in capsys.readouterr().out
+
+
+# --- burden_inputs -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "status, decision_h, ks",
+    [(status, burden.DECISION_H, REGROUNDING_KS) for status in STATUSES]
+    + [("COPIES", 30, REGROUNDING_KS), ("INDETERMINATE", 20, (1, 3, 7))],
+)
+def test_burden_inputs_reads_every_field_from_its_own_key_at_the_decision_horizon(
+    record, tmp_path, status, decision_h, ks,
+):
+    """Compared with `BurdenInputs` built from the spec's formulas -- not from the
+    records, and not by `reading_burden` -- both in memory and after a round trip
+    through the files the measure phase writes.
+
+    At `decision_h=30` and `20` the horizon step is not the last one: a read at
+    `[-1]` or at `[h]` is another number, where at 45 `[-1]` and `[h - 1]` are the
+    same element. The margin is read at the DECISION horizon of the records, and
+    the rungs are the records' own `ks`, whose last one is not 45 in the third."""
+    spec = _scenario(status)
+    records = _records_from(record, spec, decision_h=decision_h, ks=ks)
+    expected = _expected_inputs(spec, decision_h=decision_h, ks=ks)
+    assert script.burden_inputs(records) == expected
+    args = _read_args(tmp_path, records)
+    loaded = script.load_burden(args.out, READ_ARMS, READ_SEEDS)
+    assert script.burden_inputs(loaded) == expected
+
+
+@pytest.mark.parametrize("field", ["decision_h", "ks"])
+def test_burden_inputs_refuses_a_pool_that_disagrees_on_the_one_value_it_takes(record, field):
+    """`BurdenInputs` holds ONE decision horizon and ONE ladder for nine cells, so
+    the pick is made where it is taken, and does not depend on
+    `require_one_protocol` having run first."""
+    records = _records_from(record, _scenario("COPIES"))
+    DISAGREEMENTS[field](records[LAST_CELL])
+    with pytest.raises(SystemExit) as caught:
+        script.burden_inputs(records)
+    message = str(caught.value)
+    assert f"disagree on {field}:" in message and "random_vit seed 2" in message, message
+
+
+# --- the plan, and loading ---------------------------------------------------
+
+
+def test_read_phase_refuses_a_plan_narrower_than_the_bar_before_loading_anything(tmp_path):
+    """`--arms pixel_ae` cannot be read: Reading H needs `ARMS_REQUIRED` arms, and
+    falling through would print INDETERMINATE under a sentence about one arm --
+    a status the plan produced and the data did not. It raises, and BEFORE the
+    records are looked for: the directory below does not exist, so a plan check
+    made after the load would return 11 instead.
+
+    `--arms a a a` is ONE arm: counting the list would let it through."""
+    for arms in (["pixel_ae"], ["pixel_ae", "pixel_ae", "pixel_ae"]):
+        args = types.SimpleNamespace(out=tmp_path / "absent", arms=arms, seeds=[0, 1, 2])
+        with pytest.raises(SystemExit) as caught:
+            script.read_phase(args)
+        message = str(caught.value)
+        assert f"ARMS_REQUIRED={burden.ARMS_REQUIRED}" in message, message
+        assert "1 arm(s)" in message, message
+
+
+def test_two_arms_of_the_nine_are_a_readable_plan_and_only_they_are_pooled(
+    record, tmp_path, capsys,
+):
+    """Two arms is the bar, so it is readable; and the third arm's records are
+    on disk and outside the plan, so they must not be pooled."""
+    args = _read_args(
+        tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")),
+        arms=("pixel_ae", "frozen_ssl"),
+    )
+    assert script.read_phase(args) == 0
+    out = capsys.readouterr().out
+    assert "in 2 of 2 arms (frozen_ssl, pixel_ae)" in out, out
+    assert "random_vit" not in out
+
+
+def test_read_phase_names_the_first_missing_cell_and_exits_eleven(record, tmp_path, capsys):
+    """Two cells are missing; the one the PLAN reaches first is the one named,
+    and nothing is written."""
+    records = _records_from(record, _scenario("COPIES"))
+    del records[SECOND_CELL], records[LAST_CELL]
+    args = _read_args(tmp_path, records)
+    assert script.read_phase(args) == script.EXIT_NO_CHECKPOINTS
+    out = capsys.readouterr().out
+    assert "NO CELL" in out and "frozen_ssl seed 1" in out and "random_vit seed 2" not in out, out
+    assert "--phase measure" in out
+    assert not (args.out / "burden.txt").exists()
+
+
+def test_a_record_filed_under_another_cells_name_is_refused(record, tmp_path):
+    """A swapped pair of files would pool one cell under another's name with every
+    count still right."""
+    records = _records_from(record, _scenario("COPIES"))
+    records[("pixel_ae", 2)], records[("pixel_ae", 1)] = records[("pixel_ae", 1)], records[("pixel_ae", 2)]
+    args = _read_args(tmp_path, records)
+    with pytest.raises(SystemExit) as caught:
+        script.read_phase(args)
+    message = str(caught.value)
+    assert "burden_pixel_ae_seed1.json" in message or "burden_pixel_ae_seed2.json" in message, message
+    assert "seed" in message and "arm='pixel_ae'" in message, message
+
+
+# --- what is written, and what is printed -----------------------------------
+
+
+def test_burden_txt_is_the_formatters_text_byte_for_byte_and_stdout_is_the_same_string(
+    record, tmp_path, capsys,
+):
+    """THE MUTATIONS THIS EXISTS FOR: `write_text(text.rstrip())`, and `print(text)`
+    on a string that already ends in a newline. Both are invisible to a test that
+    compares two reads of the SAME code (each read strips the same bytes), so the
+    expected text is built here, from the spec, by the formatter -- not by the
+    read phase -- and compared with the file and with stdout separately.
+
+    The precondition is asserted: the text ends in exactly one newline, which is
+    what `rstrip()` would lose and `print()` would double."""
+    spec = _scenario("PREDICTS_MOTION")
+    inputs = _expected_inputs(spec)
+    expected = burden.format_reading_burden(burden.reading_burden(inputs), inputs)
+    assert expected.endswith("\n") and not expected.endswith("\n\n")
+    args = _read_args(tmp_path, _records_from(record, spec))
+    assert script.read_phase(args) == 0
+    assert (args.out / "burden.txt").read_bytes() == expected.encode()
+    assert capsys.readouterr().out == expected
+
+
+def test_the_reading_is_byte_identical_on_two_reads(record, tmp_path):
+    """The point of the two-phase split: a reading reproducible from the records
+    without a GPU. Two independent reads, in two directories, of the same nine
+    records. (Only a comparison against the formatter -- the test above -- can see
+    a `rstrip()`, which both reads here would apply alike.)"""
+    records = _records_from(record, _scenario("PREDICTS_MOTION"))
+    first, second = _read_args(tmp_path / "a", records), _read_args(tmp_path / "b", records)
+    assert script.read_phase(first) == script.read_phase(second) == 0
+    text = (first.out / "burden.txt").read_bytes()
+    assert text and (second.out / "burden.txt").read_bytes() == text
+
+
+# --- main: the three phases --------------------------------------------------
+
+
+def _main(monkeypatch, argv, *, measure=0, read=0):
+    """`main(argv)` with BOTH phases replaced by recorders, returning
+    `(status, phases_run)`. What this pins is the WIRING: which phase runs, in
+    which order, and whether a failed measure stops the read."""
+    ran = []
+
+    def fake_measure(args):
+        ran.append("measure")
+        return measure
+
+    def fake_read(args):
+        ran.append("read")
+        return read
+
+    monkeypatch.setattr(script, "measure_phase", fake_measure)
+    monkeypatch.setattr(script, "read_phase", fake_read)
+    return script.main(argv), ran
+
+
+def test_main_runs_the_phases_the_flag_names_and_returns_the_last_status(monkeypatch):
+    assert _main(monkeypatch, ["--phase", "measure"]) == (0, ["measure"])
+    assert _main(monkeypatch, ["--phase", "read"]) == (0, ["read"])
+    assert _main(monkeypatch, ["--phase", "all"]) == (0, ["measure", "read"])
+    assert _main(monkeypatch, ["--phase", "read"], read=45) == (45, ["read"])
+    assert _main(monkeypatch, ["--phase", "all"], read=46) == (46, ["measure", "read"])
+
+
+def test_a_failed_measure_stops_phase_all_before_it_reads(monkeypatch):
+    """A measure that returned 14 wrote no record for its cell, and a read after
+    it would be over a pool missing that cell."""
+    assert _main(monkeypatch, ["--phase", "all"], measure=14, read=0) == (14, ["measure"])
+
+
+def test_the_default_phase_is_read_and_the_parser_names_the_three():
+    """A default of `measure` would make a bare invocation pay for nine cells of
+    GPU time; `read` costs none and refuses by name when there are no records."""
+    args = script._parser().parse_args([])
+    assert args.phase == "read"
+    assert script.PHASES == ("all", "measure", "read")
+    assert args.out == Path("runs/m3m_burden")
+    with pytest.raises(SystemExit) as caught:
+        script._parser().parse_args(["--phase", "readd"])
+    assert caught.value.code == 2
+
+
+def test_phase_all_refuses_a_plan_it_could_not_read_before_measuring_anything(monkeypatch):
+    """`--phase all --arms pixel_ae` would be the whole measure followed by a
+    refusal at the read. `--phase measure` is allowed the same plan: the
+    milestone's smoke is one cell."""
+    ran = []
+    monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
+    with pytest.raises(SystemExit) as caught:
+        script.main(["--phase", "all", "--arms", "pixel_ae"])
+    assert f"ARMS_REQUIRED={burden.ARMS_REQUIRED}" in str(caught.value)
+    assert ran == []
+    assert _main(monkeypatch, ["--phase", "measure", "--arms", "pixel_ae"]) == (0, ["measure"])
+
+
+def test_main_reads_the_arms_seeds_and_directory_the_command_line_names(
+    monkeypatch, record, tmp_path, capsys,
+):
+    """The flag names reach the fields `read_phase` reads, through the real read
+    phase. The measure phase is made unreachable: a `--phase read` that fell into
+    it would load the real checkpoints from `--source`'s default."""
+    def forbidden(args):
+        raise AssertionError("--phase read reached the measure phase")
+
+    monkeypatch.setattr(script, "measure_phase", forbidden)
+    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")))
+    argv = ["--phase", "read", "--out", str(args.out), "--arms", "pixel_ae", "frozen_ssl",
+            "--seeds", "0", "1", "2"]
+    assert script.main(argv) == 0
+    assert "in 2 of 2 arms" in capsys.readouterr().out
+    broken = _read_args(tmp_path / "broken", _records_from(record, _scenario("UNRESOLVED_CONTROL")))
+    assert script.main(["--phase", "read", "--out", str(broken.out)]) == 45
