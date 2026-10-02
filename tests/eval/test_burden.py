@@ -903,9 +903,13 @@ def _by_arm(**shape_per_arm):
 
 
 def test_predicts_motion_when_the_whole_interval_clears_zero():
-    reading = reading_burden(_inputs(_nine(**CLEARS_MOTION)))
+    """Cells go in in reverse, so the tally comes out sorted only if the
+    reading sorts it: the rule prints the arms, and the table is byte for
+    byte."""
+    reading = reading_burden(_inputs(list(reversed(_nine(**CLEARS_MOTION)))))
     assert reading.status == "PREDICTS_MOTION"
     assert reading.arms_motion == ARMS
+    assert f"({', '.join(ARMS)})" in reading.rule
     assert reading.arms_copies == ()
     assert reading.seeds_total == {arm: 3 for arm in ARMS}
 
@@ -933,20 +937,27 @@ def test_an_interval_straddling_zero_falls_through():
     assert "by default rather than by evidence" in reading.rule
 
 
-def test_the_bars_are_strict_on_the_motion_side_and_inclusive_on_the_copies_side():
-    """`margin_high <= 0` clears COPIES, so a high end of exactly 0 is COPIES;
-    `margin_low > 0` clears PREDICTS_MOTION, so a low end of exactly 0 is not.
+def test_a_margin_of_exactly_zero_at_the_high_end_reads_copies():
+    """The bar is `margin_high <= 0`, so a high end of exactly 0 clears COPIES.
 
-    THE MUTATIONS THIS EXISTS FOR: `< 0` instead of `<= 0` on the copies side,
-    which would send an exactly-zero high end to INDETERMINATE; and `>= 0`
-    instead of `> 0` on the motion side, which would let a low end of exactly
-    zero establish PREDICTS_MOTION.
+    THE MUTATION THIS EXISTS FOR: `< 0` instead of `<= 0`, which would send an
+    exactly-zero cell to INDETERMINATE.
     """
-    on_copies = reading_burden(_inputs(_nine(margin=-1.0, low=-2.0, high=0.0)))
-    assert on_copies.status == "COPIES"
-    on_motion = reading_burden(_inputs(_nine(margin=2.0, low=0.0, high=4.0)))
-    assert on_motion.status == "INDETERMINATE"
-    assert on_motion.arms_motion == ()
+    reading = reading_burden(_inputs(_nine(margin=-1.0, low=-2.0, high=0.0)))
+    assert reading.status == "COPIES"
+    assert reading.arms_copies == ARMS
+
+
+def test_a_margin_of_exactly_zero_at_the_low_end_does_not_read_motion():
+    """The other side of the same edge: `margin_low > 0` is strict, so a low
+    end of exactly 0 clears nothing.
+
+    THE MUTATION THIS EXISTS FOR: `>= 0` instead of `> 0`, which would let a
+    low end of exactly zero establish PREDICTS_MOTION.
+    """
+    reading = reading_burden(_inputs(_nine(margin=2.0, low=0.0, high=4.0)))
+    assert reading.status == "INDETERMINATE"
+    assert reading.arms_motion == ()
 
 
 def test_the_two_decisive_statuses_can_never_both_clear():
@@ -1059,12 +1070,13 @@ def test_one_broken_control_outranks_every_other_status(setting, broken):
 
 
 def test_every_broken_cell_is_named_not_only_the_first():
+    """Cells go in in reverse, so the names come out sorted only if the reading
+    sorts them."""
     cells = _with(_nine(**CLEARS_MOTION), "frozen_ssl", 0, identity_residual=1e-6)
     cells = _with(cells, "random_vit", 2, k_one_is_floor=True)
-    reading = reading_burden(_inputs(cells))
+    reading = reading_burden(_inputs(list(reversed(cells))))
     assert reading.status == "UNRESOLVED_CONTROL"
-    assert "frozen_ssl seed 0" in reading.rule
-    assert "random_vit seed 2" in reading.rule
+    assert "in frozen_ssl seed 0, random_vit seed 2:" in reading.rule
     assert "pixel_ae" not in reading.rule
 
 
@@ -1116,12 +1128,23 @@ def test_an_arm_short_of_three_seeds_is_refused_not_tallied(kept):
 
 
 def test_unreadable_names_every_cause_it_has():
+    """Two stationary cells and two short arms, in reverse insertion order: every
+    one is named, and each list comes out sorted only if the reading sorts it."""
     cells = _with(_nine(**CLEARS_MOTION), "frozen_ssl", 2, displacement_median=5.0)
-    cells = [c for c in cells if not (c.arm == "pixel_ae" and c.seed == 2)]
-    reading = reading_burden(_inputs(cells))
+    cells = _with(cells, "pixel_ae", 0, displacement_median=5.0)
+    cells = [
+        c for c in cells
+        if not (c.arm == "frozen_ssl" and c.seed == 1)
+        and not (c.arm == "random_vit" and c.seed >= 1)
+    ]
+    reading = reading_burden(_inputs(list(reversed(cells))))
     assert reading.status == "UNREADABLE"
-    assert "frozen_ssl seed 2" in reading.rule
-    assert "pixel_ae carries 2 seed(s)" in reading.rule
+    assert "in frozen_ssl seed 2, pixel_ae seed 0," in reading.rule
+    assert (
+        "frozen_ssl carries 2 seed(s), fewer than 3; "
+        "random_vit carries 1 seed(s), fewer than 3"
+    ) in reading.rule
+    assert "pixel_ae carries" not in reading.rule
 
 
 @pytest.mark.parametrize(
