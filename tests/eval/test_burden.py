@@ -54,12 +54,21 @@ def test_burden_is_the_cost_over_the_floor():
 
 
 def test_compounding_is_exactly_zero_at_k_equals_one():
-    """A CONTROL WITH A KNOWN ANSWER, true by construction: at k=1 both sides
-    are the same curve, so the difference is exactly 0 -- not approximately.
+    """`compounding(x, x)` is exactly 0 -- not approximately. A CONTROL WITH A
+    KNOWN ANSWER, true by construction: at k=1 both arguments are the same
+    curve.
 
-    THE MUTATION THIS EXISTS FOR: computing compounding against the FLOOR
-    instead of against the k=1 curve, which makes this read `burden(1)`
-    instead of 0.
+    THE MUTATIONS THIS EXISTS FOR: anything that makes `compounding(x, x)`
+    nonzero -- `curve_k + curve_one`, `curve_k.copy()`, `curve_k - 0.5 *
+    curve_one`, or an `np.where(curve_k == curve_one, 1, ...)` special case.
+
+    WHAT IT CANNOT PIN is which curve the second argument is. "Compounding
+    against the FLOOR instead of the k=1 curve" is inexpressible at this scope:
+    there is no floor here, and renaming `compounding`'s second parameter to
+    `floor` is the same function. That guard lives at the CALL SITE, where
+    `identity_residual` must pass `curve_one`; passing `floor` there is caught
+    by the identity tests below, which compare `burden(k)` against
+    `burden(1) + compounding(k)`.
     """
     curve_one = np.array([12.0, 15.0, 22.0])
     result = compounding(curve_one, curve_one)
@@ -73,19 +82,21 @@ def test_compounding_is_the_cost_of_correcting_less_often():
 
 
 def test_the_identity_is_exact_on_the_magnitudes_this_milestone_measures():
-    """burden(k) == burden(1) + compounding(k) holds BIT-FOR-BIT here, and that
-    is a property of the regime rather than luck.
+    """burden(k) == burden(1) + compounding(k) holds BIT-FOR-BIT on this
+    fixture, and that is a property of its construction rather than luck.
 
-    Position errors run 100-250 Doom map units and the three curves are
-    monotone -- floor <= the k=1 rung <= the open loop -- so each subtraction
-    falls in the Sterbenz regime and is exact; the sum of two exact differences
-    then rounds to exactly the whole. Measured over 40 random fixtures in this
-    range the residual is 0.0 in every one, and six adversarial
-    wide-dynamic-range triples (floor at 1e16, at 2**53, at 1.0 with 1e-17
-    steps) also give 0.0.
+    The floor is 100-150, the k=1 rung sits at most 5 above it and the open
+    loop at most 80 above that. Every operand is therefore at least 64, so a
+    multiple of 2**-46, and every difference the identity forms is below 128
+    (the largest, `curve_k - floor`, is below 85). A multiple of 2**-46 below
+    128 is exactly representable, so both summand differences are exact, so is
+    their sum, and it equals the whole. That holds for every draw the
+    construction can make, not only this seed's, and it does not depend on the
+    ratio `curve_k / floor`.
 
-    So the recorded residual being zero is the ANSWER in this regime, not a
-    free pass -- which is why the sibling test below exists.
+    So a residual of 0.0 is the ANSWER here, not a free pass -- which is why
+    the sibling tests below exist: they show `identity_residual` can report
+    something other than zero.
     """
     rng = np.random.default_rng(0)
     floor = rng.uniform(100.0, 150.0, size=45)

@@ -43,11 +43,35 @@ IDENTITY_TOLERANCE: float = 1e-9
 """The bound on the decomposition's floating-point residual.
 
 `burden(k) = burden(1) + compounding(k)` is algebraic -- the floor cancels --
-so at the magnitudes this milestone measures (floor in 100-250, curves monotone),
-the residual is exactly 0.0. The three subtractions each fall in the Sterbenz
-regime and are exact. At magnitudes outside this regime (e.g., curves near 1.7e8),
-the residual is nonzero: 2.9802322387695312e-08 at that scale. This tolerance
-bounds those wider regimes and leaves margin for other measurements.
+so the residual is rounding and nothing else. It is exactly 0.0 whenever the
+two summand differences, `curve_one - floor` and `curve_k - curve_one`, are
+exact: their sum is then `curve_k - floor` in real arithmetic, which is what
+`burden(k)` rounds. Only those two subtractions need be exact, not all three.
+
+Sterbenz's lemma makes a subtraction exact when its operands are within a
+factor of two. For monotone curves (floor <= curve_one <= curve_k) that covers
+both summand differences whenever `curve_k <= 2 * floor`, so inside that ratio
+the residual is exactly 0.0.
+
+Above that ratio exactness is not guaranteed, and the lemma does not stretch to
+cover a range: floor=106.90575077107698, curve_one=110.35124079639952,
+curve_k=238.65922676171652 is monotone and inside 100-250, yet its ratio is 2.23
+and its residual is 2.842170943040401e-14 -- 2**-45, one unit in the last place
+at that magnitude. With every value in 100-250 the residual is three roundings
+of at most 2**-46 each, so it cannot exceed 3 * 2**-46 = 4.3e-14, and 1e-9 sits
+more than four orders of magnitude above that.
+
+That is the regime this milestone reads, and it is not wholly inside the exact
+one. Across the nine cells of `runs/m3_study_v2`, `max(k45_position) /
+min(floor_position)` runs from 1.15 to 2.205, and `pixel_ae_seed0` at 2.205 is
+outside it: 8 of its 45 steps at k=45 fall beyond the lemma's reach. The
+residual read off that cell is still 0.0, as it is for every rung on all nine
+cells -- but that is the data's doing, not a guarantee.
+
+The tolerance does NOT bound wide-spread inputs. Curves near 1.7e8 over a floor
+near 5e6 reach 2.9802322387695312e-08, about thirty times this tolerance;
+`test_the_identity_residual_is_measured_and_its_tolerance_is_reachable` pins
+exactly that.
 """
 
 CONFIDENCE: float = 0.95
