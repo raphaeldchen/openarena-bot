@@ -24,7 +24,7 @@ PER CELL, FROM ONE GATHER:
                   excluded, with an interval of its own. `live` is how many
                   columns survived that exclusion.
   prior_bits      the same estimator on `prior_probs`. A COMPANION THAT DECIDES
-                  NOTHING, free from the same forward pass, and spec 2.4
+                  NOTHING (spec 2.4), free from the same forward pass; spec 3.3
                   requires it per cell: the prior does not see `enc(t)`, so it
                   is the information the prior's distribution carries through
                   `h` alone, which is what M3g's "the prior is the failing
@@ -683,8 +683,8 @@ def cell_capacity(gathered, *, seed: int, resamples: int = RESAMPLES) -> dict:
     `prior_bits` is the same estimator on `prior_probs`, which `observe` already
     returned, so it costs nothing. NOT a known-answer control: the prior is a
     function of `h`, `h` encodes past frames, so its distribution genuinely
-    varies across rows and the reading is positive. It decides nothing, and spec
-    2.4 requires it per cell.
+    varies across rows and the reading is positive. It decides nothing (spec
+    2.4), and spec 3.3 requires it per cell as a raw level.
 
     Both redundancy numbers ship as PLAIN FLOATS. The ratio is derived at read
     time by `redundancy_ratio`, which returns None for a collapsed code -- a

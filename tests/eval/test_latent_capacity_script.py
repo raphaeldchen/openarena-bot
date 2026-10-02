@@ -982,9 +982,9 @@ def test_every_measured_value_is_a_plain_python_scalar():
 
 
 def test_cell_capacity_reads_the_prior_from_prior_probs_not_the_posterior():
-    """Spec 2.4 requires `prior_bits` per cell as a companion that decides
-    nothing: it is free from the same forward pass and speaks to M3g's finding
-    that the prior is the failing stage.
+    """Spec 2.4 makes `prior_bits` a companion that decides nothing and spec
+    3.3 requires it per cell as a raw level: it is free from the same forward
+    pass and speaks to M3g's finding that the prior is the failing stage.
 
     The fixture's prior is COLLAPSED -- every row the same distribution -- so it
     reads ~0 bits while the posterior reads several. An implementation reading
