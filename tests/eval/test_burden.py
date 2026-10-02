@@ -1422,6 +1422,26 @@ def test_two_decisive_statuses_that_both_reach_the_bar_are_refused():
     assert f"only with at least {2 * ARMS_REQUIRED} arms, and there are 4" in message
 
 
+def test_the_refusal_takes_its_bar_and_its_arm_count_from_the_module(monkeypatch):
+    """A bar of three over six arms, three clearing each way: the bar and the
+    `2 * bar` the message states are neither of them the shipped 2 and 4, so a
+    number written as a literal cannot pass.
+
+    THE MUTATIONS THIS EXISTS FOR: the bar, the `2 * ARMS_REQUIRED` bound or the
+    arm count written as a literal inside the refusal's message.
+    """
+    monkeypatch.setattr("mbfps.eval.burden.ARMS_REQUIRED", 3)
+    arms = ("a", "b", "c", "d", "e", "f")
+    cells = _by_arm(**{
+        arm: CLEARS_MOTION if i < 3 else CLEARS_COPIES for i, arm in enumerate(arms)
+    })
+    with pytest.raises(ValueError) as refused:
+        reading_burden(_inputs(cells, decision_h=30))
+    message = str(refused.value)
+    assert "PREDICTS_MOTION (a, b, c) and COPIES (d, e, f) each reach 3 arms at horizon 30" in message
+    assert "only with at least 6 arms, and there are 6" in message
+
+
 @pytest.mark.parametrize(
     "motion_arms, copies_arms, status",
     [(2, 1, "PREDICTS_MOTION"), (1, 2, "COPIES")],
