@@ -1080,6 +1080,28 @@ def test_every_broken_cell_is_named_not_only_the_first():
     assert "pixel_ae" not in reading.rule
 
 
+def test_the_control_check_and_its_rule_use_the_tolerance_the_module_holds(monkeypatch):
+    """A residual of 1e-8 is past today's tolerance and inside the patched one,
+    so the same cell is a missed control under one and a hit under the other,
+    and the sentence must print the tolerance the check used.
+
+    THE MUTATIONS THIS EXISTS FOR: `controls_ok` comparing against a literal
+    instead of `IDENTITY_TOLERANCE`, and the `UNRESOLVED_CONTROL` rule printing
+    a literal where it interpolates the constant.
+    """
+    cells = _with(_nine(**CLEARS_MOTION), "pixel_ae", 1, identity_residual=1e-8)
+    assert reading_burden(_inputs(cells)).status == "UNRESOLVED_CONTROL"
+
+    monkeypatch.setattr("mbfps.eval.burden.IDENTITY_TOLERANCE", 1e-7)
+    assert reading_burden(_inputs(cells)).status == "PREDICTS_MOTION"
+
+    cells = _with(cells, "pixel_ae", 1, identity_residual=1e-6)
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNRESOLVED_CONTROL"
+    assert "within 1e-07" in reading.rule
+    assert "1e-09" not in reading.rule
+
+
 @pytest.mark.parametrize(
     "shape", [CLEARS_MOTION, CLEARS_COPIES], ids=["would-read-motion", "would-read-copies"]
 )
