@@ -2655,15 +2655,58 @@ def test_the_self_check_table_reports_what_each_cell_was_scored_on(
     table = _section(out, "self-check per record")
     assert len([line for line in table.splitlines() if "---" not in line]) == 10
     for (arm, seed), record in sorted(records.items()):
-        # Selected by the cell's own `step`, which is unique per cell: an arm
-        # name matches three rows and a seed matches three more.
+        # Selected by the arm and seed TOKENS together, which are unique per
+        # cell: an arm name alone matches three rows and a seed alone matches
+        # three more.
         row = _row_for(table, arm, seed)
         cells = dict(zip(script.SELF_CHECK_COLUMNS, row.split(), strict=True))
         assert cells["step"] == str(record["step"]), row
         assert cells["windows"] == str(READ_WINDOWS), row
         assert cells["gathered"] == str(READ_ROWS), row
         assert cells["clusters"] == str(READ_CLUSTERS), row
+        # The all-passing pool only: this pins the `yes` branch and nothing
+        # else, and `"yes"` written as a bare literal satisfies it. The `NO`
+        # branch has its own test below.
         assert cells["ok"] == "yes", row
+
+
+def test_the_self_check_table_says_no_for_exactly_the_cell_that_failed(
+    tmp_path, capsys,
+):
+    """THE `ok` COLUMN HAS TWO BRANCHES AND THE TEST ABOVE FEEDS ONE.
+
+    Every record `_pool()` builds carries `self_check.ok = True`, so
+    `cells["ok"] == "yes"` is satisfied by `"yes"` written as a bare literal in
+    `_self_check_table` -- verified: that mutation left the whole file green,
+    the `NO` branch executed by no test at all while the assertion read as a
+    pin. Nothing else on the read path reads `self_check.ok`, so this column is
+    the only place a failed self-check can reach a reader of the reading.
+
+    One record of nine has the flag False, and the table must say `NO` for that
+    cell and `yes` for the other eight. The victim is a MIDDLE cell (neither the
+    first nor the last row of the sorted pool), so a column that is `yes` for
+    every cell, `NO` for every cell, or that reads one end of the pool and
+    spreads it, each disagrees with it."""
+    records = _pool()
+    victim = ("pixel_ae", 1)
+    ordered = sorted(records)
+    assert 0 < ordered.index(victim) < len(ordered) - 1, ordered
+    records[victim]["self_check"]["ok"] = False
+    status, out = _read(tmp_path, capsys, records)
+    assert status == script.EXIT_OK, (
+        "a record whose self-check failed is a column in the table, not a "
+        "refusal: the measure phase is what refuses it, before writing"
+    )
+    table = _section(out, "self-check per record")
+    seen = {}
+    for cell in ordered:
+        row = _row_for(table, *cell)
+        cells = dict(zip(script.SELF_CHECK_COLUMNS, row.split(), strict=True))
+        seen[cell] = cells["ok"]
+    assert seen[victim] == "NO", seen
+    assert {cell: ok for cell, ok in seen.items() if cell != victim} == {
+        cell: "yes" for cell in ordered if cell != victim
+    }, seen
 
 
 def test_the_self_check_table_refuses_window_lists_of_different_lengths():
@@ -2821,7 +2864,10 @@ def test_read_phase_reads_records_written_before_resamples_was_recorded(
     reading prints. An `ARM_FIELDS` or `_self_check_table` that grew a
     `_get(record, cell, "capacity", "resamples")` would refuse the stripped pool
     by name through `_get` and fail here; one that printed it would pass a
-    does-not-raise test and fail this one."""
+    does-not-raise test and fail this one.
+
+    ALL NINE or NONE: both pools here are uniform, so a read path that compares
+    the field across records passes this test. The mixed pool is the next one."""
     records = _pool()
     with_field, out_with = _read(tmp_path / "with", capsys, records)
     for record in records.values():
@@ -2835,6 +2881,48 @@ def test_read_phase_reads_records_written_before_resamples_was_recorded(
         "shipped records do not carry it and must read identically"
     )
     assert (tmp_path / "without" / "capacity.txt").read_bytes() == (
+        tmp_path / "with" / "capacity.txt"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("stripped_end", ("first_four", "last_four"))
+def test_read_phase_reads_a_pool_where_only_some_records_carry_resamples(
+    tmp_path, capsys, stripped_end,
+):
+    """THE REALISTIC CASE THE TEST ABOVE LEAVES OUT: A MIXED POOL.
+
+    The test above strips the field from all nine records or from none. The
+    pool this milestone will actually meet is mixed: a cell re-measured after
+    `capacity.resamples` was added carries it, the cells measured before do
+    not. A read path that compared the field across records -- through
+    `_one_value` in `_pooled_shape`, say -- sees one value in either uniform
+    pool (the draw count in one, `None` in the other) and so passed every test
+    in this file while REFUSING the pool that is in fact sound.
+
+    Four of the nine records lose the field and five keep it, taken once from
+    the front of the sorted pool and once from the back, so a check that looks
+    at only the first record or only the last cannot sit on the safe side of
+    the split in both. Driven through `main --phase read`, and compared byte for
+    byte against the reading of the pool that has the field everywhere, because
+    the field changes nothing the reading prints."""
+    records = _pool()
+    ordered = sorted(records)
+    victims = ordered[:4] if stripped_end == "first_four" else ordered[-4:]
+    with_field, out_with = _read(tmp_path / "with", capsys, records)
+    for cell in victims:
+        del records[cell]["capacity"]["resamples"]
+    carrying = [cell for cell in ordered if "resamples" in records[cell]["capacity"]]
+    assert len(victims) == 4 and len(carrying) == 5, (victims, carrying)
+    assert set(carrying).isdisjoint(victims)
+    mixed, out_mixed = _read(tmp_path / "mixed", capsys, records)
+
+    assert (with_field, mixed) == (script.EXIT_OK, script.EXIT_OK)
+    assert "verdict:" in out_mixed, out_mixed
+    assert out_mixed == out_with, (
+        "the reading changed when `capacity.resamples` was removed from four "
+        "of the nine records"
+    )
+    assert (tmp_path / "mixed" / "capacity.txt").read_bytes() == (
         tmp_path / "with" / "capacity.txt"
     ).read_bytes()
 

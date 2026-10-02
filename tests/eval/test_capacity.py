@@ -312,16 +312,8 @@ footprint on the interval is largest where draws are few. Measured on
     50 draws      89.2968  77.3548  86.3008   (closest pair 2.996 apart)
     200 draws     89.2340  88.8869  88.9611   (closest pair 0.074 apart)
 
-At the protocol's 1000 a test here would have to claim a margin its own
-measurement does not support. 50 draws is where the effect is plainly visible,
-and the call costs well under a second."""
-
-SEED_TEST_MARGIN = 0.5
-"""Chosen from the measurement above: a sixth of the 2.996 bits that the closest
-pair of seeds is measured apart at `SEED_TEST_RESAMPLES`. An implementation that
-ignores its seed reads a gap of EXACTLY 0.0, so any margin up to the measured
-gap tells the two apart; this one is wide enough that float debris cannot pass
-for a moved interval and narrow enough to leave the measurement 6x of room."""
+At the protocol's 1000 the footprint is smaller still. 50 draws is where the
+effect is plainly visible, and the call costs well under a second."""
 
 
 def _heterogeneous_episodes(n_episodes=8, per_episode=50, seed=0):
@@ -362,10 +354,25 @@ def test_the_interval_requires_its_seed_and_draws_from_it():
 
     WHAT WRONG IMPLEMENTATION EACH ASSERTION CATCHES. The missing-seed call
     catches a DEFAULTED seed, which is how M3j shipped every cell drawing from
-    seed 0. The gap catches a constant or ignored seed (`default_rng(0)`): the
-    gap is exactly 0.0. The repeat catches an UNSEEDED generator
-    (`default_rng()`), which would pass the gap and make every record
-    unreproducible."""
+    seed 0. Three DISTINCT bounds under three seeds catch a constant or ignored
+    seed (`default_rng(0)`: one bound), and a seed collapsed onto fewer values
+    (`seed // 2`, `seed % 2`: two). The repeat catches an UNSEEDED generator
+    (`default_rng()`), which would pass the distinctness check -- three random
+    bounds are three bounds -- and make every record unreproducible.
+
+    THERE IS NO MARGIN ON HOW FAR APART THE BOUNDS ARE, and there used to be one
+    (0.5 bits). It added no power: every implementation that ignores its seed
+    produces a gap of EXACTLY 0, which the distinctness check already refuses.
+    What it added was fragility. Seeds (0, 1, 2) happen to clear 0.5 by a wide
+    margin at this fixture (their closest pair is 2.996 apart), but that is a
+    property of those three seeds: of the 24,360 ordered triples of distinct
+    seeds drawn from 0..29, 78.8% have a pair whose `ci_high` is closer than 0.5
+    at 50 draws. And it failed for faults that are not the seed's, reporting
+    "the interval is not drawing from its seed" under a quantile bug that only
+    narrowed the interval (`tail = 1 - confidence`, or `ci_high` taken at the
+    0.75 quantile). Those belong to
+    `test_the_interval_is_the_percentile_bootstrap_it_claims_to_be`, which
+    names them correctly."""
     probs, groups = _heterogeneous_episodes()
     stats = episode_stats(probs, groups)
 
@@ -384,13 +391,6 @@ def test_the_interval_requires_its_seed_and_draws_from_it():
     )
     bounds = {(out["ci_low"], out["ci_high"]) for out in outs}
     assert len(bounds) == 3, f"three seeds gave {bounds}: the seed is ignored"
-    for one, two in itertools.combinations(outs, 2):
-        gap = abs(one["ci_high"] - two["ci_high"])
-        assert gap > SEED_TEST_MARGIN, (
-            f"two seeds put ci_high {gap:.4f} apart; this fixture measures 2.996 "
-            f"for the closest pair at {SEED_TEST_RESAMPLES} draws and the margin "
-            f"is {SEED_TEST_MARGIN}. The interval is not drawing from its seed"
-        )
 
     again = at(1)
     assert (again["ci_low"], again["ci_high"]) == (
