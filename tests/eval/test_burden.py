@@ -306,6 +306,17 @@ def test_scored_targets_are_the_rows_the_model_is_scored_on():
     assert scored_targets(window_targets).shape[0] == horizon
 
 
+def _targets(xy: np.ndarray, headings_degrees) -> np.ndarray:
+    """`(N, 4)` targets in `probe_targets`' layout: x, y, sin(angle), cos(angle).
+
+    The angle columns are NOT zero and they VARY from row to row, because the
+    position metric must ignore them and a fixture that zeroes them cannot tell
+    a Euclidean distance over `x, y` from one over all four columns.
+    """
+    radians = np.deg2rad(np.asarray(headings_degrees, dtype=np.float64))
+    return np.column_stack([xy, np.sin(radians), np.cos(radians)])
+
+
 def test_one_step_persistence_is_the_true_one_step_displacement():
     """Its error IS the displacement, known from ground truth with no model.
 
@@ -313,10 +324,17 @@ def test_one_step_persistence_is_the_true_one_step_displacement():
     persistence the record already carries) instead of to the row before it.
     That baseline is RIGGED for this comparison -- it has seen h-1 fewer frames
     than the k=1 rung -- and spec 2.2 forbids it by name.
+
+    The second mutation: taking the norm over all four target columns rather than
+    the position pair. MEASURED on this fixture, that reads 5.10, 1.41 and 10.10
+    where the true displacements are 5, 0 and 10: the heading turns at every
+    step, including the one where the agent does not move, so the angle columns
+    add 1.00, 1.41 and 1.41. A fixture whose angle columns are zero, or constant,
+    reads 5, 0 and 10 either way and cannot tell the two apart.
     """
     # Moves (3, 4) then (0, 0) then (6, 8): displacements 5, 0, 10.
     xy = np.array([[0.0, 0.0], [3.0, 4.0], [3.0, 4.0], [9.0, 12.0]])
-    window_targets = np.hstack([xy, np.zeros((4, 2))])
+    window_targets = _targets(xy, [10.0, 70.0, 160.0, 250.0])
     assert one_step_persistence(window_targets) == pytest.approx([5.0, 0.0, 10.0])
 
     # The rigged baseline would give cumulative distance from row 0 instead.
@@ -328,7 +346,7 @@ def test_one_step_persistence_is_the_true_one_step_displacement():
 def test_motion_margin_is_positive_when_the_prior_beats_stillness():
     """Positive means one prior step beats assuming no motion."""
     xy = np.array([[0.0, 0.0], [3.0, 4.0], [3.0, 4.0], [9.0, 12.0]])
-    window_targets = np.hstack([xy, np.zeros((4, 2))])
+    window_targets = _targets(xy, [10.0, 70.0, 160.0, 250.0])
     # Displacements are 5, 0, 10. A prior that errs by 2, 1, 3 beats stillness
     # at steps 1 and 3 and loses at step 2, where the agent did not move.
     curve_one = np.array([2.0, 1.0, 3.0])
