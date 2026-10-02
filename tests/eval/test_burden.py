@@ -1,4 +1,11 @@
-"""Unit behaviour of `eval.burden` -- arrays in, numbers out, no torch."""
+"""Unit behaviour of `eval.burden` -- arrays in, numbers out, no checkpoint and
+no device.
+
+`burden` itself is NOT torch-free in its import graph (it imports
+`probe.position_error`, and `probe` imports torch at module level), so these
+tests import torch too. What they do not need is a GPU, a checkpoint or a file:
+every number under test is a function of the arrays handed in.
+"""
 
 import numpy as np
 import pytest
@@ -329,9 +336,12 @@ def test_motion_margin_is_positive_when_the_prior_beats_stillness():
 
 
 def test_motion_margin_refuses_a_curve_that_is_not_the_scored_length():
-    """THE MUTATION THIS EXISTS FOR: dropping the guard. A curve of length
-    horizon+1 would broadcast against a baseline of length horizon only by
-    accident of the numbers, and silently not at all otherwise.
+    """THE MUTATION THIS EXISTS FOR: dropping the guard. A length-5 curve against
+    a length-4 baseline never broadcasts: NumPy rejects it with its OWN
+    ValueError, so a dropped guard is caught only because the message differs.
+    The case that really does broadcast silently is a length-1 curve, which
+    `test_motion_margin_refuses_a_broadcastable_curve_and_a_nonfinite_value`
+    pins.
     """
     window_targets = np.zeros((5, 4))
     with pytest.raises(ValueError, match="same length"):
@@ -469,8 +479,9 @@ def test_scored_targets_refuses_what_is_not_a_window_and_returns_float64():
 
 def test_one_step_persistence_coerces_before_it_subtracts():
     """The window arrives from `probe_targets`, but a plain list has no `.shape`
-    and an unsigned-integer window WRAPS: uint8 0 - 3 is 253, so a baseline of
-    displacement 5 would read 356.
+    and an unsigned-integer window WRAPS: uint8 0 - 3 is 253 and 0 - 4 is 252, so
+    the step that moves (3, 4) -- a displacement of 5 -- would read
+    sqrt(253**2 + 252**2) = 357.09.
 
     THE MUTATIONS THIS EXISTS FOR: dropping the `np.asarray` coercion (the list
     case), and dropping `dtype=np.float64` from BOTH coercions (the uint8 case).
@@ -599,11 +610,12 @@ def test_the_interval_refuses_a_malformed_margin_a_bad_resample_count_and_a_bad_
 
     A groups array of shape (6, 1) has the right SIZE and the wrong RANK, so only
     the rank operand of the label guard rejects it. A horizon of 0 or -1 is not
-    refused by NumPy at all -- it indexes the LAST column -- so only the lower
-    bound stands between it and a silently wrong interval; a horizon past the
-    end is caught by the upper bound (a missing one surfaces as an IndexError,
-    which is not the ValueError asserted here). The two edges that must WORK are
-    exercised too, so a bound moved one step inward also fails.
+    refused by NumPy at all -- `h - 1` is then -1 or -2, which index the LAST and
+    the SECOND-TO-LAST column -- so only the lower bound stands between it and a
+    silently wrong interval; a horizon past the end is caught by the upper bound
+    (a missing one surfaces as an IndexError, which is not the ValueError
+    asserted here). The two edges that must WORK are exercised too, so a bound
+    moved one step inward also fails.
 
     THE MUTATIONS THIS EXISTS FOR: dropping the rank check on `window_margin`;
     dropping the rank operand of the label guard; `resamples < 1` -> `< 0`; and
