@@ -271,9 +271,11 @@ def measure_cell(
     agent did not move -- in one place that is tested.
 
     `study_record` is the cell's own study record, read STRICTLY: `steps`,
-    `kl_rate_above_free_bits` and `kl_dyn_max` are carried from the training
-    history beside the checkpoint, and a record without them is not a study
-    record.
+    `kl_rate_above_free_bits`, `kl_dyn_max` and `git_sha` are carried from the
+    training history beside the checkpoint, and a record without them is not a
+    study record. `git_sha` is as strict as the other three because the read phase
+    compares it across records as a protocol field: a default would let a record
+    that merely lacks it pass for one written where git could not answer.
 
     Keys of every per-`k` and per-`h` mapping are STRINGS, the form JSON gives
     them back in, so the record is identical before and after it is written.
@@ -332,7 +334,7 @@ def measure_cell(
         "step": int(study_record["steps"]),
         "kl_rate_above_free_bits": float(study_record["kl_rate_above_free_bits"]),
         "kl_dyn_max": float(study_record["kl_dyn_max"]),
-        "record_git_sha": study_record.get("git_sha", "unknown"),
+        "record_git_sha": study_record["git_sha"],
         "git_sha": git_sha(),
         "device": str(device),
         "context": int(context),

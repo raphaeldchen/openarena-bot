@@ -559,16 +559,28 @@ def test_the_record_carries_the_training_numbers_of_its_own_cell(rig):
     assert record["record_git_sha"] == "study-sha"
 
 
-@pytest.mark.parametrize("missing", ["steps", "kl_rate_above_free_bits", "kl_dyn_max"])
+@pytest.mark.parametrize(
+    "missing", ["steps", "kl_rate_above_free_bits", "kl_dyn_max", "git_sha"],
+)
 def test_a_study_record_missing_a_training_number_is_refused_not_defaulted(rig, missing):
     """ONE KEY LEFT OUT PER CASE. A record built as `{"steps": 1}` lacks two keys
     at once, so the strict read of the second is what raises and a lenient read of
     the first -- `.get("steps", 0)`, or either KL field with a default -- changes
     nothing. Each key is the only one missing here, so each is pinned by itself.
 
+    `git_sha` IS ONE OF THEM, because the read phase compares it across records
+    as a protocol field. A default of "unknown" there is a value `study.git_sha()`
+    itself writes when git cannot answer, so a record that merely LACKS the key
+    would be indistinguishable from one written where git was unavailable, and
+    cells from different code versions would pool into one finding with no
+    refusal at all. (`study.UNKNOWN_GIT_SHA` present in the record is a different
+    thing and still carried.)
+
     THE MUTATIONS THIS EXISTS FOR: `study_record["steps"]` ->
     `study_record.get("steps", 0)`, and the same for `kl_rate_above_free_bits` and
-    `kl_dyn_max`; each survived the previous single `{"steps": 1}` case."""
+    `kl_dyn_max`, each of which survived the previous single `{"steps": 1}` case;
+    and `study_record["git_sha"]` -> `study_record.get("git_sha", "unknown")`, the
+    line as it was written, which survived every test."""
     study = {
         "steps": 12345, "kl_rate_above_free_bits": 0.25, "kl_dyn_max": 7.5,
         "git_sha": "study-sha",
