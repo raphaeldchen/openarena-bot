@@ -8,6 +8,7 @@ every number under test is a function of the arrays handed in.
 """
 
 import dataclasses
+import itertools
 
 import numpy as np
 import pytest
@@ -1201,6 +1202,194 @@ def test_arms_that_clear_in_opposite_directions_do_not_make_a_status():
     assert reading.status == "INDETERMINATE"
     assert reading.arms_motion == ("frozen_ssl",)
     assert reading.arms_copies == ("pixel_ae",)
+
+
+# --- Reading H: what the INDETERMINATE sentence says ------------------------
+#
+# The sentence ships in `burden.txt`, so it is specification. Its first draft
+# said "the motion_margin interval straddles 0", which is false whenever an arm
+# cleared cleanly -- and INDETERMINATE arises in three different ways, only one
+# of which can have every interval straddle. The true condition is that neither
+# tally reached `ARMS_REQUIRED`, so the sentence reports the tallies themselves.
+
+FALL_THROUGH_WORDS = (
+    "This status is the fall-through, not a bar that was cleared, so it arrived "
+    "by default rather than by evidence"
+)
+
+
+def _says_nothing_about_straddling(rule):
+    """The first draft's claim and its consequent. Neither is true once an arm
+    has cleared, and neither is needed when none has."""
+    assert "straddl" not in rule, rule
+    assert "could not be shown" not in rule, rule
+
+
+def test_the_fall_through_sentence_says_so_when_no_arm_clears_either_way():
+    """Nothing cleared: both tallies are empty and the sentence says so. The
+    third arm is MIXED -- one seed each of motion, copies and straddling -- so
+    its intervals do not all straddle either, and the sentence still may not say
+    they do.
+
+    THE MUTATIONS THIS EXISTS FOR: the situation clause taken from the wrong
+    branch (an empty tally read as "short of the bar", or as a split), and the
+    first draft's wording that the interval straddles 0.
+    """
+    cells = (
+        _arm_cells("frozen_ssl", STRADDLES, STRADDLES, STRADDLES)
+        + _arm_cells("pixel_ae", STRADDLES, STRADDLES, STRADDLES)
+        + _arm_cells("random_vit", CLEARS_MOTION, CLEARS_COPIES, STRADDLES)
+    )
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "INDETERMINATE"
+    assert (reading.arms_motion, reading.arms_copies) == ((), ())
+    rule = reading.rule
+    assert f"neither decisive status reaches {ARMS_REQUIRED} arms at horizon {DECISION_H}" in rule
+    assert "motion is cleared by 0 of 3 arms (none) and copies by 0 of 3 arms (none)" in rule
+    assert "no arm has a strict majority of its seeds clearing 0 in either direction" in rule
+    assert "short of the bar" not in rule
+    assert "opposite directions" not in rule
+    _says_nothing_about_straddling(rule)
+    assert FALL_THROUGH_WORDS in rule
+
+
+@pytest.mark.parametrize(
+    "shape, tallies",
+    [
+        (CLEARS_MOTION, "motion is cleared by 1 of 3 arms (frozen_ssl) and copies by 0 of 3 arms (none)"),
+        (CLEARS_COPIES, "motion is cleared by 0 of 3 arms (none) and copies by 1 of 3 arms (frozen_ssl)"),
+    ],
+    ids=["motion", "copies"],
+)
+def test_the_fall_through_sentence_names_the_one_arm_that_cleared_and_how_far_short(
+    shape, tallies
+):
+    """One arm clears cleanly and the other two straddle. That arm's interval
+    does NOT straddle 0, so a sentence saying the interval straddles is false
+    here; what is true is that the reading is one arm short of the bar.
+
+    THE MUTATIONS THIS EXISTS FOR: the first draft's wording, which names no
+    arm; the two tallies printed against each other's labels; the shortfall
+    written as `ARMS_REQUIRED` rather than `ARMS_REQUIRED - len(cleared)`; and a
+    `cleared` that reads only `arms_motion`, which the copies case sees.
+    """
+    reading = reading_burden(_inputs(_by_arm(
+        frozen_ssl=shape, pixel_ae=STRADDLES, random_vit=STRADDLES,
+    )))
+    assert reading.status == "INDETERMINATE"
+    assert (reading.arms_motion, reading.arms_copies) == (
+        (("frozen_ssl",), ()) if shape is CLEARS_MOTION else ((), ("frozen_ssl",))
+    )
+    rule = reading.rule
+    assert tallies in rule
+    assert (
+        "every arm that clears does so in the same direction, and the reading "
+        "falls short of the bar by 1 arm(s)"
+    ) in rule
+    assert "opposite directions" not in rule
+    assert "no arm has a strict majority" not in rule
+    _says_nothing_about_straddling(rule)
+    assert FALL_THROUGH_WORDS in rule
+
+
+def test_the_fall_through_sentence_says_the_arms_disagree_when_they_clear_opposite_ways():
+    """`frozen_ssl` clears motion and `pixel_ae` clears copies; neither interval
+    straddles 0. That is a different situation from one arm short of the bar --
+    the evidence points both ways -- and the sentence has to tell them apart.
+
+    THE MUTATIONS THIS EXISTS FOR: the first draft's wording; the situation
+    clause selected on `arms_motion or arms_copies` where it must need BOTH,
+    which prints "short of the bar" over a split reading; and the two tallies
+    printed against each other's labels.
+    """
+    reading = reading_burden(_inputs(_by_arm(
+        frozen_ssl=CLEARS_MOTION, pixel_ae=CLEARS_COPIES, random_vit=STRADDLES,
+    )))
+    assert reading.status == "INDETERMINATE"
+    assert (reading.arms_motion, reading.arms_copies) == (("frozen_ssl",), ("pixel_ae",))
+    rule = reading.rule
+    assert (
+        "motion is cleared by 1 of 3 arms (frozen_ssl) and copies by 1 of 3 arms (pixel_ae)"
+    ) in rule
+    assert (
+        "the arms clear in opposite directions, so the reading is split, not merely short"
+    ) in rule
+    assert "short of the bar" not in rule
+    assert "no arm has a strict majority" not in rule
+    _says_nothing_about_straddling(rule)
+    assert FALL_THROUGH_WORDS in rule
+
+
+def test_the_fall_through_sentence_is_true_of_every_arrangement_of_three_arms():
+    """All 27 ways three arms can each clear motion, clear copies or straddle:
+    wherever the status is INDETERMINATE, the tallies the sentence prints and
+    the situation it names are recomputed from the FIXTURE's shapes, not read
+    back from the reading's own tuples.
+
+    THE MUTATION THIS EXISTS FOR: a branch of the situation clause that is
+    wrong for some arrangement the three named tests above do not build (a tally
+    printed from the wrong tuple, or a split read as short).
+    """
+    shapes = {"motion": CLEARS_MOTION, "copies": CLEARS_COPIES, "straddle": STRADDLES}
+    seen = set()
+    for choice in itertools.product(shapes, repeat=3):
+        reading = reading_burden(_inputs(_by_arm(**dict(zip(ARMS, (shapes[c] for c in choice))))))
+        motion = [a for a, c in zip(ARMS, choice) if c == "motion"]
+        copies = [a for a, c in zip(ARMS, choice) if c == "copies"]
+        if len(motion) >= ARMS_REQUIRED or len(copies) >= ARMS_REQUIRED:
+            assert reading.status != "INDETERMINATE", choice
+            continue
+        assert reading.status == "INDETERMINATE", choice
+
+        def tally(arms):
+            return f"{len(arms)} of 3 arms ({', '.join(arms) or 'none'})"
+
+        rule = reading.rule
+        assert f"motion is cleared by {tally(motion)} and copies by {tally(copies)}" in rule, choice
+        if motion and copies:
+            situation = "split"
+            assert "the arms clear in opposite directions, so the reading is split" in rule
+            assert "short of the bar" not in rule and "no arm has" not in rule
+        elif motion or copies:
+            situation = "short"
+            assert "falls short of the bar by 1 arm(s)" in rule
+            assert "opposite directions" not in rule and "no arm has" not in rule
+        else:
+            situation = "none"
+            assert "no arm has a strict majority of its seeds" in rule
+            assert "short of the bar" not in rule and "opposite directions" not in rule
+        _says_nothing_about_straddling(rule)
+        assert FALL_THROUGH_WORDS in rule
+        seen.add(situation)
+
+    assert seen == {"none", "short", "split"}
+
+
+def test_the_fall_through_sentence_takes_its_numbers_from_the_module_and_the_inputs(
+    monkeypatch,
+):
+    """Four arms, a bar of three, a horizon of 30: none of them the shipped
+    value, so a number written as a literal cannot pass. One arm clears motion,
+    which is 2 short of three -- and 1 short of the two the module ships with.
+
+    THE MUTATIONS THIS EXISTS FOR: the horizon, the bar, the shortfall's bar or
+    the arm count written as a literal inside `_fall_through_rule`, each equal
+    to the shipped value and so invisible to every three-arm test above.
+    """
+    monkeypatch.setattr("mbfps.eval.burden.ARMS_REQUIRED", 3)
+    cells = _by_arm(
+        frozen_ssl=CLEARS_MOTION, pixel_ae=STRADDLES, random_vit=STRADDLES,
+        scratch=STRADDLES,
+    )
+    reading = reading_burden(_inputs(cells, decision_h=30))
+    assert reading.status == "INDETERMINATE"
+    assert reading.arms_motion == ("frozen_ssl",)
+    rule = reading.rule
+    assert "neither decisive status reaches 3 arms at horizon 30." in rule
+    assert "motion is cleared by 1 of 4 arms (frozen_ssl)" in rule
+    assert "falls short of the bar by 2 arm(s)" in rule
+    for stale in ("horizon 45", "reaches 2 arms", "of 3 arms", "by 1 arm(s)"):
+        assert stale not in rule, stale
 
 
 @pytest.mark.parametrize(

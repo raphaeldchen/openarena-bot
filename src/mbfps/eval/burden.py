@@ -380,6 +380,55 @@ class BurdenStatus:
     seeds_total: dict[str, int]
 
 
+def _fall_through_rule(
+    arms_motion: tuple[str, ...], arms_copies: tuple[str, ...],
+    decision_h: int, n_arms: int,
+) -> str:
+    """The `INDETERMINATE` sentence, built from the two tallies it is a verdict on.
+
+    THE CONDITION IS THAT NEITHER TALLY REACHED `ARMS_REQUIRED`, and nothing
+    stronger. The first draft said "the motion_margin interval straddles 0",
+    which holds only when no arm cleared; it was printed verbatim when one arm
+    cleared motion alone and when two arms cleared in opposite directions, where
+    the clearing arms' intervals do not straddle anything. So the sentence
+    reports what DID clear, and names which of three situations this is: no arm
+    clearing either way, the clearing arms all pointing one way but too few, or
+    the arms splitting. The second and third are different results and the
+    artefact has to let a reader tell them apart.
+
+    The sentence ships in `burden.txt`; its wording is specification.
+    """
+    def tally(arms: tuple[str, ...]) -> str:
+        return f"{len(arms)} of {n_arms} arms ({', '.join(arms) or 'none'})"
+
+    if arms_motion and arms_copies:
+        situation = (
+            "the arms clear in opposite directions, so the reading is split, "
+            "not merely short"
+        )
+    elif arms_motion or arms_copies:
+        short = ARMS_REQUIRED - len(arms_motion or arms_copies)
+        situation = (
+            "every arm that clears does so in the same direction, and the "
+            f"reading falls short of the bar by {short} arm(s)"
+        )
+    else:
+        situation = (
+            "no arm has a strict majority of its seeds clearing 0 in either "
+            "direction"
+        )
+    return (
+        f"neither decisive status reaches {ARMS_REQUIRED} arms at horizon "
+        f"{decision_h}. An arm clears motion when the whole motion_margin "
+        "interval is above 0, and copies when it is at or below 0, in a "
+        f"strict majority of its seeds. Here motion is cleared by "
+        f"{tally(arms_motion)} and copies by {tally(arms_copies)}: "
+        f"{situation}. This status is the fall-through, not a bar that was "
+        "cleared, so it arrived by default rather than by evidence and "
+        "licenses no positive claim in either direction"
+    )
+
+
 def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
     """Reading H: is the rollout compounding, or did the one-step map never
     learn motion?
@@ -486,13 +535,8 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
         )
     return BurdenStatus(
         status="INDETERMINATE",
-        rule=(
-            f"neither decisive status clears {ARMS_REQUIRED} arms at horizon "
-            f"{inputs.decision_h}: the motion_margin interval straddles 0, so "
-            "the one-step map could not be shown to beat stillness and could "
-            "not be shown to match it. This status is the fall-through, not a "
-            "bar that was cleared, so it arrived by default rather than by "
-            "evidence and licenses no positive claim in either direction"
+        rule=_fall_through_rule(
+            arms_motion, arms_copies, inputs.decision_h, len(by_arm)
         ),
         arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
     )
