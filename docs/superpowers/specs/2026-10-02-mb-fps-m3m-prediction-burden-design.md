@@ -67,44 +67,63 @@ training (one cell at 20,000 steps took 1.47 h) on the wrong one.
 
 ### 2.1 The prediction-burden ladder
 
-Three curves at each horizon k, differing in exactly one variable — how much
-prediction is demanded. Every one routes its final latent through the **same**
-embedding head and the same position readout.
+`diagnostics.regrounding_sweep` already imagines k steps, re-observes the real
+frames, and repeats across the horizon, for `REGROUNDING_KS = (1, 3, 5, 15, 45)`.
+M3m reads that existing ladder rather than building an arm of its own.
 
-| curve | observes real frames through | final draw comes from | status |
+| rung | re-grounds | what each scored latent is | role |
 |---|---|---|---|
-| `floor(k)` | t+k | the posterior, which saw frame t+k | already recorded |
-| `teacher_forced(k)` | t+k−1 | the prior, one step from the true state | **the one new arm** |
-| `open_loop(k)` | t only | the prior, k steps from its own draws | already recorded as `rssm_position` |
+| `floor` | every step | a ZERO-step posterior, seeing the frame it is scored on | the known lower anchor |
+| `k = 1` | every step, after the prediction | a ONE-step prior from a posterior-grounded state | **the one-step map, measured** |
+| `k = 3, 5, 15` | every 3 / 5 / 15 steps | a prior 1..k steps past its last correction | the burden curve |
+| `k = 45` | never | the open loop | **bitwise self-check** against the shipped `rssm_position` |
 
-The decomposition is **exact by construction**:
+The floor is **not** the k→0 limit: it sees the frame it is scored on, while k=1
+is a prior step from a state grounded one frame earlier. So k=1 must sit
+STRICTLY above the floor, and `is_bitwise_the_floor(1)` reads `False` on all
+nine shipped cells — the control already holds.
+
+Define, per horizon step and per window:
 
 ```
-open_loop(k) − floor(k) = [teacher_forced(k) − floor(k)] + [open_loop(k) − teacher_forced(k)]
-                        =       one_step_cost(k)         +     compounding_cost(k)
+burden(k)      = sweep.curve(k) − floor
+compounding(k) = burden(k) − burden(1)
 ```
 
-`one_step_cost(k)` is what one step of prediction costs at time t+k.
-`compounding_cost(k)` is what it costs that the preceding k−1 draws were
-uncorrected by observation rather than corrected by it. Both are **paired**
-differences over identical windows with identical weights, not two independent
-estimates — the distinction that stalled M3k, whose statistic had an
-effect-to-noise ratio of 0.22.
+`burden(1)` is what one step of prediction costs. `compounding(k)` is what it
+costs that correction arrives every k steps rather than every step, and
+`compounding(1) = 0` **exactly**, by construction rather than by estimate.
+`burden(45)` is the full open-loop cost the gate reads.
+
+Every rung is a mean over the same windows with the same weights, and
+`RegroundingSweep` retains the per-window rows (`window_position` per k, and
+`window_floor_position`) so every comparison is **paired**. The class's own
+comment records that the unpaired spread overstates the paired bars by 1.7× to
+3.9× on the shipped cells — enough to hide the k=1 versus k=3 separation — which
+is why the paired form is required and the unpaired one is not used.
 
 ### 2.2 `motion_margin` — and the baseline that makes it fair
 
-The natural-looking comparison is `teacher_forced(k)` against the recorded
-`persistence_position(k)`. **That comparison is rigged and must not be used.**
+**Notation, because two different axes were both called `k` in the first draft.**
+`k` is the **re-grounding period** — how often observation corrects the rollout —
+and ranges over `REGROUNDING_KS = (1, 3, 5, 15, 45)`. `h` is the **horizon
+step**, 1..45, and is reported over `REPORTED_H`. So `burden(k, h)` is the cost
+at horizon step `h` of correcting only every `k` steps, and the quantity Reading
+H decides on is at `k = 1`, `h = DECISION_H`.
+
+The natural-looking comparison is the `k = 1` rung against the recorded
+`persistence_position`. **That comparison is rigged and must not be used.**
 Recorded persistence copies the position at t, the last frame the *open-loop*
-rollout saw, while `teacher_forced(k)` has observed through t+k−1. It would win
-on information advantage rather than by predicting anything.
+rollout saw, while the `k = 1` rung is re-grounded every step and has therefore
+observed through h−1. It would win on information advantage rather than by
+predicting anything.
 
 The fair baseline is **one-step persistence**: predict that the agent did not
-move between t+k−1 and t+k. Its error is exactly the true one-step displacement,
+move between h−1 and h. Its error is exactly the true one-step displacement,
 known from ground truth with no model involved.
 
 ```
-motion_margin(k) = one_step_persistence(k) − teacher_forced(k)
+motion_margin(h) = one_step_persistence(h) − sweep.curve(1)[h]
 ```
 
 Positive means one prior step beats assuming stillness. This is the inherited
@@ -113,23 +132,23 @@ an exactly known quantity.
 
 ### 2.3 Controls with known answers, and the base control
 
-Three controls come from construction rather than estimation:
+Four controls, three of them already implemented and already passing on the nine
+shipped cells:
 
-1. **`compounding_cost(1) = 0` exactly.** At k=1 there are no preceding
-   uncorrected draws, so `teacher_forced(1)` and `open_loop(1)` are the same
-   computation.
-2. **The identity.** `one_step_cost(k) + compounding_cost(k)` must equal
-   `open_loop(k) − floor(k)`. Computed in float64 over magnitudes of order 250,
-   a few ULPs is ~1e-13, so the tolerance is **1e-9** — about four orders of
-   margin. The measured residual is recorded per cell rather than asserted to be
-   zero: M3l's `floor_bits` read 5.7e-14, not 0.0, and the legend that called it
-   "exactly 0" is still an open follow-up.
-3. **The index pin.** `teacher_forced` at k=0 degenerates to `open_loop`'s first
-   step, so their **prior logits at k=0 must be bit-identical**. This is a
-   deterministic check on the alignment that `evaluate_rollout` records as
-   *"Verified empirically, not by argument"*: with an oracle model, using
-   `start + context` rather than `start + context + 1` gives a perfect predictor
-   a constant nonzero error at every horizon.
+1. **`compounding(1) = 0` exactly** — the same computation on both sides.
+2. **The k=45 rung reproduces the record bitwise.** `open_loop_divergence`
+   reads 0.0 on all nine shipped cells. `regrounding_sweep` refuses a `ks` that
+   omits the horizon, because that pass *is* this self-check: "a sweep without
+   it reports curves nothing has checked".
+3. **k=1 is strictly above the floor.** `is_bitwise_the_floor(1)` reads `False`
+   on all nine. Equality would mean the grounding consumed the frame it is
+   scored on, and the whole ladder would be meaningless.
+4. **The burden identity.** `burden(1) + compounding(k)` must equal `burden(k)`.
+   Computed in float64 over magnitudes of order 250, a few ULPs is ~1e-13, so
+   the tolerance is **1e-9** — about four orders of margin. The measured
+   residual is recorded per cell rather than asserted to be zero: M3l's
+   `floor_bits` read 5.7e-14, not 0.0, and the legend that called it "exactly 0"
+   is still an open follow-up.
 
 The **base control** guards the one confound that would silently decide the
 reading. If the agent is largely stationary, the true one-step displacement is
@@ -145,10 +164,13 @@ Cells that fail are named and the run refuses (exit 46).
 
 Reported per cell as raw levels, gating nothing:
 
-- **`compounding_share(k) = compounding_cost(k) / (open_loop(k) − floor(k))`.**
-  Interpretable where the denominator is large, and exactly 0 at k=1 by control
-  1. It is **not** read at small k, where the denominator is the same vanishing
-  quantity that produced `pixel_ae` seed 1's `+3.39 / −3.36`.
+- **The burden curve over the ladder** — `burden(k, DECISION_H)` for
+  k = 1, 3, 5, 15, 45, which shows how fast the cost grows as correction becomes
+  rarer, and whether it grows smoothly or jumps.
+- **`compounding_share(k) = compounding(k, DECISION_H) / burden(k, DECISION_H)`.** Interpretable where
+  the denominator is large, and exactly 0 at k=1 by control 1. It is **not**
+  read at small horizon, where the denominator is the same vanishing quantity
+  that produced `pixel_ae` seed 1's `+3.39 / −3.36`.
 - **The band-relative figure**, expressing the costs as fractions of the
   persistence-to-floor band so they can be set beside `gap_closed`. Reported for
   continuity with the gate's own units; decides nothing, for the same reason.
@@ -163,8 +185,10 @@ Reported per cell as raw levels, gating nothing:
 Evaluated in order. The first that applies is the reading.
 
 1. **Refusals** — no status, a named `SystemExit`, nothing written:
-   - the identity residual exceeding 1e-9, or the k=0 logits not bit-identical
-     → **exit 45**;
+   - the burden identity residual exceeding 1e-9;
+     `open_loop_divergence` not 0.0, so the k=45 rung does not reproduce the
+     record bitwise; or `is_bitwise_the_floor(1)` returning `True`, so the
+     grounding consumed the frame it is scored on → **exit 45**;
    - the base control failing in any cell, a protocol disagreement across
      records, or an arm/seed plan narrowed such that no data could reach a
      positive verdict → **exit 46**. The last is the trap
@@ -186,7 +210,7 @@ Evaluated in order. The first that applies is the reading.
 ### 3.2 Where the bars come from
 
 `DECISION_H = 45`, because that is the horizon the M3 gate reads. The full
-`REPORTED_K = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)` is reported as raw levels so
+`REPORTED_H = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)` is reported as raw levels so
 a reader may apply a different horizon rather than inheriting this one.
 
 `ARMS_REQUIRED = 2` of 3, matching every milestone from M3i onward.
@@ -222,46 +246,70 @@ longer horizon cannot help; it does not name what target would.
 
 | file | change |
 |---|---|
-| `src/mbfps/eval/rollout.py` (255 lines) | **modify** — the `teacher_forced` arm and the one-step-persistence baseline |
-| `src/mbfps/eval/burden.py` | **new** — `DECISION_H`, `REPORTED_K`, `ARMS_REQUIRED`, the decomposition, `motion_margin`, Reading H with its statuses and sentences, the identity check, the formatters |
+| `src/mbfps/eval/burden.py` | **new** — `DECISION_H`, `REPORTED_H`, `ARMS_REQUIRED`, `burden`, `compounding`, `motion_margin`, the identity check, Reading H with its statuses and sentences, the formatters |
 | `scripts/prediction_burden.py` | **new** — measure and read phases, exits 45 and 46 |
 | `tests/eval/test_burden.py` | **new** |
 | `tests/eval/test_prediction_burden_script.py` | **new** |
-| `tests/eval/test_rollout.py` | **modify** — the new arm and the index pin |
 | `tests/eval/test_diagnose_dynamics_script.py` | **modify** — the exit registry gains `{45, 46}` |
 
-### 4.1 Why the new arm lives in `rollout.py` and nowhere else
+**`src/mbfps/eval/rollout.py` and `src/mbfps/eval/diagnostics.py` are NOT
+modified.** The first version of this spec put a new `teacher_forced` arm in
+`rollout.py`. That was wrong three times over, and the correction is the main
+thing this section records:
 
-The floor already runs `observe` over the real future, so the posterior `h` and
-`z` at every future step — exactly the states `teacher_forced` needs — are
-already in hand; the new arm is one batched `_step` plus `prior_net`, not a new
-rollout loop. More importantly, the truth-index convention lives there, and so
-does the window rule in `window_starts`, which exists precisely so that
-`gather_probe_data` and both diagnostics cut identical windows. Computing the
-new arm anywhere else means re-deriving an off-by-one that was settled
-empirically.
+- The arm already exists. `regrounding_sweep`'s k=1 rung *is* a one-step prior
+  from a posterior-grounded state, and it is implemented, tested, wired into
+  `scripts/diagnose_dynamics.py --ks`, and already run on the nine cells.
+- `rollout.py` averages over windows, so the per-window rows a clustered
+  bootstrap needs do not survive there. `RegroundingSweep` retains them.
+- `rollout.py` has no RNG-snapshot machinery. `_diagnose`'s header states that
+  arms drawing from different stream points "differ by sampling noise, and the
+  measured effect is uninterpretable", and that the snapshot must be
+  device-aware because on MPS a CPU-only snapshot "inflates the apparent action
+  effect by ~100x … while every CPU test still passes". A hand-built arm in
+  `rollout.py` would manufacture exactly that artefact.
 
-`src/mbfps/eval/diagnostics.py` is 1,948 lines. It is not touched by this
-milestone, and consolidating it is out of scope.
+So M3m **consumes** `regrounding_sweep` and `evaluate_rollout` and adds only
+what does not exist: the one-step-persistence baseline, `motion_margin`, the
+burden decomposition, Reading H, and the two-phase script.
 
-There are already three episode-clustered bootstraps — `capacity.py`,
-`probe.py` and `pooling.py`. M3m **reuses** one rather than adding a fourth, and
-must resample the same episode labels over the same window set that
-`evaluate_rollout` cuts. Consolidating the three is out of scope.
+`diagnostics.py` is 1,948 lines and `rollout.py` duplicates its rollout body on
+purpose — the header explains that unifying them would make the k=horizon
+degeneracy true by construction and turn the bitwise self-check into
+decoration. Neither is refactored here. There are also three
+episode-clustered bootstraps already (`capacity.py`, `probe.py`, `pooling.py`);
+M3m reuses one rather than adding a fourth, resampling the episode labels the
+record already carries under `windows.episode`. Consolidating the three is out
+of scope.
+
+### 4.1 Why the nine shipped records are not enough
+
+The sweep ran on all nine cells with `ks = [1, 3, 5, 15, 45]`, and
+`self_checks.smallest_k = 1` with `smallest_k_is_bitwise_the_floor = False` is
+recorded. But the keys carrying the sweep's **numbers** — `k` and
+`floor_margin` — were added to `scripts/diagnose_dynamics.py` after those
+records were written, and are absent from all nine. The curves exist in the code
+path and not on disk, so M3m must re-run the sweep. It is an existing, tested
+code path, not new behaviour.
 
 ### 4.2 Two phases, one record per cell
 
-`--phase measure` writes one JSON record per cell carrying the four curves, the
-per-window costs, the intervals, the three controls' measured values, the base
+`--phase measure` calls `evaluate_rollout` and `regrounding_sweep` per cell and
+writes one JSON record carrying: every rung's curve, the per-window rows, the
+one-step-persistence baseline, `motion_margin` with its episode-clustered
+interval at every `REPORTED_H`, the four controls' measured values, the base
 control, the training-history companions, and the protocol fields.
 `--phase read` pools the nine, refuses on protocol disagreement, and prints
-Reading H. A reading is therefore reproducible from records without a GPU, as
-in M3l, where `capacity.txt` came out byte-identical on three independent reads.
+Reading H. A reading is therefore reproducible from records without a GPU, as in
+M3l, where `capacity.txt` came out byte-identical on three independent reads.
 
 ## 5. Constraints
 
 - No training. This milestone reads the nine existing 20,000-step checkpoints in
   `runs/m3_study_v2`.
+- `src/mbfps/eval/rollout.py` and `src/mbfps/eval/diagnostics.py` are not
+  modified. M3m consumes `evaluate_rollout` and `regrounding_sweep`; a
+  re-implementation of either arm is a defect, not an alternative (section 4).
 - Nothing under `runs/` is removed or overwritten. `runs/` is a symlink to
   storage shared by every worktree.
 - The test command is `.venv/bin/python -m pytest`; there is no `pytest` entry
@@ -277,20 +325,24 @@ in M3l, where `capacity.txt` came out byte-identical on three independent reads.
 
 ## 6. Cost
 
-One pass over nine cells, no training. The new arm adds one batched prior step
-per horizon on top of an existing 45-step `imagine` and 45-step `observe`, so
-**20–35 minutes**, bracketed by M3l's 18-minute measure and M3h's 33-minute
-sweep. The read phase is seconds.
+One pass over nine cells, no training. Per cell: one `evaluate_rollout` and one
+`regrounding_sweep` over five rungs. The action-intervention ladder and the
+interventions that make `diagnose_dynamics` expensive are **not** run. M3h's
+full nine-cell sweep took 33m25s, so expect **25–45 minutes**. The read phase is
+seconds.
 
 ## 7. Exit criteria
 
 M3m is complete when Reading H is read from nine cells at one `git_sha`, with:
 
-- the identity residual recorded per cell and within 1e-9;
-- the k=0 logit pin holding on all nine;
+- the burden identity residual recorded per cell and within 1e-9;
+- `open_loop_divergence` 0.0 and `is_bitwise_the_floor(1)` `False` on all nine,
+  both recorded;
+- `burden(k)` and `compounding(k)` recorded for every rung of
+  `REGROUNDING_KS`, with `compounding(1)` exactly 0;
 - the base control recorded per cell, with the cells that fail it named;
 - `motion_margin` with an episode-clustered interval at every
-  `REPORTED_K`, and the status read at `DECISION_H`;
+  `REPORTED_H`, and the status read at `DECISION_H`;
 - the companions of 2.4 reported as raw levels;
 - the results section re-derivable from the records alone.
 
@@ -309,14 +361,21 @@ introduced by the readout — that is a separate question and a separate spec.
 
 ## 9. Spec self-review
 
-- **Placeholders:** none. `DECISION_H = 45`, `REPORTED_K` has ten entries,
+- **Placeholders:** none. `DECISION_H = 45`, `REPORTED_H` has ten entries,
   `ARMS_REQUIRED = 2`, the identity tolerance is 1e-9 with its ULP derivation,
   the exit codes are 45 and 46, and the base control is a measured ratio rather
   than a constant.
 - **Internal consistency:** the asymmetry in 3.3 matches the statuses in 3.1;
   the companions in 2.4 are excluded from 3.1's tally; the architecture in 4
   lists exactly the files the exit criteria in 7 require.
-- **Two corrections made while drafting.** First, a claim that the model
+- **Three corrections made while drafting.** The third was found only by reading
+  the code the plan would have to call, and is the largest: the first version of
+  section 4 specified a new `teacher_forced` arm in `rollout.py`. That arm
+  already exists as `regrounding_sweep`'s k=1 rung — tested, wired, and already
+  run on the nine cells — and `rollout.py` is additionally the wrong home,
+  because it averages over windows and has no device-aware RNG snapshot. The
+  spec review that preceded this checked the spec against itself and could not
+  catch it. Second, a claim that the model
   "closes 38–73% of the band in most cells" at k=1: the measured spread is
   +0.08 to +0.73 with four of nine above +0.38, so "most" was wrong and the
   figures are now stated exactly. Second, section 2.2's baseline. The first
@@ -324,7 +383,7 @@ introduced by the readout — that is a separate question and a separate spec.
   `persistence_position`, which is anchored at t and would have handed the new
   arm a k-step information advantage. Section 2.2 now states the rigged
   comparison explicitly so it is not reintroduced, and section 5 requires a test
-  that fails if it is.
+  that fails if it is. First, the "38–73% in most cells" claim above.
 - **Ambiguity:** "a strict majority of the seeds present" is stated as computed
   from the record set rather than stored, and an arm with fewer than 3 seeds is
   refused rather than tallied.
