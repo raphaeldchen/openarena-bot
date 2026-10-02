@@ -1695,3 +1695,210 @@ which is how M3k's three fixture defects should have been caught:
 3. **`test_live_classes_counts_the_columns_that_vary` did not renormalise.** Zeroing class 7 left rows summing to 31/32, which `_require_distributions` refuses — the test would have failed on the guard rather than on the count. It now renormalises, and the expected count is `CATS * CLASSES - CATS` rather than a bare number, so it tracks the config.
 4. **"`floor_bits` reads exactly 0.0" was false**, in the test, the exit criteria, the acceptance step and two docstrings. Measured: +5.68e-14 at 500 rows, −1.42e-13 at 2,000, +5.40e-13 at the ~11,000 a real cell carries — float summation order. Every tolerance is now 1e-9, with the M3h precedent cited where it is stated: a sweep once refused on an 8.527e-14 mismatch that was summation order and not a defect. Claiming bit-exactness where only near-exactness holds is a failure this project has already paid for once.
 5. **The renormalisation in that same test divided by zero.** The fixture was the *one-hot* `_deterministic_uniform`, so zeroing class 7 emptied every row whose one-hot was class 7, and `dead /= dead.sum(...)` then raised `RuntimeWarning: invalid value encountered in divide` — which the suite's zero-warning requirement turns into a failure. The fixture is now the Dirichlet base, whose smallest row sum after zeroing is a measured 0.7242.
+
+---
+
+## Task 6 results
+
+**Run directories:** `runs/m3l_smoke` (one-cell smoke) and `runs/m3l_capacity` (the nine cells and the read). Both as named here; no stale directory name from a previous milestone's plan was carried into any command.
+
+**Reading G: `SPARE_CAPACITY`.** Read exit code **0**. Taken on nine records at one `git_sha` `756c369272bd37999bb7fad08e7c68263d6efcd2`, equal to `runs/m3l_capacity/.head`.
+
+Every number below is derived from `runs/m3l_capacity/capacity_<arm>_seed<seed>.json` and names the field it came from. Nothing is read from the log.
+
+### The suite
+
+`.venv/bin/python -m pytest -q`: **2502 passed, 0 failed, 0 warnings, 1996.84s (33m16s)**. Full output at `.superpowers/sdd/suite-m3l-task6.txt`.
+
+### The smoke
+
+One cell (`--arms pixel_ae --seeds 0 --out runs/m3l_smoke`), **2m18s** wall. Every figure the plan's Step 2 named agreed:
+
+| expected | read from the record | result |
+|---|---|---|
+| `clusters` 24 | `clusters` = 24 | agrees |
+| 229 windows | 229 distinct `(windows.episode, windows.window)` pairs | agrees |
+| 11,450 rows | `rows` = `capacity.rows` = 11,450 (= 229 × 50) | agrees |
+| `floor` within 1e-9 of 0 | `capacity.checks.floor` = **+1.4921e-13** | agrees |
+| two ceiling routes agree to 1e-9 | `checks.ceiling` 29.7490165247 vs `checks.argmax_marginal` 29.7490165247, \|diff\| = **7.1054e-15** | agrees |
+| −1e-9 ≤ bits ≤ 160 + 1e-9 | `checks.bits` = 1.7362 | agrees |
+| 0 ≤ ceiling ≤ 160 + 1e-9 | `checks.ceiling` = 29.7490 | agrees |
+
+`checks.floor_ok`, `checks.routes_ok` and `checks.bracket_ok` were all `true`. `self_check.ok` `true`, with `reference_position_max_delta` 8.5265e-14 against a `reference_position_magnitude` of 203.60.
+
+A note that counts as evidence rather than bookkeeping: **the smoke's record and the nine-cell run's record for `pixel_ae` seed 0 are byte-identical in every field** — `capacity`, `windows`, `base_control` and `self_check` all compare equal. Two independent invocations of the measure produced the same numbers on the same cell.
+
+The brief's expectation line reads "229 windows" and `windows.episode` has 11,450 entries; that is not a disagreement. `windows.episode` and `windows.window` are one entry **per gathered row**, as `_window_count`'s docstring states, and the window count is the number of distinct pairs. My first pass compared the wrong quantity and I re-derived it before proceeding.
+
+### The nine-cell measure
+
+Launched `--phase measure --source runs/m3_study_v2 --out runs/m3l_capacity`. **18m08s** wall clock (`.started` 2026-10-01T15:24:31Z, `.finished` 15:42:39Z); last record written at 17m43s. Well inside the ~30–45 minute budget, and no cell stalled the way M3k's one 28-minute cell did.
+
+| cell | wall clock |
+|---|---|
+| `pixel_ae` s0 | 2m14s |
+| `pixel_ae` s1 | 1m32s |
+| `pixel_ae` s2 | 1m32s |
+| `frozen_ssl` s0 | 1m38s |
+| `frozen_ssl` s1 | 1m27s |
+| `frozen_ssl` s2 | 1m32s |
+| `random_vit` s0 | 1m30s |
+| `random_vit` s1 | 2m40s |
+| `random_vit` s2 | 3m34s |
+
+Spread 1m27s–3m34s; the two slowest were the last two cells, while an unrelated `pytest` run belonging to another project held one core at 100% for part of the window.
+
+**Step 4 acceptance, asserted from the records and not from the log** (`measure_phase` returns `EXIT_OK` even when a check fails, so `$?` was never consulted; the read phase was also run without a pipe so no `tee` status could be mistaken for Python's):
+
+- nine records present
+- **one** `git_sha` across all nine, equal to `.head`
+- one value across all nine for each of `clusters` (24), `rows` (11,450), `z_cats` (32), `z_classes` (32), `ceiling_bits` (160.0), `context` (5), `horizon` (45), `step` (20000), `split_seed` (0), `device` (`mps`), `torch_version` (2.13.0), and the window count
+- `self_check.ok` true on all nine
+- no non-finite value anywhere in any of the nine records
+
+**Every estimator check on every cell.** All three flags `true` on all nine; the underlying numbers:
+
+| cell | `checks.floor` | routes \|`ceiling` − `argmax_marginal`\| | `checks.bits` | `checks.ceiling` | flags |
+|---|---|---|---|---|---|
+| `pixel_ae` s0 | +1.492e-13 | 7.105e-15 | 1.7362 | 29.7490 | ok |
+| `pixel_ae` s1 | +3.340e-13 | ≤1e-9 | 0.8896 | 25.5595 | ok |
+| `pixel_ae` s2 | +3.411e-13 | ≤1e-9 | 1.4340 | 31.7971 | ok |
+| `frozen_ssl` s0 | −2.203e-13 | ≤1e-9 | 1.7181 | 32.0145 | ok |
+| `frozen_ssl` s1 | +6.395e-14 | ≤1e-9 | 1.3511 | 32.2711 | ok |
+| `frozen_ssl` s2 | +2.203e-13 | ≤1e-9 | 1.9917 | 34.9336 | ok |
+| `random_vit` s0 | −3.766e-13 | ≤1e-9 | 2.1911 | 33.5238 | ok |
+| `random_vit` s1 | +4.263e-14 | ≤1e-9 | 2.5762 | 39.0356 | ok |
+| `random_vit` s2 | −4.263e-14 | ≤1e-9 | 2.1328 | 32.4066 | ok |
+
+Largest `|floor|` is 3.766e-13, at `random_vit` s0 — 3.42 orders inside the 1e-9 tolerance, and the size the plan predicted from summation order. (I first wrote 3.411e-13 here, reading the largest *positive* floor rather than the largest magnitude; re-deriving the column caught it.) `bits_carried ≤ ceiling_bits` was **not** checked, correctly: it is not a theorem, and here it happens to hold in all nine cells, which is a fact about these codes and not a validation of the non-theorem.
+
+### The read
+
+`--phase read --out runs/m3l_capacity` returned **exit 0**. `capacity.txt` is 4,655 bytes.
+
+Byte-identity: a second `--phase read` produced stdout identical to the first `capacity.txt`, and the rewritten `capacity.txt` is identical to the first. All four artefacts share SHA256 `06bfe79b2254b4706f17aaf0df318b62747f449b827469c909b430ff5a2d4422`. `diff` reported no difference.
+
+### `bits_carried` against the 160-bit ceiling
+
+**`bits_carried` is the per-categorical informations summed — an upper bound on the code's joint information, not the joint information itself.** It is never "the code carries N of 160 bits". Measured during development: 32 categoricals that all copy one 5-bit variable read the full 160.0000 while carrying 5 bits jointly, a 32× overstatement, and nothing in the figure distinguishes that from an independent code of the same reading.
+
+Per cell, from `capacity.bits`, `capacity.ci_low`, `capacity.ci_high`, against the record's own `ceiling_bits` of 160.0:
+
+| cell | `bits` | `ci_low` | `ci_high` | share of 160 | `ci_high` as % of the 80 cut |
+|---|---|---|---|---|---|
+| `pixel_ae` s0 | 1.7362 | 1.4518 | 1.9528 | 1.085% | 2.44% |
+| `pixel_ae` s1 | 0.8896 | 0.6427 | 1.1830 | 0.556% | 1.48% |
+| `pixel_ae` s2 | 1.4340 | 1.1855 | 1.6414 | 0.896% | 2.05% |
+| `frozen_ssl` s0 | 1.7181 | 1.5054 | 1.9105 | 1.074% | 2.39% |
+| `frozen_ssl` s1 | 1.3511 | 1.1591 | 1.5154 | 0.844% | 1.89% |
+| `frozen_ssl` s2 | 1.9917 | 1.7953 | 2.1335 | 1.245% | 2.67% |
+| `random_vit` s0 | 2.1911 | 1.9539 | 2.3625 | 1.369% | 2.95% |
+| `random_vit` s1 | 2.5762 | 2.2432 | 2.8166 | 1.610% | 3.52% |
+| `random_vit` s2 | 2.1328 | 1.6932 | 2.5612 | 1.333% | 3.20% |
+
+Per arm, as the seed mean of `capacity.bits` with the conservative hull of the seeds' intervals:
+
+- `pixel_ae` **1.3533** (0.85% of 160), hull [0.6427, 1.9528], `seeds_spare` 3/3
+- `frozen_ssl` **1.6870** (1.05% of 160), hull [1.1591, 2.1335], `seeds_spare` 3/3
+- `random_vit` **2.3000** (1.44% of 160), hull [1.6932, 2.8166], `seeds_spare` 3/3
+
+Pooled over all nine: mean **1.7801**, **1.11% of 160**, min 0.8896, max 2.5762.
+
+**The whole interval sits below the 80-bit cut in 9 of 9 cells and so in 3 of 3 arms. There is no exception to name.** The largest `ci_high` anywhere is 2.8166 (`random_vit` s1), which is 3.52% of the cut — the cut is 28× the largest upper confidence bound in the run, and 45× the pooled mean. This margin is so wide that the reading does not depend on where the half-ceiling cut was placed: any cut above ~2.9 bits would return the same status.
+
+**This is the direction in which the estimator is sound.** A reading *below* a cut is conservative: if the upper bound on the joint information is below 80, the joint information is below 80 too. `SPARE_CAPACITY` therefore genuinely refutes the bottleneck lever, and the asymmetry that makes a *high* reading uninformative does not weaken it. It strengthens it — see the redundancy below.
+
+The second route, `checks.ceiling` (the information in the argmax **pattern**, itself also a per-categorical sum and so also an upper bound), reads 25.5595–39.0356 across the nine cells, 15.97%–24.40% of 160. Even that much looser quantity leaves three quarters of the ceiling unaccounted for in 9 of 9 cells. It is reported as a companion; it gates nothing and its only job in the protocol is the two-route check.
+
+### `frame_share` and `live`
+
+From `capacity.frame_share`, `capacity.frame_low`, `capacity.frame_high`, `capacity.live`:
+
+| cell | `frame_share` | `frame_low` | `frame_high` | `frame_low` > 0.5 | `live` |
+|---|---|---|---|---|---|
+| `pixel_ae` s0 | 0.5381 | 0.2866 | 0.7280 | no | 1024 |
+| `pixel_ae` s1 | 0.2947 | 0.1942 | 0.3997 | no | 1024 |
+| `pixel_ae` s2 | 0.3515 | 0.2284 | 0.4616 | no | 1024 |
+| `frozen_ssl` s0 | 0.2207 | 0.0742 | 0.3403 | no | 1024 |
+| `frozen_ssl` s1 | 0.2317 | 0.1297 | 0.3256 | no | 1024 |
+| `frozen_ssl` s2 | 0.0708 | −0.6013 | 0.5419 | no | 1024 |
+| `random_vit` s0 | 0.5061 | 0.4338 | 0.5699 | no | 1024 |
+| `random_vit` s1 | 0.4621 | 0.3685 | 0.5569 | no | 1024 |
+| `random_vit` s2 | 0.4153 | 0.2887 | 0.5329 | no | 1024 |
+
+Per arm, seed mean of `frame_share` with the seeds' hull: `pixel_ae` **0.3948** [0.1942, 0.7280], `frozen_ssl` **0.1744** [−0.6013, 0.5419], `random_vit` **0.4612** [0.2887, 0.5699]. Pooled mean **0.3435**, min 0.0708, max 0.5381. `seeds_frame` is **0/3 in every arm**.
+
+**`frame_low` clears 0.5 in 0 of 9 cells, so `FRAME_REENCODING` did not clear in any arm.** The exceptions worth naming run the other way: the **point estimate** exceeds 0.5 in **2 of 9** cells — `pixel_ae` s0 at 0.5381 (margin +0.0381 over the cut) and `random_vit` s0 at 0.5061 (margin +0.0061) — but neither interval does, `frame_low` being 0.2866 and 0.4338 respectively. The rule requires the interval, never the point estimate, and on that rule both cells fail. `frozen_ssl` s2 carries the widest interval in the run, [−0.6013, 0.5419]; a negative lower bound on an R² is a legitimate reading for a probe that beats the sample mean by less than its own resampling noise, and it is reported rather than clipped.
+
+So this run did **not** reach the case the rule anticipates where both objective-lever statuses clear and precedence picks the label. Only the spare cut cleared.
+
+**`live` is 1024 of 1024 in 9 of 9 cells** — every one of the `z_cats × z_classes` columns varies across rows. The low `bits_carried` is therefore **not** the dead-column form of posterior collapse: nothing is frozen. All 1024 columns move; they simply move very little, and, per the redundancy below, largely together. Reporting `live` as high is what makes that distinction available rather than guessed at.
+
+### `redundancy_bits` against `redundancy_floor`, and what the ratio licenses
+
+From `capacity.redundancy_bits` and `capacity.redundancy_floor`, with the ratio formed by `redundancy_ratio` on those two fields. **These ratios surprised me, so I checked them twice** — once through `redundancy_ratio` and once through an exact rational division of the two stored floats. The two routes agree to better than 1e-9 on all nine cells.
+
+| cell | `redundancy_bits` | `redundancy_floor` | ratio |
+|---|---|---|---|
+| `pixel_ae` s0 | 0.001459213 | 0.000015737 | 92.724 |
+| `pixel_ae` s1 | 0.000598965 | 0.000004747 | 126.165 |
+| `pixel_ae` s2 | 0.001068157 | 0.000005969 | 178.966 |
+| `frozen_ssl` s0 | 0.001448272 | 0.000007831 | 184.944 |
+| `frozen_ssl` s1 | 0.000877793 | 0.000005509 | 159.347 |
+| `frozen_ssl` s2 | 0.002068317 | 0.000022782 | 90.788 |
+| `random_vit` s0 | 0.002575320 | 0.000030098 | 85.565 |
+| `random_vit` s1 | 0.002989736 | 0.000040975 | 72.965 |
+| `random_vit` s2 | 0.003514769 | 0.000020484 | 171.582 |
+
+The ratio is **defined in 9 of 9 cells** — every `redundancy_floor` is above `RATIO_MIN_FLOOR` = 1e-9 — and ranges **72.965 to 184.944**. No cell is the collapsed, "not defined" case.
+
+The per-arm figures `capacity.txt` prints are **the ratio of the seed means, not the mean of the per-seed ratios**, because `CapacityArm` carries each redundancy figure as a seed mean: `frozen_ssl` **121.656**, `pixel_ae` **118.183**, `random_vit` **99.171**. The mean of the per-seed ratios would instead be 145.026, 132.618 and 110.037. They are different statistics and the printed column is the former; naming which is which matters because the two differ by up to 23 points here.
+
+**What the ratio licenses.** The redundancy sits **two orders of magnitude above its own circular-shift floor** in every cell, not near it. By §2.4 that means the summed `bits_carried` **overstates** the code's joint information substantially — the categoricals are strongly dependent on each other, so the information counted once per categorical is largely the same information counted many times. Pairwise mutual information is also only pairwise: dependence that exists only among three or more categoricals is invisible here, so a high ratio is evidence *of* redundancy while a low one would not have proven its absence.
+
+**The direction matters, and here it runs in favour of the verdict rather than against it.** A high ratio is what would have destroyed a `CAPACITY_BOUND` verdict resting on a high reading, because the high reading would then be an artefact of double-counting rather than capacity in use. This run's reading is **low** and the status is read off its being *below* a cut, where the upper-bound property is the conservative direction. A ratio of 73–185 says the true joint information is likely *well below* even the 1.7801 bits the sum reports. So the companion that could only have weakened a bottleneck verdict instead tightens a spare-capacity one.
+
+In absolute terms both redundancy figures are tiny: 0.0006–0.0035 bits per pair against a `PAIR_CEILING_BITS` of 5.0, i.e. at most 0.07% of what a pair could share. The ratio is large because the floor is minute (4.7e-6 to 4.1e-5), which is itself the expected behaviour of a data-calibrated null on a code this close to deterministic — the finite-sample bias that puts a full-entropy independent code at ~0.064 bits per pair is far smaller when the per-row distributions barely move.
+
+### `prior_bits`, the companion that decides nothing
+
+From `capacity.prior_bits`: `pixel_ae` 1.0283 / 0.7378 / 1.0499 (mean **0.9386**), `frozen_ssl` 0.8320 / 0.6453 / 1.3667 (mean **0.9480**), `random_vit` 1.3762 / 1.5897 / 1.3530 (mean **1.4396**). Pooled mean **1.1088**, min 0.6453, max 1.5897. It gates nothing: no status, check or refusal in this run depends on it.
+
+The posterior reading exceeds the prior reading in **9 of 9 cells**, by +0.1518 to +0.9864 bits. On M3g's finding that the prior is the failing stage — a verdict that was `PREDICT FAILS` in 2 of 3 arms (`frozen_ssl`, `random_vit`) and `ENCODE FAILS` in `pixel_ae`, not 3 of 3 — this is consistent in direction and almost worthless in strength: the distribution the rollout actually runs on carries, as a summed upper bound, between 0.65 and 1.59 of 160 bits, less than the posterior does in every cell. It is one more reading on a scale where everything is near zero, and it separates no hypothesis. It is reported because §2.4 requires it per cell, and it decides nothing.
+
+### Does the rule's status agree with the magnitudes?
+
+**Yes, and with an unusually wide margin. They do not disagree anywhere.**
+
+Under the rule as written: `controls_failed` empty (all three estimator checks pass on all nine cells), so no `UNRESOLVED_ESTIMATOR`; `base_failed` empty — `base_control.position_r2` is 0.650–0.710 and clears `BASE_R2_FLOOR` = 0.10 in 9 of 9 cells, 3/3 seeds in each of 3 arms — so no `UNRESOLVED_BASE`; `arms_spare` = all three arms against a bar of 2, so **`SPARE_CAPACITY`**; `arms_frame` empty, so `FRAME_REENCODING` was not reached; `CAPACITY_BOUND` was not reached.
+
+I re-derived all four tallies from the record fields independently of the script, applying `ci_high < 80`, `frame_low > 0.5`, `position_r2 > 0.10` and the three check flags per cell, and counting seeds then arms. The hand derivation returns `SPARE_CAPACITY`, matching what `read_phase` printed.
+
+The magnitudes say the same thing far more loudly than the rule needs them to: 1.11% of the ceiling pooled, the largest upper bound in the run at 3.52% of the cut. The only place a reader might look for tension is the frame point estimate exceeding 0.5 in 2 of 9 cells; that is not a conflict with the status, both because the rule reads the interval (which clears in 0 of 9) and because `SPARE_CAPACITY` takes precedence over `FRAME_REENCODING` in any case. **Nothing in this run requires the human to arbitrate between the rule and the numbers.**
+
+**`CAPACITY_BOUND` did not occur, so its fall-through caveat does not apply to this verdict.** Recording what would have followed if it had, since the run's own companions settle it: a `CAPACITY_BOUND` here would have been reported as arriving by default rather than by evidence, and it would have been **self-contradicting** beside these numbers — a redundancy ratio of 72.965–184.944, two orders above its floor, means the summed reading overstates the joint information, so no high reading could have supported "the capacity is in use". The `live` count of 1024/1024 would have been the one companion not contradicting it.
+
+### What this licenses, and what it does not
+
+Per spec §8:
+
+- **It refutes the bottleneck lever.** `SPARE_CAPACITY` in 3 of 3 arms, each in 3 of 3 seeds, with the whole interval below the cut in 9 of 9 cells, means adding capacity to `z` is not what limits this model. The ~13.5 hours should go to the **objective** lever. This is the direction the estimator supports soundly, and the redundancy companion strengthens rather than qualifies it.
+- **It does not establish the positive claim that the embedding objective is the cause.** `FRAME_REENCODING` did **not** clear — `frame_low` exceeds 0.5 in 0 of 9 cells and the pooled `frame_share` is 0.3435 — so this run refutes the bottleneck without demonstrating that `z` is mostly the current frame re-encoded. The objective lever is where the evidence sends the next milestone, by elimination of the alternative rather than by its own bar being cleared. A reader who wants the positive form of that claim does not have it here.
+- **It does not reopen M3k.** Reading F stays `INDISTINGUISHABLE`. M3l measured a different quantity a different way; the two are companions, not a revision.
+- **It does not move the M3 gate**, which remains `beats_persistence` and eight criteria. M3l is instrumentation, like M3d–M3k.
+- **It does not explain why `z` carries so little.** 1.11% of the ceiling with all 1024 columns live and the categoricals strongly inter-redundant is a description, not a mechanism. Whether the embedding loss, the KL balance, the free-bits setting or something else produces it is the next milestone's question, and nothing here chooses among them.
+
+### Files changed
+
+- `docs/superpowers/plans/2026-09-30-mb-fps-m3l-latent-capacity.md` — this section.
+- `.superpowers/sdd/suite-m3l-task6.txt` — the suite output (new).
+- `.superpowers/sdd/m3l-task-6-report.md` — the task report (new).
+- Under `runs/` (gitignored, so this section is the permanent record): `runs/m3l_smoke/` and `runs/m3l_capacity/` with nine records, `measure.log`, `read.log` and `capacity.txt`.
+
+No source file, test or checkpoint was modified. Nothing under `runs/` was removed. No M3b–M3k verdict was touched.
+
+### Concerns
+
+1. **`capacity.txt`'s estimator-check caption says "floor exactly 0"** (`src/mbfps/eval/capacity.py:905`), where the implementation correctly tests `abs(floor) <= 1e-9` and the measured floors are ~1e-13. This is the exact wording defect this plan's own self-review item 4 swept out of the test, the exit criteria, the acceptance step and two docstrings; this one printed caption survived. It is cosmetic — no number and no decision is affected — but it is a claim of bit-exactness in the shipped artefact where only near-exactness holds. Not fixed here: changing it would change `capacity.txt`'s bytes and invalidate the byte-identity evidence recorded above, and Task 6 is the run, not a code change.
+2. **Free disk fell from 24Gi to 19Gi across the nine-cell measure** and did not fully return. The nine records total ~2.1MB, so this is cache or swap pressure rather than output. It did not threaten this run, but a longer measure on this host would want checking first.
+3. **An unrelated `pytest` process from another project held one core at 100%** during part of both the suite and the measure. Timings here are therefore upper bounds on a quiet host; no number in the reading depends on wall clock.
