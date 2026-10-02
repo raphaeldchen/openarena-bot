@@ -543,8 +543,14 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
 
 
 READING_COLUMNS: tuple[str, ...] = (
-    "arm", "seed", "margin", "ci_low", "ci_high", "burden45", "comp45", "clears",
+    "arm", "seed", "margin", "ci_low", "ci_high", "burden_k", "comp_k", "clears",
 )
+"""`burden_k` and `comp_k` are `burden(k = ks[-1], h = decision_h)`: the rung of
+the ladder is the LAST re-grounding period and the horizon is the decision
+horizon, and both happen to be 45 in production. The labels carry neither
+number, because a header is a constant and the values are not -- a label saying
+`45` would not say which axis, and would lie the day `ks[-1]` changed. The
+legend, which is built per call, states both."""
 READING_WIDTHS: tuple[int, ...] = (13, 6, 11, 11, 11, 11, 11, 17)
 
 
@@ -588,10 +594,12 @@ def format_reading_burden(reading: BurdenStatus, inputs: BurdenInputs) -> str:
         "POSITIVE means one prior step from the true state beats assuming the "
         "agent did not move. Ground truth, not an estimate, so a reading in "
         "EITHER direction is evidence",
-        f"  burden45/comp45 = burden(k={inputs.ks[-1]}, h={inputs.decision_h}) "
-        f"and compounding(k={inputs.ks[-1]}, h={inputs.decision_h}); "
-        f"compounding(k=1) is 0 by construction and the identity residual is "
-        f"held within {IDENTITY_TOLERANCE:g}",
+        f"  {READING_COLUMNS[5]}/{READING_COLUMNS[6]} = "
+        f"burden(k={inputs.ks[-1]}, h={inputs.decision_h}) and "
+        f"compounding(k={inputs.ks[-1]}, h={inputs.decision_h}), where k is the "
+        "re-grounding period, the last of those listed above, and h is the "
+        "horizon step; compounding(k=1) is 0 by construction and the identity "
+        f"residual is held within {IDENTITY_TOLERANCE:g}",
         f"  a status needs a strict majority of each arm's seeds in at least "
         f"{ARMS_REQUIRED} of {len(reading.seeds_total)} arms",
         f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}",

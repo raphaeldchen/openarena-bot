@@ -1531,12 +1531,12 @@ def test_each_column_carries_the_quantity_it_is_named_for():
     by_cell = {(r["arm"], r["seed"]): r for r in table}
     assert by_cell[("frozen_ssl", "0")] == {
         "arm": "frozen_ssl", "seed": "0", "margin": "+3.0000", "ci_low": "+1.0000",
-        "ci_high": "+5.0000", "burden45": "+90.0000", "comp45": "+88.0000",
+        "ci_high": "+5.0000", "burden_k": "+90.0000", "comp_k": "+88.0000",
         "clears": "motion",
     }
     assert by_cell[("pixel_ae", "1")] == {
         "arm": "pixel_ae", "seed": "1", "margin": "+2.0000", "ci_low": "+0.0000",
-        "ci_high": "+4.0000", "burden45": "+101.5000", "comp45": "+99.2500",
+        "ci_high": "+4.0000", "burden_k": "+101.5000", "comp_k": "+99.2500",
         "clears": "-",
     }
     assert by_cell[("pixel_ae", "2")]["clears"] == "copies"
@@ -1587,6 +1587,40 @@ def test_the_table_interpolates_its_numbers_and_never_hardcodes_them():
     assert f"held within {IDENTITY_TOLERANCE:g}" in text
     assert f"in at least {ARMS_REQUIRED} of 3 arms" in text
     assert "exactly 0" not in text
+
+
+def test_the_legend_states_both_axes_and_the_header_does_not_depend_on_ks():
+    """`burden_k` and `comp_k` are `burden(k = ks[-1], h = decision_h)` -- two
+    axes, and the header names neither value. The first draft called the columns
+    `burden45` and `comp45`: both axes are 45 in production, so the label did not
+    say WHICH 45, and it would have lied the first time `ks[-1]` was not 45.
+
+    The legend is where the axes are stated, interpolated, so it must follow the
+    inputs: here `ks` ends in 15 and the horizon is 30, and the header is the
+    same line it is under the shipped `ks`.
+
+    THE MUTATIONS THIS EXISTS FOR: header names carrying the rung as a digit,
+    by constant (`burden45`) or built from `ks[-1]` per call; the legend's `k`
+    read from `ks[0]`, from the horizon or as a literal 45; its `h` read from
+    `DECISION_H`; and the axis words dropped, which leaves two bare numbers.
+    """
+    shipped = _inputs(_nine(**CLEARS_MOTION))
+    moved = _inputs(_nine(**CLEARS_MOTION), decision_h=30, ks=(1, 3, 5, 15))
+    shipped_text, moved_text = _table(shipped), _table(moved)
+
+    assert shipped_text.splitlines()[1] == moved_text.splitlines()[1]
+    header = moved_text.splitlines()[1]
+    assert header.split() == list(READING_COLUMNS)
+    assert not any(ch.isdigit() for ch in header), header
+
+    burden_col, comp_col = READING_COLUMNS[5], READING_COLUMNS[6]
+    legend = next(l for l in moved_text.splitlines() if l.startswith(f"  {burden_col}/{comp_col} ="))
+    assert "burden(k=15, h=30) and compounding(k=15, h=30)" in legend
+    assert "k is the re-grounding period" in legend
+    assert "h is the horizon step" in legend
+    assert "45" not in legend
+    shipped_legend = next(l for l in shipped_text.splitlines() if l.startswith(f"  {burden_col}/"))
+    assert "burden(k=45, h=45) and compounding(k=45, h=45)" in shipped_legend
 
 
 def test_the_table_follows_the_module_and_the_inputs_it_is_given(monkeypatch):
