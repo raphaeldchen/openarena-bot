@@ -256,6 +256,11 @@ def measure_cell(
     margin compares two differently fitted pipelines -- the drift
     `evaluate_rollout`'s own comments record as having destroyed a signal once.
 
+    THE FLOOR IS READ FROM THREE PLACES, two passes and no control between them:
+    `reference.floor_position` (the record's curve, every burden and the identity
+    residual), `sweep.reference.floor_position` (what `k_one_is_floor` compares
+    against) and `sweep.window_floor_position` (the base control's median).
+
     THE K=1 RUNG IS THE ONE-STEP ARM. `regrounding_sweep`'s `k=1` re-grounds
     after every step and imagines one prior step from a posterior-grounded state,
     which is exactly what the margin asks about; re-implementing it here would be
