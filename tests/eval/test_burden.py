@@ -389,6 +389,8 @@ def test_the_interval_clusters_on_episodes_and_requires_its_seed():
     sig = inspect.signature(margin_interval)
     assert sig.parameters["seed"].default is inspect.Parameter.empty
     assert sig.parameters["seed"].kind is inspect.Parameter.KEYWORD_ONLY
+    # `resamples` DOES have a default, and it is the module constant.
+    assert sig.parameters["resamples"].default == RESAMPLES
 
 
 def test_the_interval_refuses_what_it_cannot_cluster():
@@ -433,17 +435,25 @@ def test_the_recorded_confidence_matches_what_the_estimator_takes():
 def test_scored_targets_refuses_what_is_not_a_window_and_returns_float64():
     """A window is (horizon + 1, K) with at least two rows. The two operands of
     the guard are exercised separately: a 1-D array has plenty of elements but
-    the wrong rank, and a single row has the right rank but nothing to score.
+    the wrong rank, a single row has the right rank but nothing to score, and a
+    rank-3 array has plenty of rows but is not a window.
 
     THE MUTATIONS THIS EXISTS FOR: dropping either operand of the guard
     (`< 2` -> `< 1` lets a single row through, returning an empty array that
-    every downstream mean turns into NaN), and dropping the float64 coercion.
-    An unsigned-integer window left uncoerced would wrap on subtraction.
+    every downstream mean turns into NaN), loosening the rank test from
+    `!= 2` to `< 2` (which lets a rank-3 array through), and dropping the
+    float64 coercion. That last one is pinned here by the RETURN DTYPE and
+    nothing else: `scored_targets` only slices, it does not subtract, so the
+    unsigned wrap is not expressible at this scope --
+    `test_one_step_persistence_coerces_before_it_subtracts` pins it where it can
+    occur.
     """
     with pytest.raises(ValueError, match="at least two rows"):
         scored_targets(np.zeros(5))  # rank 1, five elements
     with pytest.raises(ValueError, match="at least two rows"):
         scored_targets(np.zeros((1, 4)))  # rank 2, one row
+    with pytest.raises(ValueError, match="at least two rows"):
+        scored_targets(np.zeros((3, 4, 2)))  # rank 3, three rows
     with pytest.raises(ValueError, match="at least two rows"):
         scored_targets(np.zeros((0, 4)))
 
