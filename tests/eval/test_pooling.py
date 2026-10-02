@@ -801,10 +801,11 @@ def test_unpaired_contrast_refuses_a_different_reading_and_a_pool_against_itself
         unpaired_contrast(_pooled("pixel_ae", "val", 0.5, 0.1), _pooled("pixel_ae", "val", 0.4, 0.1))
 
 
-# Pre-rename constants captured by running the current code
-POOLED_RATIO_AT_SEED_0 = 0.6666666666666666
-POOLED_CI_LOW_AT_SEED_0 = 0.6666666666666666
-POOLED_CI_HIGH_AT_SEED_0 = 0.6666666666666666
+# Constants captured by running the current code on the varied fixture
+POOLED_RATIO_AT_SEED_0 = 1.725
+POOLED_CI_LOW_AT_SEED_0 = 1.2307692307692308
+POOLED_CI_HIGH_AT_SEED_0 = 12.5
+POOLED_SE_AT_SEED_0 = 4.156273027301207
 
 
 def test_the_bootstrap_helpers_are_public_and_draw_whole_episodes():
@@ -839,12 +840,36 @@ def test_the_bootstrap_helpers_are_public_and_draw_whole_episodes():
 def test_promoting_the_helpers_changed_no_pooled_number():
     """The promotion is a rename. `pool_ratio`'s output is unchanged.
 
+    THE FIXTURE MUST DISCRIMINATE, AND THIS TEST ASSERTS THAT ABOUT ITSELF.
+    An earlier version used `_scaled_cells((1.0, 1.0, 1.0))`, which gives 2
+    clusters, 12 rows and an interval of EXACTLY zero width -- every bootstrap
+    replicate identical -- so a changed percentile moved nothing and a changed
+    `ddof` moved only a figure the test did not assert. It could not fail under
+    two of the three mutations it exists to catch. `varied` spans three
+    episodes and its interval has width.
+
     THE MUTATION THIS EXISTS FOR: any edit to the helpers' bodies while
-    renaming them -- a different percentile, `ddof=0`, drawing without
-    replacement -- moves these figures.
+    renaming them -- a different percentile, `ddof=0`, or drawing without
+    replacement.
     """
-    cells = _scaled_cells((1.0, 1.0, 1.0))
-    pooled = pool_ratio(cells, bootstrap=200, seed=0)
+    varied = [
+        series(
+            "pixel_ae", seed, [0.0] * 4,
+            embedding=[1.0 + seed, 5.0, 9.0 + seed, 100.0],
+            noise=[2.0, 4.0, 4.0 + seed, 8.0], episodes=(0, 0, 1, 2),
+        )
+        for seed in SEEDS
+    ]
+    pooled = pool_ratio(varied, bootstrap=2000, seed=0)
+
+    # The guard this test was missing: a zero-width interval or a zero
+    # standard error would make every comparison below hold for the wrong
+    # reason, and the test would silently stop testing anything.
+    assert pooled.clusters == 3
+    assert pooled.ci_low < pooled.ci_high
+    assert pooled.bootstrap_se > 0.0
+
     assert pooled.ratio == pytest.approx(POOLED_RATIO_AT_SEED_0, abs=1e-12)
     assert pooled.ci_low == pytest.approx(POOLED_CI_LOW_AT_SEED_0, abs=1e-12)
     assert pooled.ci_high == pytest.approx(POOLED_CI_HIGH_AT_SEED_0, abs=1e-12)
+    assert pooled.bootstrap_se == pytest.approx(POOLED_SE_AT_SEED_0, abs=1e-12)
