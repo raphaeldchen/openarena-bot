@@ -667,11 +667,14 @@ def _ratio_of_medians(numerator: np.ndarray, noise: np.ndarray, name: str) -> fl
     return float(np.median(numerator) / ruler)
 
 
-def _episode_bootstrap(labels: np.ndarray, bootstrap: int, seed: int):
+def episode_bootstrap(labels: np.ndarray, bootstrap: int, seed: int):
     """Yield `bootstrap` index arrays, each the rows of one draw of the
     episodes WITH replacement -- every row of a drawn episode, as many times
     as it was drawn. The ruler for a ratio of medians, which has no sandwich
-    standard error: resample the clusters, recompute."""
+    standard error: resample the clusters, recompute.
+
+    PUBLIC because `eval.burden` consumes it. A fourth episode bootstrap in
+    this codebase would be the wrong answer; there are already three."""
     rng = default_rng(seed)
     groups = np.unique(labels)
     members = {group: np.flatnonzero(labels == group) for group in groups}
@@ -680,7 +683,11 @@ def _episode_bootstrap(labels: np.ndarray, bootstrap: int, seed: int):
         yield np.concatenate([members[group] for group in draw])
 
 
-def _interval(replicates: np.ndarray) -> tuple[float, float, float]:
+def percentile_interval(replicates: np.ndarray) -> tuple[float, float, float]:
+    """Return (low, high, se) at the 2.5/97.5 percentiles, `se` the sample
+    standard deviation with `ddof=1`, or NaN for a single replicate.
+
+    PUBLIC because `eval.burden` consumes it."""
     low, high = np.percentile(replicates, [2.5, 97.5])
     se = float(replicates.std(ddof=1)) if replicates.size > 1 else float("nan")
     return float(low), float(high), se
@@ -733,8 +740,8 @@ def pool_ratio(cells, *, bootstrap: int = 2000, seed: int = 0) -> PooledRatio:
     name = f"{cells[0].arm} seeds {tuple(c.seed for c in cells)}"
     ratio_of = lambda index: _ratio_of_medians(numerator[index], noise[index], name)  # noqa: E731
     everything = np.arange(numerator.size)
-    replicates = np.array([ratio_of(index) for index in _episode_bootstrap(labels, bootstrap, seed)])
-    low, high, se = _interval(replicates)
+    replicates = np.array([ratio_of(index) for index in episode_bootstrap(labels, bootstrap, seed)])
+    low, high, se = percentile_interval(replicates)
     return PooledRatio(
         arm=cells[0].arm, rung=cells[0].rung, seeds=tuple(cell.seed for cell in cells),
         rows=int(numerator.size), clusters=int(np.unique(labels).size),
@@ -794,9 +801,9 @@ def paired_ratio_contrast(treatment, control, *, bootstrap: int = 2000, seed: in
     everything = np.arange(int(keep.sum()))
     replicates = np.array([
         ratio_of("t", index) - ratio_of("c", index)
-        for index in _episode_bootstrap(labels, bootstrap, seed)
+        for index in episode_bootstrap(labels, bootstrap, seed)
     ])
-    low, high, se = _interval(replicates)
+    low, high, se = percentile_interval(replicates)
     return PairedRatioContrast(
         treatment=treatment[0].arm, control=control[0].arm, rung=treatment[0].rung,
         windows=int(keep.sum()), windows_excluded=int((~keep).sum()),

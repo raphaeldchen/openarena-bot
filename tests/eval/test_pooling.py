@@ -19,6 +19,8 @@ around the ways a pooled table can be wrong while every count looks right:
     cell and the field, raised BEFORE any statistic is computed.
 """
 
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -797,3 +799,52 @@ def test_unpaired_contrast_refuses_a_different_reading_and_a_pool_against_itself
         )
     with pytest.raises(IncompatibleCells, match="against itself"):
         unpaired_contrast(_pooled("pixel_ae", "val", 0.5, 0.1), _pooled("pixel_ae", "val", 0.4, 0.1))
+
+
+# Pre-rename constants captured by running the current code
+POOLED_RATIO_AT_SEED_0 = 0.6666666666666666
+POOLED_CI_LOW_AT_SEED_0 = 0.6666666666666666
+POOLED_CI_HIGH_AT_SEED_0 = 0.6666666666666666
+
+
+def test_the_bootstrap_helpers_are_public_and_draw_whole_episodes():
+    """M3m consumes these from another module, so they carry public names.
+
+    THE MUTATION THIS EXISTS FOR: renaming them back to `_episode_bootstrap` /
+    `_interval` breaks the import; drawing rows instead of episodes makes the
+    yielded index arrays contain partial episodes.
+    """
+    from mbfps.eval.pooling import episode_bootstrap, percentile_interval
+
+    labels = np.array([0, 0, 0, 1, 1, 2])
+    draws = list(episode_bootstrap(labels, bootstrap=50, seed=0))
+    assert len(draws) == 50
+    members = {0: {0, 1, 2}, 1: {3, 4}, 2: {5}}
+    for index in draws:
+        # Every drawn episode contributes ALL of its rows, so the multiset of
+        # rows is a union of whole episodes -- never a partial one.
+        counts = Counter(index.tolist())
+        for episode, rows in members.items():
+            per_row = {counts.get(row, 0) for row in rows}
+            assert len(per_row) == 1, (episode, counts)
+
+    replicates = np.arange(1001, dtype=np.float64)
+    low, high, se = percentile_interval(replicates)
+    assert low == pytest.approx(25.0)
+    assert high == pytest.approx(975.0)
+    assert se == pytest.approx(float(replicates.std(ddof=1)))
+    assert np.isnan(percentile_interval(np.array([3.0]))[2])
+
+
+def test_promoting_the_helpers_changed_no_pooled_number():
+    """The promotion is a rename. `pool_ratio`'s output is unchanged.
+
+    THE MUTATION THIS EXISTS FOR: any edit to the helpers' bodies while
+    renaming them -- a different percentile, `ddof=0`, drawing without
+    replacement -- moves these figures.
+    """
+    cells = _scaled_cells((1.0, 1.0, 1.0))
+    pooled = pool_ratio(cells, bootstrap=200, seed=0)
+    assert pooled.ratio == pytest.approx(POOLED_RATIO_AT_SEED_0, abs=1e-12)
+    assert pooled.ci_low == pytest.approx(POOLED_CI_LOW_AT_SEED_0, abs=1e-12)
+    assert pooled.ci_high == pytest.approx(POOLED_CI_HIGH_AT_SEED_0, abs=1e-12)
