@@ -558,8 +558,24 @@ def test_the_record_carries_the_training_numbers_of_its_own_cell(rig):
     assert record["kl_dyn_max"] == 7.5
     assert record["record_git_sha"] == "study-sha"
 
-    with pytest.raises(KeyError):
-        script.measure_cell(**_cell_kwargs(rig, study_record={"steps": 1}))
+
+@pytest.mark.parametrize("missing", ["steps", "kl_rate_above_free_bits", "kl_dyn_max"])
+def test_a_study_record_missing_a_training_number_is_refused_not_defaulted(rig, missing):
+    """ONE KEY LEFT OUT PER CASE. A record built as `{"steps": 1}` lacks two keys
+    at once, so the strict read of the second is what raises and a lenient read of
+    the first -- `.get("steps", 0)`, or either KL field with a default -- changes
+    nothing. Each key is the only one missing here, so each is pinned by itself.
+
+    THE MUTATIONS THIS EXISTS FOR: `study_record["steps"]` ->
+    `study_record.get("steps", 0)`, and the same for `kl_rate_above_free_bits` and
+    `kl_dyn_max`; each survived the previous single `{"steps": 1}` case."""
+    study = {
+        "steps": 12345, "kl_rate_above_free_bits": 0.25, "kl_dyn_max": 7.5,
+        "git_sha": "study-sha",
+    }
+    del study[missing]
+    with pytest.raises(KeyError, match=missing):
+        script.measure_cell(**_cell_kwargs(rig, study_record=study))
 
 
 def test_the_record_names_its_episodes_and_clusters_its_windows(rig, record):
