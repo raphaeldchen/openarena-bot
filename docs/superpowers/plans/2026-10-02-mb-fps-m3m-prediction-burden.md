@@ -20,6 +20,7 @@ Every task's requirements implicitly include this section.
 - **Subject lines must not overstate.** `motion_margin` is a level against ground truth; `burden` is a difference of two measured curves. Neither licenses a claim about *why* the one-step map behaves as it does.
 - **Two axes, never conflated.** `k` is the **re-grounding period**, over `REGROUNDING_KS = (1, 3, 5, 15, 45)`. `h` is the **horizon step**, 1..45, reported over `REPORTED_H`. Write `burden(k, h)`.
 - **After mutating a source file to check a test bites, revert it and clear `__pycache__`** under `src/`, `tests/`, `scripts/`.
+- **MUTATION CHECKS COME AFTER THE TASK'S COMMIT.** Each task below lists its mutation table before its commit step. Execute the **commit first**, then the mutation checks against the committed state. Reverting an *uncommitted* implementation with `git checkout -- <file>` destroys the implementation itself, and on a newly created file it fails outright. With the work committed, `git checkout -- <file>` is an exact revert. If a mutation shows a test does not bite, strengthen the test and `git commit --amend`.
 - **Every test must be watched failing under a named mutation and passing after revert.** Roughly 30 tests that could not fail were caught across M3k and M3l. A test nobody watched fail is not evidence.
 - **Exit codes 45 and 46 belong to this milestone.** 39/40 are M3j's, 41/42 M3k's, 43/44 M3l's. Reused: `EXIT_NO_CHECKPOINTS = 11`, `EXIT_SPLIT_MISMATCH = 12`, `EXIT_RECORD_MISMATCH = 14`, `EXIT_SELF_CHECK_FAILED = 30`.
 - **Record every protocol parameter the reading depends on**, including the confidence level and the resample count. M3l shipped a headline interval whose draw count was not on the record; the fix is in this plan from the start.
@@ -97,7 +98,7 @@ def test_promoting_the_helpers_changed_no_pooled_number():
     renaming them -- a different percentile, `ddof=0`, drawing without
     replacement -- moves these figures.
     """
-    cells = _pool_cells()
+    cells = _scaled_cells((1.0, 1.0, 1.0))
     pooled = pool_ratio(cells, bootstrap=200, seed=0)
     assert pooled.ratio == pytest.approx(POOLED_RATIO_AT_SEED_0, abs=1e-12)
     assert pooled.ci_low == pytest.approx(POOLED_CI_LOW_AT_SEED_0, abs=1e-12)
@@ -106,7 +107,7 @@ def test_promoting_the_helpers_changed_no_pooled_number():
 
 Add at the top of the file if absent: `from collections import Counter`, and `from mbfps.eval.pooling import pool_ratio`.
 
-`_pool_cells()` is a helper the file already has for `pool_ratio` tests; if its name differs, reuse the existing fixture rather than writing a new one. `POOLED_RATIO_AT_SEED_0`, `POOLED_CI_LOW_AT_SEED_0` and `POOLED_CI_HIGH_AT_SEED_0` are module-level constants you fill in Step 3 **by running the current code before the rename** — they are the pre-rename values, which is the whole point.
+`_scaled_cells(scales, *, arm="pixel_ae", episodes=EPISODES)` already exists in that file at `:487` and builds three cells whose per-cell ratios are 0.5, 0.5 and 2.0 — use `_scaled_cells((1.0, 1.0, 1.0))` and do **not** write a second fixture. `POOLED_RATIO_AT_SEED_0`, `POOLED_CI_LOW_AT_SEED_0` and `POOLED_CI_HIGH_AT_SEED_0` are module-level constants you fill in **by running the current code before the rename** — they are the pre-rename values, which is the whole point.
 
 - [ ] **Step 2: Capture the pre-rename values, then run the test to verify it fails**
 
@@ -114,9 +115,10 @@ First record what the current code produces, so the constants are evidence rathe
 
 ```bash
 .venv/bin/python -c "
-from tests.eval.test_pooling import _pool_cells
+import sys; sys.path.insert(0, 'tests/eval')
+from test_pooling import _scaled_cells
 from mbfps.eval.pooling import pool_ratio
-p = pool_ratio(_pool_cells(), bootstrap=200, seed=0)
+p = pool_ratio(_scaled_cells((1.0, 1.0, 1.0)), bootstrap=200, seed=0)
 print(repr(p.ratio), repr(p.ci_low), repr(p.ci_high))
 "
 ```
@@ -171,7 +173,7 @@ git checkout -- src/mbfps/eval/pooling.py
 find src tests scripts -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
 ```
 
-Re-apply your Step 3 edit after the revert (or make the mutation in a scratch copy instead — your choice, but the suite must end green and the tree clean).
+Per Global Constraints, commit before running this check, so `git checkout --` is an exact revert rather than a loss of your work. End green with a clean tree.
 
 - [ ] **Step 6: Commit**
 
