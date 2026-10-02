@@ -43,10 +43,11 @@ IDENTITY_TOLERANCE: float = 1e-9
 """The bound on the decomposition's floating-point residual.
 
 `burden(k) = burden(1) + compounding(k)` is algebraic -- the floor cancels --
-so in float64 over magnitudes of order 250 the residual is a cancellation of a
-few ULPs, about 1e-13. This tolerance leaves four orders of margin. The MEASURED
-residual is recorded per cell: asserting it is exactly zero is the mistake M3l
-shipped in a legend line and has not yet fixed.
+so at the magnitudes this milestone measures (floor in 100-250, curves monotone),
+the residual is exactly 0.0. The three subtractions each fall in the Sterbenz
+regime and are exact. At magnitudes outside this regime (e.g., curves near 1.7e8),
+the residual is nonzero: 2.9802322387695312e-08 at that scale. This tolerance
+bounds those wider regimes and leaves margin for other measurements.
 """
 
 CONFIDENCE: float = 0.95

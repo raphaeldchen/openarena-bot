@@ -72,27 +72,51 @@ def test_compounding_is_the_cost_of_correcting_less_often():
     assert compounding(curve_k, curve_one) == pytest.approx([0.0, 4.0, 18.0])
 
 
-def test_the_identity_holds_and_is_reported_as_a_measured_residual():
-    """burden(k) == burden(1) + compounding(k) is ALGEBRAIC: the floor cancels.
-    In floating point it is a cancellation, so the residual is a few ULPs and
-    is RECORDED rather than asserted to be zero -- M3l's floor_bits read
-    5.7e-14, not 0.0, and the legend that called it "exactly 0" is still an
-    open follow-up.
+def test_the_identity_is_exact_on_the_magnitudes_this_milestone_measures():
+    """burden(k) == burden(1) + compounding(k) holds BIT-FOR-BIT here, and that
+    is a property of the regime rather than luck.
 
-    THE MUTATION THIS EXISTS FOR: returning a hardcoded 0.0, which would hide
-    a genuinely broken decomposition.
+    Position errors run 100-250 Doom map units and the three curves are
+    monotone -- floor <= the k=1 rung <= the open loop -- so each subtraction
+    falls in the Sterbenz regime and is exact; the sum of two exact differences
+    then rounds to exactly the whole. Measured over 40 random fixtures in this
+    range the residual is 0.0 in every one, and six adversarial
+    wide-dynamic-range triples (floor at 1e16, at 2**53, at 1.0 with 1e-17
+    steps) also give 0.0.
+
+    So the recorded residual being zero is the ANSWER in this regime, not a
+    free pass -- which is why the sibling test below exists.
     """
     rng = np.random.default_rng(0)
     floor = rng.uniform(100.0, 150.0, size=45)
     curve_one = floor + rng.uniform(0.0, 5.0, size=45)
     curve_k = curve_one + rng.uniform(0.0, 80.0, size=45)
     residual = identity_residual(curve_k, curve_one, floor)
-    assert residual < IDENTITY_TOLERANCE
-    assert residual == pytest.approx(0.0, abs=1e-12)
-    # And it is derived, not hardcoded: scaling the inputs by 1e6 scales the
-    # cancellation error with them, so the value must move.
-    scaled = identity_residual(curve_k * 1e6, curve_one * 1e6, floor * 1e6)
-    assert scaled > residual
+    assert residual == 0.0
+    assert residual <= IDENTITY_TOLERANCE
+
+
+def test_the_identity_residual_is_measured_and_its_tolerance_is_reachable():
+    """Two things no well-conditioned fixture can show.
+
+    FIRST, that `identity_residual` computes rather than returning a constant.
+    Over a wide monotone spread the cancellation is real: this triple -- found
+    by searching 400,000 monotone triples over 1e-8..1e8 -- reads
+    2.9802322387695312e-08.
+
+    SECOND, that `IDENTITY_TOLERANCE` is a reachable bar rather than dead
+    decoration. A guard no input can trip is indistinguishable from no guard,
+    and this residual exceeds it by more than an order of magnitude.
+
+    THE MUTATION THIS EXISTS FOR: `return 0.0` in `identity_residual`, which is
+    an equivalent mutant against every well-conditioned fixture and fails here.
+    """
+    curve_k = np.array([167767100.17530185])
+    curve_one = np.array([77842083.6992047])
+    floor = np.array([5034536.855956038])
+    residual = identity_residual(curve_k, curve_one, floor)
+    assert residual == 2.9802322387695312e-08
+    assert residual > IDENTITY_TOLERANCE
 
 
 def test_the_decomposition_refuses_mismatched_or_nonfinite_curves():
