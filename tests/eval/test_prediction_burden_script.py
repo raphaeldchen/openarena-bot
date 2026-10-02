@@ -50,7 +50,7 @@ from mbfps.eval import burden
 from mbfps.eval.diagnostics import (
     REGROUNDING_KS, action_intervention_ladder, regrounding_sweep,
 )
-from mbfps.eval.probe import fit_probe, probe_targets
+from mbfps.eval.probe import apply_probe, fit_probe, probe_targets
 from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record
 from mbfps.eval.windows import window_starts
@@ -178,8 +178,41 @@ def _window_targets(paths) -> list[np.ndarray]:
     return out
 
 
+def _expected_k_one_rungs(rig) -> np.ndarray:
+    """The k=1 rung of `DriftingModel` over the rig, window by window, derived
+    WITHOUT the sweep: from the rig's linear probe over the episodes' frame tags.
+
+    `DriftingModel` advances the frame tag by TWO per action. At k=1 every step is
+    imagined from a state re-grounded on the real frame before it, so step `j` of a
+    window cut at `start` imagines the tag of frame `start + context + j - 1`,
+    plus two: the frame the step produced is `f = start + context + j`, and the
+    model says `f + 1`. The rung is then the Euclidean distance, in the probe's
+    first two columns (`pos_x`, `pos_y`), between the probe's reading of tag
+    `f + 1` and the episode's true position at frame `f`.
+
+    Every window of every episode, in the order the paths are GIVEN and
+    `window_starts` within each, so row `w` is the window the baseline's row `w`
+    is cut from. No `regrounding_sweep`, no `baseline_rows`, no `probe_targets`.
+    """
+    rows = []
+    for path in rig.paths:
+        episode = load_episode(path)
+        for start in window_starts(episode.length, CONTEXT, HORIZON):
+            frames = start + CONTEXT + np.arange(1, HORIZON + 1)
+            predicted = apply_probe(rig.probe, (frames + 1.0)[:, None])[:, :2]
+            true = episode.privileged[frames][:, 1:3].astype(np.float64)
+            rows.append(np.linalg.norm(predicted - true, axis=1))
+    return np.stack(rows)
+
+
 def _canonical(labels) -> np.ndarray:
-    """The partition a label array induces, independent of the numbers used."""
+    """The partition a label array induces, read off the labels' RANK order.
+
+    NOT independent of the numbers used -- `np.unique` ranks by value, not by first
+    appearance, so two label arrays that number the same blocks in a different
+    order would read as different partitions. That is harmless here because both
+    inputs are monotone (a label array walks its episodes in order and never goes
+    back), and it is a limit of this helper, not a property the callers rely on."""
     return np.unique(np.asarray(labels), return_inverse=True)[1]
 
 
@@ -332,8 +365,15 @@ def test_measure_cell_refuses_a_baseline_that_does_not_align_with_the_sweep(
 
 def test_the_stacked_margin_equals_motion_margin_window_by_window(rig, record):
     """The script subtracts stacked arrays for speed; `motion_margin` is the
-    definition, and the k=1 rung it is given here comes from a SEPARATE call of
-    the real sweep. If the two disagree the stacked path is wrong.
+    definition, and the k=1 rung it is given here is `_expected_k_one_rungs`'s
+    closed form, NOT a call of the sweep. If the two disagree the stacked path is
+    wrong.
+
+    Not a second sweep: `regrounding_sweep` is called once inside `measure_cell`
+    and once by a test, so a row order the sweep itself got wrong -- `sorted()`
+    inside it, two episodes swapped -- would be the same wrong order on both sides
+    and this comparison would pass. Windows the closed form takes in the given
+    order are what make it a reference.
 
     THE MUTATION THIS EXISTS FOR: `one - rows` instead of `rows - one` in
     `measure_cell`, which flips the sign of the quantity Reading H's verdict is
@@ -341,7 +381,7 @@ def test_the_stacked_margin_equals_motion_margin_window_by_window(rig, record):
     the margin both signs and a mean absolute value near 4 map units, so the
     flipped array is far from the right one in most windows.
     """
-    one = _independent_sweep(rig).window_position[1]
+    one = _expected_k_one_rungs(rig)
     targets = _window_targets(rig.paths)
     margin = np.asarray(record["window_margin"], dtype=np.float64)
     assert margin.shape == one.shape == (len(targets), HORIZON)
@@ -349,6 +389,41 @@ def test_the_stacked_margin_equals_motion_margin_window_by_window(rig, record):
     for w, window in enumerate(targets):
         expected = burden.motion_margin(window, one[w])
         np.testing.assert_allclose(margin[w], expected, rtol=0, atol=1e-12, err_msg=f"window {w}")
+
+
+def test_the_k_one_rung_is_each_windows_own_in_the_order_given(rig, record):
+    """Row `w` of the sweep is the window row `w` of the baseline is cut from, by
+    VALUE. The shape refusal sees only a count that drifted, and a reorder that
+    keeps the shape -- two episodes with the same number of windows swapped, or
+    `sorted()` on names that happen to give the same block sizes -- passes it.
+
+    The sweep's own k=1 rows, a second call of it, and the margin the record
+    carries are each asked against `_expected_k_one_rungs`, which does not call
+    the sweep. The record's `window_margin` is `rows - one`, so it must equal the
+    baseline's rows minus the closed form; that pins `one` INSIDE `measure_cell`
+    as well as inside the sweep.
+
+    THE MUTATIONS THIS EXISTS FOR, none of which `test_the_stacked_margin...` saw
+    while its expectation came from a second sweep: `val_paths = sorted(val_paths)`
+    inside `regrounding_sweep`; two equal-count episodes (0 and 3, one window each)
+    swapped inside it; and rows 0 and 3 of `one` swapped inside `measure_cell`.
+    """
+    expected = _expected_k_one_rungs(rig)
+    assert expected.shape == (sum(EXPECTED_WINDOWS), HORIZON)
+    # Reached: every window's rung is its own, so a swap or a reorder moves values.
+    assert len({tuple(row) for row in expected}) == expected.shape[0]
+    assert np.abs(expected[0] - expected[3]).max() > 0.5, "windows 0 and 3 are the swapped pair"
+
+    one = _independent_sweep(rig).window_position[1]
+    np.testing.assert_allclose(one, expected, rtol=1e-6, atol=1e-9)
+
+    rows = np.stack([burden.one_step_persistence(w) for w in _window_targets(rig.paths)])
+    np.testing.assert_allclose(
+        np.asarray(record["window_margin"]), rows - expected, rtol=1e-6, atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        record["curves"]["rungs"]["1"], expected.mean(axis=0), rtol=1e-6, atol=1e-9,
+    )
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
