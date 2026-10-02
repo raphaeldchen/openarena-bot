@@ -13,6 +13,7 @@ and every per-cell number below is a function of the cell's own `(arm, seed)`.
 """
 
 import importlib.util
+import itertools
 import json
 import types
 from collections import Counter
@@ -1795,10 +1796,24 @@ def test_load_capacity_returns_nine_distinct_payloads_keyed_by_cell(tmp_path):
 # read: the fixture the whole section stands on
 # ---------------------------------------------------------------------------
 
-READ_CLUSTERS: int = 3
-READ_WINDOWS: int = 6
-READ_STEPS: int = 5
+READ_CLUSTERS: int = 11
+READ_WINDOWS: int = 13
+READ_STEPS: int = 3
 READ_ROWS: int = READ_WINDOWS * READ_STEPS
+"""The three counts the self-check table prints, CHOSEN SO THAT NO ONE OF THEM
+IS A SUBSTRING OF ANOTHER OR OF `step`.
+
+They were 3 / 6 / 30 against a `step` of 20000-20008, and the three assertions
+on them were substring matches against the WHOLE table: `"6"` was satisfied by
+`20006` and `"3"` by `20003`, so neither could fail. The assertions now read
+the row's own columns, and these values are a second, independent guard --
+`test_the_self_check_counts_cannot_be_read_off_another_column` pins them, so a
+later edit cannot quietly reintroduce an ambiguity the column parse is then the
+only thing standing against.
+
+TWO DIGITS, NECESSARILY: `step` runs 20000-20008 across the nine cells, so
+EVERY digit 0-8 appears in some step and no one-digit count can avoid being a
+substring of one. 11 / 13 / 39 avoid `20`, `00`, `0X` and the longer runs."""
 
 _WINDOW_LABELS = [w for w in range(READ_WINDOWS) for _ in range(READ_STEPS)]
 _EPISODE_LABELS = [
@@ -2540,9 +2555,52 @@ def test_the_redundancy_companion_prints_both_numbers_not_only_the_ratio(
         assert f"{bits:.4f}" in line and f"{floor:.4f}" in line, line
 
 
+def test_the_self_check_counts_cannot_be_read_off_another_column():
+    """GUARDS THE FIXTURE the test below stands on, the way
+    `test_the_sentinel_still_carries_what_it_is_for` guards the byte sentinel.
+
+    `windows`, `gathered` and `clusters` are three counts printed side by side
+    with `step`. While they were 6 / 30 / 3 against steps of 20000-20008, a
+    substring assertion on any of them was satisfied by the `step` column alone
+    -- which is how three assertions that looked like measurements could not
+    fail. A later edit that set them back to such values would leave the column
+    parse as the only thing standing against it; this says so out loud."""
+    counts = {
+        "windows": str(READ_WINDOWS),
+        "gathered": str(READ_ROWS),
+        "clusters": str(READ_CLUSTERS),
+    }
+    assert len(set(counts.values())) == 3, counts
+    for (one, first), (two, second) in itertools.permutations(counts.items(), 2):
+        assert first not in second, f"{one}={first} is a substring of {two}={second}"
+    steps = {str(record["step"]) for record in _pool().values()}
+    assert len(steps) == 9, steps
+    for name, value in counts.items():
+        for step in steps:
+            assert value not in step, f"{name}={value} is a substring of step {step}"
+    # And the labels really do produce those three counts, so the fixture's
+    # constants are not three numbers the table never prints.
+    assert len(set(zip(_EPISODE_LABELS, _WINDOW_LABELS, strict=True))) == READ_WINDOWS
+    assert len(_EPISODE_LABELS) == READ_ROWS
+    assert len(set(_EPISODE_LABELS)) == READ_CLUSTERS
+
+
 def test_the_self_check_table_reports_what_each_cell_was_scored_on(
     tmp_path, capsys,
 ):
+    """BY COLUMN, never by substring against the whole table.
+
+    The assertion this replaces was `str(READ_WINDOWS) in table` for each of
+    the three counts, and it PROVABLY COULD NOT FAIL: the `step` column carries
+    20000-20008, so `"6"` was satisfied by `20006` and `"3"` by `20003` no
+    matter what the `windows` and `clusters` columns held. Two mutations of
+    `_window_count` survived it -- `return len(episode)`, which would have
+    printed the shipped table's `windows` as 11450 instead of 229, and
+    `return len(set(episode))`, which would have printed 24.
+
+    Indexed through `SELF_CHECK_COLUMNS` rather than by position, so a column
+    inserted ahead of `windows` cannot silently re-aim the assertion, and
+    `strict=True` pins the row's own width against the header's."""
     records = _pool()
     _, out = _read(tmp_path, capsys, records)
     table = _section(out, "self-check per record")
@@ -2551,9 +2609,12 @@ def test_the_self_check_table_reports_what_each_cell_was_scored_on(
         # Selected by the cell's own `step`, which is unique per cell: an arm
         # name matches three rows and a seed matches three more.
         row = _row_for(table, arm, seed)
-        assert str(record["step"]) in row, row
-    for marker in (str(READ_WINDOWS), str(READ_ROWS), str(READ_CLUSTERS), "yes"):
-        assert marker in table, marker
+        cells = dict(zip(script.SELF_CHECK_COLUMNS, row.split(), strict=True))
+        assert cells["step"] == str(record["step"]), row
+        assert cells["windows"] == str(READ_WINDOWS), row
+        assert cells["gathered"] == str(READ_ROWS), row
+        assert cells["clusters"] == str(READ_CLUSTERS), row
+        assert cells["ok"] == "yes", row
 
 
 def test_the_self_check_table_refuses_window_lists_of_different_lengths():
