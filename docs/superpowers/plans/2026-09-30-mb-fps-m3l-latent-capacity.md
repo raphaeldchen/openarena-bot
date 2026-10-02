@@ -1840,7 +1840,7 @@ From `capacity.redundancy_bits` and `capacity.redundancy_floor`, with the ratio 
 
 | cell | `redundancy_bits` | `redundancy_floor` | ratio |
 |---|---|---|---|
-| `pixel_ae` s0 | 0.001459213 | 0.000015737 | 92.724 |
+| `pixel_ae` s0 | 0.001459213 | 0.000015737 | 92.723 |
 | `pixel_ae` s1 | 0.000598965 | 0.000004747 | 126.165 |
 | `pixel_ae` s2 | 0.001068157 | 0.000005969 | 178.966 |
 | `frozen_ssl` s0 | 0.001448272 | 0.000007831 | 184.944 |
@@ -1864,7 +1864,7 @@ In absolute terms both redundancy figures are tiny: 0.0006–0.0035 bits per pai
 
 From `capacity.prior_bits`: `pixel_ae` 1.0283 / 0.7378 / 1.0499 (mean **0.9386**), `frozen_ssl` 0.8320 / 0.6453 / 1.3667 (mean **0.9480**), `random_vit` 1.3762 / 1.5897 / 1.3530 (mean **1.4396**). Pooled mean **1.1088**, min 0.6453, max 1.5897. It gates nothing: no status, check or refusal in this run depends on it.
 
-The posterior reading exceeds the prior reading in **9 of 9 cells**, by +0.1518 to +0.9864 bits. On M3g's finding that the prior is the failing stage — a verdict that was `PREDICT FAILS` in 2 of 3 arms (`frozen_ssl`, `random_vit`) and `ENCODE FAILS` in `pixel_ae`, not 3 of 3 — this is consistent in direction and almost worthless in strength: the distribution the rollout actually runs on carries, as a summed upper bound, between 0.65 and 1.59 of 160 bits, less than the posterior does in every cell. It is one more reading on a scale where everything is near zero, and it separates no hypothesis. It is reported because §2.4 requires it per cell, and it decides nothing.
+The posterior reading exceeds the prior reading in **9 of 9 cells**, by +0.1518 to +0.9864 bits. On M3g's finding that the prior is the failing stage — a verdict that was `PREDICT FAILS` in 2 of 3 arms (`frozen_ssl`, `random_vit`) and `ENCODE FAILS` in `pixel_ae`, not 3 of 3 — this is consistent in direction and almost worthless in strength: the information the prior's distribution carries through `h` alone is, as a summed upper bound, between 0.65 and 1.59 of 160 bits, less than the posterior does in every cell. These are **one-step-ahead priors under teacher forcing, not the distribution a rollout runs on**: `probe.gather_probe_data` takes them from two `observe` calls (`src/mbfps/eval/probe.py:317–332`), where `h` is advanced on **posterior**-drawn `z`, while a rollout uses `imagine` and advances `h` on **prior**-drawn `z`. The spec (§2.4) and `cell_capacity`'s docstring both describe it as "the information the prior's distribution carries through `h` alone", and that is the claim the figures support. It is one more reading on a scale where everything is near zero, and it separates no hypothesis. It is reported because §2.4 requires it per cell, and it decides nothing.
 
 ### Does the rule's status agree with the magnitudes?
 
