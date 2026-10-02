@@ -440,12 +440,31 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
     objective. Only then are the two decisive statuses tallied, and
     `INDETERMINATE` is the fall-through.
 
+    THE TWO DECISIVE STATUSES CANNOT BOTH REACH THE BAR AT THREE ARMS. With
+    `ARMS_REQUIRED = 2` and three arms, 2 + 2 > 3, and no arm sits in both
+    tallies (an interval cannot be both above 0 and at or below 0). That is a
+    fact about the arm COUNT, not about the statuses: with four arms, two
+    clearing motion and two clearing copies is a contradiction, and an order of
+    checks would resolve it by statement order rather than by evidence. So it
+    raises, naming both sets. It is unreachable today and becomes reachable only
+    if the arm count grows; if it does, the reading has to be redesigned, not
+    patched with a preference.
+
+    An EMPTY cell set raises too: it has no arm to read or to name, so neither
+    the control check nor the short-arm refusal can catch it, and it would
+    otherwise fall through to INDETERMINATE under a sentence about "0 arms".
+
     THE ASYMMETRY. Both decisive statuses are levels against an exactly known
     baseline -- the true one-step displacement -- measured on the same windows,
     so BOTH DIRECTIONS ARE SOUND. This is the structural difference from M3k,
     whose statistic spoke in one direction only, and from M3l, whose
     `bits_carried` upper-bounds the joint and was trustworthy only below a cut.
     """
+    if not inputs.cells:
+        raise ValueError(
+            "Reading H was given an empty cell set: there is no arm to read, "
+            "so no status can be taken and none is returned"
+        )
     by_arm: dict[str, list[BurdenArm]] = {}
     for cell in inputs.cells.values():
         by_arm.setdefault(cell.arm, []).append(cell)
@@ -503,6 +522,17 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
 
     arms_motion = clearing(lambda c: c.margin_low > 0.0)
     arms_copies = clearing(lambda c: c.margin_high <= 0.0)
+
+    if len(arms_motion) >= ARMS_REQUIRED and len(arms_copies) >= ARMS_REQUIRED:
+        raise ValueError(
+            f"PREDICTS_MOTION ({', '.join(arms_motion)}) and COPIES "
+            f"({', '.join(arms_copies)}) each reach {ARMS_REQUIRED} arms at "
+            f"horizon {inputs.decision_h}: the two decisive statuses "
+            "contradict each other, and the reading cannot be taken. No arm "
+            f"is in both tallies, so both reach {ARMS_REQUIRED} only with at "
+            f"least {2 * ARMS_REQUIRED} arms, and there are {len(by_arm)}: "
+            "the arm count has outgrown the bar"
+        )
 
     if len(arms_motion) >= ARMS_REQUIRED:
         return BurdenStatus(

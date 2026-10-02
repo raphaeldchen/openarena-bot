@@ -978,8 +978,10 @@ def test_the_two_decisive_statuses_can_never_both_clear():
     which the recomputation sees.
 
     What it does NOT cover: with THREE arms and `ARMS_REQUIRED == 2`, two
-    decisive statuses cannot both reach the bar (2 + 2 > 3). With four arms
-    they could, and PREDICTS_MOTION is checked first.
+    decisive statuses cannot both reach the bar (2 + 2 > 3), so this property
+    never sees both tallies at the bar. With four arms they could, and
+    `reading_burden` then refuses rather than prefer one --
+    `test_two_decisive_statuses_that_both_reach_the_bar_are_refused` pins that.
     """
     rng = np.random.default_rng(0)
     seen = {"PREDICTS_MOTION": 0, "COPIES": 0, "INDETERMINATE": 0}
@@ -1390,6 +1392,73 @@ def test_the_fall_through_sentence_takes_its_numbers_from_the_module_and_the_inp
     assert "falls short of the bar by 2 arm(s)" in rule
     for stale in ("horizon 45", "reaches 2 arms", "of 3 arms", "by 1 arm(s)"):
         assert stale not in rule, stale
+
+
+def test_two_decisive_statuses_that_both_reach_the_bar_are_refused():
+    """At three arms with `ARMS_REQUIRED == 2` the two statuses cannot both reach
+    the bar (2 + 2 > 3), so the exclusivity holds and the test above checks it.
+    It is a fact about the arm COUNT, though, and it stops being one at four
+    arms, where two clearing motion and two clearing copies is a contradiction.
+    A precedence that quietly picked PREDICTS_MOTION would resolve it by
+    statement order rather than by evidence, so the reading refuses and names
+    both sets. M3l asserted two readings "mutually exclusive by construction"
+    when one arm could clear both; here the exclusivity is real at today's arm
+    count, so it is pinned instead of trusted.
+
+    THE MUTATION THIS EXISTS FOR: deleting the refusal, which returns
+    PREDICTS_MOTION with `arms_copies` also at the bar.
+    """
+    cells = _by_arm(
+        frozen_ssl=CLEARS_COPIES, pixel_ae=CLEARS_MOTION,
+        random_vit=CLEARS_COPIES, scratch=CLEARS_MOTION,
+    )
+    with pytest.raises(ValueError) as refused:
+        reading_burden(_inputs(cells))
+    message = str(refused.value)
+    assert "PREDICTS_MOTION (pixel_ae, scratch)" in message
+    assert "COPIES (frozen_ssl, random_vit)" in message
+    assert f"reach {ARMS_REQUIRED} arms at horizon {DECISION_H}" in message
+    assert "the reading cannot be taken" in message
+    assert f"only with at least {2 * ARMS_REQUIRED} arms, and there are 4" in message
+
+
+@pytest.mark.parametrize(
+    "motion_arms, copies_arms, status",
+    [(2, 1, "PREDICTS_MOTION"), (1, 2, "COPIES")],
+    ids=["motion-at-the-bar", "copies-at-the-bar"],
+)
+def test_one_status_at_the_bar_is_read_when_the_other_is_only_present(
+    motion_arms, copies_arms, status
+):
+    """The refusal is for BOTH tallies at the bar. Four arms with one status at
+    the bar and the other holding a single arm is an ordinary reading: the
+    status is read and the other tally is reported.
+
+    THE MUTATION THIS EXISTS FOR: the refusal's condition loosened to one tally
+    at the bar and the other merely non-empty, which refuses a reading the
+    evidence does decide.
+    """
+    shapes = [CLEARS_MOTION] * motion_arms + [CLEARS_COPIES] * copies_arms
+    shapes += [STRADDLES] * (4 - len(shapes))
+    cells = _by_arm(**dict(zip(("frozen_ssl", "pixel_ae", "random_vit", "scratch"), shapes)))
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == status
+    assert len(reading.arms_motion) == motion_arms
+    assert len(reading.arms_copies) == copies_arms
+
+
+def test_an_empty_cell_set_is_refused_not_read():
+    """With no cells there is no arm, so nothing is short, nothing is broken and
+    no tally can reach the bar: the fall-through returned INDETERMINATE under a
+    sentence reading "0 of 0 arms". The short-arm refusal cannot catch it,
+    because it names an arm and there is none.
+
+    THE MUTATION THIS EXISTS FOR: deleting the refusal, which returns a status.
+    """
+    with pytest.raises(ValueError) as refused:
+        reading_burden(_inputs([]))
+    assert "empty cell set" in str(refused.value)
+    assert "no arm" in str(refused.value)
 
 
 @pytest.mark.parametrize(
