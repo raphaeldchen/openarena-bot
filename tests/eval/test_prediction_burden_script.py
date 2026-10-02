@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from mbfps.data.episode import load_episode, save_episode
 from mbfps.eval import burden
@@ -54,7 +55,7 @@ from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
-    KEYS, DriftingModel, OracleModel, synthetic_episode,
+    KEYS, STEP, DriftingModel, OracleModel, _OracleRSSM, oracle_probe, synthetic_episode,
 )
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "prediction_burden.py"
@@ -125,12 +126,12 @@ STUDY_RECORD = {
 }
 
 
-def _reference(rig, model, *, context=CONTEXT, horizon=HORIZON):
+def _reference(rig, model, *, context=CONTEXT, horizon=HORIZON, feature_backbone=None):
     """The rollout `prepare_cell` would hand back for `model`: the real
     `evaluate_rollout`, at the cell's seed and through the cell's probe."""
     return evaluate_rollout(
         model, rig.paths, rig.probe, context=context, horizon=horizon, seed=SEED,
-        device=CPU, feature_backbone=None,
+        device=CPU, feature_backbone=feature_backbone,
     )
 
 
@@ -144,6 +145,7 @@ def _cell_kwargs(rig, **over) -> dict:
     if "reference" not in over:
         kwargs["reference"] = _reference(
             rig, kwargs["model"], context=kwargs["context"], horizon=kwargs["horizon"],
+            feature_backbone=kwargs["feature_backbone"],
         )
     return kwargs
 
@@ -153,12 +155,12 @@ def record(rig):
     return script.measure_cell(**_cell_kwargs(rig))
 
 
-def _independent_sweep(rig, model=None):
+def _independent_sweep(rig, model=None, *, seed=SEED):
     """The real sweep, called again by the TEST, so what the record's numbers are
     compared with was not produced by the code under test."""
     return regrounding_sweep(
         model or DriftingModel(), rig.paths, rig.probe, ks=REGROUNDING_KS,
-        context=CONTEXT, horizon=HORIZON, seed=SEED, device=CPU, feature_backbone=None,
+        context=CONTEXT, horizon=HORIZON, seed=seed, device=CPU, feature_backbone=None,
     )
 
 
@@ -660,6 +662,130 @@ def test_the_base_control_is_the_two_medians_at_the_decision_horizon(rig, record
         float(np.median(sweep.window_floor_position[:, burden.DECISION_H - 1])), abs=1e-12,
     )
     assert base["displacement_median"] != base["floor_median"]
+
+
+# ---------------------------------------------------------------------------
+# The arguments handed to the sweep are the ones it USES.
+# ---------------------------------------------------------------------------
+
+
+class _StochasticRSSM(_OracleRSSM):
+    """`_OracleRSSM` whose `imagine` adds a standard normal draw to every step.
+
+    THE FAKE EVERY OTHER TEST HERE CANNOT BE. The oracle-family models draw no
+    random number, so a sweep handed `seed=0` and one handed the cell's seed
+    return the same curves bit for bit, and nothing downstream can tell which it
+    was given. `test_latent_capacity_script.py` names the same hazard "A
+    STANDING HAZARD" for a `frame_probe` that was handed the right seed while its
+    body ignored it: a test that shows an argument was PASSED shows nothing about
+    whether it was USED. Here the draw is one `imagine` makes, `evaluate_rollout` and the sweep
+    both seed the generator before the traversal, and a different seed gives
+    different rungs -- by up to 5.57 map units at the open-loop rung on this rig."""
+
+    def imagine(self, actions, state):
+        tag = super().imagine(actions, state)["h"]
+        tag = tag + torch.randn_like(tag)
+        return {"h": tag, "z": tag, "latent": torch.cat([tag, tag], dim=-1)}
+
+
+class StochasticModel(OracleModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rssm = _StochasticRSSM()
+
+
+def test_the_sweep_is_run_at_the_cells_seed(rig):
+    """`measure_cell` must hand `regrounding_sweep` the CELL'S seed. The
+    reference it is given was rolled out at that seed, so the k=horizon rung --
+    the same pass, which is what `open_loop_divergence` reads -- reproduces it
+    bitwise ONLY if the sweep drew the same stream. Every rung is also asked by
+    value, against a second sweep the test ran at the cell's seed.
+
+    THE MUTATION THIS EXISTS FOR: `seed=seed` -> `seed=0` in the `common` dict
+    `measure_cell` hands `regrounding_sweep`. It survived all 42 tests, because
+    no model here drew a number. With it, the open-loop control reads
+    5.569275918609585 where it should read 0.0.
+
+    On correct code the divergence control WOULD flag the mutation -- at run
+    time, in the record, after the whole nine-cell measurement had been paid for.
+    This is the check that does not wait for that."""
+    model = StochasticModel()
+    at_cell = _independent_sweep(rig, model)
+    at_zero = _independent_sweep(rig, model, seed=0)
+    # Reached: the seeds really do give different curves, or equality below is
+    # not the sweep reading its seed.
+    assert not np.array_equal(at_cell.curve(HORIZON), at_zero.curve(HORIZON))
+    assert np.abs(at_cell.curve(HORIZON) - at_zero.curve(HORIZON)).max() > 1.0
+
+    record = script.measure_cell(**_cell_kwargs(rig, model=model))
+    assert SEED != 0
+    assert record["controls"]["open_loop_divergence"] == 0.0
+    for k in REGROUNDING_KS:
+        np.testing.assert_array_equal(
+            record["curves"]["rungs"][str(k)], at_cell.curve(k), err_msg=f"k={k}",
+        )
+
+
+def _feature_rig(directory: Path, lengths=(70, 120), *, namespaced_offset=100.0, decoy_offset=200.0):
+    """Straight-line episodes whose cached features carry the frame tag OFFSET by
+    `namespaced_offset` under `random_vit`'s own namespaced suffix, and by
+    `decoy_offset` under the suffix a backbone of `None` would name."""
+    paths, episodes = [], []
+    for index, length in enumerate(lengths):
+        episode = synthetic_episode(length)
+        path = _episode_file(directory, episode, name_index=index)
+        tags = np.arange(length + 1, dtype=np.float32)
+        np.save(path.with_suffix(".features_random_vit.npy"),
+                (tags + namespaced_offset).reshape(-1, 1, 1, 1))
+        np.save(path.with_suffix(".features_None.npy"),
+                (tags + decoy_offset).reshape(-1, 1, 1, 1))
+        paths.append(path)
+        episodes.append(episode)
+    return types.SimpleNamespace(paths=paths, episodes=episodes, probe=oracle_probe(episodes[0]))
+
+
+def test_the_sweep_reads_the_feature_cache_of_the_backbone_it_was_handed(tmp_path):
+    """A feature-input arm is fed its backbone's own namespaced cache. The caches
+    here carry the frame tag offset by +100, so an exact oracle is exactly 100
+    frames of true displacement wrong at every horizon step and every rung -- a
+    closed form. A decoy cache under the suffix `None` would name carries +200,
+    so a sweep that was not handed the backbone reads another number rather than
+    merely crashing.
+
+    THE MUTATION THIS EXISTS FOR: `feature_backbone=feature_backbone` ->
+    `feature_backbone=None` in the `common` dict handed to `regrounding_sweep`,
+    which survived every test because the pixel rig never reads a cache."""
+    feature_rig = _feature_rig(tmp_path)
+    model = OracleModel()
+    model.input_kind = "features"
+    record = script.measure_cell(**_cell_kwargs(
+        feature_rig, model=model, feature_backbone="random_vit",
+    ))
+    for k in REGROUNDING_KS:
+        np.testing.assert_allclose(
+            record["curves"]["rungs"][str(k)], np.full(HORIZON, 100.0 * STEP), rtol=1e-4,
+            err_msg=f"k={k}",
+        )
+
+
+def test_the_sweep_runs_on_the_device_it_was_handed(rig):
+    """The device handed to `measure_cell` is the one the sweep traverses on, not
+    whichever device the model's first parameter lives on.
+
+    The model's only parameter is on the `meta` device, which no op here reads.
+    Handed `cpu`, the sweep runs; handed `None` it falls back to the model's own
+    device -- `meta` -- and `_rng_snapshot` refuses a device it has no verified
+    generator state for. On the real run the model has been moved to the device
+    handed in, so the two coincide: this pins the handoff, not a live hazard.
+
+    THE MUTATION THIS EXISTS FOR: `device=device` -> `device=None` in the
+    `common` dict handed to `regrounding_sweep`."""
+    model = OracleModel()
+    model.dummy = nn.Parameter(torch.zeros(1, device="meta"))
+    assert next(model.parameters()).device.type == "meta"
+    record = script.measure_cell(**_cell_kwargs(rig, model=model))
+    assert record["device"] == "cpu"
+    assert record["controls"]["open_loop_divergence"] == 0.0
 
 
 # ---------------------------------------------------------------------------
