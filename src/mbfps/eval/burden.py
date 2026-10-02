@@ -151,10 +151,18 @@ def identity_residual(
     """The largest absolute violation of
     `burden(k) == burden(1) + compounding(k)` over the horizon.
 
-    Algebraic, so this measures floating point and nothing else -- which is
-    exactly why it is worth recording: a nonzero residual beyond
-    `IDENTITY_TOLERANCE` means one of the three curves is not what its name
-    says, not that arithmetic failed.
+    Algebraic, so on the magnitudes this milestone measures it reads floating
+    point and nothing else. A residual beyond `IDENTITY_TOLERANCE` there means
+    one of the three curves is not what its name says.
+
+    THAT READING IS CONDITIONAL ON THE MAGNITUDES, and the condition is the one
+    `IDENTITY_TOLERANCE` documents: it holds while the operand pairs stay within
+    a factor of two, where the worst residual measured is 4.3e-14. On
+    wide-spread inputs the cancellation alone exceeds the tolerance -- 2.98e-08
+    at magnitudes near 1.7e8 -- so there a large residual IS arithmetic, and
+    says nothing about the curves. Position errors run 100-250 units, four
+    orders below that, which is why this is a usable control here and would not
+    be on arbitrary data.
     """
     whole = burden(curve_k, floor)
     parts = burden(curve_one, floor) + compounding(curve_k, curve_one)
