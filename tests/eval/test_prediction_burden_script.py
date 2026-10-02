@@ -503,12 +503,32 @@ def test_the_baseline_is_taken_after_the_sweep_and_never_before_it(rig, monkeypa
         ({"ks": (5, 45)}, "k=1"),
     ],
 )
-def test_measure_cell_refuses_a_protocol_the_reading_cannot_be_taken_from(rig, over, match):
+def test_measure_cell_refuses_a_protocol_the_reading_cannot_be_taken_from(
+    rig, monkeypatch, over, match,
+):
     """The status is read at `DECISION_H` and every margin is read off the k=1
     rung. Refused by name before any pass is paid for, rather than as an
-    IndexError or a KeyError after the sweep."""
+    IndexError or a KeyError after the sweep.
+
+    "BEFORE ANY PASS" IS ASKED, NOT ASSUMED: the sweep and the baseline are
+    replaced by functions that fail the test if they are called, so the refusal
+    has to win the race. Left to run, they let the refusal sit anywhere in the
+    function and the test could not tell where.
+
+    THE MUTATIONS THIS EXISTS FOR: `_require_a_readable_protocol(...)` moved to
+    just after the `regrounding_sweep(...)` call, and to just after the
+    `baseline_rows(...)` call. Both survived all 55 tests, because a refusal that
+    comes late is still a refusal with the same words.
+    """
+    kwargs = _cell_kwargs(rig, **over)
+
+    def paid_for(*args, **kwargs):
+        raise AssertionError("a pass was paid for before the protocol was refused")
+
+    monkeypatch.setattr(script, "regrounding_sweep", paid_for)
+    monkeypatch.setattr(script, "baseline_rows", paid_for)
     with pytest.raises(SystemExit, match=match):
-        script.measure_cell(**_cell_kwargs(rig, **over))
+        script.measure_cell(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1210,12 +1230,26 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
     script.measure_phase(args)
     lines = capsys.readouterr().out.strip().splitlines()
     assert len(lines) == len(CELLS)
+    last = str(REGROUNDING_KS[-1])
     for line, (arm, seed) in zip(lines, CELLS):
         record = load_record(args.out / f"burden_{arm}_seed{seed}.json")
         margin = record["margin"][str(burden.DECISION_H)]
         assert line.startswith(f"{arm} seed {seed}:"), line
         for number in (margin["point"], margin["ci_low"], margin["ci_high"]):
             assert f"{number:+.4f}" in line
+        # The burden printed is the LAST rung's, read at `DECISION_H`: the rung and
+        # the step are each written out here rather than read back off the record.
+        by_step = record["burden_by_k"][last]
+        printed = f"burden(k={last}) {by_step[burden.DECISION_H - 1]:+.4f};"
+        assert printed in line, line
+        # Reached: step 1 and step `DECISION_H` read differently, so a line that
+        # printed the first step fails; and on the drifting arm the first rung and
+        # the last do too (on the exact oracle every rung is the same, so there the
+        # rung is told apart only by the `k=` label above).
+        assert f"{by_step[0]:+.4f}" != f"{by_step[burden.DECISION_H - 1]:+.4f}"
+        if arm == "pixel_ae":
+            first_rung = record["burden_by_k"]["1"][burden.DECISION_H - 1]
+            assert f"{first_rung:+.4f}" != f"{by_step[burden.DECISION_H - 1]:+.4f}"
         assert f"{record['controls']['identity_residual']:.2e}" in line
         assert str(args.out / f"burden_{arm}_seed{seed}.json") in line
 
