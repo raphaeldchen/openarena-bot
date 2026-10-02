@@ -16,9 +16,18 @@ observation corrects the rollout, over `diagnostics.REGROUNDING_KS` -- and `h`
 is the HORIZON STEP. Both were called `k` in an early draft of the spec. Write
 `burden(k, h)`.
 
-This module holds no torch and no I/O: every number Reading H reports is a
-function of arrays, so it is testable without a checkpoint. `scripts/
-prediction_burden.py` owns the model, the device and the record schema.
+This module loads no checkpoint, touches no device and reads no file: every
+number Reading H reports is a function of arrays, so it is testable without a
+GPU. `scripts/prediction_burden.py` owns the model, the device and the record
+schema.
+
+IT IS NOT TORCH-FREE IN ITS IMPORT GRAPH, and that is deliberate. It imports
+`probe.position_error` so that the position metric has ONE definition, and
+`probe` imports torch at module level. Duplicating `position_error` here to
+keep the import clean would put a second Euclidean distance in the codebase --
+the kind of drift `evaluate_rollout`'s own comments record as having already
+destroyed a signal once, when the model and the floor were probed through
+differently fitted pipelines. One shared definition beats a clean import.
 """
 
 import numpy as np
