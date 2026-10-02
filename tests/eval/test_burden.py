@@ -17,6 +17,8 @@ from mbfps.eval.burden import (
     CONFIDENCE,
     DECISION_H,
     IDENTITY_TOLERANCE,
+    READING_COLUMNS,
+    READING_WIDTHS,
     REPORTED_H,
     RESAMPLES,
     SEEDS_MINIMUM,
@@ -26,6 +28,7 @@ from mbfps.eval.burden import (
     at_horizon,
     burden,
     compounding,
+    format_reading_burden,
     identity_residual,
     margin_interval,
     motion_margin,
@@ -1190,3 +1193,203 @@ def test_an_arm_counts_on_a_strict_majority_of_its_own_seeds(
     assert reading.status == (status if counts else "INDETERMINATE")
     assert ("frozen_ssl" in getattr(reading, tally)) == counts
     assert reading.seeds_total == {"frozen_ssl": seeds, "pixel_ae": 3, "random_vit": 3}
+
+
+# --- Reading H: the table ---------------------------------------------------
+
+
+def _table(inputs):
+    return format_reading_burden(reading_burden(inputs), inputs)
+
+
+def _fields(row):
+    """A table row cut at the column boundaries `READING_WIDTHS` fixes."""
+    out, at = [], 0
+    for width in READING_WIDTHS:
+        out.append(row[at:at + width].strip())
+        at += width
+    return out
+
+
+def _header_and_rows(text, n_rows):
+    lines = text.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.split() == list(READING_COLUMNS))
+    return lines[at], lines[at + 1:at + 1 + n_rows]
+
+
+def test_the_table_prints_one_row_per_cell_at_the_header_width():
+    inputs = _inputs(_nine(**CLEARS_MOTION))
+    text = _table(inputs)
+    lines = text.splitlines()
+    header, rows = _header_and_rows(text, 9)
+    assert len(READING_COLUMNS) == len(READING_WIDTHS)
+    assert len(header) == sum(READING_WIDTHS)
+    for a in ARMS:
+        arm_rows = [line for line in lines if line.strip().startswith(a)]
+        assert len(arm_rows) == 3, a
+        for row in arm_rows:
+            assert len(row) == len(header), (a, row)
+    assert [_fields(row)[:2] for row in rows] == [
+        [arm, str(seed)] for arm in ARMS for seed in (0, 1, 2)
+    ]
+    assert "PREDICTS MOTION" in text
+    assert text.endswith("\n")
+
+
+def test_every_column_has_room_for_the_widest_value_it_can_carry():
+    """Columns are right-aligned and unseparated, so a value that fills its
+    column runs into the one before it and `str.split` merges the two.
+
+    `-999.9999` is the widest number a position error could take in this
+    project (errors run 100-250), at nine characters; `random_vit` is the
+    longest arm name; `copies` and `motion` the longest `clears` labels.
+
+    THE MUTATIONS THIS EXISTS FOR: the first width shrunk below the longest
+    arm name, which lengthens the row beyond the header; and any numeric width
+    shrunk to the number's own length, which leaves no space between it and
+    its neighbour.
+    """
+    wide = dict(
+        burden_by_k={1: -999.9999, 45: -999.9999},
+        compounding_by_k={1: -999.9999, 45: -999.9999},
+    )
+    cells = [
+        _arm(arm="random_vit", seed=0, margin=-999.9999, low=-999.9999, high=-999.9999, **wide),
+        _arm(arm="random_vit", seed=1, margin=999.9999, low=999.9999, high=999.9999, **wide),
+    ]
+    text = _table(_inputs(cells, ks=(1, 45)))
+    header, rows = _header_and_rows(text, 2)
+    assert header.split() == list(READING_COLUMNS)
+    assert all(len(name) < width for name, width in zip(READING_COLUMNS, READING_WIDTHS))
+    for row in rows:
+        assert len(row) == len(header)
+        assert len(row.split()) == len(READING_COLUMNS), row
+    assert _fields(rows[0])[-1] == "copies"
+    assert _fields(rows[1])[-1] == "motion"
+
+
+def test_each_column_carries_the_quantity_it_is_named_for():
+    """Cells go in out of order and every number is distinct within its row, so
+    a swapped column, a wrong rung, an unsorted table or a `clears` label that
+    disagrees with the bar all show. The last two cells sit exactly ON the bars:
+    a low end of 0 clears nothing and a high end of 0 clears copies.
+
+    THE MUTATIONS THIS EXISTS FOR: `ci_low` and `ci_high` swapped; the rung
+    read from `ks[0]` instead of `ks[-1]`; dropping the `sorted`; `>=` for `>`
+    or `<` for `<=` in the `clears` label.
+    """
+    cells = _nine(**CLEARS_MOTION)
+    cells = _with(
+        cells, "pixel_ae", 1,
+        margin=2.0, margin_low=0.0, margin_high=4.0,
+        burden_by_k={1: 2.0, 3: 6.0, 5: 11.0, 15: 30.0, 45: 101.5},
+        compounding_by_k={1: 0.0, 3: 4.0, 5: 9.0, 15: 28.0, 45: 99.25},
+    )
+    cells = _with(cells, "pixel_ae", 2, margin=-1.0, margin_low=-2.0, margin_high=0.0)
+    text = _table(_inputs(list(reversed(cells))))
+    _, rows = _header_and_rows(text, 9)
+
+    table = [dict(zip(READING_COLUMNS, _fields(row), strict=True)) for row in rows]
+    assert [(r["arm"], r["seed"]) for r in table] == [
+        (arm, str(seed)) for arm in ARMS for seed in (0, 1, 2)
+    ]
+    by_cell = {(r["arm"], r["seed"]): r for r in table}
+    assert by_cell[("frozen_ssl", "0")] == {
+        "arm": "frozen_ssl", "seed": "0", "margin": "+3.0000", "ci_low": "+1.0000",
+        "ci_high": "+5.0000", "burden45": "+90.0000", "comp45": "+88.0000",
+        "clears": "motion",
+    }
+    assert by_cell[("pixel_ae", "1")] == {
+        "arm": "pixel_ae", "seed": "1", "margin": "+2.0000", "ci_low": "+0.0000",
+        "ci_high": "+4.0000", "burden45": "+101.5000", "comp45": "+99.2500",
+        "clears": "-",
+    }
+    assert by_cell[("pixel_ae", "2")]["clears"] == "copies"
+    assert by_cell[("pixel_ae", "2")]["margin"] == "-1.0000"
+    assert by_cell[("pixel_ae", "2")]["ci_high"] == "+0.0000"
+
+
+@pytest.mark.parametrize(
+    "cells, status",
+    [
+        (_nine(**CLEARS_MOTION), "PREDICTS_MOTION"),
+        (_nine(**CLEARS_COPIES), "COPIES"),
+        (_nine(**STRADDLES), "INDETERMINATE"),
+        (_with(_nine(**CLEARS_MOTION), "pixel_ae", 0, k_one_is_floor=True), "UNRESOLVED_CONTROL"),
+        (_with(_nine(**CLEARS_MOTION), "pixel_ae", 0, displacement_median=1.0), "UNREADABLE"),
+    ],
+    ids=["predicts-motion", "copies", "indeterminate", "unresolved-control", "unreadable"],
+)
+def test_the_verdict_line_closes_the_table_with_the_status_and_its_rule(cells, status):
+    """The table has to print under every status, including the two where no
+    arm votes, and its last line is the verdict and the sentence that decided
+    it, verbatim."""
+    inputs = _inputs(cells)
+    reading = reading_burden(inputs)
+    assert reading.status == status
+    text = format_reading_burden(reading, inputs)
+    assert text.endswith("\n")
+    assert text.splitlines()[-1] == (
+        f"  verdict: {status.replace('_', ' ')} -- decided by: {reading.rule}"
+    )
+    _header_and_rows(text, len(cells))
+
+
+def test_the_table_interpolates_its_numbers_and_never_hardcodes_them():
+    """THE MUTATION THIS EXISTS FOR: the legend's tolerance written as a
+    literal that is wrong. M3l shipped a legend reading "floor exactly 0" where
+    the check is abs(floor) <= 1e-9 and real floors are ~1e-13; it is still an
+    open follow-up.
+
+    This test sees only a wrong literal or a dropped number: a literal that
+    HAPPENS to equal the module's value passes it, and
+    `test_the_table_follows_the_module_and_the_inputs_it_is_given` is the one
+    that moves the values.
+    """
+    inputs = _inputs(_nine(**CLEARS_MOTION))
+    text = _table(inputs)
+    assert f"at horizon {DECISION_H} (re-grounding periods k = 1, 3, 5, 15, 45)" in text
+    assert f"held within {IDENTITY_TOLERANCE:g}" in text
+    assert f"in at least {ARMS_REQUIRED} of 3 arms" in text
+    assert "exactly 0" not in text
+
+
+def test_the_table_follows_the_module_and_the_inputs_it_is_given(monkeypatch):
+    """Every number the caption, legend and rule print is moved to a value
+    that is nowhere else in the text, so a number written as a literal -- even
+    one that equals today's value -- cannot pass.
+
+    The horizon is 30 against re-grounding periods that end in 45, and the rung
+    is read BY k (a dict lookup at `ks[-1]`), so a table that reads the rung at
+    `decision_h` raises KeyError instead of printing it under the wrong name.
+    Four arms against a bar of four, a tolerance of 1e-7: none of the shipped
+    values.
+
+    THE MUTATIONS THIS EXISTS FOR: a literal, a module constant or the
+    `ks`-derived value standing in for any of `inputs.decision_h`, the `ks`
+    list, `IDENTITY_TOLERANCE`, `ARMS_REQUIRED` or the arm count.
+    """
+    monkeypatch.setattr("mbfps.eval.burden.IDENTITY_TOLERANCE", 1e-7)
+    monkeypatch.setattr("mbfps.eval.burden.ARMS_REQUIRED", 4)
+    ladder = dict(
+        burden_by_k={1: 2.0, 2: 3.0, 7: 5.0, 45: 90.0},
+        compounding_by_k={1: 0.0, 2: 1.0, 7: 3.0, 45: 88.0},
+    )
+    cells = [
+        _arm(arm=arm, seed=seed, **CLEARS_MOTION, **ladder)
+        for arm in (*ARMS, "scratch") for seed in (0, 1, 2)
+    ]
+    inputs = _inputs(cells, decision_h=30, ks=(1, 2, 7, 45))
+    reading = reading_burden(inputs)
+    assert reading.status == "PREDICTS_MOTION"
+    text = format_reading_burden(reading, inputs)
+
+    assert "at horizon 30 (re-grounding periods k = 1, 2, 7, 45)" in text
+    assert "burden(k=45, h=30)" in text
+    assert "compounding(k=45, h=30)" in text
+    assert "held within 1e-07" in text
+    assert "in at least 4 of 4 arms" in text
+    assert "in 4 of 4 arms" in reading.rule
+    assert "clears 0 at horizon 30" in reading.rule
+    for stale in ("horizon 45", "h=45", "1e-09", "exactly 0"):
+        assert stale not in text, stale

@@ -496,3 +496,60 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
         ),
         arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
     )
+
+
+READING_COLUMNS: tuple[str, ...] = (
+    "arm", "seed", "margin", "ci_low", "ci_high", "burden45", "comp45", "clears",
+)
+READING_WIDTHS: tuple[int, ...] = (13, 6, 11, 11, 11, 11, 11, 17)
+
+
+def _row(values, widths) -> str:
+    return "".join(f"{str(v):>{w}}" for v, w in zip(values, widths, strict=True))
+
+
+def format_reading_burden(reading: BurdenStatus, inputs: BurdenInputs) -> str:
+    """Reading H as `burden.txt` carries it, byte for byte.
+
+    Every number in the caption and the legend is interpolated from the module
+    -- the decision horizon, the identity tolerance, the arm bar -- so a
+    constant that drifts cannot leave a stale literal behind. M3l shipped a
+    legend saying "floor exactly 0" over a 1e-9 check and ~1e-13 values, and it
+    is still an open follow-up.
+    """
+    lines = [
+        f"--- Reading H: the prediction burden at horizon {inputs.decision_h} "
+        f"(re-grounding periods k = {', '.join(str(k) for k in inputs.ks)})",
+        _row(READING_COLUMNS, READING_WIDTHS),
+    ]
+    for (arm, seed), cell in sorted(inputs.cells.items()):
+        clears = (
+            "motion" if cell.margin_low > 0.0
+            else "copies" if cell.margin_high <= 0.0
+            else "-"
+        )
+        lines.append(_row(
+            (
+                arm, seed,
+                f"{cell.margin:+.4f}", f"{cell.margin_low:+.4f}",
+                f"{cell.margin_high:+.4f}",
+                f"{cell.burden_by_k[inputs.ks[-1]]:+.4f}",
+                f"{cell.compounding_by_k[inputs.ks[-1]]:+.4f}",
+                clears,
+            ),
+            READING_WIDTHS,
+        ))
+    lines += [
+        "  margin = the true one-step displacement minus the k=1 rung, so "
+        "POSITIVE means one prior step from the true state beats assuming the "
+        "agent did not move. Ground truth, not an estimate, so a reading in "
+        "EITHER direction is evidence",
+        f"  burden45/comp45 = burden(k={inputs.ks[-1]}, h={inputs.decision_h}) "
+        f"and compounding(k={inputs.ks[-1]}, h={inputs.decision_h}); "
+        f"compounding(k=1) is 0 by construction and the identity residual is "
+        f"held within {IDENTITY_TOLERANCE:g}",
+        f"  a status needs a strict majority of each arm's seeds in at least "
+        f"{ARMS_REQUIRED} of {len(reading.seeds_total)} arms",
+        f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}",
+    ]
+    return "\n".join(lines) + "\n"
