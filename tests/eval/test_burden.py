@@ -407,6 +407,12 @@ def test_the_interval_refuses_what_it_cannot_cluster():
             window_margin, np.zeros(6, dtype=int), h=1, resamples=10, seed=0
         )
 
+    # The record's own null. `windows.episode` is None when the ladder carried
+    # no clustering, and a fallback to arange(n) here would silently convert
+    # this into the window-level bootstrap the docstring rules out.
+    with pytest.raises(ValueError, match="one label per window"):
+        margin_interval(window_margin, None, h=1, resamples=10, seed=0)
+
 
 def test_the_recorded_confidence_matches_what_the_estimator_takes():
     """CONFIDENCE describes `percentile_interval`; it does not configure it.
