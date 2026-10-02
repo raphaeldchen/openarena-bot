@@ -1,14 +1,21 @@
 """M3m's measure phase: the ladder, the model-free baseline, one record per cell.
 
 EVERY NUMBER IN THESE TESTS COMES FROM THE REAL CALL PATH. `measure_cell` runs
-the real `evaluate_rollout` and the real `regrounding_sweep` against the
-oracle-family models `test_rollout.py` and `test_diagnostics.py` already use, so
-a record's margin can only have been produced by the code that produces it. The
-fakes are confined to what needs nine 20,000-step checkpoints -- `load_cell` and
-`prepare_cell` -- and each of those is made to BEHAVE (refuse a directory that
-lacks the checkpoint, hand back a model whose records differ) rather than to
-record what it was called with. A previous milestone's test proved a
-`frame_probe` was HANDED the right seed while its body ignored it.
+the real `regrounding_sweep` against the oracle-family models `test_rollout.py`
+and `test_diagnostics.py` already use, so a record's margin can only have been
+produced by the code that produces it. The fakes are confined to what needs nine
+20,000-step checkpoints -- `load_cell` and `prepare_cell` -- and each of those is
+made to BEHAVE (refuse a directory that lacks the checkpoint, hand back a model
+whose records differ) rather than to record what it was called with. A previous
+milestone's test proved a `frame_probe` was HANDED the right seed while its body
+ignored it.
+
+`measure_cell` DOES NOT RUN `evaluate_rollout`: the floor and the canonical
+curves come off the `reference` it is handed, which is `Prepared.reference`, the
+rollout `prepare_cell` verified against the study record. A test that calls
+`measure_cell` directly builds that reference with the real `evaluate_rollout`
+(`_reference`); the phase tests hand each cell a reference whose curves are
+RECOGNISABLE, so the record can be asked which pass it carries.
 
 THE RIG IS CHOSEN SO THAT NO ASSERTION IS DECIDED BY THE FIXTURE.
 
@@ -43,6 +50,7 @@ from mbfps.eval.diagnostics import (
     REGROUNDING_KS, action_intervention_ladder, regrounding_sweep,
 )
 from mbfps.eval.probe import fit_probe, probe_targets
+from mbfps.eval.rollout import evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
@@ -117,6 +125,15 @@ STUDY_RECORD = {
 }
 
 
+def _reference(rig, model, *, context=CONTEXT, horizon=HORIZON):
+    """The rollout `prepare_cell` would hand back for `model`: the real
+    `evaluate_rollout`, at the cell's seed and through the cell's probe."""
+    return evaluate_rollout(
+        model, rig.paths, rig.probe, context=context, horizon=horizon, seed=SEED,
+        device=CPU, feature_backbone=None,
+    )
+
+
 def _cell_kwargs(rig, **over) -> dict:
     kwargs = dict(
         model=DriftingModel(), val_paths=rig.paths, probe=rig.probe, arm="pixel_ae",
@@ -124,6 +141,10 @@ def _cell_kwargs(rig, **over) -> dict:
         feature_backbone=None, study_record=dict(STUDY_RECORD),
     )
     kwargs.update(over)
+    if "reference" not in over:
+        kwargs["reference"] = _reference(
+            rig, kwargs["model"], context=kwargs["context"], horizon=kwargs["horizon"],
+        )
     return kwargs
 
 
@@ -391,10 +412,11 @@ def test_the_baseline_is_taken_after_the_sweep_and_never_before_it(rig, monkeypa
 
         return wrapper
 
-    for name in ("evaluate_rollout", "regrounding_sweep", "baseline_rows"):
+    kwargs = _cell_kwargs(rig)
+    for name in ("regrounding_sweep", "baseline_rows"):
         monkeypatch.setattr(script, name, recording(name))
-    script.measure_cell(**_cell_kwargs(rig))
-    assert calls == ["evaluate_rollout", "regrounding_sweep", "baseline_rows"]
+    script.measure_cell(**kwargs)
+    assert calls == ["regrounding_sweep", "baseline_rows"]
 
 
 @pytest.mark.parametrize(
@@ -585,25 +607,20 @@ def test_the_identity_residual_is_the_measured_maximum_over_the_rungs(record):
     assert controls["identity_residual"] <= burden.IDENTITY_TOLERANCE
 
 
-def test_the_open_loop_control_is_read_against_the_reference_it_was_given(rig, monkeypatch):
-    """`open_loop_divergence` compares the k=horizon rung with `evaluate_rollout`'s
-    own curve, so it must be read against THAT call's result. The reference is
-    perturbed by 0.25 at one step, and the divergence must be 0.25.
+def test_the_open_loop_control_is_read_against_the_reference_it_was_given(rig):
+    """`open_loop_divergence` compares the k=horizon rung with the reference's own
+    open-loop curve, so it must be read against THE REFERENCE `measure_cell` WAS
+    HANDED. That reference is perturbed by 0.25 at one step, and the divergence
+    must be 0.25.
 
     THE MUTATIONS THIS EXISTS FOR: `sweep.open_loop_divergence(sweep.reference)`
     (the sweep's own copy, which is never perturbed, reads 0.0), and a hard-coded
     `0.0`.
     """
-    real = script.evaluate_rollout
-
-    def perturbed(*args, **kwargs):
-        result = real(*args, **kwargs)
-        rssm = result.rssm_position.copy()
-        rssm[2] += 0.25
-        return replace(result, rssm_position=rssm)
-
-    monkeypatch.setattr(script, "evaluate_rollout", perturbed)
-    record = script.measure_cell(**_cell_kwargs(rig))
+    real = _reference(rig, DriftingModel())
+    rssm = real.rssm_position.copy()
+    rssm[2] += 0.25
+    record = script.measure_cell(**_cell_kwargs(rig, reference=replace(real, rssm_position=rssm)))
     assert record["controls"]["open_loop_divergence"] == pytest.approx(0.25, abs=1e-9)
 
 
@@ -659,6 +676,22 @@ STUDY = {
 MODELS = {("pixel_ae", 0): DriftingModel, ("frozen_ssl", 0): OracleModel}
 
 
+def _recognisable(real, index: int):
+    """`real` with its three position curves replaced by values no pass over these
+    models can produce: thousands of map units where a real floor is a few and a
+    real rung is tens, each curve on its own offset and each CELL on its own base,
+    so a record paired with another cell's reference is as visible as one that
+    recomputed it. Binary fractions, so nothing is lost to a JSON round trip."""
+    steps = np.arange(1, HORIZON + 1, dtype=np.float64)
+    base = 1000.0 * (index + 1)
+    return replace(
+        real,
+        rssm_position=base + 0.5 + 0.125 * steps,
+        persistence_position=base + 0.25 + 0.0625 * steps,
+        floor_position=base + 0.75 + 0.25 * steps,
+    )
+
+
 def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None):
     """A real `ReplayBuffer`, the real split and the real `measure_cell`; only
     `load_cell` and `prepare_cell` are faked, because they need nine checkpoints.
@@ -667,6 +700,13 @@ def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None):
     directory holding its checkpoint -- the study directory, which the record
     directory is not -- and it hands each cell a DIFFERENT model, so a record
     paired with the wrong cell reads differently.
+
+    The `Prepared` it returns is as the real one is: `common` carries the
+    protocol kwargs `evaluate_rollout` takes, and `reference` is a rollout of the
+    cell's own model over the real split. Its position curves are then made
+    RECOGNISABLE (`_recognisable`), so a record can be asked which pass it
+    carries. `args.references[(arm, seed)]` is `(verified, recomputed)`: what
+    `prepare_cell` handed over, and what a second `evaluate_rollout` would give.
     """
     data = tmp_path / "data"
     data.mkdir()
@@ -680,6 +720,7 @@ def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None):
     out = tmp_path / "burden_out"
     probe = _linear_probe(episodes)
     prepared_for = []
+    references = {}
 
     def fake_load_cell(directory, arm, seed):
         if (arm, seed) in missing:
@@ -695,17 +736,24 @@ def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None):
             return script.EXIT_NO_CHECKPOINTS, None
         if refuse == (cell.arm, cell.seed):
             return script.EXIT_RECORD_MISMATCH, None
+        model = MODELS[(cell.arm, cell.seed)]()
+        common = dict(
+            context=CONTEXT, horizon=HORIZON, seed=cell.seed, device=CPU,
+            feature_backbone=None,
+        )
+        recomputed = evaluate_rollout(model, val, probe, **common)
+        verified = _recognisable(recomputed, index=len(references))
+        references[(cell.arm, cell.seed)] = (verified, recomputed)
         return script.EXIT_OK, types.SimpleNamespace(
-            model=MODELS[(cell.arm, cell.seed)](), embedding_probe=probe,
-            common=dict(feature_backbone=None), context=CONTEXT, horizon=HORIZON,
-            reference=None,
+            model=model, embedding_probe=probe, common=common, context=CONTEXT,
+            horizon=HORIZON, reference=verified,
         )
 
     monkeypatch.setattr(script, "load_cell", fake_load_cell)
     monkeypatch.setattr(script, "prepare_cell", fake_prepare_cell)
     args = types.SimpleNamespace(
         out=out, source=source, data=data, device="cpu", context=None, horizon=None,
-        arms=["pixel_ae", "frozen_ssl"], seeds=[0],
+        arms=["pixel_ae", "frozen_ssl"], seeds=[0], references=references,
     )
     return args, prepared_for
 
@@ -735,6 +783,53 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
     assert (drifting["kl_rate_above_free_bits"], exact["kl_rate_above_free_bits"]) == (0.9126, 0.746)
     assert drifting["git_sha"] == exact["git_sha"] == git_sha()
     assert drifting["seed"] == 0 and drifting["resamples"] == burden.RESAMPLES
+
+
+def test_the_record_carries_the_reference_prepare_cell_verified(tmp_path, monkeypatch):
+    """`prepare_cell` runs a val rollout to PROVE the loaded checkpoint reproduces
+    the study record, and refuses when it does not. The floor and the canonical
+    curves in a record must be THAT rollout's, not a second pass's: a second pass
+    is identical in practice (`evaluate_rollout` seeds its sampler) but nothing
+    checked it, and a record carrying it is no longer provably the reproduction.
+
+    Asked of the record by VALUE. Each cell's `prepared.reference` carries
+    recognisable position curves (`_recognisable`), so the record's `floor`,
+    `rssm` and `persistence` curves equal them exactly, and the burden is read
+    against that floor. Asserting `evaluate_rollout` was never CALLED would pass
+    a refactor that calls it and discards the result; this does not.
+
+    THE MUTATIONS THIS EXISTS FOR, each of which makes `measure_cell` carry a
+    freshly computed `evaluate_rollout` instead of the verified one: a local
+    `reference = evaluate_rollout(model, val_paths, probe, **common)` in
+    `measure_cell` (the `reference=` it was handed is then ignored), and
+    `measure_phase` passing `reference=evaluate_rollout(prepared.model, val,
+    prepared.embedding_probe, **prepared.common)` rather than `prepared.reference`.
+    The fixture REACHES both: `prepared.common` is the real kwargs, so both run,
+    and the freshly computed curves differ from the verified ones (asserted below,
+    so the test cannot pass because the two coincide).
+    """
+    args, _ = _phase_env(tmp_path, monkeypatch)
+    assert script.measure_phase(args) == script.EXIT_OK
+    assert sorted(args.references) == [("frozen_ssl", 0), ("pixel_ae", 0)]
+    curves = ("floor_position", "rssm_position", "persistence_position")
+    for (arm, seed), (verified, recomputed) in args.references.items():
+        carried = load_record(args.out / f"burden_{arm}_seed{seed}.json")
+        for name in curves:
+            # Reached: a second pass gives other numbers, so equality below is
+            # not the two passes agreeing.
+            assert not np.array_equal(getattr(recomputed, name), getattr(verified, name)), name
+            np.testing.assert_array_equal(
+                carried["curves"][name], getattr(verified, name), err_msg=f"{arm} {name}",
+            )
+        # The ladder is read against the verified floor, rung by rung.
+        for k in REGROUNDING_KS:
+            np.testing.assert_array_equal(
+                carried["burden_by_k"][str(k)],
+                np.asarray(carried["curves"]["rungs"][str(k)]) - verified.floor_position,
+            )
+    # Each cell carries ITS OWN verified reference, not another cell's.
+    pixel, frozen = (args.references[key][0] for key in (("pixel_ae", 0), ("frozen_ssl", 0)))
+    assert not np.array_equal(pixel.floor_position, frozen.floor_position)
 
 
 def test_the_phase_scores_the_studys_own_validation_split(tmp_path, monkeypatch):

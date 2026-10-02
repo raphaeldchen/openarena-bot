@@ -16,8 +16,9 @@ TWO AXES, NEVER CONFLATED. `k` is the RE-GROUNDING PERIOD, over
 
 PER CELL, THE RECORD CARRIES:
 
-  curves          `evaluate_rollout`'s canonical position curves and every rung
-                  of the ladder (`regrounding_sweep`), plus the baseline's mean.
+  curves          the canonical position curves of the reference `prepare_cell`
+                  VERIFIED against the study record, and every rung of the
+                  ladder (`regrounding_sweep`), plus the baseline's mean.
   burden_by_k     `rung(k) - floor`, per horizon step, for every k.
   compounding_by_k `rung(k) - rung(1)`, per horizon step, for every k.
   margin          `(point, ci_low, ci_high)` of the mean `motion_margin` at every
@@ -26,7 +27,7 @@ PER CELL, THE RECORD CARRIES:
                   reader can redraw them.
   controls        four numbers with known answers, MEASURED and never asserted:
                   the identity residual, the k=horizon rung's divergence from
-                  `evaluate_rollout` (0.0), whether k=1 collapsed onto the floor
+                  that verified reference (0.0), whether k=1 collapsed onto the floor
                   (False), and the k=1 rung's compounding (0.0).
   base_control    the median true one-step displacement against the median floor
                   error at `DECISION_H`: if the agent barely moved, no method
@@ -65,10 +66,21 @@ LOADING IS `trust_horizon.py`'s: `load_cell` and `prepare_cell` are imported by
 path through `_sibling`, so the checkpoint is loaded with
 `trust_horizon.load_checkpoint_model`, the embedding probe is refit with
 `fit_probes` at the rollout's own context/horizon and at the cell's seed (exactly
-as `diagnose_dynamics.py` does), the split and the protocol are checked, and
-`evaluate_rollout` is shown to reproduce the study record -- all before a pass is
-paid for. This module holds its own copy of every class `_sibling` defines; never
-catch another importer's copy of `CellMissing`.
+as `diagnose_dynamics.py` does), the split and the protocol are checked, and the
+val rollout `prepare_cell` runs is shown to reproduce the study record -- all
+before a pass of this script's own is paid for. This module holds its own copy of
+every class `_sibling` defines; never catch another importer's copy of
+`CellMissing`.
+
+THE REFERENCE IS THE ONE THAT PASSED THAT CHECK, NOT A SECOND PASS. `prepare_cell`
+refuses (`EXIT_RECORD_MISMATCH`) unless its val rollout reproduces the study record
+within the bound of spec 2.4, and it hands that rollout back as
+`Prepared.reference`. `measure_phase` passes it to `measure_cell`, which reads the
+floor and the canonical curves off it and runs `evaluate_rollout` itself NOWHERE.
+A second pass would be identical in practice -- `evaluate_rollout` seeds its
+sampler -- but it would be a pass nothing had checked, and the curves written into
+every record would no longer be provably the ones that reproduced the study. This
+module therefore does not import `evaluate_rollout`.
 """
 
 import argparse
@@ -90,7 +102,7 @@ from mbfps.eval.burden import (
 )
 from mbfps.eval.diagnostics import REGROUNDING_KS, regrounding_sweep
 from mbfps.eval.probe import probe_targets
-from mbfps.eval.rollout import evaluate_rollout
+from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.study import SPLIT_SEED, git_sha, write_record
 from mbfps.eval.windows import window_starts
 from mbfps.utils.config import ARMS
@@ -222,20 +234,27 @@ def _require_a_readable_protocol(arm: str, seed: int, horizon: int, ks) -> None:
 
 
 def measure_cell(
-    model, val_paths, probe, *, arm: str, seed: int, context: int, horizon: int,
-    ks, device, feature_backbone, study_record: dict,
+    model, val_paths, probe, *, reference: RolloutResult, arm: str, seed: int,
+    context: int, horizon: int, ks, device, feature_backbone, study_record: dict,
 ) -> dict:
     """One cell: the floor, every rung, the baseline, the intervals, the controls.
 
-    IN THIS ORDER: `evaluate_rollout` for the floor and the canonical curves;
-    `regrounding_sweep` for every rung; `baseline_rows` LAST, so it cannot sit
-    between the sweep's arms; the alignment refusal; the finiteness refusal; the
-    per-window margin; the intervals; the controls; the base control.
+    `reference` IS `Prepared.reference`, THE ROLLOUT `prepare_cell` VERIFIED. It
+    supplies the floor and the canonical curves, and this function runs no
+    `evaluate_rollout` of its own: `prepare_cell` proved THAT pass reproduces the
+    study record (and refused with `EXIT_RECORD_MISMATCH` when it did not), so
+    the floor and the curves in the record are provably the ones that passed the
+    provenance check, where a second pass would be one nothing had checked.
 
-    `probe` IS THE ONE `fit_probes` returned, handed to BOTH passes: the floor
-    and the rungs are read through the same embedding probe, or the margin
-    compares two differently fitted pipelines -- the drift `evaluate_rollout`'s
-    own comments record as having destroyed a signal once.
+    IN THIS ORDER: `regrounding_sweep` for every rung; `baseline_rows` LAST, so
+    it cannot sit between the sweep's arms; the alignment refusal; the finiteness
+    refusal; the per-window margin; the intervals; the controls; the base control.
+
+    `probe` IS THE ONE `fit_probes` returned, and `reference` was read through
+    that same probe (`prepare_cell` fits it and passes it to its own rollout), so
+    the floor and the rungs are read through the same embedding probe, or the
+    margin compares two differently fitted pipelines -- the drift
+    `evaluate_rollout`'s own comments record as having destroyed a signal once.
 
     THE K=1 RUNG IS THE ONE-STEP ARM. `regrounding_sweep`'s `k=1` re-grounds
     after every step and imagines one prior step from a posterior-grounded state,
@@ -264,7 +283,6 @@ def measure_cell(
         context=context, horizon=horizon, seed=seed, device=device,
         feature_backbone=feature_backbone,
     )
-    reference = evaluate_rollout(model, val_paths, probe, **common)
     sweep = regrounding_sweep(model, val_paths, probe, ks=ks, **common)
     rows, labels = baseline_rows(val_paths, context=context, horizon=horizon)
 
@@ -385,6 +403,10 @@ def measure_phase(args) -> int:
     the write. The first non-`EXIT_OK` status is returned and nothing is written
     for the cell that earned it.
 
+    THE FLOOR AND THE CURVES COME FROM `prepared.reference`, the rollout
+    `prepare_cell` verified against the study record, and are not recomputed: a
+    second pass would be one the provenance check never saw.
+
     CELLS ARE LOADED FROM `args.source`, NOT `args.out`. `--out` is this script's
     own record directory and holds none of the nine checkpoints.
 
@@ -410,8 +432,9 @@ def measure_phase(args) -> int:
         if prepared is None:
             return status
         record = measure_cell(
-            prepared.model, val, prepared.embedding_probe, arm=cell.arm,
-            seed=cell.seed, context=prepared.context, horizon=prepared.horizon,
+            prepared.model, val, prepared.embedding_probe,
+            reference=prepared.reference, arm=cell.arm, seed=cell.seed,
+            context=prepared.context, horizon=prepared.horizon,
             ks=REGROUNDING_KS, device=device,
             feature_backbone=prepared.common["feature_backbone"],
             study_record=cell.record,
