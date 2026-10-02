@@ -634,21 +634,34 @@ def test_the_interval_clusters_on_episodes_and_requires_its_seed():
     episodes narrows the interval; and `seed: int = 0` lets every cell share
     one seed, which is how a previous milestone shipped nine identical draws.
     """
+    # SIX episodes, not two. MEASURED: with two episodes the resample admits
+    # only THREE distinct replicate values, so all 20 seeds I tried return
+    # byte-identical bounds and the seed assertion below is dead. Six episodes
+    # give 216 distinct replicates and no other seed reproduces seed 0's bounds.
     rng = np.random.default_rng(0)
-    # Two episodes with very different margins, so clustering matters.
     window_margin = np.vstack([
-        rng.normal(+6.0, 0.05, size=(40, 3)),
-        rng.normal(-6.0, 0.05, size=(40, 3)),
+        rng.normal(mean, 0.05, size=(20, 3))
+        for mean in (6.0, 4.0, 2.0, -2.0, -4.0, -6.0)
     ])
-    groups = np.array([0] * 40 + [1] * 40)
+    groups = np.repeat(np.arange(6), 20)
 
     point, low, high = margin_interval(
         window_margin, groups, h=1, resamples=400, seed=0
     )
     assert point == pytest.approx(window_margin[:, 0].mean(), abs=1e-12)
-    # Clustered on 2 episodes, the interval must straddle both regimes and so
-    # must be wide; a window-level bootstrap would collapse it near the mean.
+    # Clustered on episodes the interval spans the spread of episode means; a
+    # window-level bootstrap would collapse it near the mean.
     assert high - low > 5.0
+
+    # The fixture must discriminate, and this test asserts that about itself:
+    # a resample with too few clusters yields too few distinct replicates for
+    # any percentile to choose between, and every assertion below then holds
+    # for the wrong reason.
+    replicates = {
+        margin_interval(window_margin, groups, h=1, resamples=400, seed=s)[1:]
+        for s in range(8)
+    }
+    assert len(replicates) > 1, "the bounds do not move with the seed at all"
 
     # Different seeds move the BOUNDS but never the point estimate.
     other = margin_interval(window_margin, groups, h=1, resamples=400, seed=1)
