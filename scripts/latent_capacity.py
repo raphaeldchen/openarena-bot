@@ -24,7 +24,7 @@ PER CELL, FROM ONE GATHER:
                   excluded, with an interval of its own. `live` is how many
                   columns survived that exclusion.
   prior_bits      the same estimator on `prior_probs`. A COMPANION THAT DECIDES
-                  NOTHING, free from the same forward pass, and spec 3.3
+                  NOTHING, free from the same forward pass, and spec 2.4
                   requires it per cell: the prior does not see `enc(t)`, so it
                   is the information the prior's distribution carries through
                   `h` alone, which is what M3g's "the prior is the failing
