@@ -680,6 +680,47 @@ class GainSplit:
         return counts.pop()
 
 
+def _fit_and_score(fit_x, fit_y, select_x, select_y, score_x, score_y):
+    """Fit one arm on `fit`, select its ridge on `select`, score it on `score`.
+
+    The three-split discipline for a single feature set, factored out because
+    `gain_from_blocks` needs it twice (joint and base) and
+    `contrast_from_blocks` needs it twice again (two joints). `select_x is
+    None` takes `fit_probe`'s default penalty, which is unbiased too, just
+    weaker.
+
+    Returns `(predicted, r2, ridge)` on the scored rows.
+    """
+    probe = (
+        fit_probe(fit_x, fit_y)
+        if select_x is None
+        else fit_probe(fit_x, fit_y, select_x, select_y)
+    )
+    predicted = apply_probe(probe, score_x)
+    return predicted, _mean_r2(predicted, score_y), probe["ridge"]
+
+
+def _validate_groups(groups, n: int) -> tuple[np.ndarray, int]:
+    """One `groups` label per scored row, and enough units to resample.
+
+    Shared by `gain_from_blocks` and `contrast_from_blocks` so the two
+    diagnostics refuse identically-shaped inputs with identical wording.
+    """
+    groups_arr = np.asarray(groups)
+    if groups_arr.shape != (n,):
+        raise ValueError(
+            f"groups must be one label per scored row; got {groups_arr.shape} "
+            f"for {n} rows"
+        )
+    n_groups = int(np.unique(groups_arr).size)
+    if n_groups < 2:
+        raise ValueError(
+            "a bootstrap interval needs at least two resampling units (distinct "
+            f"`groups` labels); got {n_groups}"
+        )
+    return groups_arr, n_groups
+
+
 def gain_from_blocks(
     fit: GainSplit,
     select: GainSplit | None,
@@ -718,40 +759,29 @@ def gain_from_blocks(
     confidence rather than "one resampling unit, no information".
     """
     n_scored = score.rows()
-    groups_arr = np.asarray(groups)
-    if groups_arr.shape != (n_scored,):
-        raise ValueError(
-            f"groups must be one label per scored row; got {groups_arr.shape} "
-            f"for {n_scored} rows"
-        )
-    n_groups = int(np.unique(groups_arr).size)
-    if n_groups < 2:
-        raise ValueError(
-            "a bootstrap interval needs at least two resampling units (distinct "
-            f"`groups` labels); got {n_groups}"
-        )
+    groups_arr, n_groups = _validate_groups(groups, n_scored)
     fit.rows()
     joint_fit, base_fit = fit.joint(), np.asarray(fit.base, dtype=np.float64)
     joint_score, base_score = score.joint(), np.asarray(score.base, dtype=np.float64)
     target_fit = np.asarray(fit.target, dtype=np.float64)
     target_score = np.asarray(score.target, dtype=np.float64)
 
-    if select is None:
-        joint_probe = fit_probe(joint_fit, target_fit)
-        base_probe = fit_probe(base_fit, target_fit)
-    else:
+    select_target = (
+        None if select is None else np.asarray(select.target, dtype=np.float64)
+    )
+    if select is not None:
         select.rows()
-        select_target = np.asarray(select.target, dtype=np.float64)
-        joint_probe = fit_probe(joint_fit, target_fit, select.joint(), select_target)
-        base_probe = fit_probe(
-            base_fit, target_fit,
-            np.asarray(select.base, dtype=np.float64), select_target,
-        )
-
-    joint_predicted = apply_probe(joint_probe, joint_score)
-    base_predicted = apply_probe(base_probe, base_score)
-    joint_r2 = _mean_r2(joint_predicted, target_score)
-    base_r2 = _mean_r2(base_predicted, target_score)
+    joint_predicted, joint_r2, joint_ridge = _fit_and_score(
+        joint_fit, target_fit,
+        None if select is None else select.joint(), select_target,
+        joint_score, target_score,
+    )
+    base_predicted, base_r2, base_ridge = _fit_and_score(
+        base_fit, target_fit,
+        None if select is None else np.asarray(select.base, dtype=np.float64),
+        select_target,
+        base_score, target_score,
+    )
     low, high = _block_bootstrap_ci(
         joint_predicted, base_predicted, target_score,
         groups=groups_arr, resamples=resamples, confidence=confidence, seed=seed,
@@ -765,8 +795,92 @@ def gain_from_blocks(
         "confidence": confidence,
         "n_scored_windows": n_groups,
         "ridge_selected": select is not None,
-        "joint_ridge": joint_probe["ridge"],
-        "embedding_ridge": base_probe["ridge"],
+        "joint_ridge": joint_ridge,
+        "embedding_ridge": base_ridge,
+    }
+
+
+def contrast_from_blocks(
+    a, b, *, groups: np.ndarray, resamples: int = 1000,
+    confidence: float = 0.95, seed: int = 0,
+) -> dict:
+    """`R2([base (+) A]) - R2([base (+) B])` -- the base cancels outright.
+
+    `a` and `b` are each a `(fit, select, score)` triple of `GainSplit`s. Both
+    arms MUST carry the same base on the same rows: that is what makes this a
+    contrast between the two BLOCKS rather than two unrelated levels
+    subtracted, and it is why the difference of gains equals the difference of
+    joint R^2 with no base term surviving.
+
+    `_block_bootstrap_ci` already computes `r2(A) - r2(B)` per resample, so the
+    interval needs no new statistic -- only the two arms' scored predictions.
+
+    SIGNED, and the sign is the reading. Reading F is two-sided: a negative
+    contrast means B's block beats A's, which is a finding about B rather than
+    an absence. Swapping the arms negates the result, pinned by test.
+    """
+    a_fit, a_select, a_score = a
+    b_fit, b_select, b_score = b
+    n = a_score.rows()
+    target_score = np.asarray(a_score.target, dtype=np.float64)
+    b_target = np.asarray(b_score.target, dtype=np.float64)
+    # `GainSplit` carries no original row indices, only already-selected
+    # arrays -- so row alignment can only be verified by content. `target` is
+    # the field invariant to the caller's choice of block and base, so content
+    # equality is the strongest row-identity signal available given `GainSplit`
+    # carries no row indices. A collision is not a realistic concern for
+    # continuous position data.
+    b_rows = b_score.rows()
+    if b_rows != n:
+        raise ValueError(
+            f"both arms must be scored on the same rows; got {n} and {b_rows}"
+        )
+    if target_score.shape != b_target.shape or not np.array_equal(target_score, b_target):
+        raise ValueError(
+            f"both arms must be scored on the same rows; got same-length "
+            f"targets with different contents"
+        )
+    a_base = np.asarray(a_score.base, dtype=np.float64)
+    b_base = np.asarray(b_score.base, dtype=np.float64)
+    if a_base.shape != b_base.shape or not np.array_equal(a_base, b_base):
+        raise ValueError(
+            "both arms must carry the same base; the contrast is only a "
+            "comparison of the two BLOCKS because the base cancels"
+        )
+    if (a_select is None) != (b_select is None):
+        raise ValueError(
+            "both arms must use the same ridge-selection policy because the "
+            "contrast compares two blocks under one methodology"
+        )
+    groups_arr, n_groups = _validate_groups(groups, n)
+
+    def arm(fit, select, score):
+        select_target = (
+            None if select is None else np.asarray(select.target, dtype=np.float64)
+        )
+        return _fit_and_score(
+            fit.joint(), np.asarray(fit.target, dtype=np.float64),
+            None if select is None else select.joint(), select_target,
+            score.joint(), target_score,
+        )
+
+    a_predicted, a_r2, a_ridge = arm(a_fit, a_select, a_score)
+    b_predicted, b_r2, b_ridge = arm(b_fit, b_select, b_score)
+    low, high = _block_bootstrap_ci(
+        a_predicted, b_predicted, target_score,
+        groups=groups_arr, resamples=resamples, confidence=confidence, seed=seed,
+    )
+    return {
+        "contrast": a_r2 - b_r2,
+        "a_r2": a_r2,
+        "b_r2": b_r2,
+        "ci_low": low,
+        "ci_high": high,
+        "confidence": confidence,
+        "n_scored_windows": n_groups,
+        "a_ridge": a_ridge,
+        "b_ridge": b_ridge,
+        "ridge_selected": a_select is not None,
     }
 
 

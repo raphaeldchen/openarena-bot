@@ -1157,3 +1157,39 @@ def test_ladder_says_it_decides_nothing_on_its_own():
     habit across would misread this table without the caption."""
     caption = format_ladder(_inputs({})).splitlines()[0]
     assert "any horizon counts" in caption
+
+
+def test_reading_retention_defaults_to_the_module_z_bearing_set():
+    """M3j's records must keep reading exactly as recorded. The default is the
+    module constant, so every existing caller is unaffected by the keyword
+    existing at all."""
+    import inspect
+    from mbfps.eval.retention import Z_BEARING_RUNGS as shipped
+    sig = inspect.signature(reading_retention)
+    assert sig.parameters["z_bearing"].default == shipped
+    assert sig.parameters["z_bearing"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert shipped == ("stochastic", "full"), (
+        "the module constant must NOT be edited -- M3k corrects it by passing "
+        "the keyword, not by changing what M3j's records read under"
+    )
+
+
+def test_reading_retention_honours_a_corrected_z_bearing_set():
+    """M3j's own results recorded that `full` is h + z and so cannot attribute a
+    clearance to z, which made MOTION_RETAINED reachable on h alone. With only
+    `stochastic` z-bearing, a state where `full` and `deterministic` clear but
+    `stochastic` does not must read BOTTLENECK_LOSS, not MOTION_RETAINED."""
+    inputs = _inputs({("translation", 4, "full"): 0.2,
+                      ("translation", 4, "deterministic"): 0.2})
+    assert reading_retention(inputs).status == "MOTION_RETAINED"
+    corrected = reading_retention(inputs, z_bearing=("stochastic",))
+    assert corrected.status == "BOTTLENECK_LOSS"
+    assert corrected.surviving == "deterministic"
+
+
+def test_reading_retention_rejects_a_z_bearing_rung_that_is_not_a_rung():
+    """A typo in the corrected tuple would silently make nothing z-bearing and
+    read BOTTLENECK_LOSS on every input."""
+    inputs = _inputs({("translation", 4, "stochastic"): 0.2})
+    with pytest.raises(ValueError, match="not a rung"):
+        reading_retention(inputs, z_bearing=("stocastic",))
