@@ -23,6 +23,9 @@ prediction_burden.py` owns the model, the device and the record schema.
 
 import numpy as np
 
+from mbfps.eval.pooling import episode_bootstrap, percentile_interval
+from mbfps.eval.probe import position_error
+
 DECISION_H: int = 45
 """The horizon the status is read at -- the M3 gate's own horizon.
 
@@ -167,3 +170,114 @@ def identity_residual(
     whole = burden(curve_k, floor)
     parts = burden(curve_one, floor) + compounding(curve_k, curve_one)
     return float(np.max(np.abs(whole - parts)))
+
+
+def scored_targets(window_targets: np.ndarray) -> np.ndarray:
+    """The rows the model is scored on, given the window's `horizon + 1` rows.
+
+    THE SLICE, stated so the off-by-one is hard to write. `evaluate_rollout`
+    scores horizon step `j + 1` against
+    `privileged[start + context + 1 + j]`, and its comment records that this
+    was verified with an oracle model rather than argued: with
+    `start + context` instead, a PERFECT predictor carries a constant error of
+    one step of true displacement at every horizon step. The caller therefore
+    passes `privileged[start + context : start + need + 1]`, whose row 0 is the
+    last CONTEXT frame -- so the scored rows are `[1:]`, and the baseline and
+    the model are scored on the identical frames by construction.
+    """
+    window_targets = np.asarray(window_targets, dtype=np.float64)
+    if window_targets.ndim != 2 or window_targets.shape[0] < 2:
+        raise ValueError(
+            "window_targets must be (horizon + 1, K) with at least two rows; "
+            f"got {window_targets.shape}"
+        )
+    return window_targets[1:]
+
+
+def one_step_persistence(window_targets: np.ndarray) -> np.ndarray:
+    """The error of predicting each scored frame by the frame before it.
+
+    This IS the true one-step displacement -- ground truth, no model involved,
+    which is what makes `motion_margin` a level rather than a difference of two
+    estimates.
+
+    NOT the recorded `persistence_position`. That copies the position at `t`,
+    the last frame the OPEN LOOP saw, so comparing it with the k=1 rung -- which
+    is re-grounded every step and has seen `h - 1` frames more -- would hand the
+    rung a win on information advantage rather than on prediction. Spec 2.2
+    forbids that comparison by name.
+    """
+    window_targets = np.asarray(window_targets, dtype=np.float64)
+    scored = scored_targets(window_targets)
+    return position_error(window_targets[:-1], scored)
+
+
+def motion_margin(window_targets: np.ndarray, curve_one: np.ndarray) -> np.ndarray:
+    """`one_step_persistence - the k=1 rung`, per horizon step.
+
+    Positive means one prior step from a posterior-grounded state beats
+    assuming the agent did not move.
+    """
+    baseline, curve_one = _checked_pair(
+        one_step_persistence(window_targets), curve_one
+    )
+    return baseline - curve_one
+
+
+def margin_interval(
+    window_margin: np.ndarray,
+    groups: np.ndarray,
+    *,
+    h: int,
+    resamples: int = RESAMPLES,
+    seed: int,
+) -> tuple[float, float, float]:
+    """`(point, ci_low, ci_high)` for the mean margin at horizon step `h`.
+
+    THE RESAMPLING UNIT IS THE EPISODE. There are 229 windows over 24 episodes
+    on every shipped cell, and consecutive Doom frames are near-duplicates, so
+    a window-level bootstrap counts correlated observations as independent ones
+    and returns an interval several times too narrow.
+
+    `seed` IS KEYWORD-REQUIRED AND HAS NO DEFAULT. A defaulted seed is how a
+    previous milestone shipped every cell drawing the same resamples; the
+    point estimate is seed-free, so only the bounds can move, and a reader
+    cannot tell nine identical draws from nine independent ones by looking.
+
+    `groups` must carry one label per window. A record whose ladder carried no
+    clustering stores `windows.episode` as null, and its own comment requires a
+    reader to refuse rather than treat every window as its own episode --
+    falling back to `arange(n)` here would convert this into the window-level
+    bootstrap the first paragraph rules out.
+    """
+    window_margin = np.asarray(window_margin, dtype=np.float64)
+    groups = np.asarray(groups)
+    if window_margin.ndim != 2:
+        raise ValueError(
+            f"window_margin must be (windows, horizon); got {window_margin.shape}"
+        )
+    if groups.ndim != 1 or groups.size != window_margin.shape[0]:
+        raise ValueError(
+            "groups must carry one label per window; got "
+            f"{groups.shape} for {window_margin.shape[0]} windows"
+        )
+    if np.unique(groups).size < 2:
+        raise ValueError(
+            "an episode-clustered bootstrap needs at least two episodes; got "
+            f"{np.unique(groups).size}"
+        )
+    if resamples < 1:
+        raise ValueError(f"resamples must be >= 1, got {resamples}")
+
+    column = window_margin[:, h - 1] if 1 <= h <= window_margin.shape[1] else None
+    if column is None:
+        raise ValueError(
+            f"horizon step must be in 1..{window_margin.shape[1]}, got {h}"
+        )
+    point = float(column.mean())
+    replicates = np.array([
+        float(column[index].mean())
+        for index in episode_bootstrap(groups, resamples, seed)
+    ])
+    low, high, _se = percentile_interval(replicates)
+    return point, low, high

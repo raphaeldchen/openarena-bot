@@ -14,6 +14,10 @@ from mbfps.eval.burden import (
     burden,
     compounding,
     identity_residual,
+    margin_interval,
+    motion_margin,
+    one_step_persistence,
+    scored_targets,
 )
 
 
@@ -268,3 +272,361 @@ def test_the_curves_are_coerced_to_float64_before_they_are_subtracted():
     for result in (from_list_left, from_list_right):
         assert result.dtype == np.float64
         assert np.array_equal(result, np.array([2.0, 3.0]))
+
+
+def test_scored_targets_are_the_rows_the_model_is_scored_on():
+    """The baseline and the model MUST be scored on the same frames.
+
+    `evaluate_rollout` scores horizon step j+1 against
+    privileged[start + context + 1 + j]. The caller hands us
+    privileged[start + context : start + need + 1], so row 0 is the last
+    CONTEXT frame and rows 1.. are the model's truth. This test reproduces both
+    slices from one array and asserts they agree.
+
+    THE MUTATION THIS EXISTS FOR: `window_targets[:-1]` instead of
+    `window_targets[1:]`, which scores the baseline one frame early and makes
+    `motion_margin` a comparison of two different frames.
+    """
+    context, horizon, start = 5, 4, 7
+    need = context + horizon
+    privileged = np.arange(40.0).reshape(20, 2)
+    privileged = np.hstack([privileged, np.zeros((20, 2))])  # (N, 4) targets
+
+    window_targets = privileged[start + context : start + need + 1]
+    model_truth = privileged[start + context + 1 : start + need + 1]
+
+    assert np.array_equal(scored_targets(window_targets), model_truth)
+    assert scored_targets(window_targets).shape[0] == horizon
+
+
+def test_one_step_persistence_is_the_true_one_step_displacement():
+    """Its error IS the displacement, known from ground truth with no model.
+
+    THE MUTATION THIS EXISTS FOR: comparing each row to row 0 (the t-anchored
+    persistence the record already carries) instead of to the row before it.
+    That baseline is RIGGED for this comparison -- it has seen h-1 fewer frames
+    than the k=1 rung -- and spec 2.2 forbids it by name.
+    """
+    # Moves (3, 4) then (0, 0) then (6, 8): displacements 5, 0, 10.
+    xy = np.array([[0.0, 0.0], [3.0, 4.0], [3.0, 4.0], [9.0, 12.0]])
+    window_targets = np.hstack([xy, np.zeros((4, 2))])
+    assert one_step_persistence(window_targets) == pytest.approx([5.0, 0.0, 10.0])
+
+    # The rigged baseline would give cumulative distance from row 0 instead.
+    rigged = np.linalg.norm(xy[1:] - xy[0], axis=1)
+    assert rigged == pytest.approx([5.0, 5.0, 15.0])
+    assert one_step_persistence(window_targets) != pytest.approx(rigged)
+
+
+def test_motion_margin_is_positive_when_the_prior_beats_stillness():
+    """Positive means one prior step beats assuming no motion."""
+    xy = np.array([[0.0, 0.0], [3.0, 4.0], [3.0, 4.0], [9.0, 12.0]])
+    window_targets = np.hstack([xy, np.zeros((4, 2))])
+    # Displacements are 5, 0, 10. A prior that errs by 2, 1, 3 beats stillness
+    # at steps 1 and 3 and loses at step 2, where the agent did not move.
+    curve_one = np.array([2.0, 1.0, 3.0])
+    assert motion_margin(window_targets, curve_one) == pytest.approx([3.0, -1.0, 7.0])
+
+
+def test_motion_margin_refuses_a_curve_that_is_not_the_scored_length():
+    """THE MUTATION THIS EXISTS FOR: dropping the guard. A curve of length
+    horizon+1 would broadcast against a baseline of length horizon only by
+    accident of the numbers, and silently not at all otherwise.
+    """
+    window_targets = np.zeros((5, 4))
+    with pytest.raises(ValueError, match="same length"):
+        motion_margin(window_targets, np.zeros(5))
+
+
+def test_the_interval_clusters_on_episodes_and_requires_its_seed():
+    """The resampling unit is the EPISODE, not the window: 229 windows over 24
+    episodes, and consecutive Doom frames are near-duplicates, so a
+    window-level bootstrap returns an interval several times too narrow.
+
+    THE MUTATION THIS EXISTS FOR, TWICE OVER: resampling windows instead of
+    episodes narrows the interval; and `seed: int = 0` lets every cell share
+    one seed, which is how a previous milestone shipped nine identical draws.
+    """
+    # SIX episodes, not two. MEASURED: with two episodes the resample admits
+    # only THREE distinct replicate values, so all 20 seeds I tried return
+    # byte-identical bounds and the seed assertion below is dead. Six episodes
+    # give 216 distinct replicates and no other seed reproduces seed 0's bounds.
+    rng = np.random.default_rng(0)
+    window_margin = np.vstack([
+        rng.normal(mean, 0.05, size=(20, 3))
+        for mean in (6.0, 4.0, 2.0, -2.0, -4.0, -6.0)
+    ])
+    groups = np.repeat(np.arange(6), 20)
+
+    point, low, high = margin_interval(
+        window_margin, groups, h=1, resamples=400, seed=0
+    )
+    assert point == pytest.approx(window_margin[:, 0].mean(), abs=1e-12)
+    # Clustered on episodes the interval spans the spread of episode means; a
+    # window-level bootstrap would collapse it near the mean.
+    assert high - low > 5.0
+
+    # The fixture must discriminate, and this test asserts that about itself:
+    # a resample with too few clusters yields too few distinct replicates for
+    # any percentile to choose between, and every assertion below then holds
+    # for the wrong reason.
+    replicates = {
+        margin_interval(window_margin, groups, h=1, resamples=400, seed=s)[1:]
+        for s in range(8)
+    }
+    assert len(replicates) > 1, "the bounds do not move with the seed at all"
+
+    # Different seeds move the BOUNDS but never the point estimate.
+    other = margin_interval(window_margin, groups, h=1, resamples=400, seed=1)
+    assert other[0] == pytest.approx(point, abs=1e-12)
+    assert (other[1], other[2]) != (low, high)
+    # The same seed twice is identical.
+    again = margin_interval(window_margin, groups, h=1, resamples=400, seed=0)
+    assert (again[1], again[2]) == (low, high)
+
+    # `seed` has no default.
+    import inspect
+    sig = inspect.signature(margin_interval)
+    assert sig.parameters["seed"].default is inspect.Parameter.empty
+    assert sig.parameters["seed"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_interval_refuses_what_it_cannot_cluster():
+    """`windows.episode` is null on a record whose ladder carried no
+    clustering, and the record's own comment says a reader must REFUSE rather
+    than treat every window as its own episode.
+
+    THE MUTATION THIS EXISTS FOR: falling back to `np.arange(n)` for missing
+    labels, which silently converts an episode bootstrap into a window one.
+    """
+    window_margin = np.zeros((6, 3))
+    with pytest.raises(ValueError, match="one label per window"):
+        margin_interval(window_margin, np.array([0, 0, 1]), h=1, resamples=10, seed=0)
+    with pytest.raises(ValueError, match="at least two episodes"):
+        margin_interval(
+            window_margin, np.zeros(6, dtype=int), h=1, resamples=10, seed=0
+        )
+
+
+def test_the_recorded_confidence_matches_what_the_estimator_takes():
+    """CONFIDENCE describes `percentile_interval`; it does not configure it.
+
+    THE MUTATION THIS EXISTS FOR: changing `percentile_interval`'s percentiles
+    without changing CONFIDENCE, which would leave every record naming a level
+    the estimator did not take -- the defect M3l shipped and then fixed.
+    """
+    from mbfps.eval.pooling import percentile_interval
+
+    replicates = np.arange(10001, dtype=np.float64)
+    low, high, _ = percentile_interval(replicates)
+    tail = (1.0 - CONFIDENCE) / 2.0
+    assert low == pytest.approx(np.percentile(replicates, 100 * tail))
+    assert high == pytest.approx(np.percentile(replicates, 100 * (1 - tail)))
+
+
+def test_scored_targets_refuses_what_is_not_a_window_and_returns_float64():
+    """A window is (horizon + 1, K) with at least two rows. The two operands of
+    the guard are exercised separately: a 1-D array has plenty of elements but
+    the wrong rank, and a single row has the right rank but nothing to score.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping either operand of the guard
+    (`< 2` -> `< 1` lets a single row through, returning an empty array that
+    every downstream mean turns into NaN), and dropping the float64 coercion.
+    An unsigned-integer window left uncoerced would wrap on subtraction.
+    """
+    with pytest.raises(ValueError, match="at least two rows"):
+        scored_targets(np.zeros(5))  # rank 1, five elements
+    with pytest.raises(ValueError, match="at least two rows"):
+        scored_targets(np.zeros((1, 4)))  # rank 2, one row
+    with pytest.raises(ValueError, match="at least two rows"):
+        scored_targets(np.zeros((0, 4)))
+
+    integers = np.array([[0, 0], [3, 4], [9, 12]], dtype=np.uint8)
+    scored = scored_targets(integers)
+    assert scored.dtype == np.float64
+    assert np.array_equal(scored, np.array([[3.0, 4.0], [9.0, 12.0]]))
+
+    from_list = scored_targets([[0, 0], [3, 4], [9, 12]])
+    assert from_list.dtype == np.float64
+    assert np.array_equal(from_list, np.array([[3.0, 4.0], [9.0, 12.0]]))
+
+
+def test_one_step_persistence_coerces_before_it_subtracts():
+    """The window arrives from `probe_targets`, but a plain list has no `.shape`
+    and an unsigned-integer window WRAPS: uint8 0 - 3 is 253, so a baseline of
+    displacement 5 would read 356.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping the `np.asarray` coercion (the list
+    case), and dropping `dtype=np.float64` from BOTH coercions (the uint8 case).
+    Dropping `dtype` from ONE of them is an equivalent mutant: NumPy upcasts the
+    uint8 operand against the other's float64, so nothing wraps -- not pinned.
+    """
+    xy = np.array([[0, 0], [3, 4], [3, 4], [9, 12]], dtype=np.uint8)
+    window_targets = np.hstack([xy, np.zeros((4, 2), dtype=np.uint8)])
+    # The coordinates INCREASE, so predictor - truth is negative at every step
+    # that moves -- exactly where unsigned arithmetic wraps.
+    result = one_step_persistence(window_targets)
+    assert result.dtype == np.float64
+    assert result == pytest.approx([5.0, 0.0, 10.0])
+
+    as_lists = window_targets.astype(float).tolist()
+    assert one_step_persistence(as_lists) == pytest.approx([5.0, 0.0, 10.0])
+
+
+def test_motion_margin_refuses_a_broadcastable_curve_and_a_nonfinite_value():
+    """The brief's length test uses a length-5 curve against a length-4
+    baseline, which NumPy rejects with its OWN ValueError -- so a dropped guard
+    is caught only because the message differs. A length-1 curve is the real
+    hazard: it broadcasts against any baseline without complaint, and a k=1
+    curve read from the wrong record key looks exactly like that.
+
+    The other half is a non-finite value. A NaN in the k=1 curve (the right
+    operand) or in the ground-truth window (which makes the baseline NaN) would
+    otherwise flow into the per-window mean and surface as a NaN interval with
+    no indication of which input was bad.
+
+    THE MUTATION THIS EXISTS FOR: replacing the shared `_checked_pair` call
+    with a bare length comparison, which keeps the length test green and loses
+    the finiteness guard.
+    """
+    window_targets = np.zeros((5, 4))  # horizon 4, so the baseline has length 4
+    for length in (1, 3):
+        with pytest.raises(ValueError, match="same length"):
+            motion_margin(window_targets, np.zeros(length))
+
+    for bad in (np.nan, np.inf, -np.inf):
+        for position in range(4):
+            curve_one = np.ones(4)
+            curve_one[position] = bad
+            with pytest.raises(ValueError, match="finite"):
+                motion_margin(window_targets, curve_one)
+
+    corrupt = np.zeros((5, 4))
+    corrupt[2, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        motion_margin(corrupt, np.ones(4))
+
+    # A plain list is a legitimate curve, and the result is float64.
+    margin = motion_margin(window_targets, [1, 2, 3, 4])
+    assert margin.dtype == np.float64
+    assert np.array_equal(margin, np.array([-1.0, -2.0, -3.0, -4.0]))
+
+
+def test_the_interval_is_the_percentile_interval_of_the_clustered_replicate_means():
+    """The reduction, the column, the seed and the resample count, pinned
+    against an oracle assembled from the two Task-1 pieces the interval is
+    defined in terms of.
+
+    The brief's interval test reads only `h=1`, so a hard-coded column 0 passes
+    it, and its fixture never distinguishes a mean from a median. This one reads
+    `h=3` of four columns, uses episodes of UNEQUAL size (3, 7, 4, 9, 5 windows)
+    so that the window-pooled mean the replicates take differs from the mean of
+    episode means, and then asserts about itself that each alternative reading
+    lands on different bounds. MEASURED: the closest alternative (400 -> 2000
+    resamples) moves a bound by 0.404, a different seed by 0.615, and every other
+    alternative by more than 2.6; the point estimate differs from the mean of
+    episode means by 2.26. The assertion floor is 0.1, a quarter of the closest.
+
+    THE MUTATIONS THIS EXISTS FOR: `h - 1` -> `h` or a hard-coded column;
+    `.mean()` -> `.median()` or `.sum()` in the replicate; `seed` or `resamples`
+    not reaching the bootstrap; and a point estimate taken as the mean of episode
+    means rather than of the windows.
+    """
+    from mbfps.eval.pooling import episode_bootstrap, percentile_interval
+
+    rng = np.random.default_rng(3)
+    sizes = (3, 7, 4, 9, 5)
+    episode_mean = np.array([5.0, -1.0, 2.0, -4.0, 1.0])
+    column_scale = np.array([1.0, -0.5, 2.0, 0.25])  # columns are not interchangeable
+    window_margin = np.vstack([
+        episode_mean[episode] * column_scale + rng.normal(0.0, 0.3, size=(size, 4))
+        for episode, size in enumerate(sizes)
+    ])
+    groups = np.repeat(np.arange(5), sizes)
+    h, resamples, seed = 3, 400, 5
+
+    def oracle(column, labels, draws, draw_seed, reduce=np.mean):
+        replicates = np.array([
+            reduce(column[index]) for index in episode_bootstrap(labels, draws, draw_seed)
+        ])
+        low, high, _se = percentile_interval(replicates)
+        return low, high
+
+    column = window_margin[:, h - 1]
+    expected = oracle(column, groups, resamples, seed)
+    point, low, high = margin_interval(
+        window_margin, groups, h=h, resamples=resamples, seed=seed
+    )
+    assert point == pytest.approx(column.mean(), abs=1e-12)
+    assert (low, high) == pytest.approx(expected, abs=1e-12)
+
+    # The fixture must discriminate: each alternative lands on other bounds.
+    alternatives = {
+        "h=1": oracle(window_margin[:, 0], groups, resamples, seed),
+        "h=2": oracle(window_margin[:, 1], groups, resamples, seed),
+        "h=4": oracle(window_margin[:, 3], groups, resamples, seed),
+        "median": oracle(column, groups, resamples, seed, reduce=np.median),
+        "sum": oracle(column, groups, resamples, seed, reduce=np.sum),
+        "seed 0": oracle(column, groups, resamples, 0),
+        "resamples 2000": oracle(column, groups, 2000, seed),
+        "windows as episodes": oracle(column, np.arange(column.size), resamples, seed),
+    }
+    for name, bounds in alternatives.items():
+        assert max(abs(bounds[0] - expected[0]), abs(bounds[1] - expected[1])) > 0.1, name
+
+    episode_means = [column[groups == episode].mean() for episode in range(5)]
+    assert abs(point - np.mean(episode_means)) > 2.0
+
+
+def test_the_interval_refuses_a_malformed_margin_a_bad_resample_count_and_a_bad_horizon():
+    """Each remaining guard, with the operand that fires it exercised alone.
+
+    A groups array of shape (6, 1) has the right SIZE and the wrong RANK, so only
+    the rank operand of the label guard rejects it. A horizon of 0 or -1 is not
+    refused by NumPy at all -- it indexes the LAST column -- so only the lower
+    bound stands between it and a silently wrong interval; a horizon past the
+    end is caught by the upper bound (a missing one surfaces as an IndexError,
+    which is not the ValueError asserted here). The two edges that must WORK are
+    exercised too, so a bound moved one step inward also fails.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping the rank check on `window_margin`;
+    dropping the rank operand of the label guard; `resamples < 1` -> `< 0`; and
+    either bound of `1 <= h <= horizon` dropped or moved inward by one.
+    """
+    window_margin = np.arange(18.0).reshape(6, 3)
+    groups = np.repeat([0, 1], 3)
+    run = {"resamples": 10, "seed": 0}
+
+    margin_interval(window_margin, groups, h=1, **run)  # first column
+    margin_interval(window_margin, groups, h=3, **run)  # last column
+
+    with pytest.raises(ValueError, match="windows, horizon"):
+        margin_interval(window_margin[:, 0], groups, h=1, **run)
+    with pytest.raises(ValueError, match="one label per window"):
+        margin_interval(window_margin, groups.reshape(6, 1), h=1, **run)
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="resamples must be"):
+            margin_interval(window_margin, groups, h=1, resamples=bad, seed=0)
+    for bad in (0, -1, 4):
+        with pytest.raises(ValueError, match="horizon step must be"):
+            margin_interval(window_margin, groups, h=bad, **run)
+
+
+def test_the_interval_accepts_the_plain_lists_a_json_record_hands_over():
+    """`windows.episode` and the per-window margins come out of a JSON record as
+    Python lists, which have no `.ndim` for the guards to read.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping either `np.asarray` coercion at the
+    top of `margin_interval`. Dropping `dtype=np.float64` from the margin one is
+    an equivalent mutant -- an integer column's mean is the same float -- so it
+    is not pinned.
+    """
+    rng = np.random.default_rng(1)
+    window_margin = rng.normal(0.0, 1.0, size=(12, 3))
+    groups = np.repeat(np.arange(4), 3)
+
+    from_arrays = margin_interval(window_margin, groups, h=2, resamples=50, seed=7)
+    from_lists = margin_interval(
+        window_margin.tolist(), groups.tolist(), h=2, resamples=50, seed=7
+    )
+    assert from_lists == from_arrays
