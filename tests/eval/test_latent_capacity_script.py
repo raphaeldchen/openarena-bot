@@ -997,6 +997,55 @@ def test_cell_capacity_reads_the_prior_from_prior_probs_not_the_posterior():
     assert cell["prior_bits"] != pytest.approx(cell["bits"], abs=1e-3)
 
 
+def test_cell_capacity_measures_both_redundancy_numbers_on_the_posterior():
+    """THE RATIO IS ONLY MEANINGFUL IF ITS TWO HALVES DESCRIBE ONE ARRAY.
+
+    THE MUTATION THIS EXISTS FOR: `redundancy_bits(probs)` ->
+    `redundancy_bits(np.asarray(score["prior_probs"], ...))`, with
+    `redundancy_floor` on the next line still reading `probs`. It left all 452
+    targeted tests green, and it would have made the printed ratio a posterior
+    FLOOR divided into a PRIOR redundancy -- a quotient of two different codes.
+    The write-up leans on this companion to argue the true joint information is
+    well below the reported sum, so a meaningless ratio is a meaningless
+    argument.
+
+    `test_cell_capacity_reads_the_prior_from_prior_probs_not_the_posterior`
+    already catches the reverse swap for `prior_bits`, by the same fixture
+    asymmetry: the prior is COLLAPSED, so it has no pair of varying
+    categoricals and reads ~0 against the posterior's real dependence. That
+    asymmetry was simply never asserted for the redundancy pair. Measured on
+    this fixture: posterior `redundancy_bits` 0.3627 and `redundancy_floor`
+    0.0934, against -4e-9 for both on the prior -- a collapsed code's
+    circular shift is the identity, so its redundancy equals its floor BIT FOR
+    BIT and the naive ratio would be exactly 1.0.
+
+    Compared to direct estimator calls on `post_probs`, not merely bracketed:
+    the two halves must be the same two numbers the record's ratio is formed
+    from."""
+    fit, select, score = _splits()
+    post = np.asarray(score["post_probs"], dtype=np.float64)
+    prior = np.asarray(score["prior_probs"], dtype=np.float64)
+    cell = script.cell_capacity((fit, select, score), seed=0, resamples=FEW_RESAMPLES)
+
+    # The premise: the prior is collapsed, so reading it for either half is
+    # decisively wrong rather than marginally so.
+    assert redundancy_bits(prior) == pytest.approx(0.0, abs=1e-6)
+    assert redundancy_floor(prior, seed=0) == pytest.approx(0.0, abs=1e-6)
+    assert redundancy_bits(post) > 0.1 and redundancy_floor(post, seed=0) > 0.01
+
+    assert cell["redundancy_bits"] == pytest.approx(redundancy_bits(post), abs=1e-12)
+    assert cell["redundancy_floor"] == pytest.approx(
+        redundancy_floor(post, seed=0), abs=1e-12,
+    )
+    # And each is decisively away from what the prior reads, in both directions.
+    assert cell["redundancy_bits"] > 0.1, "redundancy_bits reads the collapsed prior"
+    assert cell["redundancy_floor"] > 0.01, "redundancy_floor reads the collapsed prior"
+    ratio = redundancy_ratio(cell["redundancy_bits"], cell["redundancy_floor"])
+    assert ratio == pytest.approx(
+        redundancy_bits(post) / redundancy_floor(post, seed=0), abs=1e-9,
+    ), "the printed ratio is not one code's redundancy over its own floor"
+
+
 def test_cell_capacity_never_reads_the_models_predicted_embedding():
     """The raw encoder output and the model's PREDICTED embedding answer
     different questions, and `frame_share` asks what the CURRENT FRAME explains
@@ -2723,6 +2772,40 @@ def test_read_phase_names_the_first_missing_cell_and_exits_eleven(tmp_path, caps
     assert code == script.EXIT_NO_CHECKPOINTS
     assert "NO CELL" in out and "random_vit seed 2" in out
     assert not (tmp_path / "capacity.txt").exists()
+
+
+def test_read_phase_refuses_records_that_disagree_on_the_protocol(tmp_path, capsys):
+    """THE WIRING, not the function: `require_one_protocol` is well tested in
+    isolation, and deleting its one call from `read_phase` left all 452 targeted
+    tests green. Every sibling wiring on this path already fails under a skip
+    mutation -- `capacity_inputs` -> `_require_readable_records`,
+    `capacity_inputs` -> `_pooled_shape`, `cell_capacity` ->
+    `require_temporal_order`, `read_phase` -> `require_readable_plan`,
+    `reading_capacity` -> `_common_seeds_total`. This was the one unpinned link.
+
+    `git_sha` is the field the function's own docstring records as having
+    already shipped unchecked once, pooling records from different torch builds
+    into one finding with no refusal anywhere. Driven through `main --phase
+    read`, so the refusal is pinned at the ENTRY POINT a run uses rather than at
+    a function a test chose to call.
+
+    AND NOTHING IS WRITTEN: the refusal must come before `capacity.txt`, or a
+    pool that cannot be read leaves an artefact behind that says it was."""
+    records = _pool()
+    victim = sorted(records)[-1]
+    assert victim == ("random_vit", 2)
+    records[victim]["git_sha"] = records[victim]["git_sha"] + "-dirty"
+    _write_pool(tmp_path, records)
+
+    with pytest.raises(SystemExit) as raised:
+        _main_read("--phase", "read", "--out", str(tmp_path))
+    message = str(raised.value)
+    assert "random_vit seed 2" in message, message
+    assert "git_sha" in message, message
+    assert not (tmp_path / "capacity.txt").exists(), (
+        "a pool that cannot be read must leave no artefact claiming it was"
+    )
+    assert "verdict:" not in capsys.readouterr().out
 
 
 def test_read_phase_reads_records_written_before_resamples_was_recorded(
