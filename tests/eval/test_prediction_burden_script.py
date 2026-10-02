@@ -521,8 +521,15 @@ def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
     so the permanent artefact could not be audited for it. Both the level and
     the count are recorded here from the start.
 
-    THE MUTATION THIS EXISTS FOR: dropping any of these keys, or recording a
-    literal 0.95 / 2000 instead of the module's constants.
+    THE MUTATION THIS EXISTS FOR: dropping any of these keys. It pins that each
+    is PRESENT and AGREES WITH the shipped constant, and nothing more: a literal
+    that equals the constant -- `"confidence": 0.95` -- passes it, which is the
+    one thing it cannot see. WHERE EACH VALUE IS READ FROM is pinned elsewhere:
+
+      `resamples`
+          test_the_interval_is_taken_at_the_cells_seed_and_the_draw_count_the_record_states
+      `confidence`, `decision_h`, `reported_h`, `identity_tolerance`, `split_seed`
+          test_each_protocol_constant_is_recorded_from_the_modules_own_name
     """
     assert record["confidence"] == burden.CONFIDENCE
     assert record["resamples"] == burden.RESAMPLES
@@ -542,6 +549,43 @@ def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
         assert key in record, key
     assert (record["arm"], record["seed"]) == ("pixel_ae", SEED)
     assert (record["context"], record["horizon"]) == (CONTEXT, HORIZON)
+
+
+@pytest.mark.parametrize(
+    "constant, patched, key, expected",
+    [
+        ("CONFIDENCE", 0.9, "confidence", 0.9),
+        ("DECISION_H", 30, "decision_h", 30),
+        ("REPORTED_H", (1, 7, 45), "reported_h", [1, 7, 45]),
+        ("IDENTITY_TOLERANCE", 1e-3, "identity_tolerance", 1e-3),
+        ("SPLIT_SEED", 7, "split_seed", 7),
+    ],
+)
+def test_each_protocol_constant_is_recorded_from_the_modules_own_name(
+    rig, monkeypatch, constant, patched, key, expected,
+):
+    """The record states the constant THE MODULE HOLDS, checked the way the
+    `RESAMPLES` test checks its own: the module's name is patched to a value the
+    shipped constant is not, and the record must follow it.
+
+    Comparing a record to `burden.CONFIDENCE` cannot do this. A literal `0.95`
+    EQUALS it, so recording one passes every test that compares against the
+    shipped value; only a patched module attribute tells a literal from a read.
+    The brief's mutation for `confidence` also changed `burden.CONFIDENCE`, which
+    makes it a two-file mutation the single-constant docstring never described.
+
+    THE MUTATIONS THIS EXISTS FOR, one per case, each a literal where the module's
+    constant stood, each of which survived all 50 tests: `"confidence": 0.95`,
+    `"decision_h": 45`, `"reported_h": [1, 2, 3, 5, 8, 10, 15, 20, 30, 45]`,
+    `"identity_tolerance": 1e-9`, `"split_seed": 0`. (`resamples` is the sixth, and
+    is pinned by its own patching test.) `DECISION_H` and `REPORTED_H` are also
+    read by the measurement itself, so the patched values are ones the protocol
+    guard still accepts at the cell's horizon of 45.
+    """
+    assert getattr(script, constant) != patched
+    monkeypatch.setattr(script, constant, patched)
+    record = script.measure_cell(**_cell_kwargs(rig))
+    assert record[key] == expected
 
 
 def test_the_record_carries_the_training_numbers_of_its_own_cell(rig):
