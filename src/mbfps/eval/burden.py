@@ -378,3 +378,121 @@ class BurdenStatus:
     arms_motion: tuple[str, ...]
     arms_copies: tuple[str, ...]
     seeds_total: dict[str, int]
+
+
+def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
+    """Reading H: is the rollout compounding, or did the one-step map never
+    learn motion?
+
+    PRECEDENCE. `UNRESOLVED_CONTROL` outranks everything: a reading taken from
+    an estimator that missed a known answer is not a weaker reading, it is not
+    a reading. `UNREADABLE` comes next, because a cell where the agent barely
+    moved would read COPIES for a reason that has nothing to do with the
+    objective. Only then are the two decisive statuses tallied, and
+    `INDETERMINATE` is the fall-through.
+
+    THE ASYMMETRY. Both decisive statuses are levels against an exactly known
+    baseline -- the true one-step displacement -- measured on the same windows,
+    so BOTH DIRECTIONS ARE SOUND. This is the structural difference from M3k,
+    whose statistic spoke in one direction only, and from M3l, whose
+    `bits_carried` upper-bounds the joint and was trustworthy only below a cut.
+    """
+    by_arm: dict[str, list[BurdenArm]] = {}
+    for cell in inputs.cells.values():
+        by_arm.setdefault(cell.arm, []).append(cell)
+    seeds_total = {arm: len(cells) for arm, cells in by_arm.items()}
+
+    broken = sorted(
+        f"{c.arm} seed {c.seed}" for c in inputs.cells.values() if not c.controls_ok
+    )
+    if broken:
+        return BurdenStatus(
+            status="UNRESOLVED_CONTROL",
+            rule=(
+                "a control with a known answer was missed in "
+                f"{', '.join(broken)}: the identity residual must stay within "
+                f"{IDENTITY_TOLERANCE:g}, the k=45 rung must reproduce the "
+                "record bitwise (open_loop_divergence 0.0), and the k=1 rung "
+                "must sit strictly above the floor. A reading taken from an "
+                "estimator that missed a known answer is not a weaker reading, "
+                "it is not a reading"
+            ),
+            arms_motion=(), arms_copies=(), seeds_total=seeds_total,
+        )
+
+    stationary = sorted(
+        f"{c.arm} seed {c.seed}" for c in inputs.cells.values() if not c.base_ok
+    )
+    short = sorted(arm for arm, n in seeds_total.items() if n < SEEDS_MINIMUM)
+    if stationary or short:
+        causes = []
+        if stationary:
+            causes.append(
+                "the median true one-step displacement does not exceed the "
+                f"median floor error in {', '.join(stationary)}, so no method "
+                "could detect motion prediction there"
+            )
+        if short:
+            causes.append(
+                "; ".join(
+                    f"{arm} carries {seeds_total[arm]} seed(s), fewer than "
+                    f"{SEEDS_MINIMUM}" for arm in short
+                )
+                + ", and an arm short of the minimum is refused by name rather "
+                "than tallied"
+            )
+        return BurdenStatus(
+            status="UNREADABLE", rule="; ".join(causes),
+            arms_motion=(), arms_copies=(), seeds_total=seeds_total,
+        )
+
+    def clearing(predicate) -> tuple[str, ...]:
+        return tuple(sorted(
+            arm for arm, cells in by_arm.items()
+            if sum(1 for c in cells if predicate(c)) >= strict_majority(len(cells))
+        ))
+
+    arms_motion = clearing(lambda c: c.margin_low > 0.0)
+    arms_copies = clearing(lambda c: c.margin_high <= 0.0)
+
+    if len(arms_motion) >= ARMS_REQUIRED:
+        return BurdenStatus(
+            status="PREDICTS_MOTION",
+            rule=(
+                f"the whole motion_margin interval clears 0 at horizon "
+                f"{inputs.decision_h} in {len(arms_motion)} of "
+                f"{len(by_arm)} arms ({', '.join(arms_motion)}), each in a "
+                "strict majority of its seeds: one prior step from the true "
+                "state beats assuming the agent did not move, so the one-step "
+                "map predicts real motion and what fails is rolling it "
+                "forward. A multi-step or overshooting objective is the "
+                "indicated intervention"
+            ),
+            arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
+        )
+    if len(arms_copies) >= ARMS_REQUIRED:
+        return BurdenStatus(
+            status="COPIES",
+            rule=(
+                f"the whole motion_margin interval sits at or below 0 at "
+                f"horizon {inputs.decision_h} in {len(arms_copies)} of "
+                f"{len(by_arm)} arms ({', '.join(arms_copies)}), each in a "
+                "strict majority of its seeds: one prior step from the TRUE "
+                "state is no better than assuming stillness, so a "
+                "longer-horizon term cannot rescue this and the target itself "
+                "must change"
+            ),
+            arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
+        )
+    return BurdenStatus(
+        status="INDETERMINATE",
+        rule=(
+            f"neither decisive status clears {ARMS_REQUIRED} arms at horizon "
+            f"{inputs.decision_h}: the motion_margin interval straddles 0, so "
+            "the one-step map could not be shown to beat stillness and could "
+            "not be shown to match it. This status is the fall-through, not a "
+            "bar that was cleared, so it arrived by default rather than by "
+            "evidence and licenses no positive claim in either direction"
+        ),
+        arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
+    )

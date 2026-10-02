@@ -30,6 +30,7 @@ from mbfps.eval.burden import (
     margin_interval,
     motion_margin,
     one_step_persistence,
+    reading_burden,
     scored_targets,
     strict_majority,
 )
@@ -851,3 +852,341 @@ def test_the_reading_records_are_frozen():
     for record, field in ((cell, "margin"), (inputs, "decision_h"), (status, "status")):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(record, field, 0)
+
+
+# --- Reading H: the statuses and their precedence --------------------------
+
+ARMS = ("frozen_ssl", "pixel_ae", "random_vit")
+
+# The three places an interval can sit against the two bars. Margins are given
+# so the point estimate lies inside its own interval.
+CLEARS_MOTION = dict(margin=3.0, low=1.0, high=5.0)
+CLEARS_COPIES = dict(margin=-3.0, low=-5.0, high=-1.0)
+STRADDLES = dict(margin=1.0, low=-2.0, high=4.0)
+
+
+def _inputs(cells, **over):
+    fields = dict(
+        cells={(c.arm, c.seed): c for c in cells}, decision_h=DECISION_H,
+        ks=(1, 3, 5, 15, 45),
+    )
+    fields.update(over)
+    return BurdenInputs(**fields)
+
+
+def _nine(**over):
+    return [_arm(arm=a, seed=s, **over) for a in ARMS for s in (0, 1, 2)]
+
+
+def _with(cells, arm, seed, **over):
+    """`cells` with the one cell `(arm, seed)` rebuilt with `over` applied."""
+    return [
+        dataclasses.replace(c, **over) if (c.arm, c.seed) == (arm, seed) else c
+        for c in cells
+    ]
+
+
+def _arm_cells(arm, *shapes):
+    """One arm, one seed per shape in `shapes`, seeds counted from 0."""
+    return [_arm(arm=arm, seed=seed, **shape) for seed, shape in enumerate(shapes)]
+
+
+def _by_arm(**shape_per_arm):
+    """Three seeds per arm, every seed of an arm carrying the arm's one shape."""
+    return [
+        cell for arm, shape in shape_per_arm.items()
+        for cell in _arm_cells(arm, shape, shape, shape)
+    ]
+
+
+def test_predicts_motion_when_the_whole_interval_clears_zero():
+    reading = reading_burden(_inputs(_nine(**CLEARS_MOTION)))
+    assert reading.status == "PREDICTS_MOTION"
+    assert reading.arms_motion == ARMS
+    assert reading.arms_copies == ()
+    assert reading.seeds_total == {arm: 3 for arm in ARMS}
+
+
+def test_copies_when_the_whole_interval_is_at_or_below_zero():
+    reading = reading_burden(_inputs(_nine(**CLEARS_COPIES)))
+    assert reading.status == "COPIES"
+    assert reading.arms_copies == ARMS
+    assert reading.arms_motion == ()
+
+
+def test_an_interval_straddling_zero_falls_through():
+    """And the sentence must SAY it is a fall-through. M3k's INDISTINGUISHABLE
+    overclaimed through three wordings before the review caught it.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping either phrase from the
+    `INDETERMINATE` rule. Case matters: the test reads the lowercase words, so
+    a capitalised `FALL-THROUGH` does not satisfy it.
+    """
+    reading = reading_burden(_inputs(_nine(**STRADDLES)))
+    assert reading.status == "INDETERMINATE"
+    assert reading.arms_motion == ()
+    assert reading.arms_copies == ()
+    assert "fall-through" in reading.rule
+    assert "by default rather than by evidence" in reading.rule
+
+
+def test_the_bars_are_strict_on_the_motion_side_and_inclusive_on_the_copies_side():
+    """`margin_high <= 0` clears COPIES, so a high end of exactly 0 is COPIES;
+    `margin_low > 0` clears PREDICTS_MOTION, so a low end of exactly 0 is not.
+
+    THE MUTATIONS THIS EXISTS FOR: `< 0` instead of `<= 0` on the copies side,
+    which would send an exactly-zero high end to INDETERMINATE; and `>= 0`
+    instead of `> 0` on the motion side, which would let a low end of exactly
+    zero establish PREDICTS_MOTION.
+    """
+    on_copies = reading_burden(_inputs(_nine(margin=-1.0, low=-2.0, high=0.0)))
+    assert on_copies.status == "COPIES"
+    on_motion = reading_burden(_inputs(_nine(margin=2.0, low=0.0, high=4.0)))
+    assert on_motion.status == "INDETERMINATE"
+    assert on_motion.arms_motion == ()
+
+
+def test_the_two_decisive_statuses_can_never_both_clear():
+    """Mutually exclusive because every interval has `margin_low <= margin_high`
+    and the cell refuses to be built otherwise -- asserted THROUGH
+    `reading_burden` on 500 random configurations rather than claimed. M3l's
+    spec claimed exclusivity for two tallies on DIFFERENT quantities, where a
+    single arm could clear both.
+
+    No arm may sit in both tallies, and the status must follow the tallies. The
+    arm tallies are also recomputed here by the plain "more than half of the
+    seeds" rule, so a threshold that drifts shows up as well.
+
+    THE MUTATIONS THIS EXISTS FOR: a copies predicate satisfiable together
+    with the motion one (`>= 0` for `<= 0` on `margin_high`), which puts an
+    arm in both tallies; and any drift in the per-arm or per-reading bar,
+    which the recomputation sees.
+
+    What it does NOT cover: with THREE arms and `ARMS_REQUIRED == 2`, two
+    decisive statuses cannot both reach the bar (2 + 2 > 3). With four arms
+    they could, and PREDICTS_MOTION is checked first.
+    """
+    rng = np.random.default_rng(0)
+    seen = {"PREDICTS_MOTION": 0, "COPIES": 0, "INDETERMINATE": 0}
+    for _ in range(500):
+        cells = []
+        for arm in ARMS:
+            centre = rng.uniform(-4.0, 4.0)
+            for seed in range(int(rng.integers(3, 8))):
+                mid = centre + rng.normal(0.0, 1.0)
+                half = rng.uniform(0.0, 3.0)
+                cells.append(_arm(
+                    arm=arm, seed=seed, margin=mid, low=mid - half, high=mid + half,
+                ))
+        reading = reading_burden(_inputs(cells))
+        seen[reading.status] += 1
+
+        assert not set(reading.arms_motion) & set(reading.arms_copies)
+        want_motion, want_copies = [], []
+        for arm in ARMS:
+            mine = [c for c in cells if c.arm == arm]
+            if 2 * sum(c.margin_low > 0.0 for c in mine) > len(mine):
+                want_motion.append(arm)
+            if 2 * sum(c.margin_high <= 0.0 for c in mine) > len(mine):
+                want_copies.append(arm)
+        assert reading.arms_motion == tuple(want_motion)
+        assert reading.arms_copies == tuple(want_copies)
+        if len(want_motion) >= ARMS_REQUIRED:
+            assert reading.status == "PREDICTS_MOTION"
+        elif len(want_copies) >= ARMS_REQUIRED:
+            assert reading.status == "COPIES"
+        else:
+            assert reading.status == "INDETERMINATE"
+
+    # The property is vacuous if the draw never reaches a status.
+    assert all(count >= 25 for count in seen.values()), seen
+
+
+@pytest.mark.parametrize(
+    "setting",
+    ["would-read-motion", "would-read-copies", "also-stationary", "also-short-arm"],
+)
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"identity_residual": 1e-6},
+        {"open_loop_divergence": 3.5e-4},
+        {"k_one_is_floor": True},
+    ],
+    ids=["identity", "open-loop", "k1-floor"],
+)
+def test_one_broken_control_outranks_every_other_status(setting, broken):
+    """A reading from an estimator that missed a known answer is not a weaker
+    reading; it is not a reading.
+
+    Each setting is one the OTHER statuses would claim if the control were
+    ignored: `would-read-motion` and `would-read-copies` are decisive on every
+    cell; `also-stationary` makes the broken cell itself fail the base
+    control, so UNREADABLE would claim it; `also-short-arm` leaves another arm
+    with two seeds, so UNREADABLE would claim it for that reason. The last two
+    are what pin the ORDER of the two guards: with a clean fixture, moving the
+    control check below the base check changes nothing.
+
+    THE MUTATIONS THIS EXISTS FOR: `controls_ok` returning True, and checking
+    the controls after the base or seed guard or after the tallies.
+    """
+    cells = {
+        "would-read-motion": lambda: _nine(**CLEARS_MOTION),
+        "would-read-copies": lambda: _nine(**CLEARS_COPIES),
+        "also-stationary": lambda: _nine(**CLEARS_MOTION),
+        "also-short-arm": lambda: [
+            c for c in _nine(**CLEARS_MOTION) if (c.arm, c.seed) != ("pixel_ae", 2)
+        ],
+    }[setting]()
+    over = dict(broken)
+    if setting == "also-stationary":
+        over["displacement_median"] = 9.0
+    cells = _with(cells, "frozen_ssl", 1, **over)
+
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNRESOLVED_CONTROL"
+    assert "frozen_ssl seed 1" in reading.rule
+    assert "frozen_ssl seed 0" not in reading.rule
+    assert reading.arms_motion == ()
+    assert reading.arms_copies == ()
+    assert reading.seeds_total == {
+        "frozen_ssl": 3, "pixel_ae": 2 if setting == "also-short-arm" else 3,
+        "random_vit": 3,
+    }
+
+
+def test_every_broken_cell_is_named_not_only_the_first():
+    cells = _with(_nine(**CLEARS_MOTION), "frozen_ssl", 0, identity_residual=1e-6)
+    cells = _with(cells, "random_vit", 2, k_one_is_floor=True)
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNRESOLVED_CONTROL"
+    assert "frozen_ssl seed 0" in reading.rule
+    assert "random_vit seed 2" in reading.rule
+    assert "pixel_ae" not in reading.rule
+
+
+@pytest.mark.parametrize(
+    "shape", [CLEARS_MOTION, CLEARS_COPIES], ids=["would-read-motion", "would-read-copies"]
+)
+def test_a_failed_base_control_is_unreadable_and_names_the_cell(shape):
+    """If the agent barely moved, motion_margin is at best zero and COPIES
+    would be read for a reason that has nothing to do with the objective. The
+    guard is not about direction, so both decisive statuses are tried: on every
+    other cell the interval is decisive, so ignoring the base control would
+    read PREDICTS_MOTION or COPIES.
+
+    THE MUTATIONS THIS EXISTS FOR: `base_ok` returning True, and tallying the
+    decisive statuses before the base guard.
+    """
+    cells = _with(
+        _nine(**shape), "random_vit", 1, displacement_median=9.0, floor_median=12.0
+    )
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNREADABLE"
+    assert "random_vit seed 1" in reading.rule
+    assert "random_vit seed 0" not in reading.rule
+    assert "displacement" in reading.rule
+    assert reading.arms_motion == ()
+    assert reading.arms_copies == ()
+
+
+@pytest.mark.parametrize("kept", [1, 2])
+def test_an_arm_short_of_three_seeds_is_refused_not_tallied(kept):
+    """At one seed `strict_majority(1) == 1`, so a single lucky cell would
+    establish an arm -- the M3j trap of printing a row that clears beside a
+    verdict that cannot. At two, both seeds clearing is a majority of two.
+    Every kept cell is decisive, so tallying whatever is present would read
+    PREDICTS_MOTION.
+
+    THE MUTATION THIS EXISTS FOR: deleting the `short` term from the
+    `UNREADABLE` guard.
+    """
+    cells = [
+        c for c in _nine(**CLEARS_MOTION)
+        if not (c.arm == "pixel_ae" and c.seed >= kept)
+    ]
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNREADABLE"
+    assert f"pixel_ae carries {kept} seed(s), fewer than {SEEDS_MINIMUM}" in reading.rule
+    assert "frozen_ssl carries" not in reading.rule
+    assert reading.seeds_total == {"frozen_ssl": 3, "pixel_ae": kept, "random_vit": 3}
+
+
+def test_unreadable_names_every_cause_it_has():
+    cells = _with(_nine(**CLEARS_MOTION), "frozen_ssl", 2, displacement_median=5.0)
+    cells = [c for c in cells if not (c.arm == "pixel_ae" and c.seed == 2)]
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == "UNREADABLE"
+    assert "frozen_ssl seed 2" in reading.rule
+    assert "pixel_ae carries 2 seed(s)" in reading.rule
+
+
+@pytest.mark.parametrize(
+    "shape, status, tally",
+    [
+        (CLEARS_MOTION, "PREDICTS_MOTION", "arms_motion"),
+        (CLEARS_COPIES, "COPIES", "arms_copies"),
+    ],
+)
+def test_two_arms_are_enough_and_one_is_not(shape, status, tally):
+    """THE MUTATIONS THIS EXISTS FOR: the arm bar written as `>= 3` (the
+    two-arm case then falls through) or `>= 1` (the one-arm case then
+    establishes a status). The tally is reported even when the bar is missed,
+    so a reader can see which arm cleared alone."""
+    two = reading_burden(_inputs(_by_arm(
+        frozen_ssl=shape, pixel_ae=shape, random_vit=STRADDLES,
+    )))
+    assert two.status == status
+    assert getattr(two, tally) == ("frozen_ssl", "pixel_ae")
+
+    one = reading_burden(_inputs(_by_arm(
+        frozen_ssl=shape, pixel_ae=STRADDLES, random_vit=STRADDLES,
+    )))
+    assert one.status == "INDETERMINATE"
+    assert getattr(one, tally) == ("frozen_ssl",)
+
+
+def test_arms_that_clear_in_opposite_directions_do_not_make_a_status():
+    reading = reading_burden(_inputs(_by_arm(
+        frozen_ssl=CLEARS_MOTION, pixel_ae=CLEARS_COPIES, random_vit=STRADDLES,
+    )))
+    assert reading.status == "INDETERMINATE"
+    assert reading.arms_motion == ("frozen_ssl",)
+    assert reading.arms_copies == ("pixel_ae",)
+
+
+@pytest.mark.parametrize(
+    "seeds, clearing, counts",
+    [(3, 2, True), (3, 1, False), (4, 3, True), (4, 2, False), (5, 3, True), (5, 2, False)],
+)
+@pytest.mark.parametrize(
+    "shape, status, tally",
+    [
+        (CLEARS_MOTION, "PREDICTS_MOTION", "arms_motion"),
+        (CLEARS_COPIES, "COPIES", "arms_copies"),
+    ],
+)
+def test_an_arm_counts_on_a_strict_majority_of_its_own_seeds(
+    shape, status, tally, seeds, clearing, counts
+):
+    """The probe arm has `seeds` seeds of which `clearing` are decisive and the
+    rest straddle; the second arm clears outright and the third never does, so
+    the reading is decisive exactly when the probe arm counts. Four seeds with
+    two clearing is exactly HALF, which is not a majority.
+
+    THE MUTATIONS THIS EXISTS FOR: the per-arm bar stored as `2` (right at
+    three seeds, wrong at four and five), as `1`, and as every seed; and
+    `>` for `>=` against the computed bar.
+    """
+    probe = _arm_cells(
+        "frozen_ssl", *([shape] * clearing + [STRADDLES] * (seeds - clearing))
+    )
+    cells = (
+        probe
+        + _arm_cells("pixel_ae", shape, shape, shape)
+        + _arm_cells("random_vit", STRADDLES, STRADDLES, STRADDLES)
+    )
+    reading = reading_burden(_inputs(cells))
+    assert reading.status == (status if counts else "INDETERMINATE")
+    assert ("frozen_ssl" in getattr(reading, tally)) == counts
+    assert reading.seeds_total == {"frozen_ssl": seeds, "pixel_ae": 3, "random_vit": 3}
