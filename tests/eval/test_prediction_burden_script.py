@@ -204,7 +204,10 @@ def test_baseline_rows_walks_the_given_order_and_the_shared_window_rule(tmp_path
     assert not np.array_equal(rows, reversed_rows)
 
 
-def test_baseline_rows_are_the_true_one_step_displacement_in_every_window(rig):
+@pytest.mark.parametrize(
+    "episode_index", [i for i, n in enumerate(EXPECTED_WINDOWS) if n],
+)
+def test_baseline_rows_are_the_true_one_step_displacement_in_every_window(rig, episode_index):
     """Model-free: the baseline is ground truth, so it must reproduce the
     displacement computed straight from the episode's own coordinates -- by a
     route that does not go through `probe_targets` or `burden`.
@@ -213,23 +216,29 @@ def test_baseline_rows_are_the_true_one_step_displacement_in_every_window(rig):
     moved one frame to `start + context + 1 : start + need + 2`. Every shape is
     unchanged and each row is still a plausible distance; the wobble makes
     consecutive displacements differ, so the shifted rows differ too. Every
-    window of every episode is checked, so a `start` that does not advance by
-    the stride is seen as well.
+    window of the episode is checked, so a `start` that does not advance by the
+    stride is seen as well.
+
+    ONE EPISODE PER CALL, deliberately. The length-100 episode is an exact
+    multiple of the stride, so its last window ends on the final frame and a
+    shifted slice runs off the end: stacked with the others that is a ragged
+    array and a crash, which would fail this test for a reason that is not the
+    one it names. Asked alone, every other episode fails it by VALUE.
     """
-    rows, _ = script.baseline_rows(rig.paths, context=CONTEXT, horizon=HORIZON)
+    episode = load_episode(rig.paths[episode_index])
+    x = episode.privileged[:, 1].astype(np.float64)
+    y = episode.privileged[:, 2].astype(np.float64)
     expected = []
-    for path in rig.paths:
-        episode = load_episode(path)
-        x = episode.privileged[:, 1].astype(np.float64)
-        y = episode.privileged[:, 2].astype(np.float64)
-        for start in window_starts(episode.length, CONTEXT, HORIZON):
-            frames = slice(start + CONTEXT, start + NEED + 1)
-            expected.append(np.hypot(np.diff(x[frames]), np.diff(y[frames])))
+    for start in window_starts(episode.length, CONTEXT, HORIZON):
+        frames = slice(start + CONTEXT, start + NEED + 1)
+        expected.append(np.hypot(np.diff(x[frames]), np.diff(y[frames])))
     expected = np.stack(expected)
-    assert expected.shape == (sum(EXPECTED_WINDOWS), HORIZON)
-    # The wobble must make the windows genuinely different from one another, or
-    # a shifted slice could not be seen.
-    assert np.ptp(expected[:, 0]) > 0.5
+    assert expected.shape == (EXPECTED_WINDOWS[episode_index], HORIZON)
+
+    rows, _ = script.baseline_rows([rig.paths[episode_index]], context=CONTEXT, horizon=HORIZON)
+    # A one-frame shift turns row j into what was row j + 1, so the fixture
+    # reaches the mutation only if consecutive displacements differ.
+    assert np.abs(np.diff(expected, axis=1)).max() > 0.5
     np.testing.assert_allclose(rows, expected, rtol=1e-6)
 
 
