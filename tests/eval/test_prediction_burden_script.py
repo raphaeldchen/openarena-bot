@@ -667,13 +667,35 @@ def test_the_base_control_is_the_two_medians_at_the_decision_horizon(rig, record
 # ---------------------------------------------------------------------------
 
 
+PHASE_SEEDS = (1, 2)
+"""TWO SEEDS PER ARM, AND NEITHER IS ZERO. With one seed per arm, and that seed 0,
+`measure_phase` handing `measure_cell` `seed=0` and `burden_record_path(out, arm,
+0)` were both indistinguishable from the real thing, and every test still passed.
+The second is the expensive one: in the real nine-cell run it writes every arm's
+seed-1 and seed-2 record to the seed-0 file name, so six of nine records are
+overwritten and it surfaces only at the read phase, after the GPU time is spent.
+Every cell here has a seed that differs from every other cell's, from 0, and from
+the study's own `SPLIT_SEED`."""
 STUDY = {
-    ("pixel_ae", 0): {"steps": 20000, "kl_rate_above_free_bits": 0.9126, "kl_dyn_max": 2.95,
-                      "git_sha": "study-a"},
-    ("frozen_ssl", 0): {"steps": 20001, "kl_rate_above_free_bits": 0.746, "kl_dyn_max": 1.25,
-                        "git_sha": "study-b"},
+    ("pixel_ae", 1): {"steps": 20000, "kl_rate_above_free_bits": 0.9126, "kl_dyn_max": 2.95,
+                      "git_sha": "study-a1"},
+    ("pixel_ae", 2): {"steps": 20002, "kl_rate_above_free_bits": 0.8125, "kl_dyn_max": 2.5,
+                      "git_sha": "study-a2"},
+    ("frozen_ssl", 1): {"steps": 20001, "kl_rate_above_free_bits": 0.746, "kl_dyn_max": 1.25,
+                        "git_sha": "study-b1"},
+    ("frozen_ssl", 2): {"steps": 20003, "kl_rate_above_free_bits": 0.625, "kl_dyn_max": 1.75,
+                        "git_sha": "study-b2"},
 }
-MODELS = {("pixel_ae", 0): DriftingModel, ("frozen_ssl", 0): OracleModel}
+MODELS = {
+    ("pixel_ae", 1): DriftingModel, ("pixel_ae", 2): DriftingModel,
+    ("frozen_ssl", 1): OracleModel, ("frozen_ssl", 2): OracleModel,
+}
+CELLS = tuple(STUDY)
+"""In the order `measure_phase` visits them: arm-major, seeds in the order given."""
+assert set(STUDY) == set(MODELS) == {
+    (arm, seed) for arm in ("pixel_ae", "frozen_ssl") for seed in PHASE_SEEDS
+}
+assert all(seed != 0 and seed != SPLIT_SEED for _, seed in CELLS)
 
 
 def _recognisable(real, index: int):
@@ -753,7 +775,7 @@ def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None):
     monkeypatch.setattr(script, "prepare_cell", fake_prepare_cell)
     args = types.SimpleNamespace(
         out=out, source=source, data=data, device="cpu", context=None, horizon=None,
-        arms=["pixel_ae", "frozen_ssl"], seeds=[0], references=references,
+        arms=["pixel_ae", "frozen_ssl"], seeds=list(PHASE_SEEDS), references=references,
     )
     return args, prepared_for
 
@@ -762,27 +784,60 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
     tmp_path, monkeypatch,
 ):
     """Nine records once went out serialised to ONE payload with the labels
-    dropped. Here the two cells carry different models and different study
-    records, and each file must hold its own cell's numbers.
+    dropped. Here the four cells carry two different models and four different
+    study records, and each file must hold its own cell's numbers.
+
+    THE SEED IS BOUND TWICE, because the cells' seeds are 1 and 2 (`PHASE_SEEDS`).
+    The file NAME carries the cell's seed -- a name that carried 0 would write
+    the second and third seed of every arm over one file, which the listing below
+    is the only thing to see -- and the record carries it too, as `seed` and as
+    the seed its bootstrap interval was drawn at. The interval is recomputed from
+    the record's own margins at the cell's seed and must be the one written, and
+    the two seeds of one arm, which share a model and so a point estimate, must
+    not share an interval.
+
+    THE MUTATIONS THIS EXISTS FOR, each of which the one-seed-0 fixture let
+    through with every test green: `measure_phase` handing `measure_cell`
+    `seed=0` instead of `cell.seed`, and `burden_record_path(args.out, cell.arm,
+    0)` instead of `cell.seed`.
 
     The checkpoint is looked for in `args.source`: the fake `prepare_cell`
     refuses a directory that does not hold it, and `args.out` does not.
     """
-    args, _ = _phase_env(tmp_path, monkeypatch)
+    args, prepared_for = _phase_env(tmp_path, monkeypatch)
     assert script.measure_phase(args) == script.EXIT_OK
+    assert prepared_for == list(CELLS)
     assert sorted(p.name for p in args.out.iterdir()) == [
-        "burden_frozen_ssl_seed0.json", "burden_pixel_ae_seed0.json",
+        "burden_frozen_ssl_seed1.json", "burden_frozen_ssl_seed2.json",
+        "burden_pixel_ae_seed1.json", "burden_pixel_ae_seed2.json",
     ]
-    drifting = load_record(args.out / "burden_pixel_ae_seed0.json")
-    exact = load_record(args.out / "burden_frozen_ssl_seed0.json")
-    assert (drifting["arm"], drifting["seed"]) == ("pixel_ae", 0)
-    assert (exact["arm"], exact["seed"]) == ("frozen_ssl", 0)
-    assert drifting["controls"]["k_one_is_floor"] is False
-    assert exact["controls"]["k_one_is_floor"] is True
-    assert (drifting["step"], exact["step"]) == (20000, 20001)
-    assert (drifting["kl_rate_above_free_bits"], exact["kl_rate_above_free_bits"]) == (0.9126, 0.746)
-    assert drifting["git_sha"] == exact["git_sha"] == git_sha()
-    assert drifting["seed"] == 0 and drifting["resamples"] == burden.RESAMPLES
+    records = {
+        (arm, seed): load_record(args.out / f"burden_{arm}_seed{seed}.json")
+        for arm, seed in CELLS
+    }
+    for (arm, seed), carried in records.items():
+        study = STUDY[(arm, seed)]
+        assert (carried["arm"], carried["seed"]) == (arm, seed)
+        assert carried["controls"]["k_one_is_floor"] is (arm == "frozen_ssl"), (arm, seed)
+        assert carried["step"] == study["steps"], (arm, seed)
+        assert carried["kl_rate_above_free_bits"] == study["kl_rate_above_free_bits"]
+        assert carried["kl_dyn_max"] == study["kl_dyn_max"]
+        assert carried["record_git_sha"] == study["git_sha"]
+        assert carried["git_sha"] == git_sha()
+        assert carried["resamples"] == burden.RESAMPLES
+        h = burden.DECISION_H
+        entry = carried["margin"][str(h)]
+        assert (entry["point"], entry["ci_low"], entry["ci_high"]) == burden.margin_interval(
+            np.asarray(carried["window_margin"]), np.asarray(carried["windows"]["episode"]),
+            h=h, resamples=burden.RESAMPLES, seed=seed,
+        ), (arm, seed)
+    for arm in ("pixel_ae", "frozen_ssl"):
+        first, second = (records[(arm, seed)]["margin"][str(burden.DECISION_H)] for seed in PHASE_SEEDS)
+        # Reached: same model, same windows, so the point is shared and ONLY the
+        # seed can move the bounds. If they coincided the recomputation above
+        # would pass for any seed at all.
+        assert first["point"] == second["point"], arm
+        assert (first["ci_low"], first["ci_high"]) != (second["ci_low"], second["ci_high"]), arm
 
 
 def test_the_record_carries_the_reference_prepare_cell_verified(tmp_path, monkeypatch):
@@ -810,10 +865,11 @@ def test_the_record_carries_the_reference_prepare_cell_verified(tmp_path, monkey
     """
     args, _ = _phase_env(tmp_path, monkeypatch)
     assert script.measure_phase(args) == script.EXIT_OK
-    assert sorted(args.references) == [("frozen_ssl", 0), ("pixel_ae", 0)]
+    assert sorted(args.references) == sorted(CELLS)
     curves = ("floor_position", "rssm_position", "persistence_position")
     for (arm, seed), (verified, recomputed) in args.references.items():
         carried = load_record(args.out / f"burden_{arm}_seed{seed}.json")
+        assert (carried["arm"], carried["seed"]) == (arm, seed)
         for name in curves:
             # Reached: a second pass gives other numbers, so equality below is
             # not the two passes agreeing.
@@ -827,9 +883,10 @@ def test_the_record_carries_the_reference_prepare_cell_verified(tmp_path, monkey
                 carried["burden_by_k"][str(k)],
                 np.asarray(carried["curves"]["rungs"][str(k)]) - verified.floor_position,
             )
-    # Each cell carries ITS OWN verified reference, not another cell's.
-    pixel, frozen = (args.references[key][0] for key in (("pixel_ae", 0), ("frozen_ssl", 0)))
-    assert not np.array_equal(pixel.floor_position, frozen.floor_position)
+    # Each cell carries ITS OWN verified reference, not another cell's -- and the
+    # two seeds of one arm are two cells, so they are told apart as well.
+    floors = [tuple(args.references[key][0].floor_position) for key in CELLS]
+    assert len(set(floors)) == len(CELLS)
 
 
 def test_the_phase_scores_the_studys_own_validation_split(tmp_path, monkeypatch):
@@ -842,7 +899,7 @@ def test_the_phase_scores_the_studys_own_validation_split(tmp_path, monkeypatch)
         ReplayBuffer(args.data, capacity_transitions=10**9).episode_paths(),
         val_fraction=VAL_FRACTION, seed=SPLIT_SEED,
     )
-    record = load_record(args.out / "burden_pixel_ae_seed0.json")
+    record = load_record(args.out / "burden_pixel_ae_seed1.json")
     assert record["episodes"]["val"] == [p.name for p in val]
     assert record["windows"]["total"] == sum(
         len(window_starts(load_episode(p).length, CONTEXT, HORIZON)) for p in val
@@ -850,25 +907,27 @@ def test_the_phase_scores_the_studys_own_validation_split(tmp_path, monkeypatch)
 
 
 def test_the_phase_names_a_missing_cell_and_measures_nothing(tmp_path, monkeypatch, capsys):
-    args, prepared_for = _phase_env(tmp_path, monkeypatch, missing={("frozen_ssl", 0)})
+    args, prepared_for = _phase_env(tmp_path, monkeypatch, missing={("frozen_ssl", 2)})
     assert script.measure_phase(args) == script.EXIT_NO_CHECKPOINTS
-    assert "frozen_ssl seed 0" in capsys.readouterr().out
+    assert "frozen_ssl seed 2" in capsys.readouterr().out
     assert prepared_for == []
     assert not args.out.exists() or list(args.out.iterdir()) == []
 
 
 def test_the_phase_stops_at_the_first_refusal_and_writes_nothing_for_it(tmp_path, monkeypatch):
-    args, _ = _phase_env(tmp_path, monkeypatch, refuse=("frozen_ssl", 0))
+    args, _ = _phase_env(tmp_path, monkeypatch, refuse=("frozen_ssl", 1))
     assert script.measure_phase(args) == script.EXIT_RECORD_MISMATCH
-    assert sorted(p.name for p in args.out.iterdir()) == ["burden_pixel_ae_seed0.json"]
+    assert sorted(p.name for p in args.out.iterdir()) == [
+        "burden_pixel_ae_seed1.json", "burden_pixel_ae_seed2.json",
+    ]
 
 
 def test_the_phase_measures_a_repeated_arm_once(tmp_path, monkeypatch):
     args, prepared_for = _phase_env(tmp_path, monkeypatch)
     args.arms = ["pixel_ae", "pixel_ae"]
-    args.seeds = [0, 0]
+    args.seeds = [1, 1]
     assert script.measure_phase(args) == script.EXIT_OK
-    assert prepared_for == [("pixel_ae", 0)]
+    assert prepared_for == [("pixel_ae", 1)]
 
 
 def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
@@ -877,15 +936,15 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
     args, _ = _phase_env(tmp_path, monkeypatch)
     script.measure_phase(args)
     lines = capsys.readouterr().out.strip().splitlines()
-    assert len(lines) == 2
-    record = load_record(args.out / "burden_pixel_ae_seed0.json")
-    margin = record["margin"][str(burden.DECISION_H)]
-    line = lines[0]
-    assert line.startswith("pixel_ae seed 0:")
-    for number in (margin["point"], margin["ci_low"], margin["ci_high"]):
-        assert f"{number:+.4f}" in line
-    assert f"{record['controls']['identity_residual']:.2e}" in line
-    assert str(args.out / "burden_pixel_ae_seed0.json") in line
+    assert len(lines) == len(CELLS)
+    for line, (arm, seed) in zip(lines, CELLS):
+        record = load_record(args.out / f"burden_{arm}_seed{seed}.json")
+        margin = record["margin"][str(burden.DECISION_H)]
+        assert line.startswith(f"{arm} seed {seed}:"), line
+        for number in (margin["point"], margin["ci_low"], margin["ci_high"]):
+            assert f"{number:+.4f}" in line
+        assert f"{record['controls']['identity_residual']:.2e}" in line
+        assert str(args.out / f"burden_{arm}_seed{seed}.json") in line
 
 
 def test_main_takes_its_cells_and_directories_from_the_command_line(tmp_path, monkeypatch):
@@ -894,7 +953,7 @@ def test_main_takes_its_cells_and_directories_from_the_command_line(tmp_path, mo
     args, _ = _phase_env(tmp_path, monkeypatch)
     status = script.main([
         "--phase", "measure", "--source", str(args.source), "--out", str(args.out),
-        "--data", str(args.data), "--device", "cpu", "--arms", "frozen_ssl", "--seeds", "0",
+        "--data", str(args.data), "--device", "cpu", "--arms", "frozen_ssl", "--seeds", "2",
     ])
     assert status == script.EXIT_OK
-    assert [p.name for p in args.out.iterdir()] == ["burden_frozen_ssl_seed0.json"]
+    assert [p.name for p in args.out.iterdir()] == ["burden_frozen_ssl_seed2.json"]
