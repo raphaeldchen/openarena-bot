@@ -820,6 +820,9 @@ def test_the_bootstrap_helpers_are_public_and_draw_whole_episodes():
     labels = np.array([0, 0, 0, 1, 1, 2])
     draws = list(episode_bootstrap(labels, bootstrap=50, seed=0))
     assert len(draws) == 50
+    # The draws must actually vary; 50 identical draws would satisfy every
+    # per-row check below while the bootstrap sampled nothing.
+    assert len({tuple(sorted(d.tolist())) for d in draws}) > 1
     members = {0: {0, 1, 2}, 1: {3, 4}, 2: {5}}
     for index in draws:
         # Every drawn episode contributes ALL of its rows, so the multiset of
@@ -848,9 +851,17 @@ def test_promoting_the_helpers_changed_no_pooled_number():
     two of the three mutations it exists to catch. `varied` spans three
     episodes and its interval has width.
 
-    THE MUTATION THIS EXISTS FOR: any edit to the helpers' bodies while
-    renaming them -- a different percentile, `ddof=0`, or drawing without
-    replacement.
+    WHAT THIS TEST PINS, AND WHAT IT DOES NOT. It catches `ddof=0`, drawing
+    without replacement, a changed draw count, lost episode multiplicity and a
+    changed seed stream. It does NOT pin the percentiles: three episodes give
+    only seven distinct replicate values, so `ci_high` is 12.5 for any upper
+    percentile from ~84.75 to 100 and `ci_low` is 1.2308 for any lower
+    percentile below 3.4. The percentiles are pinned exactly by the sibling
+    `test_the_bootstrap_helpers_are_public_and_draw_whole_episodes`, whose
+    `arange(1001)` lands them on exact indices. Nor does `pooled.ratio` move
+    under ANY mutation of the two helpers -- `pool_ratio` computes it without
+    touching either -- so that assertion is a fixture-drift tripwire, not a
+    behaviour pin.
     """
     varied = [
         series(
