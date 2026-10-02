@@ -7,6 +7,8 @@ tests import torch too. What they do not need is a GPU, a checkpoint or a file:
 every number under test is a function of the arrays handed in.
 """
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -17,6 +19,10 @@ from mbfps.eval.burden import (
     IDENTITY_TOLERANCE,
     REPORTED_H,
     RESAMPLES,
+    SEEDS_MINIMUM,
+    BurdenArm,
+    BurdenInputs,
+    BurdenStatus,
     at_horizon,
     burden,
     compounding,
@@ -25,6 +31,7 @@ from mbfps.eval.burden import (
     motion_margin,
     one_step_persistence,
     scored_targets,
+    strict_majority,
 )
 
 
@@ -707,3 +714,140 @@ def test_the_interval_accepts_the_plain_lists_a_json_record_hands_over():
         window_margin.tolist(), groups.tolist(), h=2, resamples=50, seed=7
     )
     assert from_lists == from_arrays
+
+
+# --- Reading H: the records and the seed bar -------------------------------
+
+
+def _arm(arm="pixel_ae", seed=0, margin=3.0, low=1.0, high=5.0, **over):
+    """A cell that passes every control, so each test perturbs one thing."""
+    fields = dict(
+        arm=arm, seed=seed, margin=margin, margin_low=low, margin_high=high,
+        burden_by_k={1: 2.0, 3: 6.0, 5: 11.0, 15: 30.0, 45: 90.0},
+        compounding_by_k={1: 0.0, 3: 4.0, 5: 9.0, 15: 28.0, 45: 88.0},
+        identity_residual=1.4e-13, open_loop_divergence=0.0,
+        k_one_is_floor=False, displacement_median=40.0, floor_median=12.0,
+        clusters=24, rows=229,
+    )
+    fields.update(over)
+    return BurdenArm(**fields)
+
+
+def test_the_seed_minimum_is_the_value_the_spec_fixes():
+    assert SEEDS_MINIMUM == 3
+
+
+def test_strict_majority_is_computed_not_stored():
+    """A fixed SEEDS_REQUIRED=2 is a majority at 3 seeds and a MINORITY at 5.
+    M3l's design was reworked for exactly this.
+
+    THE MUTATIONS THIS EXISTS FOR: `return 2`, which passes at 3 seeds and is
+    wrong at 1, 5 and 7; and `(n + 1) // 2`, which agrees with `n // 2 + 1` at
+    every odd n and returns exactly HALF at every even one -- so only the even
+    counts in the loop can see it.
+    """
+    assert strict_majority(1) == 1
+    assert strict_majority(3) == 2
+    assert strict_majority(4) == 3
+    assert strict_majority(5) == 3
+    assert strict_majority(7) == 4
+    for n in range(1, 12):
+        assert 2 * strict_majority(n) > n
+
+
+def test_strict_majority_refuses_a_count_with_no_seeds():
+    """THE MUTATION THIS EXISTS FOR: dropping the `n < 1` guard, after which
+    `strict_majority(0)` is 1 -- a "majority" of nothing."""
+    for n in (0, -1, -7):
+        with pytest.raises(ValueError, match="at least one seed"):
+            strict_majority(n)
+
+
+@pytest.mark.parametrize(
+    "over, ok",
+    [
+        ({}, True),
+        ({"identity_residual": IDENTITY_TOLERANCE}, True),
+        ({"identity_residual": float(np.nextafter(IDENTITY_TOLERANCE, 1.0))}, False),
+        ({"identity_residual": 1e-6}, False),
+        ({"identity_residual": -1e-6}, False),
+        ({"identity_residual": float("nan")}, False),
+        ({"open_loop_divergence": 3.5e-4}, False),
+        ({"open_loop_divergence": 1e-12}, False),
+        ({"open_loop_divergence": -1e-12}, False),
+        ({"open_loop_divergence": float("nan")}, False),
+        ({"k_one_is_floor": True}, False),
+    ],
+    ids=[
+        "all-controls-pass", "residual-at-tolerance", "residual-one-ulp-over",
+        "residual-large", "residual-negative", "residual-nan",
+        "divergence-large", "divergence-1e-12", "divergence-negative",
+        "divergence-nan", "k1-is-floor",
+    ],
+)
+def test_controls_ok_is_every_known_answer_hit(over, ok):
+    """Each case perturbs ONE control on a cell that passes the rest, so a
+    failure is attributable to the field that was changed.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping any one of the three conjuncts of
+    `controls_ok`; `<=` -> `<` on the tolerance (the residual-at-tolerance case
+    sits exactly on the bar); turning the divergence test into a tolerance
+    (1e-12 is a nonzero divergence, and the k=45 rung must reproduce the record
+    BITWISE); and writing a control as "not failed" instead of "passed", which
+    lets NaN through.
+
+    `identity_residual()` returns a max of absolute values and is never
+    negative, so the negative-residual case does not model a real producer: it
+    pins that the property itself reads a magnitude, for a hand-built cell.
+    """
+    assert _arm(**over).controls_ok == ok
+
+
+@pytest.mark.parametrize(
+    "displacement, floor, ok",
+    [
+        (40.0, 12.0, True),
+        (12.0000001, 12.0, True),
+        (12.0, 12.0, False),
+        (9.0, 12.0, False),
+        (float("nan"), 12.0, False),
+    ],
+    ids=["moves-far", "just-above", "equal", "below", "nan"],
+)
+def test_base_ok_needs_true_motion_strictly_above_the_readout_error(
+    displacement, floor, ok
+):
+    """THE MUTATIONS THIS EXISTS FOR: `>` -> `>=` (the equal case: a median
+    displacement exactly at the floor cannot be told from noise) and a
+    constant `return True`. NaN must fail, so a "not below" rewrite is caught
+    too."""
+    cell = _arm(displacement_median=displacement, floor_median=floor)
+    assert cell.base_ok == ok
+
+
+def test_a_cell_refuses_an_interval_whose_low_end_is_above_its_high_end():
+    """The two decisive statuses are exclusive per cell because
+    `margin_low <= margin_high`, so the record refuses to be built without it
+    rather than leaving it to the producer.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping the `__post_init__` guard, and
+    `>` -> `>=`, which would also refuse a ZERO-width interval -- legal, since
+    a bootstrap whose replicates all agree produces one.
+    """
+    with pytest.raises(ValueError, match="pixel_ae seed 4.*ci_low"):
+        _arm(arm="pixel_ae", seed=4, low=2.0, high=1.0)
+    assert _arm(low=1.5, high=1.5).margin_high == 1.5
+
+
+def test_the_reading_records_are_frozen():
+    """THE MUTATION THIS EXISTS FOR: dropping `frozen=True` from any of the
+    three, after which a status could be edited after it was decided."""
+    cell = _arm()
+    inputs = BurdenInputs(cells={("pixel_ae", 0): cell}, decision_h=DECISION_H, ks=(1, 45))
+    status = BurdenStatus(
+        status="INDETERMINATE", rule="r", arms_motion=(), arms_copies=(),
+        seeds_total={"pixel_ae": 1},
+    )
+    for record, field in ((cell, "margin"), (inputs, "decision_h"), (status, "status")):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(record, field, 0)

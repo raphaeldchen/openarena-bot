@@ -30,6 +30,8 @@ destroyed a signal once, when the model and the floor were probed through
 differently fitted pipelines. One shared definition beats a clean import.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from mbfps.eval.pooling import episode_bootstrap, percentile_interval
@@ -297,3 +299,82 @@ def margin_interval(
     ])
     low, high, _se = percentile_interval(replicates)
     return point, low, high
+
+
+SEEDS_MINIMUM: int = 3
+"""An arm with fewer seeds is refused by name rather than tallied.
+
+`strict_majority(1) == 1`, so without this a single lucky cell would establish
+an arm -- the M3j trap where `--arms random_vit` printed a row reading
+`clears = up` beside a verdict of NO DIFFERENCE.
+"""
+
+
+def strict_majority(n: int) -> int:
+    """More than half of `n`, COMPUTED from the seed count present.
+
+    Never a stored constant: `SEEDS_REQUIRED = 2` is a majority at 3 seeds and
+    a minority at 5, and M3l's design was reworked for exactly that.
+    """
+    if n < 1:
+        raise ValueError(f"a majority needs at least one seed, got {n}")
+    return n // 2 + 1
+
+
+@dataclass(frozen=True)
+class BurdenArm:
+    """One cell: one arm at one seed, at `DECISION_H`."""
+
+    arm: str
+    seed: int
+    margin: float
+    margin_low: float
+    margin_high: float
+    burden_by_k: dict[int, float]
+    compounding_by_k: dict[int, float]
+    identity_residual: float
+    open_loop_divergence: float
+    k_one_is_floor: bool
+    displacement_median: float
+    floor_median: float
+    clusters: int
+    rows: int
+
+    def __post_init__(self) -> None:
+        if self.margin_low > self.margin_high:
+            raise ValueError(
+                f"{self.arm} seed {self.seed}: an interval cannot have "
+                f"ci_low {self.margin_low} above ci_high {self.margin_high}"
+            )
+
+    @property
+    def controls_ok(self) -> bool:
+        """Every known answer hit. Checked before any status is tallied."""
+        return (
+            abs(self.identity_residual) <= IDENTITY_TOLERANCE
+            and self.open_loop_divergence == 0.0
+            and not self.k_one_is_floor
+        )
+
+    @property
+    def base_ok(self) -> bool:
+        """True motion exceeds the readout's own error, so a margin is
+        detectable at all. Self-calibrating: a ratio of two measured
+        quantities, not a magic constant."""
+        return self.displacement_median > self.floor_median
+
+
+@dataclass(frozen=True)
+class BurdenInputs:
+    cells: dict[tuple[str, int], BurdenArm]
+    decision_h: int
+    ks: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class BurdenStatus:
+    status: str
+    rule: str
+    arms_motion: tuple[str, ...]
+    arms_copies: tuple[str, ...]
+    seeds_total: dict[str, int]
