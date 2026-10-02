@@ -1285,9 +1285,10 @@ def test_every_column_has_room_for_the_widest_value_it_can_carry():
     """Columns are right-aligned and unseparated, so a value that fills its
     column runs into the one before it and `str.split` merges the two.
 
-    `-999.9999` is the widest number a position error could take in this
-    project (errors run 100-250), at nine characters; `random_vit` is the
-    longest arm name; `copies` and `motion` the longest `clears` labels.
+    `-999.9999` is a deliberately generous bound at nine characters (position
+    errors run 100-250 here, so a burden or a margin sits well inside it);
+    `random_vit` is the longest arm name; `copies` and `motion` the longest
+    `clears` labels.
 
     THE MUTATIONS THIS EXISTS FOR: the first width shrunk below the longest
     arm name, which lengthens the row beyond the header; and any numeric width
