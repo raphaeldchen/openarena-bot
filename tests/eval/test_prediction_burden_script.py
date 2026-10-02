@@ -1834,13 +1834,22 @@ def test_burden_txt_is_the_formatters_text_byte_for_byte_and_stdout_is_the_same_
 def test_the_reading_is_byte_identical_on_two_reads(record, tmp_path):
     """The point of the two-phase split: a reading reproducible from the records
     without a GPU. Two independent reads, in two directories, of the same nine
-    records. (Only a comparison against the formatter -- the test above -- can see
-    a `rstrip()`, which both reads here would apply alike.)"""
-    records = _records_from(record, _scenario("PREDICTS_MOTION"))
+    records.
+
+    THE MUTATION THIS EXISTS FOR: `rstrip()` on the text. Two reads of the SAME
+    code strip the same bytes and agree with each other, so agreement alone
+    cannot see it -- both files are ALSO compared with the formatter's text,
+    built here from the spec, which ends in the newline `rstrip()` would lose."""
+    spec = _scenario("PREDICTS_MOTION")
+    inputs = _expected_inputs(spec)
+    expected = burden.format_reading_burden(burden.reading_burden(inputs), inputs).encode()
+    assert expected.endswith(b"\n") and not expected.endswith(b"\n\n")
+    records = _records_from(record, spec)
     first, second = _read_args(tmp_path / "a", records), _read_args(tmp_path / "b", records)
     assert script.read_phase(first) == script.read_phase(second) == 0
-    text = (first.out / "burden.txt").read_bytes()
-    assert text and (second.out / "burden.txt").read_bytes() == text
+    a, b = (first.out / "burden.txt").read_bytes(), (second.out / "burden.txt").read_bytes()
+    assert a == b
+    assert a == expected
 
 
 # --- main: the three phases --------------------------------------------------
