@@ -404,13 +404,25 @@ def _bits_from_stats(stats: EpisodeStats, picked: np.ndarray) -> float:
 
 def bits_interval(
     stats: EpisodeStats, *, resamples: int = RESAMPLES,
-    confidence: float = CONFIDENCE, seed: int = 0,
+    confidence: float = CONFIDENCE, seed: int,
 ) -> dict:
     """`bits_carried` with an episode-clustered percentile interval.
 
     Episodes, not windows: windows are cut non-overlapping but several windows
     from one trajectory are not independent observations, and every reading from
     M3e onward clusters on episodes.
+
+    `seed` HAS NO DEFAULT, for `redundancy_floor`'s reason: a defaulted seed is
+    how a previous milestone shipped every cell drawing from seed 0, which
+    correlates the interval noise the seeds x arms agreement rule treats as
+    independent. A caller that forgets it is a `TypeError`, not a silent
+    collapse onto one bootstrap.
+
+    `confidence` and `resamples` are the level and the draw count the interval
+    was ACTUALLY TAKEN AT -- the arguments this function used, not a claim made
+    by its caller -- so the permanent record can be audited for both. `ci_high`
+    is the bound Reading G compares to `SPARE_CUT`, and a narrower interval
+    makes `SPARE_CAPACITY` easier to clear, so neither may go unrecorded.
     """
     n_episodes = stats.labels.size
     if n_episodes < 2:
@@ -431,6 +443,7 @@ def bits_interval(
         "ci_low": float(low),
         "ci_high": float(high),
         "confidence": confidence,
+        "resamples": int(resamples),
         "n_episodes": int(n_episodes),
     }
 

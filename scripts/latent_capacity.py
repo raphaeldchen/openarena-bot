@@ -520,7 +520,7 @@ def _r2_from_stats(stats: dict, picked: np.ndarray) -> float:
 
 def frame_probe(fit: dict, select: dict | None, score: dict, *, columns: np.ndarray,
                 groups: np.ndarray, resamples: int = RESAMPLES,
-                confidence: float = CONFIDENCE, seed: int = 0) -> dict:
+                confidence: float = CONFIDENCE, seed: int) -> dict:
     """`R2(enc(t) -> post_probs)` on `columns`, with an episode-clustered interval.
 
     The three-split discipline, unchanged: weights from `fit`, ridge selected on
@@ -558,6 +558,10 @@ def frame_probe(fit: dict, select: dict | None, score: dict, *, columns: np.ndar
     ACTUALLY TAKEN AT -- the arguments this function used, not a claim made by
     its caller -- so a reader of the record does not take `bits`' `confidence`
     to describe it.
+
+    `seed` HAS NO DEFAULT, for `redundancy_floor`'s reason: a defaulted seed is
+    how a previous milestone shipped every cell drawing from seed 0. A caller
+    that forgets it is a `TypeError`, not a silent collapse onto one bootstrap.
 
     Returns `frame_share`, `frame_low`, `frame_high`, `frame_confidence`,
     `frame_resamples`, `frame_ridge` and `frame_ridge_selected`. Only
@@ -645,18 +649,24 @@ def cell_capacity(gathered, *, seed: int, resamples: int = RESAMPLES) -> dict:
     passes it, so a production run cannot depart from the pre-registered figure.
     It exists so a test that asserts on no interval width can pay for fewer.
 
-    TWO INTERVALS, TWO METHODS, AND THE RECORD SAYS WHICH IS WHICH. `confidence`
-    and `n_episodes` come from `bits_interval` and describe the `bits` interval
-    ONLY. The frame interval carries its own `frame_confidence` and
-    `frame_resamples`, because a reader taking the one `confidence` to describe
-    both would be assuming the frame interval is the project's standard
+    TWO INTERVALS, TWO METHODS, AND THE RECORD SAYS WHICH IS WHICH. `confidence`,
+    `resamples` and `n_episodes` come from `bits_interval` and describe the
+    `bits` interval ONLY. The frame interval carries its own `frame_confidence`
+    and `frame_resamples`, because a reader taking the one `confidence` to
+    describe both would be assuming the frame interval is the project's standard
     bootstrap -- and it deliberately is not: `frame_probe` HOLDS THE R^2
     DENOMINATOR AT THE FULL SAMPLE instead of resampling it, as
     `probe._block_bootstrap_ci` does (see `_r2_stats` for the measurement that
     forces it). That makes the frame interval slightly NARROWER than a
     fully-resampled one, and `frame_low` -- the only frame number Reading G
-    compares to a cut -- inherits it. `bits_interval` does not record its draw
-    count; `cell_capacity` hands both the same `resamples`.
+    compares to a cut -- inherits it.
+
+    BOTH INTERVALS RECORD THEIR OWN DRAW COUNT. `cell_capacity` hands both the
+    same `resamples`, and `ci_high` -- the bound `SPARE_CAPACITY` is read off --
+    narrows as the draw count falls, so the permanent artefact has to be
+    auditable for it rather than for the frame interval's alone. Records written
+    before `resamples` existed do not carry it; nothing on the read path reads
+    either draw count, so those records still read.
 
     THE SCORED ROWS MUST BE IN TEMPORAL ORDER (`require_temporal_order`),
     checked first, before anything is paid for.

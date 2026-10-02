@@ -22,7 +22,8 @@ import numpy as np
 import pytest
 
 from mbfps.eval.capacity import (
-    CEILING_BITS, bits_carried, floor_bits, live_classes, reading_capacity,
+    CEILING_BITS, bits_carried, bits_interval, episode_stats, floor_bits,
+    live_classes, reading_capacity, redundancy_bits, redundancy_floor,
     redundancy_ratio,
 )
 from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
@@ -923,7 +924,7 @@ def test_the_check_flags_are_exactly_the_three_booleans():
 
 
 CAPACITY_KEYS = {
-    "bits", "ci_low", "ci_high", "confidence", "n_episodes",
+    "bits", "ci_low", "ci_high", "confidence", "resamples", "n_episodes",
     "frame_share", "frame_low", "frame_high", "frame_confidence", "frame_resamples",
     "frame_ridge", "frame_ridge_selected",
     "live", "prior_bits", "redundancy_bits", "redundancy_floor", "checks", "rows",
@@ -1297,6 +1298,80 @@ def test_the_frame_interval_takes_the_number_of_draws_it_records(monkeypatch):
         return len(calls)
 
     assert evaluations(30) - evaluations(10) == 20
+
+
+def _bits_inputs():
+    """The argument `bits_interval` takes, built the way `cell_capacity` builds
+    it: `episode_stats` of the SCORED split's posterior over its own episode
+    labels."""
+    _, _, score = _splits()
+    return episode_stats(
+        np.asarray(score["post_probs"], dtype=np.float64),
+        np.asarray(score["episode"]),
+    )
+
+
+def test_the_record_says_what_level_and_how_many_draws_the_bits_interval_took():
+    """`ci_high` IS THE NUMBER THE VERDICT IS READ FROM -- `SPARE_CAPACITY` is
+    `ci_high < SPARE_CUT` per seed -- and a narrower interval makes that status
+    EASIER to clear. So the level and the draw count it was taken at are pinned
+    here and recorded on the permanent artefact, exactly as c9f6a3b pinned them
+    for the frame half.
+
+    THE MUTATION THIS EXISTS FOR: `cell_capacity`'s `bits_interval(...)` call
+    with `resamples=11, confidence=0.50`. It left all 484 tests green --
+    `confidence` was on the record but nothing compared it, and the draw count
+    was not recorded at all.
+
+    The values are asserted, not merely the keys, and each against a number this
+    test did not take from the code under test: `CONFIDENCE` and `RESAMPLES` are
+    the protocol's own constants and `FEW_RESAMPLES` is chosen to differ from
+    `RESAMPLES`, so an implementation that hardcodes the draw count fails at the
+    first call and one that halves the confidence at the second.
+
+    A RECORDED VALUE IS AN ECHO, so the bounds are ALSO compared to a direct
+    `bits_interval` call at the protocol's level and the stated draws: a
+    `cell_capacity` that recorded `CONFIDENCE` while handing `bits_interval`
+    something else would read the right keys beside the wrong interval."""
+    splits = _splits()
+    cell = script.cell_capacity(splits, seed=0, resamples=FEW_RESAMPLES)
+    assert type(cell["confidence"]) is float
+    assert cell["confidence"] == CONFIDENCE
+    assert type(cell["resamples"]) is int
+    assert cell["resamples"] == FEW_RESAMPLES != RESAMPLES
+
+    direct = bits_interval(
+        _bits_inputs(), resamples=FEW_RESAMPLES, confidence=CONFIDENCE, seed=0,
+    )
+    assert (cell["ci_low"], cell["ci_high"]) == (
+        direct["ci_low"], direct["ci_high"],
+    ), "cell_capacity's bits interval is not the one the protocol's level gives"
+    assert cell["bits"] == direct["bits"]
+
+    # The production call: `measure_cell` never passes `resamples`.
+    production = script.cell_capacity(splits, seed=0)
+    assert production["resamples"] == RESAMPLES
+    assert production["confidence"] == CONFIDENCE
+
+
+def test_neither_bootstrap_entry_point_defaults_its_seed():
+    """A defaulted seed is how M3j shipped every cell drawing from seed 0, which
+    correlates the interval noise the seeds x arms agreement rule treats as
+    independent. `redundancy_floor(probs, *, seed)` has required it since it was
+    written; `bits_interval` and `frame_probe` defaulted it to 0, so a caller
+    that forgot it got a silent collapse onto one bootstrap rather than a
+    `TypeError`. Closed BY CONSTRUCTION here, in addition to the behavioural
+    seed tests -- the Counter at
+    `test_every_estimator_call_gets_the_cells_own_bootstrap_seed` can only pin
+    the callers this script happens to have."""
+    fit, select, score, columns, groups = _frame_inputs()
+    with pytest.raises(TypeError, match="seed"):
+        bits_interval(_bits_inputs(), resamples=FEW_RESAMPLES)
+    with pytest.raises(TypeError, match="seed"):
+        script.frame_probe(
+            fit, select, score, columns=columns, groups=groups,
+            resamples=FEW_RESAMPLES,
+        )
 
 
 def test_frame_probe_refuses_columns_that_do_not_vary_on_the_scored_rows():
@@ -1796,7 +1871,8 @@ def _read_record(arm, seed, *, spare=False, framey=False, base=True,
         "split_seed": 1234, "torch_version": "2.4.0", "git_sha": "deadbeef",
         "capacity": {
             **bits, **frame, **redundancy,
-            "confidence": CONFIDENCE, "n_episodes": clusters,
+            "confidence": CONFIDENCE, "resamples": RESAMPLES,
+            "n_episodes": clusters,
             "frame_confidence": CONFIDENCE, "frame_resamples": RESAMPLES,
             "live": COLUMNS - rank, "prior_bits": 5.0 + rank,
             "checks": {
@@ -2586,6 +2662,37 @@ def test_read_phase_names_the_first_missing_cell_and_exits_eleven(tmp_path, caps
     assert code == script.EXIT_NO_CHECKPOINTS
     assert "NO CELL" in out and "random_vit seed 2" in out
     assert not (tmp_path / "capacity.txt").exists()
+
+
+def test_read_phase_reads_records_written_before_resamples_was_recorded(
+    tmp_path, capsys,
+):
+    """THE NINE RECORDS ON DISK PREDATE `capacity.resamples`, and the run's
+    reproducibility rests on their still being readable: a field added to the
+    measure half must not make the shipped artefact unreadable by the half that
+    reads it.
+
+    Driven as a BYTE COMPARISON of the two readings rather than as a bare
+    "does not raise": the field is not merely tolerated, it changes nothing the
+    reading prints. An `ARM_FIELDS` or `_self_check_table` that grew a
+    `_get(record, cell, "capacity", "resamples")` would refuse the stripped pool
+    by name through `_get` and fail here; one that printed it would pass a
+    does-not-raise test and fail this one."""
+    records = _pool()
+    with_field, out_with = _read(tmp_path / "with", capsys, records)
+    for record in records.values():
+        del record["capacity"]["resamples"]
+    assert all("resamples" not in r["capacity"] for r in records.values())
+    without_field, out_without = _read(tmp_path / "without", capsys, records)
+
+    assert (with_field, without_field) == (script.EXIT_OK, script.EXIT_OK)
+    assert out_without == out_with, (
+        "the reading changed when `capacity.resamples` was removed; the nine "
+        "shipped records do not carry it and must read identically"
+    )
+    assert (tmp_path / "without" / "capacity.txt").read_bytes() == (
+        tmp_path / "with" / "capacity.txt"
+    ).read_bytes()
 
 
 def test_read_phase_refuses_a_plan_it_cannot_read_before_loading_anything(tmp_path):

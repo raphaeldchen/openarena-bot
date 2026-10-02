@@ -302,6 +302,147 @@ def test_the_interval_needs_two_episodes():
                       resamples=10, confidence=CONFIDENCE, seed=0)
 
 
+SEED_TEST_RESAMPLES = 50
+"""Draws for the seed test -- NOT the protocol's `RESAMPLES`, and on purpose.
+
+A percentile bound's sampling noise falls with the draw count, so the seed's
+footprint on the interval is largest where draws are few. Measured on
+`_heterogeneous_episodes()`, `ci_high` at seeds 0 / 1 / 2:
+
+    50 draws      89.2968  77.3548  86.3008   (closest pair 2.996 apart)
+    200 draws     89.2340  88.8869  88.9611   (closest pair 0.074 apart)
+
+At the protocol's 1000 a test here would have to claim a margin its own
+measurement does not support. 50 draws is where the effect is plainly visible,
+and the call costs well under a second."""
+
+SEED_TEST_MARGIN = 0.5
+"""Chosen from the measurement above: a sixth of the 2.996 bits that the closest
+pair of seeds is measured apart at `SEED_TEST_RESAMPLES`. An implementation that
+ignores its seed reads a gap of EXACTLY 0.0, so any margin up to the measured
+gap tells the two apart; this one is wide enough that float debris cannot pass
+for a moved interval and narrow enough to leave the measurement 6x of room."""
+
+
+def _heterogeneous_episodes(n_episodes=8, per_episode=50, seed=0):
+    """Episodes that differ in how much their rows carry: alternating Dirichlet
+    0.05 (near-deterministic rows) and 5.0 (near-uniform rows).
+
+    `_dirichlet` alone gives every episode the same concentration, so which
+    episodes a draw picks barely moves `bits_carried` and the seeds' footprint
+    on the bounds is a few hundredths of a bit. Here WHICH episodes a draw picks
+    is the whole story, so an ignored seed is visible by bits rather than by
+    rounding."""
+    rng = np.random.default_rng(seed)
+    blocks, groups = [], []
+    for episode in range(n_episodes):
+        alpha = 0.05 if episode % 2 == 0 else 5.0
+        blocks.append(rng.dirichlet(np.full(CLASSES, alpha), size=(per_episode, CATS)))
+        groups.append(np.full(per_episode, episode))
+    return np.concatenate(blocks), np.concatenate(groups)
+
+
+def test_the_interval_requires_its_seed_and_draws_from_it():
+    """THE SEED IS DRAWN FROM, not just handed over.
+
+    THE MUTATION THIS EXISTS FOR: `np.random.default_rng(seed)` ->
+    `np.random.default_rng(0)` INSIDE `bits_interval`. It left all 484 tests
+    green. `test_every_estimator_call_gets_the_cells_own_bootstrap_seed` wraps
+    `bits_interval` and reads `kwargs["seed"]`, which proves the HAND-OFF and
+    never the behaviour -- the hazard that test's own docstring names as A
+    STANDING HAZARD. The branch wrote the behavioural companion for
+    `frame_probe` and for `redundancy_floor` and not for `bits_interval`, which
+    is the one `ci_high` -- the bound the verdict is read off -- comes from.
+
+    `bits` IS IDENTICAL ACROSS THE THREE SEEDS, and that identity is what makes
+    this a test of the INTERVAL'S seed rather than of the measurement: the point
+    estimate is `_bits_from_stats` at every episode once, with no randomness in
+    it, so a bound that moves while `bits` does not can only have moved because
+    the DRAWS did.
+
+    WHAT WRONG IMPLEMENTATION EACH ASSERTION CATCHES. The missing-seed call
+    catches a DEFAULTED seed, which is how M3j shipped every cell drawing from
+    seed 0. The gap catches a constant or ignored seed (`default_rng(0)`): the
+    gap is exactly 0.0. The repeat catches an UNSEEDED generator
+    (`default_rng()`), which would pass the gap and make every record
+    unreproducible."""
+    probs, groups = _heterogeneous_episodes()
+    stats = episode_stats(probs, groups)
+
+    with pytest.raises(TypeError, match="seed"):
+        bits_interval(stats, resamples=SEED_TEST_RESAMPLES, confidence=CONFIDENCE)
+
+    def at(seed):
+        return bits_interval(
+            stats, resamples=SEED_TEST_RESAMPLES, confidence=CONFIDENCE, seed=seed,
+        )
+
+    outs = [at(seed) for seed in (0, 1, 2)]
+    assert len({out["bits"] for out in outs}) == 1, (
+        "the point estimate must not depend on the seed, or a moving bound is "
+        "not evidence about the interval's draws"
+    )
+    bounds = {(out["ci_low"], out["ci_high"]) for out in outs}
+    assert len(bounds) == 3, f"three seeds gave {bounds}: the seed is ignored"
+    for one, two in itertools.combinations(outs, 2):
+        gap = abs(one["ci_high"] - two["ci_high"])
+        assert gap > SEED_TEST_MARGIN, (
+            f"two seeds put ci_high {gap:.4f} apart; this fixture measures 2.996 "
+            f"for the closest pair at {SEED_TEST_RESAMPLES} draws and the margin "
+            f"is {SEED_TEST_MARGIN}. The interval is not drawing from its seed"
+        )
+
+    again = at(1)
+    assert (again["ci_low"], again["ci_high"]) == (
+        outs[1]["ci_low"], outs[1]["ci_high"],
+    ), "the same seed twice must give the same interval"
+
+
+def test_the_interval_is_taken_at_the_confidence_it_records():
+    """`confidence` is only evidence if the interval was TAKEN at it -- the same
+    hazard as the seed: a `bits_interval` that echoed its argument while cutting
+    the tails at a hardcoded 2.5% would record 0.5 beside a 95% interval. Same
+    seed, same draws, so a 50% interval must sit strictly inside the 95% one at
+    BOTH ends; an ignored `confidence` makes them identical."""
+    probs, groups = _heterogeneous_episodes()
+    stats = episode_stats(probs, groups)
+
+    def at(confidence):
+        return bits_interval(
+            stats, resamples=SEED_TEST_RESAMPLES, confidence=confidence, seed=0,
+        )
+
+    wide, narrow = at(0.95), at(0.50)
+    assert (wide["confidence"], narrow["confidence"]) == (0.95, 0.50)
+    assert wide["ci_low"] < narrow["ci_low"] <= narrow["ci_high"] < wide["ci_high"]
+
+
+def test_the_interval_takes_the_number_of_draws_it_records(monkeypatch):
+    """`resamples` is only evidence if that many draws were taken. Counted as a
+    DIFFERENCE between two runs, so the one extra evaluation that produces the
+    point estimate drops out and the test does not depend on how it is computed:
+    30 draws must cost exactly 20 more bootstrap evaluations than 10. A loop of
+    a hardcoded length costs 0 more."""
+    import mbfps.eval.capacity as module
+
+    probs, groups = _heterogeneous_episodes()
+    stats = episode_stats(probs, groups)
+    real, calls = module._bits_from_stats, []
+    monkeypatch.setattr(
+        module, "_bits_from_stats", lambda *a: calls.append(1) or real(*a),
+    )
+
+    def evaluations(resamples):
+        calls.clear()
+        out = bits_interval(
+            stats, resamples=resamples, confidence=CONFIDENCE, seed=0,
+        )
+        assert out["resamples"] == resamples
+        return len(calls)
+
+    assert evaluations(30) - evaluations(10) == 20
+
+
 def test_the_estimator_refuses_rows_that_are_not_distributions():
     """A caller handing logits instead of probabilities would get a number, not
     an error, and it would look plausible. Refused at the point the array first
