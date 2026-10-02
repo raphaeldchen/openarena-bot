@@ -1522,6 +1522,21 @@ def test_the_record_keeps_a_margin_interval_at_every_reported_horizon():
         assert entry["ci_low"] <= entry["point"] <= entry["ci_high"], h
 
 
+def test_the_stacked_margin_equals_motion_margin_window_by_window():
+    """The script subtracts stacked arrays for speed; `motion_margin` is the
+    definition. If they disagree, the stacked path is wrong.
+
+    THE MUTATION THIS EXISTS FOR: `one - rows` instead of `rows - one`, which
+    flips the sign of the quantity Reading H's verdict is read from and leaves
+    every shape and every interval intact.
+    """
+    record = script.measure_cell(**_cell_kwargs())
+    margin = np.asarray(record["window_margin"], dtype=np.float64)
+    for w in range(margin.shape[0]):
+        expected = burden.motion_margin(_window_targets(w), _fake_one()[w])
+        assert margin[w] == pytest.approx(expected, abs=1e-12)
+
+
 def test_the_measured_controls_are_recorded_not_asserted():
     """The identity residual is a MEASURED float. Recording a hardcoded 0.0 is
     the defect M3l shipped in a legend line and has not yet fixed."""
@@ -1624,6 +1639,18 @@ def baseline_rows(val_paths, *, context: int, horizon: int):
         )
         margin[int(h)] = {"point": point, "ci_low": low, "ci_high": high}
 ```
+
+**The stacked margin must agree with `motion_margin`, and a test must pin it.**
+`motion_margin(window_targets, curve_one)` is the per-window definition, with
+`burden.py`'s shape and finiteness guard behind it. The line above subtracts the
+stacked arrays instead, for speed, which puts the sign convention in two places
+and bypasses that guard. So `measure_cell` must refuse a non-finite `rows` or
+`one` by name before subtracting — `margin_interval` does **not** check, and a
+NaN there returns `(nan, nan, nan)` silently — and a test must assert that
+`window_margin[w]` equals `motion_margin(window_targets_w, one[w])` for **every**
+window `w` on a small fixture. If the two ever disagree the stacked path is
+wrong, not `motion_margin`. Without that test `motion_margin` is test-only code
+and the production sign convention is unpinned.
 
 The base control compares the median true displacement against the median floor error at `DECISION_H`:
 
