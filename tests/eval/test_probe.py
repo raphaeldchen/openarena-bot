@@ -608,16 +608,38 @@ def _packed(latent: torch.Tensor) -> dict:
     """The real RSSM returns `latent = cat([h, z])` plus `h` and `z` separately,
     and callers hand `(h[:, -1], z[:, -1])` back as the next window's state.
     These stubs are one feature wide, so there is nothing to split -- but the
-    keys have to be there or the state handoff cannot be exercised at all."""
-    return {"latent": latent, "h": latent, "z": latent}
+    keys have to be there or the state handoff cannot be exercised at all.
+
+    M3l: the gather also collects `post_logits` / `prior_logits`, so a stub
+    has to return them. Uniform over two classes -- `(B, T, 1, 2)`, the real
+    `(B, T, z_cats, z_classes)` shape with the two axes shrunk to match the
+    one-feature latent -- because no test that runs on a stub reads the values;
+    the ones that do use the real RSSM (`_RealRSSMModel`, below)."""
+    b, t = latent.shape[0], latent.shape[1]
+    logits = torch.zeros(b, t, 1, 2)
+    return {"latent": latent, "h": latent, "z": latent,
+            "post_logits": logits, "prior_logits": logits}
 
 
-class _PassThroughRSSM(nn.Module):
+class _StubCfg:
+    """The one `RSSMConfig` field the gather reads off `model.rssm.cfg`."""
+
+    sample_temperature = 1.0
+
+
+class _StubRSSM(nn.Module):
+    """Base of every stub RSSM the gather runs against: it carries the `cfg`
+    the gather reads the sampling temperature from."""
+
+    cfg = _StubCfg()
+
+
+class _PassThroughRSSM(_StubRSSM):
     def observe(self, embeddings, actions, state=None):
         return _packed(embeddings)
 
 
-class _NoisyRSSM(nn.Module):
+class _NoisyRSSM(_StubRSSM):
     """A posterior that genuinely SAMPLES, like the real categorical one."""
 
     def observe(self, embeddings, actions, state=None):
@@ -838,7 +860,7 @@ from mbfps.eval.probe import gather_probe_data  # noqa: E402
 from mbfps.eval.rollout import evaluate_rollout  # noqa: E402
 
 
-class _DepthRSSM(nn.Module):
+class _DepthRSSM(_StubRSSM):
     """Latent == how many frames have been filtered since the last ZERO state.
 
     That count is the thing at issue. Under the rollout's protocol it can never
@@ -853,7 +875,7 @@ class _DepthRSSM(nn.Module):
         return _packed(depth.expand(b, t, 1).contiguous())
 
 
-class _ObserveImagineRSSM(nn.Module):
+class _ObserveImagineRSSM(_StubRSSM):
     """A pass-through posterior plus a trivial one-step-per-action dynamics
     model -- just enough structure for BOTH `gather_probe_data` (`observe`
     only) and `evaluate_rollout` (`observe` and `imagine`) to run on the same
@@ -868,7 +890,7 @@ class _ObserveImagineRSSM(nn.Module):
         return _packed(h0.unsqueeze(1) + steps)
 
 
-class _RecordingRSSM(nn.Module):
+class _RecordingRSSM(_StubRSSM):
     """Records `(length, warm_started)` for every `observe` call."""
 
     def __init__(self) -> None:
@@ -971,8 +993,9 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
     timestep, so misaligned rows would compare two different frames and no
     shape check would notice.
 
-    There are SEVEN keys -- four payload arrays and M3j's three row indices --
-    and the two embeddings are not interchangeable:
+    There are NINE keys -- four payload arrays, M3j's three row indices and
+    M3l's two posterior/prior distributions -- and the two embeddings are not
+    interchangeable:
     `"embedding"` is the head's PREDICTED embedding (the space the rollout band
     is scored in, what `fit_probes` fits on) and `"encoder_embedding"` is the
     RAW encoder output for the same frame (the reference the filtering gate
@@ -984,7 +1007,7 @@ def test_gather_probe_data_returns_aligned_rows_under_the_documented_keys(
 
     assert set(data) == {
         "latent", "embedding", "encoder_embedding", "targets",
-        "window", "step", "episode",
+        "window", "step", "episode", "post_probs", "prior_probs",
     }
     assert data["latent"].shape == (20, 1)
     assert data["embedding"].shape == (20, 7), "embedding is the HEAD's output"
@@ -1059,18 +1082,20 @@ def test_gather_probe_data_episode_labels_skip_episodes_that_contribute_nothing(
     )
 
 
-def test_gather_probe_data_is_deterministic_and_returns_exactly_seven_keys(tmp_path):
+def test_gather_probe_data_is_deterministic_and_returns_exactly_nine_keys(tmp_path):
     """Two calls over the same paths and kwargs must agree row for row, and
-    the returned dict must carry exactly the four payload arrays plus the three
-    row indices -- no more, no fewer.
+    the returned dict must carry exactly the four payload arrays, the three
+    row indices and M3l's two distributions -- no more, no fewer.
 
     Both sides of the array comparison below are calls made AFTER the indices
     were added, so this pins determinism across calls, not invariance against
     some pre-change array (those no longer exist to compare against; the
     call-site audit that established the four original keys are unchanged by
-    every existing caller is recorded elsewhere, not here). The seven-key set is
+    every existing caller is recorded elsewhere, not here). The nine-key set is
     pinned by exact equality, so an extra or missing key fails even if every
-    array happens to match."""
+    array happens to match. M3l's additivity is pinned separately, against an
+    independent reference, by
+    `test_the_new_gather_keys_change_nothing_that_was_there_before`."""
     paths = _write_episodes(tmp_path, [20, 20])
     first = _gather(paths, context=2, horizon=3)
     second = _gather(paths, context=2, horizon=3)
@@ -1078,7 +1103,7 @@ def test_gather_probe_data_is_deterministic_and_returns_exactly_seven_keys(tmp_p
         np.testing.assert_array_equal(first[key], second[key], err_msg=key)
     assert set(first) == {
         "latent", "embedding", "encoder_embedding", "targets",
-        "window", "step", "episode",
+        "window", "step", "episode", "post_probs", "prior_probs",
     }
 
 
@@ -2370,3 +2395,311 @@ def test_contrast_rejects_arms_with_mismatched_ridge_selection():
     b = (b_fit, b_select, b_score)
     with pytest.raises(ValueError, match="same ridge-selection policy"):
         contrast_from_blocks(a, b, groups=np.arange(200) // 5, resamples=10)
+
+
+# ---------------------------------------------------------------------------
+# M3l: `gather_probe_data` yields the posterior and prior DISTRIBUTIONS.
+#
+# Everything above drives the gather through one-feature stubs. These need the
+# REAL `RSSM`: `post_logits` / `prior_logits` at `(B, T, z_cats, z_classes)` are
+# the thing under test, and a stub that invented them would make every
+# assertion below a statement about the stub.
+# ---------------------------------------------------------------------------
+
+from mbfps.data.episode import load_episode  # noqa: E402
+from mbfps.eval.probe import _sampling_probs  # noqa: E402
+from mbfps.eval.windows import window_starts  # noqa: E402
+from mbfps.models.rssm import RSSM, RSSMConfig  # noqa: E402
+
+
+class _EmbedEncoder(nn.Module):
+    """`_TagEncoder`'s frame tag, lifted to the real RSSM's embedding width by a
+    fixed seeded projection, so every frame still gets its own distinct
+    embedding but the real `post_net` can consume it."""
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        generator = torch.Generator().manual_seed(0)
+        self.register_buffer("projection", torch.randn(1, width, generator=generator))
+
+    def forward(self, obs):
+        tag = obs[:, 0, 0, 0].to(torch.float32).unsqueeze(-1) / 20.0
+        return tag @ self.projection
+
+
+class _RealRSSMModel(nn.Module):
+    input_kind = "obs"
+
+    def __init__(self, sample_temperature: float = 1.0) -> None:
+        super().__init__()
+        cfg = RSSMConfig(sample_temperature=sample_temperature)
+        self.encoder = _EmbedEncoder(cfg.embed_dim)
+        self.rssm = RSSM(cfg, seed=0)
+        self.heads = _WideningHeads(1)
+
+
+def _probe_fixture(tmp_path):
+    """`(model, paths, backbone, device)` for the real RSSM over two 20-step
+    episodes -- enough for several windows per episode at context=3, horizon=5."""
+    model = _RealRSSMModel()
+    paths = _write_episodes(tmp_path, [20, 20])
+    return model, paths, None, torch.device("cpu")
+
+
+@torch.no_grad()
+def _reference_gather(model, paths, *, context, horizon, seed) -> dict:
+    """What `gather_probe_data`'s window loop computed BEFORE M3l, written out
+    straight from `RSSM.observe`: `context` frames from a zero state, then the
+    rest warm-started, concatenated on the time axis.
+
+    It is an oracle rather than a second call to the gather because a second
+    call would run the SAME (possibly perturbed) code under the SAME seed, and
+    two runs of a deterministic function agree with each other whether or not
+    it consumes a random draw along the way. Only something that never ran the
+    collection can say what the draws should have been."""
+    torch.manual_seed(seed)
+    need = context + horizon
+    out: dict[str, list] = {
+        key: [] for key in
+        ("latent", "embedding", "encoder_embedding", "post_logits", "prior_logits")
+    }
+    for path in paths:
+        episode = load_episode(path)
+        all_actions = torch.as_tensor(episode.actions.astype(np.int64)).unsqueeze(0)
+        for start in window_starts(episode.length, context, horizon):
+            frames = torch.as_tensor(episode.obs[start : start + need + 1])
+            window = model.encoder(frames).unsqueeze(0)[:, 1:]
+            actions = all_actions[:, start : start + need]
+            observed = model.rssm.observe(window[:, :context], actions[:, :context])
+            state = (observed["h"][:, -1], observed["z"][:, -1])
+            future = model.rssm.observe(
+                window[:, context:], actions[:, context:], state=state
+            )
+            latent = torch.cat([observed["latent"], future["latent"]], dim=1)
+            out["latent"].append(latent[0].numpy())
+            out["embedding"].append(model.heads(latent)["embedding"][0].numpy())
+            out["encoder_embedding"].append(window[0].numpy())
+            for key in ("post_logits", "prior_logits"):
+                joined = torch.cat([observed[key], future[key]], dim=1)
+                out[key].append(joined[0].numpy())
+    return {key: np.concatenate(rows) for key, rows in out.items()}
+
+
+def test_the_gather_yields_the_posterior_and_prior_distributions(tmp_path):
+    """`bits_carried` needs the DISTRIBUTIONS, not the samples. `"latent"`
+    carries the one-hot `z` the model drew; the information content of the code
+    is a property of the distribution it was drawn from, so M3l needs
+    `post_logits` as probabilities.
+
+    Row-aligned with every existing array, and shaped `(N, z_cats, z_classes)`
+    rather than flattened, because the estimator sums an entropy per categorical
+    and a flattened array cannot tell the 32 groups apart."""
+    model, paths, backbone, device = _probe_fixture(tmp_path)
+    data = gather_probe_data(model, paths, backbone, device, context=3, horizon=5)
+
+    n = data["latent"].shape[0]
+    for key in ("post_probs", "prior_probs"):
+        assert key in data, f"the gather does not yield {key}"
+        assert data[key].shape == (n, RSSMConfig.z_cats, RSSMConfig.z_classes), (
+            f"{key} is {data[key].shape}, expected "
+            f"{(n, RSSMConfig.z_cats, RSSMConfig.z_classes)}"
+        )
+        # Distributions, not logits: each categorical must sum to 1.
+        sums = data[key].sum(axis=-1)
+        np.testing.assert_allclose(sums, 1.0, atol=1e-5)
+        assert (data[key] >= 0.0).all(), f"{key} carries a negative probability"
+
+
+def test_the_new_gather_keys_change_nothing_that_was_there_before(tmp_path):
+    """`gather_probe_data` reports onto the research gate through
+    `study.py` and `scripts/eval_rollout.py`, so M3l's change has to be
+    provably additive rather than argued to be.
+
+    It is additive structurally: `RSSM.observe` ALREADY computes and returns
+    both logit tensors, so collecting them consumes no randomness and adds no
+    operation. This pins that claim against `_reference_gather`, which never
+    ran the collection -- `assert_array_equal`, not `allclose`, because a
+    perturbed RNG draw would change `z` and therefore `latent` and `embedding`
+    outright, not slightly.
+
+    The reference is load-bearing. Comparing two gathers under one seed, both
+    running the new code, cannot fail: a collection that consumed a draw would
+    consume it identically in both, and the two would agree."""
+    model, paths, backbone, device = _probe_fixture(tmp_path)
+    kw = dict(context=3, horizon=5, seed=7)
+    first = gather_probe_data(model, paths, backbone, device, **kw)
+    second = gather_probe_data(model, paths, backbone, device, **kw)
+
+    inherited = ("latent", "embedding", "encoder_embedding", "targets",
+                 "window", "step", "episode")
+    assert set(first) == set(inherited) | {"post_probs", "prior_probs"}, (
+        "the gather's key set moved beyond the two keys M3l adds"
+    )
+    for key in inherited:
+        np.testing.assert_array_equal(
+            first[key], second[key],
+            err_msg=f"{key} is not reproducible under one seed",
+        )
+
+    reference = _reference_gather(model, paths, **kw)
+    for key in ("latent", "embedding", "encoder_embedding"):
+        np.testing.assert_array_equal(
+            first[key], reference[key],
+            err_msg=f"{key} differs from what the gather computed before M3l; "
+                    f"the collection may have consumed a random draw",
+        )
+
+
+def test_the_distributions_are_the_posterior_and_prior_the_model_computed(tmp_path):
+    """The two tests above cannot tell the posterior from the prior, or one row
+    order from another: both would pass if `post_probs` were the softmax of
+    `prior_logits`, or if the two windows' halves were joined in the wrong
+    order. This one names the tensor.
+
+    Checked against the softmax of the logits `_reference_gather` saw, row for
+    row. At the shipped temperature of 1.0 the distribution `z` is drawn from
+    IS the plain softmax."""
+    model, paths, backbone, device = _probe_fixture(tmp_path)
+    kw = dict(context=3, horizon=5, seed=7)
+    data = gather_probe_data(model, paths, backbone, device, **kw)
+    reference = _reference_gather(model, paths, **kw)
+
+    assert model.rssm.cfg.sample_temperature == 1.0, "the plain softmax only holds at 1.0"
+    post = torch.softmax(torch.as_tensor(reference["post_logits"]), dim=-1).numpy()
+    prior = torch.softmax(torch.as_tensor(reference["prior_logits"]), dim=-1).numpy()
+    np.testing.assert_allclose(data["post_probs"], post, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(data["prior_probs"], prior, rtol=0.0, atol=1e-6)
+    # ...and the two are genuinely different tensors on this fixture, so the
+    # equalities above cannot be satisfied by one standing in for the other.
+    assert np.abs(post - prior).max() > 1e-3
+
+
+def test_sampling_probs_tempers_the_logits_the_way_the_sampler_does():
+    """Every gather above runs at the shipped `sample_temperature = 1.0`, where
+    the temperature branch is never taken, so a helper that ignored the
+    temperature altogether would pass all of them. The information content of
+    the code is a property of the distribution `z` was drawn from, and
+    `RSSM._sample` draws from `softmax(logits / tau)`; at 1.0 it divides by
+    nothing."""
+    logits = torch.randn(4, 3, 5, generator=torch.Generator().manual_seed(0))
+    plain = torch.softmax(logits, dim=-1)
+
+    np.testing.assert_array_equal(
+        _sampling_probs(logits, 1.0).numpy(), plain.numpy(),
+    )
+    sharper = _sampling_probs(logits, 0.5)
+    np.testing.assert_allclose(
+        sharper.numpy(), torch.softmax(logits / 0.5, dim=-1).numpy(), atol=1e-7,
+    )
+    # A temperature below 1 concentrates the distribution; above 1 flattens it.
+    assert (sharper.max(dim=-1).values > plain.max(dim=-1).values).all()
+    assert (_sampling_probs(logits, 2.0).max(dim=-1).values
+            < plain.max(dim=-1).values).all()
+
+
+def test_the_gather_reads_the_sampling_temperature_off_the_model(tmp_path):
+    """`_sampling_probs` is right in isolation and the gathers above are right
+    at 1.0, and a gather that hardcoded 1.0 instead of reading the model's own
+    `cfg.sample_temperature` would pass both. At a temperature of 0.5 the code
+    was drawn from `softmax(logits / 0.5)`, so that is what the gather must
+    return -- and it must differ from the plain softmax, or this checks
+    nothing."""
+    model = _RealRSSMModel(sample_temperature=0.5)
+    paths = _write_episodes(tmp_path, [20, 20])
+    kw = dict(context=3, horizon=5, seed=7)
+    data = gather_probe_data(model, paths, None, torch.device("cpu"), **kw)
+    reference = _reference_gather(model, paths, **kw)
+
+    post_logits = torch.as_tensor(reference["post_logits"])
+    tempered = torch.softmax(post_logits / 0.5, dim=-1).numpy()
+    plain = torch.softmax(post_logits, dim=-1).numpy()
+    assert np.abs(tempered - plain).max() > 1e-3, "the fixture cannot tell the two apart"
+    np.testing.assert_allclose(data["post_probs"], tempered, rtol=0.0, atol=1e-6)
+
+    # BOTH arrays, not just the posterior: applying the temperature to
+    # `post_logits` alone and leaving the prior at 1.0 passed this test while it
+    # asserted only `post_probs`. The prior gets the same temperature because it
+    # is the distribution `imagine` draws from, and a companion measured under a
+    # different temperature than the thing it companions is not a companion.
+    prior_tempered = torch.softmax(
+        torch.as_tensor(reference["prior_logits"]) / 0.5, dim=-1
+    ).numpy()
+    np.testing.assert_allclose(data["prior_probs"], prior_tempered, rtol=0.0, atol=1e-6)
+
+    # float32, which the brief specifies and which `.double()` would otherwise
+    # satisfy every other assertion in this file while doubling the record size.
+    for key in ("post_probs", "prior_probs"):
+        assert data[key].dtype == np.float32, f"{key} is {data[key].dtype}"
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.5, 1.0, 2.0])
+def test_the_sampling_probs_helper_mirrors_rssm_sample_at_every_temperature(temperature):
+    """The helper's docstring claims to mirror `RSSM._sample`'s temperature
+    handling, so it has to mirror BOTH of its special cases.
+
+    `_sample` skips the division at 0.0 as well as 1.0, and at 0.0 it discards
+    its draw for the argmax -- so the distribution it effectively samples from
+    there is a POINT MASS, not the softmax it happened to compute. Dividing at
+    0.0 instead yields NaN, and the estimator's own guard would then refuse it
+    with the wrong diagnosis ("logits handed in place of probabilities"): a
+    loud failure blaming the caller for the helper's bug. Unreachable at the
+    shipped 1.0, which is exactly why nothing else would catch it."""
+    # The argmax must NOT be index 0, and there must be more than one row with
+    # DIFFERENT argmaxes. With a single row whose max was already index 0, a
+    # point mass at index 0 -- or an argmax taken over the wrong dim, which
+    # returns 0 on a size-1 axis -- passed this test identically. Verified: with
+    # the old fixture, replacing the scatter with `onehot[..., 0] = 1.0` passed.
+    logits = torch.tensor([[[1.0, 2.0, -1.0, 0.5],
+                            [0.5, -1.0, 1.0, 3.0]]])
+    assert logits.argmax(-1).tolist() == [[1, 3]], "the fixture's whole premise"
+    probs = _sampling_probs(logits, temperature)
+    assert torch.isfinite(probs).all(), f"non-finite at temperature {temperature}"
+    torch.testing.assert_close(probs.sum(-1), torch.ones_like(probs.sum(-1)))
+
+    if temperature == 0.0:
+        expected = torch.nn.functional.one_hot(
+            logits.argmax(dim=-1), logits.shape[-1]
+        ).to(probs.dtype)
+        torch.testing.assert_close(probs, expected)
+        assert probs[0, 0].argmax().item() == 1 and probs[0, 1].argmax().item() == 3
+    elif temperature == 1.0:
+        # Bitwise the plain softmax: no division is taken at the shipped value.
+        assert (probs == torch.softmax(logits, dim=-1)).all()
+    else:
+        torch.testing.assert_close(probs, torch.softmax(logits / temperature, dim=-1))
+
+
+def test_the_sampling_probs_helper_refuses_a_negative_temperature():
+    """`RSSM._sample` refuses it; a helper that claims to mirror it must too."""
+    with pytest.raises(ValueError, match="must be >= 0"):
+        _sampling_probs(torch.zeros(1, 1, 4), -1.0)
+
+
+def test_the_distributions_are_row_aligned_with_the_latent_they_came_from(tmp_path):
+    """Row alignment is by construction -- the same two `observe` calls, the
+    same axis, the same order -- but every later task's numbers rest on it, so
+    it gets an independent pin rather than only the oracle's.
+
+    At `sample_temperature = 0.0` the code `RSSM._sample` draws is exactly the
+    argmax of the posterior logits, so `post_probs.argmax` must equal `z.argmax`
+    ON EVERY ROW. That is what makes this a check of alignment rather than of
+    distribution: shifting the arrays by one row breaks it. At 1.0 an untrained
+    model is near-uniform, so no statistical check would be informative --
+    measured, the mean log-prob of the aligned pairing and of a one-row-shifted
+    pairing agree to three decimals."""
+    model = _RealRSSMModel(sample_temperature=0.0)
+    paths = _write_episodes(tmp_path, [20, 20])
+    data = gather_probe_data(model, paths, None, torch.device("cpu"),
+                             context=3, horizon=5, seed=7)
+
+    cats, classes = RSSMConfig.z_cats, RSSMConfig.z_classes
+    z = data["latent"][:, RSSMConfig.h_dim:].reshape(-1, cats, classes)
+    aligned = data["post_probs"].argmax(axis=-1)
+    np.testing.assert_array_equal(aligned, z.argmax(axis=-1))
+
+    assert data["post_probs"].shape[0] > 1, "a one-row gather cannot show a shift"
+    shifted = np.roll(z.argmax(axis=-1), 1, axis=0)
+    assert not np.array_equal(aligned, shifted), (
+        "a one-row shift is undetectable here, so this test cannot see a "
+        "misalignment either"
+    )

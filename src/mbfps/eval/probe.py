@@ -151,6 +151,39 @@ def probe_r2(probe: dict, latents: np.ndarray, targets: np.ndarray) -> float:
     return _mean_r2(apply_probe(probe, latents), targets)
 
 
+def _sampling_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """The distribution `RSSM._sample` actually draws from, as probabilities.
+
+    The temperature matters because the information content of the code is a
+    property of the distribution `z` came from, not of the raw logits. Written
+    as a guarded division rather than an unconditional one so the shipped
+    `sample_temperature = 1.0` path is bitwise the plain softmax, exactly as
+    `RSSM._sample` does it -- M3h added the temperature and took the same care,
+    and an unconditional `logits / 1.0` is not guaranteed bitwise identical.
+
+    Mirrors `_sample` at BOTH of its special cases, not just 1.0: it skips the
+    division at 0.0 as well, and at 0.0 it takes the argmax, so the distribution
+    it effectively draws from there is a point mass rather than the softmax.
+    Unreachable at the shipped 1.0, and written out because a future
+    temperature change should be reflected rather than silently mis-reported.
+    """
+    if temperature < 0.0:
+        raise ValueError(f"sampling temperature must be >= 0, got {temperature}")
+    if temperature == 0.0:
+        # `_sample` draws from the untempered softmax at 0.0 and then DISCARDS
+        # the draw for the argmax, so the distribution it effectively samples
+        # from is a point mass -- which is what this has to report, not the
+        # softmax it happened to compute. Dividing here instead would give NaN,
+        # and the estimator's guard would then refuse it with the wrong
+        # diagnosis ("logits handed in place of probabilities").
+        onehot = torch.zeros_like(logits)
+        onehot.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        return onehot
+    if temperature != 1.0:
+        logits = logits / temperature
+    return torch.softmax(logits, dim=-1)
+
+
 @torch.no_grad()
 def gather_probe_data(
     model,
@@ -194,7 +227,7 @@ def gather_probe_data(
     prevent. What is matched here is the filtering DEPTH, which is what the
     three references actually share.
 
-    Returns seven row-aligned arrays:
+    Returns nine row-aligned arrays:
 
     - `"latent"` `(N, LATENT)` -- the posterior latent.
     - `"embedding"` `(N, EMBED)` -- the model's PREDICTED embedding, i.e.
@@ -212,6 +245,13 @@ def gather_probe_data(
       from, over the episodes that contributed at least one window. M3j
       resamples on this rather than on `"window"`; see `_block_bootstrap_ci`'s
       `groups`.
+    - `"post_probs"`, `"prior_probs"` `(N, z_cats, z_classes)` float32 -- the
+      posterior (the distribution `"latent"`'s `z` was drawn from) and the
+      prior, each as probabilities under `RSSM._sample`'s own temperature,
+      NOT flattened. M3l measures the information content of the code, which
+      is a property of the distribution rather than of the one-hot draw in
+      `"latent"`. Collected from the very `observe` calls `"latent"` comes
+      from, so they add no operation and consume no random draw.
 
     THE TWO EMBEDDINGS ARE NOT REDUNDANT AND MUST NOT BE COLLAPSED INTO ONE.
     They answer different questions, and each is the wrong array for the
@@ -246,6 +286,7 @@ def gather_probe_data(
     torch.manual_seed(seed)
     need = context + horizon
     latents, embeddings, encoder_embeddings, targets = [], [], [], []
+    post_probs, prior_probs = [], []
     windows: list[np.ndarray] = []
     steps: list[np.ndarray] = []
     episodes: list[np.ndarray] = []
@@ -279,6 +320,17 @@ def gather_probe_data(
                 window[:, context:], actions[:, context:], state=state
             )
             latent = torch.cat([observed["latent"], future["latent"]], dim=1)
+            # Row-aligned with `latent` by construction: the same two `observe`
+            # calls, concatenated on the same axis in the same order. Deriving
+            # these from a second pass would reintroduce the row-alignment
+            # hazard M3k needed two layered guards for.
+            temperature = model.rssm.cfg.sample_temperature
+            for key, sink in (("post_logits", post_probs),
+                              ("prior_logits", prior_probs)):
+                joined = torch.cat([observed[key], future[key]], dim=1)
+                sink.append(
+                    _sampling_probs(joined, temperature)[0].float().cpu().numpy()
+                )
 
             latents.append(latent[0].float().cpu().numpy())
             embeddings.append(
@@ -328,6 +380,12 @@ def gather_probe_data(
         # from one trajectory are not independent observations, and every
         # reading from M3e onward clusters on episodes rather than windows.
         "episode": np.concatenate(episodes),
+        # M3l. `(N, z_cats, z_classes)`, NOT flattened: the estimator sums an
+        # entropy per categorical and a flattened array cannot tell the groups
+        # apart. Additive -- `observe` already computed both, so collecting
+        # them consumes no randomness, which a test pins.
+        "post_probs": np.concatenate(post_probs),
+        "prior_probs": np.concatenate(prior_probs),
     }
 
 
