@@ -258,6 +258,11 @@ def margin_interval(
     reader to refuse rather than treat every window as its own episode --
     falling back to `arange(n)` here would convert this into the window-level
     bootstrap the first paragraph rules out.
+
+    `window_margin` must be finite EVERYWHERE, not only in the column read at
+    `h`. A NaN that reaches the mean returns `(nan, nan, nan)` -- no exception,
+    no indication of which input was bad -- and that triple is the quantity
+    Reading H's verdict is read from, so a silent one is a silent wrong verdict.
     """
     window_margin = np.asarray(window_margin, dtype=np.float64)
     groups = np.asarray(groups)
@@ -265,6 +270,8 @@ def margin_interval(
         raise ValueError(
             f"window_margin must be (windows, horizon); got {window_margin.shape}"
         )
+    if not np.isfinite(window_margin).all():
+        raise ValueError("every window_margin value must be finite")
     if groups.ndim != 1 or groups.size != window_margin.shape[0]:
         raise ValueError(
             "groups must carry one label per window; got "

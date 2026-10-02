@@ -618,6 +618,37 @@ def test_the_interval_refuses_a_malformed_margin_a_bad_resample_count_and_a_bad_
             margin_interval(window_margin, groups, h=bad, **run)
 
 
+def test_the_interval_refuses_a_nonfinite_margin_wherever_it_sits():
+    """A NaN in the column read at `h` used to return `(nan, nan, nan)` with no
+    refusal. That triple is what Reading H's verdict is read from, so a silent
+    one is a silent wrong verdict. MEASURED on this fixture before the guard
+    existed: a NaN at (0, 0) gave `(nan, nan, nan)` at `h=1`, while one at (3, 1)
+    or (5, 2) gave a finite interval -- the corrupt cell was silently ignored.
+
+    The positions are the first, a middle and the last cell of the matrix. At
+    `h=1` only the first lies in the column that is read; the middle and the last
+    lie in columns that are NOT, so they pin that the refusal covers the whole
+    array rather than the one column the mean is taken over.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping the finiteness guard, and narrowing
+    it to the column read at `h` (or to the first row).
+    """
+    window_margin = np.arange(18.0).reshape(6, 3)
+    groups = np.repeat([0, 1], 3)
+    run = {"h": 1, "resamples": 10, "seed": 0}
+
+    # The control: the same call on the unpoisoned array is finite, so each
+    # refusal below is attributable to the one cell that was changed.
+    assert np.isfinite(margin_interval(window_margin, groups, **run)).all()
+
+    for bad in (np.nan, np.inf, -np.inf):
+        for row, column in ((0, 0), (3, 1), (5, 2)):
+            poisoned = window_margin.copy()
+            poisoned[row, column] = bad
+            with pytest.raises(ValueError, match="finite"):
+                margin_interval(poisoned, groups, **run)
+
+
 def test_the_interval_accepts_the_plain_lists_a_json_record_hands_over():
     """`windows.episode` and the per-window margins come out of a JSON record as
     Python lists, which have no `.ndim` for the guards to read.
