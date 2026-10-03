@@ -598,12 +598,18 @@ def _versus(mine, reference) -> str:
     """`mine vs reference`, in a form a person can act on.
 
     A value that fits on a line is printed as it is. Two long lists -- the 150
-    window labels of `windows.episode`, the episode names of `episodes.val` --
-    are the case a bare truncation fails: they are cut at the same character and
-    read as one text, however they differ. So they are told apart by LENGTH when
-    the lengths differ (`151 vs 150 rows`) and by the FIRST INDEX where they
-    differ when they do not, with the two values found there. A pair that neither
-    form covers falls back to the two truncations.
+    window labels of `windows.episode`, the episode names of `episodes.val` -- are
+    the case a bare truncation fails: they are cut at the same character and read
+    as one text, however they differ. So they are told apart by LENGTH when the
+    lengths differ (`151 vs 150 rows`) and by the FIRST INDEX where they differ when
+    they do not, with the two values found there.
+
+    THERE IS NO FALLBACK, because no `_PROTOCOL_FIELDS` pick reaches one: the only
+    values longer than a line are those two lists (the longest scalar, `git_sha`,
+    prints at 42 characters against a line of 60), and the caller compares only
+    values that differ, so two long lists of one length differ at SOME index. A
+    value outside that set raises (`TypeError`, `StopIteration`) instead of being
+    printed as two truncations that read as one.
 
     The count is of rows, not of anything the lists hold; the previous milestone
     printed `(N vs M rows)` alone, which is the same number twice when the lists
@@ -611,13 +617,9 @@ def _versus(mine, reference) -> str:
     shown = f"{_brief(mine)} vs {_brief(reference)}"
     if max(len(repr(mine)), len(repr(reference))) <= _LINE:
         return shown
-    if not (isinstance(mine, (list, tuple)) and isinstance(reference, (list, tuple))):
-        return shown
     if len(mine) != len(reference):
         return f"{len(mine)} vs {len(reference)} rows"
-    at = next((i for i, (a, b) in enumerate(zip(mine, reference)) if a != b), None)
-    if at is None:
-        return shown
+    at = next(i for i, (a, b) in enumerate(zip(mine, reference)) if a != b)
     return (
         f"{len(mine)} rows, first differing at index {at}: "
         f"{_brief(mine[at])} vs {_brief(reference[at])}"
