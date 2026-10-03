@@ -384,14 +384,7 @@ introduced by the readout — that is a separate question and a separate spec.
 - **Internal consistency:** the asymmetry in 3.3 matches the statuses in 3.1;
   the companions in 2.4 are excluded from 3.1's tally; the architecture in 4
   lists exactly the files the exit criteria in 7 require.
-- **Three corrections made while drafting.** The third was found only by reading
-  the code the plan would have to call, and is the largest: the first version of
-  section 4 specified a new `teacher_forced` arm in `rollout.py`. That arm
-  already exists as `regrounding_sweep`'s k=1 rung — tested, wired, and already
-  run on the nine cells — and `rollout.py` is additionally the wrong home,
-  because it averages over windows and has no device-aware RNG snapshot. The
-  spec review that preceded this checked the spec against itself and could not
-  catch it. Second, a claim that the model
+- **Three corrections made while drafting.** First, a claim that the model
   "closes 38–73% of the band in most cells" at k=1: the measured spread is
   +0.08 to +0.73 with four of nine above +0.38, so "most" was wrong and the
   figures are now stated exactly. Second, section 2.2's baseline. The first
@@ -399,7 +392,13 @@ introduced by the readout — that is a separate question and a separate spec.
   `persistence_position`, which is anchored at t and would have handed the new
   arm a k-step information advantage. Section 2.2 now states the rigged
   comparison explicitly so it is not reintroduced, and section 5 requires a test
-  that fails if it is. First, the "38–73% in most cells" claim above.
+  that fails if it is. Third, and the largest, found only by reading the code the
+  plan would have to call: the first version of section 4 specified a new
+  `teacher_forced` arm in `rollout.py`. That arm already exists as
+  `regrounding_sweep`'s k=1 rung — tested, wired, and already run on the nine
+  cells — and `rollout.py` is additionally the wrong home, because it averages
+  over windows and has no device-aware RNG snapshot. The spec review that
+  preceded this checked the spec against itself and could not catch it.
 - **Ambiguity:** "a strict majority of the seeds present" is stated as computed
   from the record set rather than stored, and an arm with fewer than 3 seeds is
   refused rather than tallied.
