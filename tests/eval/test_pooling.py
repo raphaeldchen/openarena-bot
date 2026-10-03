@@ -19,6 +19,8 @@ around the ways a pooled table can be wrong while every count looks right:
     cell and the field, raised BEFORE any statistic is computed.
 """
 
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -797,3 +799,88 @@ def test_unpaired_contrast_refuses_a_different_reading_and_a_pool_against_itself
         )
     with pytest.raises(IncompatibleCells, match="against itself"):
         unpaired_contrast(_pooled("pixel_ae", "val", 0.5, 0.1), _pooled("pixel_ae", "val", 0.4, 0.1))
+
+
+# Constants captured by running the current code on the varied fixture
+POOLED_RATIO_AT_SEED_0 = 1.725
+POOLED_CI_LOW_AT_SEED_0 = 1.2307692307692308
+POOLED_CI_HIGH_AT_SEED_0 = 12.5
+POOLED_SE_AT_SEED_0 = 4.156273027301207
+
+
+def test_the_bootstrap_helpers_are_public_and_draw_whole_episodes():
+    """M3m consumes these from another module, so they carry public names.
+
+    THE MUTATION THIS EXISTS FOR: renaming them back to `_episode_bootstrap` /
+    `_interval` breaks the import; drawing rows instead of episodes makes the
+    yielded index arrays contain partial episodes.
+    """
+    from mbfps.eval.pooling import episode_bootstrap, percentile_interval
+
+    labels = np.array([0, 0, 0, 1, 1, 2])
+    draws = list(episode_bootstrap(labels, bootstrap=50, seed=0))
+    assert len(draws) == 50
+    # The draws must actually vary; 50 identical draws would satisfy every
+    # per-row check below while the bootstrap sampled nothing.
+    assert len({tuple(sorted(d.tolist())) for d in draws}) > 1
+    members = {0: {0, 1, 2}, 1: {3, 4}, 2: {5}}
+    for index in draws:
+        # Every drawn episode contributes ALL of its rows, so the multiset of
+        # rows is a union of whole episodes -- never a partial one.
+        counts = Counter(index.tolist())
+        for episode, rows in members.items():
+            per_row = {counts.get(row, 0) for row in rows}
+            assert len(per_row) == 1, (episode, counts)
+
+    replicates = np.arange(1001, dtype=np.float64)
+    low, high, se = percentile_interval(replicates)
+    assert low == pytest.approx(25.0)
+    assert high == pytest.approx(975.0)
+    assert se == pytest.approx(float(replicates.std(ddof=1)))
+    assert np.isnan(percentile_interval(np.array([3.0]))[2])
+
+
+def test_promoting_the_helpers_changed_no_pooled_number():
+    """The promotion is a rename. `pool_ratio`'s output is unchanged.
+
+    THE FIXTURE MUST DISCRIMINATE, AND THIS TEST ASSERTS THAT ABOUT ITSELF.
+    An earlier version used `_scaled_cells((1.0, 1.0, 1.0))`, which gives 2
+    clusters, 12 rows and an interval of EXACTLY zero width -- every bootstrap
+    replicate identical -- so a changed percentile moved nothing and a changed
+    `ddof` moved only a figure the test did not assert. It could not fail under
+    two of the three mutations it exists to catch. `varied` spans three
+    episodes and its interval has width.
+
+    WHAT THIS TEST PINS, AND WHAT IT DOES NOT. It catches `ddof=0`, drawing
+    without replacement, a changed draw count, lost episode multiplicity and a
+    changed seed stream. It does NOT pin the percentiles: three episodes give
+    only seven distinct replicate values, so `ci_high` is 12.5 for any upper
+    percentile from ~84.75 to 100 and `ci_low` is 1.2308 for any lower
+    percentile below 3.4. The percentiles are pinned exactly by the sibling
+    `test_the_bootstrap_helpers_are_public_and_draw_whole_episodes`, whose
+    `arange(1001)` lands them on exact indices. Nor does `pooled.ratio` move
+    under ANY mutation of the two helpers -- `pool_ratio` computes it without
+    touching either -- so that assertion is a fixture-drift tripwire, not a
+    behaviour pin.
+    """
+    varied = [
+        series(
+            "pixel_ae", seed, [0.0] * 4,
+            embedding=[1.0 + seed, 5.0, 9.0 + seed, 100.0],
+            noise=[2.0, 4.0, 4.0 + seed, 8.0], episodes=(0, 0, 1, 2),
+        )
+        for seed in SEEDS
+    ]
+    pooled = pool_ratio(varied, bootstrap=2000, seed=0)
+
+    # The guard this test was missing: a zero-width interval or a zero
+    # standard error would make every comparison below hold for the wrong
+    # reason, and the test would silently stop testing anything.
+    assert pooled.clusters == 3
+    assert pooled.ci_low < pooled.ci_high
+    assert pooled.bootstrap_se > 0.0
+
+    assert pooled.ratio == pytest.approx(POOLED_RATIO_AT_SEED_0, abs=1e-12)
+    assert pooled.ci_low == pytest.approx(POOLED_CI_LOW_AT_SEED_0, abs=1e-12)
+    assert pooled.ci_high == pytest.approx(POOLED_CI_HIGH_AT_SEED_0, abs=1e-12)
+    assert pooled.bootstrap_se == pytest.approx(POOLED_SE_AT_SEED_0, abs=1e-12)

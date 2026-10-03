@@ -669,6 +669,30 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"latent_capacity collides with {other} on {clash}"
 
+    prediction = statuses("prediction_burden")
+    reused_by_prediction = dict(reused)
+    shared_with_trust = {
+        name: value for name, value in prediction.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_prediction, (
+        f"prediction_burden shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_prediction} is shared on purpose"
+    )
+    assert len(set(prediction.values())) == len(prediction), prediction
+    assert 1 not in prediction.values() and 2 not in prediction.values()
+    assert prediction["EXIT_CONTROL_BROKEN"] == 45
+    assert prediction["EXIT_UNREADABLE"] == 46
+    own = set(prediction.values()) - set(reused_by_prediction.values()) - {0}
+    assert own == {45, 46}
+    # 43 and 44 are M3l's, so 45 and 46 are the next two free numbers: asked of the
+    # tool that held the highest, so a later renumbering of either cannot pass.
+    assert own == {max(set(capacity.values()) - {0}) + 1, max(set(capacity.values()) - {0}) + 2}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion",
+                  "latent_retention", "latent_width", "latent_capacity", "trust_horizon"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"prediction_burden collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys
