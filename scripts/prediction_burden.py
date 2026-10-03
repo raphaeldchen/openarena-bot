@@ -25,10 +25,12 @@ PER CELL, THE RECORD CARRIES:
                   `REPORTED_H`, episode-clustered, drawn at the cell's own seed.
   window_margin   the per-window margins the intervals are drawn from, so a
                   reader can redraw them.
-  controls        four numbers with known answers, MEASURED and never asserted:
+  controls        five numbers with known answers, MEASURED and never asserted:
                   the identity residual, the k=horizon rung's divergence from
                   that verified reference (0.0), whether k=1 collapsed onto the floor
-                  (False), and the k=1 rung's compounding (0.0).
+                  (False), the k=1 rung's compounding (0.0), and the divergence
+                  between the floor the reference carries and the floor the sweep's
+                  own pass computed (0.0).
   base_control    the median true one-step displacement against the median floor
                   error at `DECISION_H`: if the agent barely moved, no method
                   could detect motion prediction in that cell.
@@ -297,10 +299,16 @@ def measure_cell(
     margin compares two differently fitted pipelines -- the drift
     `evaluate_rollout`'s own comments record as having destroyed a signal once.
 
-    THE FLOOR IS READ FROM THREE PLACES, two passes and no control between them:
-    `reference.floor_position` (the record's curve, every burden and the identity
-    residual), `sweep.reference.floor_position` (what `k_one_is_floor` compares
-    against) and `sweep.window_floor_position` (the base control's median).
+    THE FLOOR IS READ FROM THREE PLACES, from two passes: `reference.floor_position`
+    (the record's curve, every burden and the identity residual),
+    `sweep.reference.floor_position` (what `k_one_is_floor` compares against) and
+    `sweep.window_floor_position` (the base control's median). What ties the two
+    passes together is `controls["floor_divergence"]`, the largest absolute
+    difference between the first two curves over the horizon, which must be 0.0.
+    `open_loop_divergence == 0.0` is NOT that control: it shows the two passes agree
+    on the RSSM curve, and says nothing about the floor curve. It is RECORDED, not
+    judged -- Reading H does not read it, so a record that lacks it (the nine that
+    predate it) is still readable.
 
     THE RULERS ARE THE SWEEP'S PAIRED ONES, never its unpaired spread. `burden(1)`
     is the k=1 rung minus the floor and `compounding(ks[-1])` is the last rung minus
@@ -373,6 +381,9 @@ def measure_cell(
         "open_loop_divergence": float(sweep.open_loop_divergence(reference)),
         "k_one_is_floor": bool(sweep.is_bitwise_the_floor(1, "position")),
         "compounding_at_k_one_max_abs": float(np.max(np.abs(compounding_k[1]))),
+        "floor_divergence": float(np.max(np.abs(
+            floor - sweep.reference.floor_position
+        ))),
     }
     margin = {}
     for h in REPORTED_H:

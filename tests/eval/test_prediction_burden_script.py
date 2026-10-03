@@ -794,6 +794,37 @@ def test_the_open_loop_control_is_read_against_the_reference_it_was_given(rig):
     assert record["controls"]["open_loop_divergence"] == pytest.approx(0.25, abs=1e-9)
 
 
+def test_the_floor_is_controlled_between_the_two_passes_that_read_it(rig, record):
+    """The floor is read from two passes: `reference.floor_position` carries every
+    burden and the identity residual, and `sweep.reference.floor_position` is what
+    `k_one_is_floor` compares against. `open_loop_divergence == 0.0` shows the two
+    agree on the RSSM curve; it says nothing about the floor curve. So the
+    divergence between the two floors is recorded beside it.
+
+    The reference handed in has its floor moved at two steps, neither of them the
+    decision horizon, by -0.25 and +0.125: the divergence is the LARGEST ABSOLUTE
+    difference over the horizon, 0.25, and a first step, a mean, a sum, an
+    unsigned maximum or a read at `DECISION_H` each gives another number.
+
+    THE MUTATIONS THIS EXISTS FOR: a hard-coded `0.0`; the sweep's floor compared
+    with itself (it reads 0.0 against every reference, so only a perturbed one can
+    tell it from the real control); another curve of the reference in the floor's
+    place (nonzero on the unperturbed record); and `np.max` without `np.abs`,
+    `np.mean`, or a read at one step in place of the maximum over the horizon.
+    """
+    assert record["controls"]["floor_divergence"] == 0.0
+    assert type(record["controls"]["floor_divergence"]) is float
+
+    real = _reference(rig, DriftingModel())
+    floor = real.floor_position.copy()
+    floor[7] -= 0.25
+    floor[20] += 0.125
+    moved = script.measure_cell(**_cell_kwargs(rig, reference=replace(real, floor_position=floor)))
+    assert moved["controls"]["floor_divergence"] == pytest.approx(0.25, abs=1e-9)
+    # Only the floor moved: the two controls are not the same number.
+    assert moved["controls"]["open_loop_divergence"] == 0.0
+
+
 def test_the_controls_with_known_answers_are_measured_not_asserted(rig, record):
     """On the drifting model the open loop reproduces bitwise, k=1 is NOT the
     floor, and the k=1 rung's compounding is exactly zero. On the exact oracle
