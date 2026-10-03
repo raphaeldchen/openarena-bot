@@ -554,8 +554,12 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
                 "strict majority of its seeds: one prior step from the true "
                 "state beats assuming the agent did not move, so the one-step "
                 "map predicts real motion and what fails is rolling it "
-                "forward. A multi-step or overshooting objective is the "
-                "indicated intervention"
+                "forward. The readout error pushes this margin NEGATIVE -- a "
+                "perfect one-step predictor still pays it while the "
+                "ground-truth baseline does not -- so clearing 0 is a "
+                "conservative result rather than a flattered one, and the base "
+                "control passed in every cell. A multi-step or overshooting "
+                "objective is the indicated intervention"
             ),
             arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
         )
