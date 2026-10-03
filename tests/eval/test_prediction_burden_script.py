@@ -1939,6 +1939,23 @@ def test_a_failed_measure_stops_phase_all_before_it_reads(monkeypatch):
     assert _main(monkeypatch, ["--phase", "all"], measure=14, read=0) == (14, ["measure"])
 
 
+@pytest.mark.parametrize("status", [11, 12, 14, 30])
+def test_a_failed_measure_is_the_exit_status_of_phase_measure_too(monkeypatch, status):
+    """`--phase measure` has no read after it, and that is exactly where a failed
+    measure's status could be dropped on the floor: the guard that stops the read
+    in `--phase all` is also what RETURNS the status, and a `--phase measure` that
+    fell through to `EXIT_OK` would print a success after a refused 30-minute run.
+
+    THE MUTATION THIS EXISTS FOR: narrowing `main`'s `if status != EXIT_OK:` to
+    `and args.phase == "all"`. The statuses are the literals `measure_phase` can
+    return (11, 12, 14 from the shared cell checks, 30 from the self-check), not
+    `script.EXIT_*`, and `read` is made to answer 0 so a status that was read from
+    the wrong phase is a different number."""
+    assert _main(monkeypatch, ["--phase", "measure"], measure=status, read=0) == (
+        status, ["measure"],
+    )
+
+
 def test_the_default_phase_is_read_and_the_parser_names_the_three():
     """A default of `measure` would make a bare invocation pay for nine cells of
     GPU time; `read` costs none and refuses by name when there are no records."""
