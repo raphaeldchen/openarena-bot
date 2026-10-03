@@ -1843,11 +1843,13 @@ def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(re
     """A record that lacks a protocol field is refused BY NAME, not with a bare
     `KeyError` and not by defaulting the field.
 
-    `all` is the case a default would pass: if every record lacks `git_sha` and
-    a missing field is read as `None`, the nine agree on `None` and pool with no
-    refusal. With only one record lacking it the default would disagree with the
-    other eight and be refused anyway, which is why the two single-record cases
-    cannot tell a refusal from a default."""
+    THE MUTATION THIS EXISTS FOR: reading a missing field as `None`. All three
+    cases fail under it, in two different ways. With only one record lacking the
+    field the default is still refused -- as a DISAGREEMENT with the other eight,
+    naming `git_sha` and `None` -- and what tells that from the refusal by name is
+    the message assertion (`lacks git_sha`), not the raise. `all` is the case where
+    the default raises nothing at all: every record lacks `git_sha`, the nine agree
+    on `None` and pool with no refusal."""
     records = _records_from(record, _scenario("COPIES"))
     victims = {"first": [FIRST_CELL], "last": [LAST_CELL], "all": sorted(records)}[lacking]
     for cell in victims:

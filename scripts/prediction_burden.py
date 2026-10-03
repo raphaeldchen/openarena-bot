@@ -154,8 +154,9 @@ EXIT_CONTROL_BROKEN: int = 45
 """A control with a known answer was missed: the identity residual, the k=45
 rung's bitwise reproduction of the record, or k=1 collapsing onto the floor.
 
-RAISED IN THE READ PHASE from `reading_burden`'s `UNRESOLVED_CONTROL`, never
-here: the measure phase records the control and carries on."""
+RETURNED BY THE READ PHASE from `reading_burden`'s `UNRESOLVED_CONTROL`, as 46 is
+from `UNREADABLE`, and never by the measure phase, which records the control and
+carries on."""
 
 EXIT_UNREADABLE: int = 46
 """The reading cannot be taken from this data: a cell where the agent barely
@@ -752,9 +753,14 @@ status falls through to `EXIT_OK`. `PREDICTS_MOTION`, `COPIES` and
 `INDETERMINATE` are READINGS, and a milestone that exited non-zero on a finding
 would make "the run worked" and "the news was good" the same signal.
 
-The numbered statuses report what was found in the DATA. A narrowed plan is the
-operator asking for something no data can answer, so it raises rather than
-adding a status -- the distinction M3j's `require_readable_plan` introduced."""
+The numbered statuses report what was found in the DATA, and the two kinds of
+narrowed plan are told apart by which of them that is. A plan narrower than
+`ARMS_REQUIRED` ARMS is the operator asking for something no data can answer, so
+`read_phase` RAISES it by name (`require_readable_plan`) rather than adding a
+status -- the distinction M3j's `require_readable_plan` introduced. A narrowed
+SEED plan is `reading_burden`'s own refusal: an arm short of `SEEDS_MINIMUM` comes
+back through this table as `UNREADABLE`, 46, naming the arm, and nothing raises.
+(`--phase all` refuses that plan by name, in `main`, before it has measured.)"""
 
 
 def _plan(args) -> tuple[list[str], list[int]]:
