@@ -32,6 +32,12 @@ PER CELL, THE RECORD CARRIES:
   base_control    the median true one-step displacement against the median floor
                   error at `DECISION_H`: if the agent barely moved, no method
                   could detect motion prediction in that cell.
+  rulers          two PAIRED standard errors at `DECISION_H`, off the sweep's own
+                  per-window rows: the ruler on `burden(1)` and the ruler on
+                  `compounding(ks[-1])`. The curves in the record are means, and the
+                  per-window rows they came from are not kept, so without these no
+                  interval on a share read off the ladder could be computed from the
+                  records afterwards.
   protocol        the confidence level AND the resample count, from `burden`'s
                   constants. M3l shipped a headline interval whose draw count the
                   permanent artefact could not be audited for.
@@ -296,6 +302,17 @@ def measure_cell(
     residual), `sweep.reference.floor_position` (what `k_one_is_floor` compares
     against) and `sweep.window_floor_position` (the base control's median).
 
+    THE RULERS ARE THE SWEEP'S PAIRED ONES, never its unpaired spread. `burden(1)`
+    is the k=1 rung minus the floor and `compounding(ks[-1])` is the last rung minus
+    the k=1 rung, both on the same windows from the same per-window RNG snapshot, so
+    the ruler each has to clear is the spread of the per-window DIFFERENCE:
+    `floor_margin_standard_error(1)` and `paired_standard_error(ks[-1], 1)`.
+    `curve_standard_error` is the between-window spread of ONE curve, dominated by
+    window difficulty that every rung shares, and `diagnostics` measured it
+    overstating the bar for an adjacent-k difference by 1.7x to 3.9x. Recorded at
+    `DECISION_H`, the horizon the headline share is read at, because the per-window
+    rows they come from are not kept.
+
     THE K=1 RUNG IS THE ONE-STEP ARM. `regrounding_sweep`'s `k=1` re-grounds
     after every step and imagines one prior step from a posterior-grounded state,
     which is exactly what the margin asks about; re-implementing it here would be
@@ -371,6 +388,14 @@ def measure_cell(
             [at_horizon(window, DECISION_H) for window in sweep.window_floor_position]
         )),
     }
+    rulers = {
+        "floor_margin_standard_error": at_horizon(
+            sweep.floor_margin_standard_error(1), DECISION_H
+        ),
+        "paired_standard_error": at_horizon(
+            sweep.paired_standard_error(ks[-1], 1), DECISION_H
+        ),
+    }
 
     return {
         "arm": arm,
@@ -404,6 +429,7 @@ def measure_cell(
         "window_margin": window_margin.tolist(),
         "controls": controls,
         "base_control": base_control,
+        "rulers": rulers,
         "windows": {"total": int(rows.shape[0]), "episode": labels.tolist()},
         "episodes": {"val": [Path(p).name for p in val_paths]},
     }

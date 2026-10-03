@@ -565,7 +565,7 @@ def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
         "arm", "seed", "margin", "controls", "base_control", "burden_by_k",
         "compounding_by_k", "curves", "windows", "git_sha", "step",
         "kl_rate_above_free_bits", "kl_dyn_max", "window_margin", "episodes",
-        "context", "horizon", "torch_version",
+        "context", "horizon", "torch_version", "rulers",
     ):
         assert key in record, key
     assert (record["arm"], record["seed"]) == ("pixel_ae", SEED)
@@ -832,6 +832,100 @@ def test_the_base_control_is_the_two_medians_at_the_decision_horizon(rig, record
     assert base["displacement_median"] != base["floor_median"]
 
 
+# --- the paired rulers -------------------------------------------------------
+#
+# The record keeps the MEAN curves and drops the per-window rows they came from, so
+# the interval on the one conclusion the ladder carries (the share of the open-loop
+# cost that is compounding) can only be computed from what is recorded at
+# measurement time. `RegroundingSweep` already has the paired rulers; the record
+# carries two of them, at `DECISION_H`.
+
+
+def _expected_rulers(sweep, last, h):
+    """The two rulers off a sweep the TEST ran, at 1-indexed horizon step `h`."""
+    return (
+        float(sweep.floor_margin_standard_error(1)[h - 1]),
+        float(sweep.paired_standard_error(last, 1)[h - 1]),
+    )
+
+
+def test_the_rulers_are_the_sweeps_own_paired_standard_errors(rig, record):
+    """`floor_margin_standard_error(1)` -- the ruler on `burden(1)` -- and
+    `paired_standard_error(ks[-1], 1)` -- the ruler on `compounding(ks[-1])` --
+    each at `DECISION_H`, compared by value with a second sweep the test ran.
+
+    The two are told apart from the UNPAIRED spread of a single curve, which the
+    sweep names `curve_standard_error` and documents as overstating a k-to-k bar
+    by 1.7x to 3.9x: this fixture's paired rulers differ from every unpaired
+    spread by far more than float noise, so a ruler taken from the wrong method
+    cannot pass.
+
+    THE MUTATIONS THIS EXISTS FOR: `curve_standard_error(1)` for the first and
+    `curve_standard_error(ks[-1])` for the second (the unpaired spreads the spec
+    calls an overstatement); `paired_standard_error(ks[-1], 3)` (the wrong second
+    rung); `floor_margin_standard_error(ks[-1])` (the wrong rung against the
+    floor). `paired_standard_error(1, ks[-1])` is an EQUIVALENT mutant: the spread of
+    a difference is the spread of its negation.
+    """
+    sweep = _independent_sweep(rig)
+    last = REGROUNDING_KS[-1]
+    floor_margin, paired = _expected_rulers(sweep, last, burden.DECISION_H)
+    assert record["rulers"]["floor_margin_standard_error"] == floor_margin
+    assert record["rulers"]["paired_standard_error"] == paired
+    assert all(type(v) is float for v in record["rulers"].values())
+
+    h = burden.DECISION_H - 1
+    unpaired = {k: float(sweep.curve_standard_error(k)[h]) for k in REGROUNDING_KS}
+    for name, ruler in (("floor_margin", floor_margin), ("paired", paired)):
+        for k, spread in unpaired.items():
+            assert abs(ruler - spread) > 1e-3 * spread, (name, k)
+    # ... and not another rung's paired ruler either.
+    assert paired != float(sweep.paired_standard_error(REGROUNDING_KS[1], 1)[h])
+    assert floor_margin != float(sweep.floor_margin_standard_error(last)[h])
+
+
+def test_the_rulers_are_taken_at_the_decision_horizon_the_module_holds(rig, monkeypatch):
+    """At `DECISION_H`, read off the module's name -- patched to 30 here, where the
+    two rulers read differently than at step 45 -- and not at the last step, the
+    first, or a literal 45.
+
+    THE MUTATIONS THIS EXISTS FOR: a literal `45` or `-1` in place of
+    `DECISION_H`, and `at_horizon(..., 1)`.
+    """
+    sweep = _independent_sweep(rig)
+    last = REGROUNDING_KS[-1]
+    assert _expected_rulers(sweep, last, 30) != _expected_rulers(sweep, last, 45)
+    assert _expected_rulers(sweep, last, 30) != _expected_rulers(sweep, last, 1)
+    monkeypatch.setattr(script, "DECISION_H", 30)
+    rulers = script.measure_cell(**_cell_kwargs(rig))["rulers"]
+    floor_margin, paired = _expected_rulers(sweep, last, 30)
+    assert rulers == {
+        "floor_margin_standard_error": floor_margin, "paired_standard_error": paired,
+    }
+
+
+def test_the_paired_ruler_belongs_to_the_last_rung_the_table_prints(rig):
+    """`paired_standard_error` is the ruler on `compounding(ks[-1])`, the quantity
+    the table's `comp_k` column prints, so it pairs the LAST rung of the ladder it
+    was given with k=1 -- not a literal 45 and not the horizon. The ladder here ends
+    in 3 with 45 in the middle, where the last rung and the horizon differ.
+
+    THE MUTATIONS THIS EXISTS FOR: `paired_standard_error(45, 1)` and
+    `paired_standard_error(horizon, 1)`, each of which equals the shipped line on
+    every ladder that ends at the horizon, which is why this ladder does not.
+    """
+    ks = (1, 45, 3)
+    sweep = regrounding_sweep(
+        DriftingModel(), rig.paths, rig.probe, ks=ks, context=CONTEXT, horizon=HORIZON,
+        seed=SEED, device=CPU, feature_backbone=None,
+    )
+    record = script.measure_cell(**_cell_kwargs(rig, ks=ks))
+    floor_margin, paired = _expected_rulers(sweep, 3, burden.DECISION_H)
+    assert record["rulers"]["paired_standard_error"] == paired
+    assert paired != _expected_rulers(sweep, 45, burden.DECISION_H)[1]
+    assert record["rulers"]["floor_margin_standard_error"] == floor_margin
+
+
 # A horizon step is read through `burden.at_horizon` or it is not read at all.
 # Its docstring says that indexing with `h` rather than `h - 1` "shifts every
 # reported number by one step and breaks no shape, which is why this is a function
@@ -850,23 +944,28 @@ def _sentinel_at_horizon(asked):
     return at_horizon
 
 
-def test_the_base_control_reads_both_medians_through_at_horizon(rig, monkeypatch):
-    """`measure_cell`'s two medians, the displacement and the floor, are each read
-    at `DECISION_H` through `burden.at_horizon`.
+def test_measure_cell_reads_every_horizon_step_through_at_horizon(rig, monkeypatch):
+    """`measure_cell`'s four horizon reads -- the two base-control medians (the
+    displacement and the floor) and the two rulers -- are each taken at
+    `DECISION_H` through `burden.at_horizon`.
 
-    THE MUTATIONS THIS EXISTS FOR, one per median: `rows[:, DECISION_H - 1]` and
-    `sweep.window_floor_position[:, DECISION_H - 1]` written by hand again, each of
-    which left the script's tests green before this one. Each median is a number
-    that only `at_horizon` could have returned, so the other site cannot cover for
-    the one mutated.
+    THE MUTATIONS THIS EXISTS FOR, one per read: `rows[:, DECISION_H - 1]`,
+    `sweep.window_floor_position[:, DECISION_H - 1]`, and `[DECISION_H - 1]` on
+    either ruler, written by hand again, each of which left the script's tests green
+    before this one. Each read is a number that only `at_horizon` could have
+    returned, so another site cannot cover for the one mutated.
     """
     asked = []
     monkeypatch.setattr(script, "at_horizon", _sentinel_at_horizon(asked))
-    base = script.measure_cell(**_cell_kwargs(rig))["base_control"]
-    assert base == {"displacement_median": SENTINEL, "floor_median": SENTINEL}
+    record = script.measure_cell(**_cell_kwargs(rig))
+    assert record["base_control"] == {"displacement_median": SENTINEL, "floor_median": SENTINEL}
+    assert record["rulers"] == {
+        "floor_margin_standard_error": SENTINEL, "paired_standard_error": SENTINEL,
+    }
     assert set(asked) == {burden.DECISION_H}
-    # One call per window per median: the median is of the windows, not of one read.
-    assert len(asked) == 2 * sum(EXPECTED_WINDOWS)
+    # One call per window per median -- the median is of the windows, not of one
+    # read -- and one per ruler.
+    assert len(asked) == 2 * sum(EXPECTED_WINDOWS) + 2
 
 
 # ---------------------------------------------------------------------------
