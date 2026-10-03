@@ -80,9 +80,10 @@ def test_burden_is_the_cost_over_the_floor():
 
 def test_burden_keeps_its_sign_when_the_curve_is_below_the_floor():
     """A negative burden is a result, not an error: in the nine cells of
-    `runs/m3_study_v2` the k=1 curve sits below the floor at 3 to 22 of the 45
-    steps. A caller that wants a magnitude takes `abs` itself, so `burden` must
-    hand back the sign.
+    `runs/m3m_burden` the k=1 curve sits below the floor at 3 to 22 of the 45
+    steps (16, 4, 22, 3, 20, 5, 7, 5, 15; the rungs are in no other record). A
+    caller that wants a magnitude takes `abs` itself, so `burden` must hand back
+    the sign.
 
     THE MUTATIONS THIS EXISTS FOR: `np.abs(curve_k - floor)` and
     `np.maximum(curve_k - floor, 0.0)`, both of which survive any fixture whose
@@ -123,9 +124,10 @@ def test_compounding_is_the_cost_of_correcting_less_often():
 
 def test_compounding_keeps_its_sign_when_the_rung_is_below_the_k1_curve():
     """A negative compounding is a result, not an error: in the nine cells of
-    `runs/m3_study_v2` the k=3 curve sits below the k=1 curve at 7 to 25 of the
-    45 steps. A caller that wants a magnitude takes `abs` itself, so
-    `compounding` must hand back the sign.
+    `runs/m3m_burden` the k=3 curve sits below the k=1 curve at 7 to 25 of the 45
+    steps (25, 13, 9, 11, 11, 14, 11, 15, 7; the rungs are in no other record). A
+    caller that wants a magnitude takes `abs` itself, so `compounding` must hand
+    back the sign.
 
     THE MUTATIONS THIS EXISTS FOR: `np.abs(curve_k - curve_one)` and
     `np.maximum(curve_k - curve_one, 0.0)`, both of which survive any fixture
