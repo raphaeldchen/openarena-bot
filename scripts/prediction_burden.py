@@ -64,6 +64,8 @@ different ways that are kept apart on purpose:
     are never caught into a status or an exit.
 
 `burden.txt` is written only for a reading, and is the same bytes stdout carries.
+A read that takes no reading also removes the one an earlier read of the same
+`--out` left, so the file is the current reading or it is absent.
 
 THE ONE ALIGNMENT RISK. `regrounding_sweep` retains its per-window rows in the
 order IT walked, and `baseline_rows` walks the validation episodes in a second,
@@ -710,9 +712,18 @@ def read_phase(args) -> int:
     a second newline on stdout and none in the file. The text is written as it
     is -- never `rstrip()`ped.
 
-    A REFUSAL WRITES NOTHING. Its status and the rule that names the offending
-    cells are printed, and no `burden.txt` is created, so there is no file to be
-    mistaken for a reading.
+    A REFUSAL WRITES NOTHING, AND LEAVES NOTHING. Its status and the rule that
+    names the offending cells are printed, and no `burden.txt` is created. The
+    `burden.txt` an EARLIER read of the same `--out` left is removed FIRST, before
+    any refusal is reached: left in place it would sit beside a line saying none
+    was written, and a later reader could not tell a stale reading from a current
+    one. It is removed before the plan is even checked, so that every way out of
+    this function that does not reach the write -- a returned status, a named
+    `SystemExit`, an exception from `reading_burden` -- leaves the directory
+    without a reading the current invocation did not produce. The reading costs
+    nothing to take again (no GPU), which is what makes removing it the cheaper
+    error. Only `<--out>/burden.txt` is touched: the records, and anything else in
+    the directory, are not.
 
     NOTHING CATCHES `reading_burden` HERE, and that is deliberate. It raises
     `ValueError` for an empty cell set and for two decisive statuses that both
@@ -720,6 +731,8 @@ def read_phase(args) -> int:
     an arm count that has outgrown the bar into an exit number. The first is
     unreachable from here (the plan check refuses before any record is read); the
     second is reachable only with four or more arms."""
+    reading_path = Path(args.out) / "burden.txt"
+    reading_path.unlink(missing_ok=True)
     arms, seeds = _plan(args)
     require_readable_plan(arms)
     try:
@@ -738,7 +751,7 @@ def read_phase(args) -> int:
         )
         return code
     text = format_reading_burden(reading, inputs)
-    (Path(args.out) / "burden.txt").write_text(text)
+    reading_path.write_text(text)
     print(text, end="")
     return EXIT_OK
 

@@ -1567,6 +1567,103 @@ def test_read_phase_writes_nothing_when_it_refuses(record, tmp_path, capsys):
         capsys.readouterr()
 
 
+def _overwrite_record(args, cell, new) -> None:
+    """Replace one cell's file in place -- under its literal name, as `_read_args`
+    wrote it."""
+    write_record(args.out / f"burden_{cell[0]}_seed{cell[1]}.json", new)
+
+
+def _make_control_broken(args, record) -> None:
+    _overwrite_record(
+        args, LAST_CELL, _records_from(record, _scenario("UNRESOLVED_CONTROL"))[LAST_CELL],
+    )
+
+
+def _make_unreadable(args, record) -> None:
+    _overwrite_record(
+        args, LAST_CELL, _records_from(record, _scenario("UNREADABLE"))[LAST_CELL],
+    )
+
+
+def _make_protocol_disagree(args, record) -> None:
+    odd = _records_from(record, _scenario("PREDICTS_MOTION"))[LAST_CELL]
+    DISAGREEMENTS["git_sha"](odd)
+    _overwrite_record(args, LAST_CELL, odd)
+
+
+def _make_cell_missing(args, record) -> None:
+    (args.out / f"burden_{LAST_CELL[0]}_seed{LAST_CELL[1]}.json").unlink()
+
+
+def _make_plan_too_narrow(args, record) -> None:
+    args.arms = ["pixel_ae"]
+
+
+STALE_REFUSALS = {
+    # name: (what to change after a good read, what the second read does)
+    "UNRESOLVED_CONTROL": (_make_control_broken, 45),
+    "UNREADABLE": (_make_unreadable, 46),
+    "a missing cell": (_make_cell_missing, script.EXIT_NO_CHECKPOINTS),
+    "a protocol disagreement": (_make_protocol_disagree, SystemExit),
+    "a plan too narrow to read": (_make_plan_too_narrow, SystemExit),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(STALE_REFUSALS))
+def test_a_refusal_removes_the_burden_txt_an_earlier_read_left_and_nothing_else(
+    record, tmp_path, capsys, monkeypatch, refusal,
+):
+    """A reading from an earlier read of the SAME directory is not a reading of
+    what is there now. If it survived a refusal, `burden.txt` would sit beside a
+    line saying none was written, and nothing in the directory would say which of
+    the two a later reader holds.
+
+    THE MUTATIONS THIS EXISTS FOR: removing the unlink; making it conditional on
+    reaching the status check (so only the two numbered refusals clear it, and a
+    named `SystemExit` or a missing cell leave the file); and an unlink that
+    reaches past `--out`. A successful read comes first, so the file is a real
+    reading and its absence afterwards is the refusal's doing; the SECOND read is
+    asked in the same directory, over records changed in the one way each case
+    names.
+
+    Three things sit where an over-wide unlink would find them: a `burden.txt`
+    beside the output directory, one in the current directory, and a `.txt` file
+    that is not `burden.txt` inside it. The directory must hold exactly what it
+    held before the second read, less `burden.txt`."""
+    change, outcome = STALE_REFUSALS[refusal]
+    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")))
+    stale = args.out / "burden.txt"
+    assert script.read_phase(args) == 0
+    assert "verdict: PREDICTS MOTION -- decided by:" in stale.read_text()
+    capsys.readouterr()
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    bystanders = [tmp_path / "burden.txt", cwd / "burden.txt", args.out / "notes.txt"]
+    for bystander in bystanders:
+        bystander.write_text("not this one")
+
+    change(args, record)
+    before = sorted(p.name for p in args.out.iterdir())
+    assert "burden.txt" in before
+    if isinstance(outcome, int):
+        assert script.read_phase(args) == outcome
+        out = capsys.readouterr().out
+        if outcome in (45, 46):
+            assert "no reading was taken, so no burden.txt was written" in out, out
+        assert "verdict:" not in out
+    else:
+        with pytest.raises(outcome):
+            script.read_phase(args)
+
+    assert not stale.exists(), "the reading an earlier read left is still there"
+    assert sorted(p.name for p in args.out.iterdir()) == [n for n in before if n != "burden.txt"]
+    for bystander in bystanders:
+        assert bystander.exists(), f"{bystander} was removed: it is not --out's burden.txt"
+        assert bystander.read_text() == "not this one", bystander
+
+
 def test_a_contradiction_between_the_decisive_statuses_propagates_and_writes_nothing(
     record, tmp_path,
 ):
