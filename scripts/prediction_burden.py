@@ -540,9 +540,45 @@ def _pick(cell, field: str, pick, record: dict):
         ) from error
 
 
+_LINE = 60
+"""How much of one value a refusal prints before it stops being a line."""
+
+
 def _brief(value) -> str:
+    """`repr(value)` cut to a line. For ONE value that is all there is to say; two
+    long values that differ somewhere in the middle need `_versus`, which says where."""
     text = repr(value)
-    return text if len(text) <= 60 else text[:57] + "..."
+    return text if len(text) <= _LINE else text[:_LINE - 3] + "..."
+
+
+def _versus(mine, reference) -> str:
+    """`mine vs reference`, in a form a person can act on.
+
+    A value that fits on a line is printed as it is. Two long lists -- the 150
+    window labels of `windows.episode`, the episode names of `episodes.val` --
+    are the case a bare truncation fails: they are cut at the same character and
+    read as one text, however they differ. So they are told apart by LENGTH when
+    the lengths differ (`151 vs 150 rows`) and by the FIRST INDEX where they
+    differ when they do not, with the two values found there. A pair that neither
+    form covers falls back to the two truncations.
+
+    The count is of rows, not of anything the lists hold; the previous milestone
+    printed `(N vs M rows)` alone, which is the same number twice when the lists
+    are as long as each other."""
+    shown = f"{_brief(mine)} vs {_brief(reference)}"
+    if max(len(repr(mine)), len(repr(reference))) <= _LINE:
+        return shown
+    if not (isinstance(mine, (list, tuple)) and isinstance(reference, (list, tuple))):
+        return shown
+    if len(mine) != len(reference):
+        return f"{len(mine)} vs {len(reference)} rows"
+    at = next((i for i, (a, b) in enumerate(zip(mine, reference)) if a != b), None)
+    if at is None:
+        return shown
+    return (
+        f"{len(mine)} rows, first differing at index {at}: "
+        f"{_brief(mine[at])} vs {_brief(reference[at])}"
+    )
 
 
 def _require_agreement(records: dict, fields) -> list:
@@ -563,9 +599,8 @@ def _require_agreement(records: dict, fields) -> list:
             if mine != reference:
                 raise SystemExit(
                     f"{cell[0]} seed {cell[1]} and {first_cell[0]} seed "
-                    f"{first_cell[1]} disagree on {field}: {_brief(mine)} vs "
-                    f"{_brief(reference)}; they are not one measurement and "
-                    "cannot be read as one"
+                    f"{first_cell[1]} disagree on {field}: {_versus(mine, reference)}; "
+                    "they are not one measurement and cannot be read as one"
                 )
     return items
 

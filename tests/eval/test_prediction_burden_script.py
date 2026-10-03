@@ -1749,6 +1749,83 @@ def test_one_record_that_disagrees_on_any_protocol_field_is_refused_naming_it(
     assert victim in named and len(named) == 2, (named, message)
 
 
+def _long_episode_pool(record, odd) -> dict:
+    """The nine records, every one describing 150 windows labelled `0..149`, and the
+    LAST cell's labels then changed as `odd` says (`{index: label}`). 150 labels
+    is far past what one printed line holds."""
+    records = _records_from(record, _scenario("COPIES"))
+    for cell in records.values():
+        cell["windows"]["episode"] = list(range(150))
+    for index, label in odd.items():
+        records[LAST_CELL]["windows"]["episode"][index] = label
+    return records
+
+
+@pytest.mark.parametrize(
+    "odd, said",
+    [
+        # The review's case: two 150-element lists that differ only in the LAST one.
+        # Truncated to a line they print identically, and `(150 vs 150 rows)` would
+        # say nothing either: the count is the same.
+        pytest.param({149: 999}, "150 rows, first differing at index 149: 999 vs 149", id="last only"),
+        # Two differences: the FIRST is the one named, not the last.
+        pytest.param(
+            {100: 777, 149: 999}, "150 rows, first differing at index 100: 777 vs 100",
+            id="two differences",
+        ),
+    ],
+)
+def test_a_long_disagreement_names_the_first_index_where_the_values_differ(record, odd, said):
+    """A refusal a person cannot act on is barely one. Both values are 150 labels;
+    cut to a line they are the same text, so the message must say WHERE.
+
+    THE MUTATIONS THIS EXISTS FOR: truncating each value to a line, which is what
+    this printed before (`last only` fails -- the two truncations are
+    character-for-character equal); naming the last differing index instead of the
+    first (`two differences` fails); and printing the same index whatever the
+    values are. The expected text is spelled out here, from the pool built above,
+    not taken from the message."""
+    records = _long_episode_pool(record, odd)
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert "random_vit seed 2 and frozen_ssl seed 0 disagree on windows.episode: " in message, message
+    assert said in message, message
+
+
+def test_a_long_disagreement_in_length_prints_both_lengths(record):
+    """Two lists of different length, 151 labels against 150, that agree on every
+    label both hold: no index among the labels they share is different, so the
+    lengths are what the message must carry.
+
+    THE MUTATION THIS EXISTS FOR: dropping the length branch, which leaves the two
+    lists identical for as long as the shorter one runs, so that looking for a
+    first differing index finds none and the fallback prints two truncations that
+    read the same. `mine` is the later cell's, `reference` the first's."""
+    records = _long_episode_pool(record, {})
+    records[LAST_CELL]["windows"]["episode"].append(149)
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert "random_vit seed 2 and frozen_ssl seed 0 disagree on windows.episode: " in message, message
+    assert "151 vs 150 rows" in message, message
+
+
+def test_a_short_disagreement_is_still_printed_in_full(record):
+    """A list that fits on a line is printed as it is: a ladder `[1, 3, 7, 15, 45]`
+    against `[1, 3, 7, 15, 46]` is readable as two lists, and an index would be
+    one more thing to look up.
+
+    THE MUTATION THIS EXISTS FOR: taking the index form for every sequence."""
+    records = _records_from(record, _scenario("COPIES"))
+    reference = [int(k) for k in records[FIRST_CELL]["ks"]]
+    odd = reference[:-1] + [reference[-1] + 1]
+    records[LAST_CELL]["ks"] = odd
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    assert f"disagree on ks: {odd!r} vs {reference!r};" in str(caught.value)
+
+
 def test_a_pool_that_agrees_on_the_protocol_is_accepted_whatever_else_differs(record):
     """Nothing but the table is compared. The per-cell numbers, the cell's own
     training provenance and its label all differ between cells by construction;
