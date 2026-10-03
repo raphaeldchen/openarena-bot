@@ -2201,3 +2201,72 @@ multi-step objective would.
 
 `2791 passed, 0 failures` in 36m49s at `349edee`, the SHA the nine records carry.
 `runs/m3l_capacity` is byte-identical to before this milestone.
+
+---
+
+## Task 7 addendum: the paired rulers, and what they do to the 97%
+
+The final whole-branch review found that the milestone's one surviving conclusion
+shipped with **no interval**, and that the records could not give one
+retrospectively: `burden_by_k` and `compounding_by_k` were stored as mean curves,
+and `RegroundingSweep`'s paired rulers — `floor_margin_standard_error(k)` and
+`paired_standard_error(k, other)`, which spec §2.1 calls required because the
+unpaired spread overstates the paired bars 1.7× to 3.9× — were referenced nowhere.
+
+`measure_cell` now records both at `DECISION_H`, and the nine cells were
+re-measured at `cc5c1d9` into `runs/m3m_burden_rulers/` in 19m20s. **The nine
+original records in `runs/m3m_burden/` are untouched**; the ladder reproduces them
+identically (`burden_by_k` equal to within 1e-12 on every cell), so this is the
+same measurement with the rulers added, at a second `git_sha`.
+
+Each recorded ruler is **one** standard error of the column means
+(`diagnostics.py:1813-1823`); the sibling tool doubles it for a bar
+(`diagnose_dynamics.py:1430`), so the test below is against 2 SE.
+
+| cell | `burden(1)` | 1 SE | \|b1\|/SE | resolvable? | `compounding(45)`/SE | resolvable? |
+|---|---|---|---|---|---|---|
+| `frozen_ssl` s0 | 2.189 | 2.654 | 0.82 | no | 8.57 | yes |
+| `frozen_ssl` s1 | 6.519 | 3.355 | **1.94** | no | 10.10 | yes |
+| `frozen_ssl` s2 | −0.714 | 1.380 | 0.52 | no | 6.81 | yes |
+| `pixel_ae` s0 | 4.640 | 3.009 | 1.54 | no | 11.63 | yes |
+| `pixel_ae` s1 | 0.269 | 1.488 | 0.18 | no | 5.56 | yes |
+| `pixel_ae` s2 | 5.845 | 3.254 | 1.80 | no | 8.60 | yes |
+| `random_vit` s0 | 2.086 | 1.693 | 1.23 | no | 7.69 | yes |
+| `random_vit` s1 | 2.074 | 2.301 | 0.90 | no | 8.95 | yes |
+| `random_vit` s2 | 3.952 | 2.845 | 1.39 | no | 8.49 | yes |
+
+**`burden(1)` is not resolvable from zero at 2 SE in 9 of 9 cells** — the largest
+ratio anywhere is 1.94. **`compounding(45)` is resolvable in 9 of 9, at 5.56 to
+11.63 SE.**
+
+### This strengthens the conclusion and retires the 97%
+
+The point estimates said ~97% of the open-loop cost over the floor is compounding,
+with the remaining ~3% the one prior step. **That 3% is not resolvable.** Within
+the resolution of this measurement the one-step prediction cost is
+indistinguishable from zero, while compounding is resolved by a factor of 5.6 to
+11.6 in every cell. The data is consistent with the whole of the open-loop cost
+over the floor being compounding.
+
+So the finding is not "97%, so 3% is the one-step map". It is: **the one-step map's
+cost over the floor cannot be distinguished from zero, and the rollout's cost can,
+by an order of magnitude.** The direction the earlier point estimates indicated is
+unchanged and the precision they implied was unsupported.
+
+**Still no interval on the share itself.** The share is a ratio, so an interval on
+it needs the covariance between the two rulers, which is not recorded. The two
+component intervals above are what the records carry, and they are the ones the
+conclusion rests on.
+
+### One finding, not two
+
+`observed_margin − perfect_margin = −burden(1, 45)` **exactly** (to 8.5e-14), by
+definition: both margins share the `one_step_persistence` term, so their difference
+is `floor − rung_1`. The "observed margins sit within 0.1%–5.8% of a perfect
+predictor" statement in the section above and "`burden(1)` is small" are therefore
+**the same fact in two coordinate systems**, not two independent confirmations. A
+reader who counts them separately overcounts the evidence.
+
+This also says precisely why one statistic worked and the other did not:
+`motion_margin` carries the floor as an additive contaminant, and the ladder
+subtracts it.
