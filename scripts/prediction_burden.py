@@ -56,7 +56,9 @@ different ways that are kept apart on purpose:
   * BY NAME, with no number (`SystemExit` carrying the message, status 1): a plan
     narrower than `ARMS_REQUIRED` arms, records that disagree on any
     `_PROTOCOL_FIELDS` entry (`git_sha` among them), a record filed under another
-    cell's name. These are the operator's, not the data's.
+    cell's name, and `--phase all` over fewer than `SEEDS_MINIMUM` seeds (refused
+    before any cell is measured; a `read` over the same plan returns 46 instead).
+    These are the operator's, not the data's.
   * BY NUMBER: 45 when a control with a known answer was missed, 46 when the data
     cannot be read (a cell where the agent barely moved, an arm short of
     `SEEDS_MINIMUM` seeds). 11 names a cell whose record is missing.
@@ -117,8 +119,8 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.burden import (
     ARMS_REQUIRED, CONFIDENCE, DECISION_H, IDENTITY_TOLERANCE, REPORTED_H, RESAMPLES,
-    BurdenArm, BurdenInputs, burden, compounding, format_reading_burden, identity_residual,
-    margin_interval, one_step_persistence, reading_burden,
+    SEEDS_MINIMUM, BurdenArm, BurdenInputs, burden, compounding, format_reading_burden,
+    identity_residual, margin_interval, one_step_persistence, reading_burden,
 )
 from mbfps.eval.diagnostics import REGROUNDING_KS, regrounding_sweep
 from mbfps.eval.probe import probe_targets
@@ -160,10 +162,13 @@ EXIT_UNREADABLE: int = 46
 moved, or an arm short of SEEDS_MINIMUM seeds.
 
 RETURNED BY THE READ PHASE from `reading_burden`'s `UNREADABLE`, never here.
-Two refusals look like it and are NOT it: records that disagree on the protocol
-and a plan narrower than ARMS_REQUIRED arms are raised BY NAME (a `SystemExit`
-carrying the message, so status 1) and have no number of their own. The numbered
-exits report what was found in the DATA; those two are the operator's."""
+Three refusals look like it and are NOT it: records that disagree on the protocol,
+a plan narrower than ARMS_REQUIRED arms, and `--phase all` over fewer than
+SEEDS_MINIMUM seeds are raised BY NAME (a `SystemExit` carrying the message, so
+status 1) and have no number of their own. The numbered exits report what was
+found in the DATA; those three are the operator's. The last differs from a `read`
+over the same short plan, which DOES return 46: `--phase all` knows the plan is
+short before it has measured anything, and `read` learns it from the records."""
 
 PHASES: tuple[str, ...] = ("all", "measure", "read")
 """The phases this script runs. `all` is `measure` and then `read`.
@@ -589,7 +594,9 @@ def require_readable_plan(arms) -> None:
     THE SEED COUNT IS NOT CHECKED HERE, deliberately. An arm carrying fewer than
     `SEEDS_MINIMUM` seeds is `reading_burden`'s own refusal, and comes back as
     `UNREADABLE` (46) naming the arm: a plan check on seeds would stand in front
-    of it and make that status unreachable from the read phase.
+    of it and make that status unreachable from the read phase, and `read_phase`
+    calls this. `--phase all` asks the seed question separately, in `main`, before
+    it measures (`require_seeds_for_a_verdict`).
 
     The caller passes the DISTINCT arms (`_plan`): `--arms a a a` is one arm."""
     if len(arms) < ARMS_REQUIRED:
@@ -597,6 +604,32 @@ def require_readable_plan(arms) -> None:
             f"a plan of {len(arms)} arm(s) cannot be read: Reading H needs "
             f"ARMS_REQUIRED={ARMS_REQUIRED} arms to reach a decisive status, and "
             "would otherwise print INDETERMINATE for a reason the data did not give"
+        )
+
+
+def require_seeds_for_a_verdict(seeds) -> None:
+    """Refuse a plan with fewer than `SEEDS_MINIMUM` DISTINCT seeds.
+
+    CALLED BY `main` FOR `--phase all` ONLY, never by `read_phase`. Every arm of a
+    plan carries the plan's seeds, so a plan short of the minimum leaves every arm
+    short of it and `reading_burden` can only answer `UNREADABLE` (46). Asked
+    after `--phase all` that is every planned cell of GPU time spent to learn
+    something the command line already said; asked here it costs nothing.
+
+    It is not a status of its own, for the reason `require_readable_plan` gives:
+    the numbered exits report what was found in the DATA, and this is the
+    operator's plan. And it is not in `read_phase`, because a `read` over a short
+    plan is how 46 is reached from the records (a plan check there would stand in
+    front of it); a `--phase measure` over a short plan is the milestone's smoke.
+
+    The caller passes the DISTINCT seeds (`_plan`): `--seeds 0 0 0` is one seed."""
+    if len(seeds) < SEEDS_MINIMUM:
+        raise SystemExit(
+            f"a plan of {len(seeds)} seed(s) cannot reach a verdict: every arm would "
+            f"carry fewer than SEEDS_MINIMUM={SEEDS_MINIMUM} seeds, and Reading H "
+            "refuses such an arm (UNREADABLE) once the cells are already measured. "
+            f"Pass at least {SEEDS_MINIMUM} distinct seeds, or run --phase measure "
+            "for a smoke"
         )
 
 
@@ -788,12 +821,16 @@ def main(argv: list[str] | None = None) -> int:
     not run when the measure stopped with a status: a cell that was refused wrote
     no record, and a read after it would be over a pool missing that cell.
 
-    `--phase all` REFUSES A PLAN `read` COULD NOT READ before any cell is
-    measured; `--phase measure` is allowed one, because the milestone's smoke is
-    one cell."""
+    `--phase all` REFUSES A PLAN `read` COULD NOT TAKE A READING FROM before any
+    cell is measured: fewer than `ARMS_REQUIRED` arms, or fewer than
+    `SEEDS_MINIMUM` seeds. `--phase measure` is allowed either, because the
+    milestone's smoke is one cell; `--phase read` is allowed a short SEED plan,
+    because that is where 46 is read from the records."""
     args = _parser().parse_args(argv)
     if args.phase == "all":
-        require_readable_plan(_plan(args)[0])
+        arms, seeds = _plan(args)
+        require_readable_plan(arms)
+        require_seeds_for_a_verdict(seeds)
     if args.phase in ("measure", "all"):
         status = measure_phase(args)
         if status != EXIT_OK:

@@ -2078,6 +2078,63 @@ def test_phase_all_refuses_a_plan_it_could_not_read_before_measuring_anything(mo
     assert _main(monkeypatch, ["--phase", "measure", "--arms", "pixel_ae"]) == (0, ["measure"])
 
 
+@pytest.mark.parametrize(
+    "seeds, distinct",
+    [
+        pytest.param(
+            [str(i) for i in range(burden.SEEDS_MINIMUM - 1)], burden.SEEDS_MINIMUM - 1,
+            id="one short of the minimum",
+        ),
+        pytest.param(["5"], 1, id="one seed"),
+        # `--seeds a a a` is ONE seed: counting the list would let it through, and
+        # the read would then find an arm with one seed.
+        pytest.param(["5"] * burden.SEEDS_MINIMUM, 1, id="enough listed, one distinct"),
+    ],
+)
+def test_phase_all_refuses_too_few_seeds_before_measuring_anything(
+    monkeypatch, seeds, distinct,
+):
+    """`--phase all --seeds 0 1` would measure all six cells and then come back 46:
+    every arm carries two seeds, and `reading_burden` refuses an arm short of
+    `SEEDS_MINIMUM`. The plan is known at the start, so the refusal is made there.
+
+    THE MUTATIONS THIS EXISTS FOR: dropping the check from `main`; counting the
+    seeds as listed instead of as distinct (the third case); and making the
+    check `<=` (see the boundary test below). It raises BY NAME rather than
+    returning 46 -- the numbered exits report what was found in the data -- and
+    `ran == []` is what says it came BEFORE the measure, not after it."""
+    ran = []
+    monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
+    monkeypatch.setattr(script, "read_phase", lambda args: ran.append("read") or 0)
+    with pytest.raises(SystemExit) as caught:
+        script.main(["--phase", "all", "--seeds", *seeds])
+    message = str(caught.value)
+    assert f"SEEDS_MINIMUM={burden.SEEDS_MINIMUM}" in message, message
+    assert f"{distinct} seed(s)" in message, message
+    assert ran == []
+
+
+def test_a_seed_plan_short_of_the_minimum_is_refused_only_where_it_would_waste_a_measure(
+    monkeypatch,
+):
+    """The seed check belongs to `--phase all` and to nothing else.
+
+    `--phase measure` is the milestone's smoke and may run one seed. `--phase read`
+    must REACH `read_phase` with a short plan, because that is where the short-arm
+    46 comes from (`test_an_arm_short_of_the_minimum_seeds_is_unreadable_not_a_raise`
+    drives it): a check in front of it would make the status unreachable. And
+    exactly `SEEDS_MINIMUM` seeds is a plan -- the boundary a `<=` would refuse.
+
+    THE MUTATIONS THIS EXISTS FOR: applying the check to `--phase measure` (the
+    first line fails), applying it to `--phase read` (the second), and `<=` for `<`
+    (the third)."""
+    short = ["--seeds", *(str(i) for i in range(burden.SEEDS_MINIMUM - 1))]
+    assert _main(monkeypatch, ["--phase", "measure", *short]) == (0, ["measure"])
+    assert _main(monkeypatch, ["--phase", "read", *short], read=46) == (46, ["read"])
+    enough = ["--seeds", *(str(i) for i in range(burden.SEEDS_MINIMUM))]
+    assert _main(monkeypatch, ["--phase", "all", *enough]) == (0, ["measure", "read"])
+
+
 def test_main_reads_the_arms_seeds_and_directory_the_command_line_names(
     monkeypatch, record, tmp_path, capsys,
 ):
