@@ -454,11 +454,21 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
     the control check nor the short-arm refusal can catch it, and it would
     otherwise fall through to INDETERMINATE under a sentence about "0 arms".
 
-    THE ASYMMETRY. Both decisive statuses are levels against an exactly known
-    baseline -- the true one-step displacement -- measured on the same windows,
-    so BOTH DIRECTIONS ARE SOUND. This is the structural difference from M3k,
-    whose statistic spoke in one direction only, and from M3l, whose
-    `bits_carried` upper-bounds the joint and was trustworthy only below a cut.
+    THE ASYMMETRY, AND WHERE IT HOLDS. Both decisive statuses are levels against
+    an exactly known baseline -- the true one-step displacement -- measured on
+    the same windows. That makes a reading in EITHER direction evidence ONLY IN A
+    CELL THE BASE CONTROL ADMITS, where the median true one-step displacement
+    exceeds the median floor error. The margin subtracts a probe-space quantity
+    (the k=1 rung) from a ground-truth one that pays no readout error, so it
+    carries the readout error with it: outside the gate a negative margin IS
+    that error, and a perfect one-step predictor would read negative too. On M3m's
+    own nine cells the gate refused all nine, and the margin sat within 0.1% to
+    5.8% of the value a perfect predictor would have read (`## Task 7 results`,
+    in the plan). That is why `UNREADABLE` outranks both statuses above, and why
+    the sentences below are conditioned on it. Inside the gate this is the
+    structural difference from M3k, whose statistic spoke in one direction only,
+    and from M3l, whose `bits_carried` upper-bounds the joint and was
+    trustworthy only below a cut.
     """
     if not inputs.cells:
         raise ValueError(
@@ -557,9 +567,11 @@ def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
                 f"horizon {inputs.decision_h} in {len(arms_copies)} of "
                 f"{len(by_arm)} arms ({', '.join(arms_copies)}), each in a "
                 "strict majority of its seeds: one prior step from the TRUE "
-                "state is no better than assuming stillness, so a "
-                "longer-horizon term cannot rescue this and the target itself "
-                "must change"
+                "state is no better than assuming stillness, and the base "
+                "control passed in every cell (the median true one-step "
+                "displacement exceeds the median floor error), so that "
+                "margin is not only the readout error. A longer-horizon term "
+                "cannot rescue this and the target itself must change"
             ),
             arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
         )
@@ -622,8 +634,12 @@ def format_reading_burden(reading: BurdenStatus, inputs: BurdenInputs) -> str:
     lines += [
         "  margin = the true one-step displacement minus the k=1 rung, so "
         "POSITIVE means one prior step from the true state beats assuming the "
-        "agent did not move. Ground truth, not an estimate, so a reading in "
-        "EITHER direction is evidence",
+        "agent did not move. The displacement is ground truth but the rung is "
+        "read through the probe, so the margin carries the readout error: a "
+        "reading in EITHER direction is evidence only where the base control "
+        "passed, the median true one-step displacement exceeding the median "
+        f"floor error at horizon {inputs.decision_h}, and below that gate a "
+        "negative margin is the readout error",
         f"  {READING_COLUMNS[5]}/{READING_COLUMNS[6]} = "
         f"burden(k={inputs.ks[-1]}, h={inputs.decision_h}) and "
         f"compounding(k={inputs.ks[-1]}, h={inputs.decision_h}), where k is the "

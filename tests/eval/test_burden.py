@@ -916,10 +916,24 @@ def test_predicts_motion_when_the_whole_interval_clears_zero():
 
 
 def test_copies_when_the_whole_interval_is_at_or_below_zero():
+    """And the sentence must carry the condition it is true under. A margin at or
+    below 0 is only the model copying where the readout error is smaller than the
+    displacement, which is exactly what the base control checks; outside it a
+    perfect one-step predictor reads negative too (M3m's own nine cells: within
+    0.1% to 5.8% of what a perfect predictor would read). So the rule names the
+    control the reading passed, rather than asserting the inference bare.
+
+    THE MUTATION THIS EXISTS FOR: the rule as first shipped, "one prior step from
+    the TRUE state is no better than assuming stillness, so a longer-horizon
+    term cannot rescue this", with the base control's clause removed.
+    """
     reading = reading_burden(_inputs(_nine(**CLEARS_COPIES)))
     assert reading.status == "COPIES"
     assert reading.arms_copies == ARMS
     assert reading.arms_motion == ()
+    assert "the base control passed in every cell" in reading.rule
+    assert "the median true one-step displacement exceeds the median floor error" in reading.rule
+    assert "not only the readout error" in reading.rule
 
 
 def test_an_interval_straddling_zero_falls_through():
@@ -1675,7 +1689,28 @@ def test_the_table_interpolates_its_numbers_and_never_hardcodes_them():
     assert f"at horizon {DECISION_H} (re-grounding periods k = 1, 3, 5, 15, 45)" in text
     assert f"held within {IDENTITY_TOLERANCE:g}" in text
     assert f"in at least {ARMS_REQUIRED} of 3 arms" in text
+    assert f"median floor error at horizon {DECISION_H}," in text
     assert "exactly 0" not in text
+
+
+def test_the_legend_conditions_a_reading_in_either_direction_on_the_base_control():
+    """The margin's legend is written into `burden.txt` on every successful
+    reading, so it is the sentence a reader of the artefact meets. The margin
+    subtracts a probe-space rung from a ground-truth displacement, so it carries
+    the readout error, and it is evidence in either direction ONLY where the base
+    control passed. The first legend said "Ground truth, not an estimate, so a
+    reading in EITHER direction is evidence", unconditionally -- the claim the
+    refusal of all nine cells showed to be wrong.
+
+    THE MUTATION THIS EXISTS FOR: that sentence, restored.
+    """
+    text = _table(_inputs(_nine(**CLEARS_MOTION)))
+    legend = next(l for l in text.splitlines() if l.startswith("  margin ="))
+    assert "only where the base control passed" in legend
+    assert "the rung is read through the probe" in legend
+    assert "negative margin is the readout error" in legend
+    assert "Ground truth, not an estimate" not in legend
+    assert "so a reading in EITHER direction is evidence" not in legend
 
 
 def test_the_legend_states_both_axes_and_the_header_does_not_depend_on_ks():
@@ -1749,5 +1784,6 @@ def test_the_table_follows_the_module_and_the_inputs_it_is_given(monkeypatch):
     assert "in at least 4 of 4 arms" in text
     assert "in 4 of 4 arms" in reading.rule
     assert "clears 0 at horizon 30" in reading.rule
+    assert "median floor error at horizon 30," in text
     for stale in ("horizon 45", "h=45", "1e-09", "exactly 0"):
         assert stale not in text, stale

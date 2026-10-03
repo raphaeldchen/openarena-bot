@@ -237,6 +237,22 @@ Here the true one-step displacement is ground truth, not an estimate, and
 `motion_margin` is a paired difference against it. A reading in either direction
 is evidence.
 
+> **Errata, added after Task 7. The paragraph above is left as it was
+> designed, because this spec is the record of what was designed and M3n
+> inherits it.** Its bolded sentence and "A reading in either direction is
+> evidence" are **not true unconditionally.** `motion_margin` subtracts a
+> probe-space quantity (the k=1 rung) from a ground-truth one that pays no
+> readout error, so the margin carries the readout error with it. Both
+> directions are sound **only in a cell the base control of 2.3 admits** — where
+> the median true one-step displacement exceeds the median floor error. Outside
+> it a negative margin *is* the readout error, and a perfect one-step predictor
+> would read negative too. On the nine shipped cells the displacement is 3.9695
+> against a floor of 88.29 to 224.36 (22.2× to 56.5×), the base control refused
+> all nine, and the margins sat within 0.1% to 5.8% of what a perfect predictor
+> would have read. Reading H returned `UNREADABLE` and the question was answered
+> by the ladder instead. See `## Task 7 results` in the plan, which also names the
+> probe-space baseline that would make the margin readable.
+
 What neither status licenses: a claim about **why** the one-step map behaves as
 it does. `PREDICTS_MOTION` says a multi-step objective is the indicated next
 intervention; it does not say that one would pass the gate. `COPIES` says a
