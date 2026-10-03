@@ -1950,3 +1950,132 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **3. Type consistency.** `burden(curve_k, floor)` and `compounding(curve_k, curve_one)` keep their argument order from Task 2 through Task 5. `margin_interval` returns `(point, ci_low, ci_high)` in Task 3 and is unpacked in that order in Task 5. `BurdenArm`'s fourteen fields in Task 4 are each written by Task 5. `READING_COLUMNS` has eight entries and `READING_WIDTHS` eight widths. `REPORTED_H` is the horizon grid and `ks`/`REGROUNDING_KS` the re-grounding periods, never swapped — the Global Constraints fix the notation and Task 3's test asserts `DECISION_H in REPORTED_H`.
 
 **4. One risk the plan cannot remove.** Row-for-row alignment between `baseline_rows` and `sweep.window_position[1]` rests on both loops consuming `window_starts` over the same `val_paths` in the same order. Task 5 guards it three ways — the documented traversal rule, the shape refusal, and a test whose two episodes have *different* window counts so a reordering is caught — but there is no bitwise tie between the two loops, and the implementer should say so in their report rather than claim one.
+
+---
+
+## Task 7 results
+
+Nine cells at one `git_sha` `349edee67077`, step 20000, `ks = [1, 3, 5, 15, 45]`,
+`decision_h = 45`, `confidence = 0.95`, `resamples = 2000`, 229 windows over 24
+episodes per cell, torch 2.13.0 on mps. Measure span 23.1 min (~2.9 min/cell),
+inside §6's 25–45 min estimate. Records in `runs/m3m_burden/`. Every figure below
+is re-derivable from `runs/m3m_burden/*.json` alone.
+
+### Reading H refuses: `UNREADABLE`, exit 46
+
+The base control fails in **9 of 9 cells**. Per cell, the median true one-step
+displacement is **3.9695** map units — ground truth, so identical across cells —
+against a median floor error of **88.29 to 224.36**, a ratio of **22.2× to 56.5×**.
+No `burden.txt` was written; the refusal names all nine cells.
+
+**The specified statistic is not viable on this data, and the reason is a design
+error in §2.2.** `motion_margin = one_step_persistence − the k=1 rung` subtracts a
+model quantity measured *through the probe* from a ground-truth quantity that pays
+no readout error. The readout error dominates the signal by a factor of 22 to 56,
+so the margin measures the floor, not the model.
+
+`motion_margin` at h=45 reads **−116.47 to −244.60**, and the whole interval is
+below 0 in **9 of 9** cells (largest `ci_high` = −100.73). **That does not mean the
+code copies, and `COPIES` is not the finding.** A *perfect* one-step predictor
+would read ≈ −94 on these cells, because it would still pay the readout error its
+baseline does not. The base control exists for exactly this confound and it fired;
+the cut was not retuned to manufacture a verdict.
+
+**How the error happened.** §2.2 correctly identified that comparing the
+re-grounded k=1 rung against the recorded *t-anchored* `persistence_position` is
+rigged — the rung has observed h−1 frames more. The replacement made the baseline
+ground truth and treated "no model involved" as the virtue. But `evaluate_rollout`
+already records the opposite lesson in the code:
+
+> "ALL THREE references go through the IDENTICAL pipeline (encode -> RSSM ->
+> emb_head) and are probed with the SAME probe... Fitting on real encoder
+> embeddings and applying to predicted ones is a distribution mismatch, and it was
+> destroying the signal: band below 2 SE at 18 of 45 horizon steps, against 2 of
+> 45 once every reference shares the pipeline. gap_closed at horizon 45 moved from
+> -7.26 to -0.78 on the same checkpoint."
+
+One unfairness was fixed and a second introduced. The fix for the next milestone is
+a **probe-space** one-step baseline — the floor's own predicted position at h−1 held
+to h — so both sides pay the same readout error and the difference isolates
+prediction. That needs the floor's predicted positions, which `evaluate_rollout`
+computes internally and does not return, so it is not a change M3m could make
+under its own constraint not to modify `rollout.py`.
+
+### What the ladder answers, and it is sound
+
+`burden(k, h) = curve_k[h] − floor[h]` and `compounding(k, h) = curve_k[h] −
+curve_1[h]` are differences of two curves measured **through the same pipeline**, so
+the readout error cancels and they are commensurable. `burden(k, 45)` per cell:
+
+| cell | k=1 | k=3 | k=5 | k=15 | k=45 | compounding share |
+|---|---|---|---|---|---|---|
+| `frozen_ssl` s0 | 2.189 | 4.060 | 4.326 | 28.665 | 90.436 | 97.6% |
+| `frozen_ssl` s1 | 6.519 | 10.994 | 21.317 | 34.849 | 114.242 | 94.3% |
+| `frozen_ssl` s2 | **−0.714** | 5.970 | 4.598 | 18.593 | 67.845 | 101.1% |
+| `pixel_ae` s0 | 4.640 | 6.612 | 11.341 | 46.261 | 142.071 | 96.7% |
+| `pixel_ae` s1 | 0.269 | 2.306 | 5.021 | 8.747 | 31.235 | 99.1% |
+| `pixel_ae` s2 | 5.845 | 9.386 | 12.727 | 33.685 | 107.294 | 94.6% |
+| `random_vit` s0 | 2.086 | 6.113 | 9.848 | 23.555 | 64.337 | 96.8% |
+| `random_vit` s1 | 2.074 | 1.104 | 2.224 | 25.330 | 77.495 | 97.3% |
+| `random_vit` s2 | 3.952 | 8.396 | 4.717 | 28.707 | 83.062 | 95.2% |
+
+`burden(1)` mean **2.984** (min −0.714, max 6.519). `burden(45)` mean **86.446**
+(min 31.235, max 142.071). The compounding share at k=45 runs **94.3% to 101.1%**,
+mean **97.0%**, and compounding is the majority of the cost in **9 of 9** cells.
+
+**So ~97% of what the open loop pays over the floor is attributable to correction
+arriving every 45 steps rather than every step, not to the one prior step itself.**
+A multi-step or overshooting objective is the indicated intervention.
+
+**What the ladder does not license.** It says one prior step is cheap *relative to
+seeing the frame*. It does **not** say the one-step map beats assuming no motion —
+that is what `motion_margin` was for, and it is unreadable. In particular,
+comparing `burden(1)` = 2.984 against the true displacement of 3.9695 is
+**invalid**, for precisely the reason the margin is: one is a probe-space
+difference, the other is ground truth. That comparison is not made here.
+
+### Controls, all nine cells
+
+- `open_loop_divergence` = **0.0** on all nine: the k=45 rung reproduces the shipped
+  `curves.rssm_position` of `runs/m3_study_v2` **bitwise**, on a stochastic model.
+- `is_bitwise_the_floor(1)` = **False** on all nine: k=1 sits off the floor, so the
+  grounding never consumed the frame it is scored on.
+- `compounding(k=1)` = **exactly 0.0** on all nine, by construction.
+- Identity residual: **0.0** on eight cells and **2.842e-14** on `pixel_ae` s0,
+  against a 1e-9 tolerance. The one nonzero cell is the one whose
+  `open_loop / floor` ratio exceeds 2 (2.20), which is where §2.3's exactness
+  condition stops holding — the tolerance behaved as documented.
+- Read determinism: two independent reads produced **byte-identical** stdout (358
+  bytes), and the refusal left no `burden.txt`.
+
+### Companions, which decide nothing
+
+`kl_rate_above_free_bits` **0.7455–0.9757** and `kl_dyn_max` **1.868–36.222** nats
+against a 0.20-nat floor, carried onto every record so §1's refutation travels with
+the reading: the dynamics prior trained on 75–98% of steps, and "the loss never asks
+for prediction" is false as stated.
+
+### One figure worth keeping
+
+`frozen_ssl` s2's `burden(1)` is **−0.714**: its k=1 rung sits 0.6% *below* the floor
+at h=45, which puts its compounding share above 100%. Both curves are stochastic
+draws, so a 0.6% inversion is sampling noise rather than a violation of the floor's
+meaning, which concerns the k→0 limit and not per-step ordering.
+
+It is reportable only because Task 2's review found that `np.abs(curve_k − floor)`
+and `np.maximum(..., 0.0)` both survived the entire suite — every fixture being
+monotone and non-negative. Under either clamp this cell would read `+0.714` and
+99.2%: plausible, wrong, and silent.
+
+### This does not pass the M3 exit gate
+
+The gate remains failed on `beats_persistence`, `band_is_usable` and
+`filtering_beats_embedding`, and `gap_closed(45)` is negative in 9 of 9 position
+cells. M3m narrows the objective lever to a horizon problem and names the
+intervention; it does not close the gate, and it licenses no claim that a
+multi-step objective would.
+
+### Tests
+
+`2791 passed, 0 failures` in 36m49s at `349edee`, the SHA the nine records carry.
+`runs/m3l_capacity` is byte-identical to before this milestone.
