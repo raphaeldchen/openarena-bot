@@ -1560,7 +1560,7 @@ def test_read_phase_writes_nothing_when_it_refuses(record, tmp_path, capsys):
     checked. Asked of BOTH refusals, with the exit code asserted so the file is
     absent because the refusal was reached and not because something else
     stopped first."""
-    for index, status in enumerate(("UNRESOLVED_CONTROL", "UNREADABLE")):
+    for status in ("UNRESOLVED_CONTROL", "UNREADABLE"):
         args = _read_args(tmp_path / status, _records_from(record, _scenario(status)))
         assert script.read_phase(args) == script.READ_EXITS[status], status
         assert not (args.out / "burden.txt").exists(), status
@@ -1664,14 +1664,24 @@ def test_a_pool_that_agrees_on_the_protocol_is_accepted_whatever_else_differs(re
     assert script.require_one_protocol(records) is None
 
 
-@pytest.mark.parametrize("victim", [FIRST_CELL, LAST_CELL], ids=["first", "last"])
-def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(record, victim):
+@pytest.mark.parametrize("lacking", ["first", "last", "all"])
+def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(record, lacking):
+    """A record that lacks a protocol field is refused BY NAME, not with a bare
+    `KeyError` and not by defaulting the field.
+
+    `all` is the case a default would pass: if every record lacks `git_sha` and
+    a missing field is read as `None`, the nine agree on `None` and pool with no
+    refusal. With only one record lacking it the default would disagree with the
+    other eight and be refused anyway, which is why the two single-record cases
+    cannot tell a refusal from a default."""
     records = _records_from(record, _scenario("COPIES"))
-    del records[victim]["git_sha"]
+    victims = {"first": [FIRST_CELL], "last": [LAST_CELL], "all": sorted(records)}[lacking]
+    for cell in victims:
+        del records[cell]["git_sha"]
     with pytest.raises(SystemExit) as caught:
         script.require_one_protocol(records)
     message = str(caught.value)
-    assert f"{victim[0]} seed {victim[1]}" in message and "git_sha" in message, message
+    assert f"{victims[0][0]} seed {victims[0][1]} lacks git_sha" in message, message
 
 
 def test_an_empty_pool_is_refused_by_name():
