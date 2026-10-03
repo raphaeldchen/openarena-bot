@@ -1957,9 +1957,24 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Nine cells at one `git_sha` `349edee67077`, step 20000, `ks = [1, 3, 5, 15, 45]`,
 `decision_h = 45`, `confidence = 0.95`, `resamples = 2000`, 229 windows over 24
-episodes per cell, torch 2.13.0 on mps. Measure span 23.1 min (~2.9 min/cell),
-inside §6's 25–45 min estimate. Records in `runs/m3m_burden/`. Every figure below
-is re-derivable from `runs/m3m_burden/*.json` alone.
+episodes per cell, torch 2.13.0 on mps. Records in `runs/m3m_burden/`.
+
+**Timing, which no record carries** (no record has a timestamp and `run.log` has
+none), read from the files' own times with `stat`. `run.log` was created at 19:48:53,
+the launch; the first record was written at 19:51:24 and the last at 20:14:27. That
+gives two different quantities, which are not interchangeable:
+
+- the **first-to-last record-write span is 23.1 min** over eight intervals, **2.88
+  min** each. It excludes the first cell's own measure (2.5 min from launch,
+  loading included), so it is not the wall clock, and it is *below* §6's 25–45 min
+  estimate;
+- the **launch-to-last-write wall clock is 25.6 min**, **2.84 min/cell** over nine,
+  which is *inside* §6's estimate, at its lower edge.
+
+**What is re-derivable from the records.** Every figure below is re-derivable from
+`runs/m3m_burden/*.json` alone **except two**: the timing above (file-system times,
+not record fields) and the `gap_closed(45)` claim under *This does not pass the M3
+exit gate*, which comes from `runs/m3_study_v2`.
 
 ### Reading H refuses: `UNREADABLE`, exit 46
 
@@ -1976,10 +1991,51 @@ so the margin measures the floor, not the model.
 
 `motion_margin` at h=45 reads **−116.47 to −244.60**, and the whole interval is
 below 0 in **9 of 9** cells (largest `ci_high` = −100.73). **That does not mean the
-code copies, and `COPIES` is not the finding.** A *perfect* one-step predictor
-would read ≈ −94 on these cells, because it would still pay the readout error its
-baseline does not. The base control exists for exactly this confound and it fired;
-the cut was not retuned to manufacture a verdict.
+code copies, and `COPIES` is not the finding.** A *perfect* one-step predictor has
+`rung_1 == floor`, so its margin is `one_step_persistence[45] − floor_position[45]`:
+it would still pay the readout error its baseline does not. Taken per cell from
+the records, that is **−112.28 to −244.33** (mean −143.57, median −132.74), and the
+margin the model actually read sits within **0.1% to 5.8%** of it:
+
+| cell | a perfect predictor | observed | observed − perfect | relative |
+|---|---|---|---|---|
+| `frozen_ssl` s0 | −119.04 | −121.23 | −2.19 | 1.8% |
+| `frozen_ssl` s1 | −112.28 | −118.80 | −6.52 | 5.8% |
+| `frozen_ssl` s2 | −117.18 | **−116.47** | **+0.71** | 0.6% |
+| `pixel_ae` s0 | −115.84 | −120.48 | −4.64 | 4.0% |
+| `pixel_ae` s1 | −244.33 | −244.60 | −0.27 | 0.1% |
+| `pixel_ae` s2 | −149.11 | −154.95 | −5.85 | 3.9% |
+| `random_vit` s0 | −151.67 | −153.76 | −2.09 | 1.4% |
+| `random_vit` s1 | −132.74 | −134.82 | −2.07 | 1.6% |
+| `random_vit` s2 | −149.89 | −153.84 | −3.95 | 2.6% |
+
+In `frozen_ssl` s2 the observed margin is *above* what a perfect predictor would
+read. The column `observed − perfect` is not a coincidence of the fixture:
+`margin = one_step_persistence − rung_1` and `perfect = one_step_persistence −
+floor`, so it is exactly `−burden(1, 45)` (checked on the nine cells to 8.5e-14).
+The model contributes the 0.27 to 6.52 map units of `burden(1)`; the other 112 to
+244 are the readout. The base control exists for exactly this confound and it
+fired; the cut was not retuned to manufacture a verdict.
+
+The refused statistic, per cell, at h=45 (point, then the 95% episode-clustered
+interval; the base control's median floor error and its ratio to the median true
+displacement of 3.9695 beside it):
+
+| cell | `motion_margin` | `ci_low` | `ci_high` | floor error | floor ÷ displacement |
+|---|---|---|---|---|---|
+| `frozen_ssl` s0 | −121.2320 | −138.1792 | −103.5678 | 95.01 | 23.9× |
+| `frozen_ssl` s1 | −118.8008 | −139.0938 | −101.6545 | 88.29 | 22.2× |
+| `frozen_ssl` s2 | −116.4653 | −137.1071 | −100.7302 | 95.93 | 24.2× |
+| `pixel_ae` s0 | −120.4766 | −137.4205 | −103.3699 | 94.10 | 23.7× |
+| `pixel_ae` s1 | −244.6039 | −292.1211 | −193.3336 | 224.36 | 56.5× |
+| `pixel_ae` s2 | −154.9547 | −183.7534 | −128.7161 | 114.27 | 28.8× |
+| `random_vit` s0 | −153.7604 | −185.5852 | −124.0128 | 108.12 | 27.2× |
+| `random_vit` s1 | −134.8152 | −165.5694 | −106.9296 | 90.18 | 22.7× |
+| `random_vit` s2 | −153.8443 | −184.2872 | −126.5497 | 105.27 | 26.5× |
+
+Read from the records and checked against `run.log`: all nine triples agree to four
+decimal places. They are given here so that the statistic that did not decide is
+shown as fully as the companion that did.
 
 **How the error happened.** §2.2 correctly identified that comparing the
 re-grounded k=1 rung against the recorded *t-anchored* `persistence_position` is
@@ -2027,6 +2083,57 @@ mean **97.0%**, and compounding is the majority of the cost in **9 of 9** cells.
 arriving every 45 steps rather than every step, not to the one prior step itself.**
 A multi-step or overshooting objective is the indicated intervention.
 
+**The share is read at k=45 only, and that was a judgement; the rest of §2.4's
+companions were not delivered.** Spec §2.4 asks for `compounding_share(k)` and §7
+requires "the companions of 2.4 reported as raw levels". The ~97% above is a
+hand-computed instance of the first, at one rung, taken from the recorded
+`burden_by_k` and `compounding_by_k`; it is not a field of any record and no code
+computes it. The band-relative companion (§2.4's third bullet, the costs as
+fractions of the persistence-to-floor band) was **not implemented, recorded or
+reported**. So §7's criterion on the companions is met in part: the burden curve
+over the ladder and the KL carry-over are reported as raw levels, the share only at
+k=45 and by hand, the band-relative figure not at all.
+
+Reading the share at k=45 only is deliberate, not an oversight. At k=3,
+`random_vit` s1 reads **−87.9%**, because `burden(3, 45)` is **1.104** and
+`compounding(3, 45)` is **−0.970**: exactly the vanishing-denominator case §2.4
+warns of (there at small horizon, here at small k). The share across the ladder,
+derived from the same records:
+
+| cell | k=3 | k=5 | k=15 | k=45 |
+|---|---|---|---|---|
+| `frozen_ssl` s0 | 46.1% | 49.4% | 92.4% | 97.6% |
+| `frozen_ssl` s1 | 40.7% | 69.4% | 81.3% | 94.3% |
+| `frozen_ssl` s2 | 112.0% | 115.5% | 103.8% | 101.1% |
+| `pixel_ae` s0 | 29.8% | 59.1% | 90.0% | 96.7% |
+| `pixel_ae` s1 | 88.3% | 94.6% | 96.9% | 99.1% |
+| `pixel_ae` s2 | 37.7% | 54.1% | 82.6% | 94.6% |
+| `random_vit` s0 | 65.9% | 78.8% | 91.1% | 96.8% |
+| `random_vit` s1 | **−87.9%** | 6.8% | 91.8% | 97.3% |
+| `random_vit` s2 | 52.9% | 16.2% | 86.2% | 95.2% |
+| **median** | **46.1%** | **59.1%** | **91.1%** | **96.8%** |
+
+The medians rise with k: 46.1%, 59.1%, 91.1%, 96.8%. Seven of the nine cells rise
+at every step; `frozen_ssl` s2 and `random_vit` s2 do not. At k=3 six of the nine
+cells lie in 29.8% to 65.9%; the other three are 88.3%, 112.0% and −87.9%, and they
+are the cells where the denominator is small (`random_vit` s1 and `pixel_ae` s1 have
+the two smallest `burden(3, 45)`, 1.104 and 2.306) or where `burden(1)` is negative
+(`frozen_ssl` s2). At k=45 all nine lie in 94.3% to 101.1%, which is the one rung
+where the denominator is large in every cell (31.2 to 142.1).
+
+**There is no interval on the ~97%, and these records cannot give one.**
+`burden_by_k` and `compounding_by_k` are means over 229 windows; the per-window
+rungs and the per-window floor were not kept, so nothing can be computed from the
+records afterwards, and the 94.3% to 101.1% is the spread *across nine cells*, not
+an uncertainty in any one of them. `RegroundingSweep` already carries the paired
+rulers the spec requires (`floor_margin_standard_error` and
+`paired_standard_error`, because the unpaired spread overstates a k-to-k bar by
+1.7× to 3.9×), and until the fix that followed this section nothing on the branch
+referenced either. `measure_cell` now records both at the decision horizon, under
+`rulers`: `floor_margin_standard_error(1)`, the ruler on `burden(1)`, and
+`paired_standard_error(ks[-1], 1)`, the ruler on `compounding(ks[-1])`. The next
+measurement carries them; these nine records do not.
+
 **What the ladder does not license.** It says one prior step is cheap *relative to
 seeing the frame*. It does **not** say the one-step map beats assuming no motion —
 that is what `motion_margin` was for, and it is unreadable. In particular,
@@ -2042,9 +2149,19 @@ difference, the other is ground truth. That comparison is not made here.
   grounding never consumed the frame it is scored on.
 - `compounding(k=1)` = **exactly 0.0** on all nine, by construction.
 - Identity residual: **0.0** on eight cells and **2.842e-14** on `pixel_ae` s0,
-  against a 1e-9 tolerance. The one nonzero cell is the one whose
-  `open_loop / floor` ratio exceeds 2 (2.20), which is where §2.3's exactness
-  condition stops holding — the tolerance behaved as documented.
+  against a 1e-9 tolerance. The one nonzero cell is the one outside the exactness
+  condition in `IDENTITY_TOLERANCE`'s docstring (`burden.py`), which is written in
+  terms of `max(rung_45) / min(floor)`: that ratio is **2.205** on `pixel_ae` s0 and
+  **1.15 to 1.97** on the other eight. (The same cell reads 2.171 if the ratio is
+  taken at h=45 only, 2.181 at its worst single step; it is above 2 on every
+  definition and no other cell is above 2 on any.) The tolerance behaved as
+  documented.
+- **No control between the two floors.** Every burden and the identity residual
+  read the floor from `prepared.reference`, while `k_one_is_floor` and the base
+  control's median read it from the sweep's own pass. `open_loop_divergence = 0.0`
+  shows the two passes agree on the RSSM curve, not on the floor curve. The control
+  that closes this, `controls.floor_divergence`, was added after this run and is
+  not in these nine records.
 - Read determinism: two independent reads produced **byte-identical** stdout (358
   bytes), and the refusal left no `burden.txt`.
 
@@ -2064,8 +2181,13 @@ meaning, which concerns the k→0 limit and not per-step ordering.
 
 It is reportable only because Task 2's review found that `np.abs(curve_k − floor)`
 and `np.maximum(..., 0.0)` both survived the entire suite — every fixture being
-monotone and non-negative. Under either clamp this cell would read `+0.714` and
-99.2%: plausible, wrong, and silent.
+monotone and non-negative. Under `np.abs` this cell's `burden(1)` would read
+**+0.7141** and its share, taken as `(burden(45) − burden(1)) / burden(45)` as a
+share built from clamped burdens would be, **98.95%**; under `np.maximum(..., 0.0)`
+it would read **0.0000** and **100.00%**. (The actual share, `compounding(45) /
+burden(45)`, is 101.05%.) Plausible, wrong, and silent in both cases: the clamps
+would have masked the one cell that shows the floor is a limit and not a per-step
+bound.
 
 ### This does not pass the M3 exit gate
 
