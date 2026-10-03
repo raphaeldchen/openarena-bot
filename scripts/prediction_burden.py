@@ -119,8 +119,9 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.burden import (
     ARMS_REQUIRED, CONFIDENCE, DECISION_H, IDENTITY_TOLERANCE, REPORTED_H, RESAMPLES,
-    SEEDS_MINIMUM, BurdenArm, BurdenInputs, burden, compounding, format_reading_burden,
-    identity_residual, margin_interval, one_step_persistence, reading_burden,
+    SEEDS_MINIMUM, BurdenArm, BurdenInputs, at_horizon, burden, compounding,
+    format_reading_burden, identity_residual, margin_interval, one_step_persistence,
+    reading_burden,
 )
 from mbfps.eval.diagnostics import REGROUNDING_KS, regrounding_sweep
 from mbfps.eval.probe import probe_targets
@@ -363,8 +364,12 @@ def measure_cell(
         )
         margin[str(h)] = {"point": point, "ci_low": low, "ci_high": high}
     base_control = {
-        "displacement_median": float(np.median(rows[:, DECISION_H - 1])),
-        "floor_median": float(np.median(sweep.window_floor_position[:, DECISION_H - 1])),
+        "displacement_median": float(np.median(
+            [at_horizon(window, DECISION_H) for window in rows]
+        )),
+        "floor_median": float(np.median(
+            [at_horizon(window, DECISION_H) for window in sweep.window_floor_position]
+        )),
     }
 
     return {
@@ -416,7 +421,7 @@ def _cell_line(record: dict, path: Path) -> str:
     return (
         f"{record['arm']} seed {record['seed']}: margin at h={record['decision_h']} "
         f"{margin['point']:+.4f} [{margin['ci_low']:+.4f}, {margin['ci_high']:+.4f}]; "
-        f"burden(k={last}) {record['burden_by_k'][last][record['decision_h'] - 1]:+.4f}; "
+        f"burden(k={last}) {at_horizon(record['burden_by_k'][last], record['decision_h']):+.4f}; "
         f"identity {controls['identity_residual']:.2e}; open-loop "
         f"{controls['open_loop_divergence']:.1e}; k=1 is floor "
         f"{controls['k_one_is_floor']}; {record['windows']['total']} windows; wrote {path}"
@@ -708,11 +713,13 @@ def burden_inputs(records: dict) -> BurdenInputs:
     its own record does not name.
 
     Each cell's margin is read at the decision horizon and each rung at the
-    decision horizon's step -- `[h - 1]`, because the curves are 0-indexed and
-    the horizon is counted from 1 (`burden.at_horizon`). The record's keys are
-    strings, the form JSON gives them back in; `BurdenArm` takes integer rungs.
-    `clusters` is the number of distinct episodes the windows were cut from and
-    `rows` the number of windows; neither is read by the verdict."""
+    decision horizon's step, through `burden.at_horizon`: the curves are 0-indexed
+    and the horizon is counted from 1, and that function is the one place the
+    difference is written. The record's keys are strings, the form JSON gives them
+    back in; `BurdenArm` takes integer rungs. `clusters` is the number of distinct
+    episodes the windows were cut from and `rows` the number of windows; neither is
+    read by anything -- not the verdict, the controls or the table -- and they ride
+    on the cell for a reader of it."""
     items = _require_agreement(records, ("decision_h", "ks"))
     decision_h = int(items[0][1]["decision_h"])
     ks = tuple(int(k) for k in items[0][1]["ks"])
@@ -726,10 +733,10 @@ def burden_inputs(records: dict) -> BurdenInputs:
             margin_low=float(margin["ci_low"]),
             margin_high=float(margin["ci_high"]),
             burden_by_k={
-                k: float(record["burden_by_k"][str(k)][decision_h - 1]) for k in ks
+                k: at_horizon(record["burden_by_k"][str(k)], decision_h) for k in ks
             },
             compounding_by_k={
-                k: float(record["compounding_by_k"][str(k)][decision_h - 1]) for k in ks
+                k: at_horizon(record["compounding_by_k"][str(k)], decision_h) for k in ks
             },
             identity_residual=float(controls["identity_residual"]),
             open_loop_divergence=float(controls["open_loop_divergence"]),

@@ -832,6 +832,43 @@ def test_the_base_control_is_the_two_medians_at_the_decision_horizon(rig, record
     assert base["displacement_median"] != base["floor_median"]
 
 
+# A horizon step is read through `burden.at_horizon` or it is not read at all.
+# Its docstring says that indexing with `h` rather than `h - 1` "shifts every
+# reported number by one step and breaks no shape, which is why this is a function
+# rather than a convention" -- and for as long as every call site wrote its own
+# `- 1`, replacing its body with a raise left the whole script's tests green. These
+# tests patch the script's own name for it to a function that returns a number no
+# measurement can produce and records the horizon it was asked for, so a site that
+# indexes by hand reads a real number where the sentinel should be.
+SENTINEL = 123456.789
+
+
+def _sentinel_at_horizon(asked):
+    def at_horizon(curve, h):
+        asked.append(h)
+        return SENTINEL
+    return at_horizon
+
+
+def test_the_base_control_reads_both_medians_through_at_horizon(rig, monkeypatch):
+    """`measure_cell`'s two medians, the displacement and the floor, are each read
+    at `DECISION_H` through `burden.at_horizon`.
+
+    THE MUTATIONS THIS EXISTS FOR, one per median: `rows[:, DECISION_H - 1]` and
+    `sweep.window_floor_position[:, DECISION_H - 1]` written by hand again, each of
+    which left the script's tests green before this one. Each median is a number
+    that only `at_horizon` could have returned, so the other site cannot cover for
+    the one mutated.
+    """
+    asked = []
+    monkeypatch.setattr(script, "at_horizon", _sentinel_at_horizon(asked))
+    base = script.measure_cell(**_cell_kwargs(rig))["base_control"]
+    assert base == {"displacement_median": SENTINEL, "floor_median": SENTINEL}
+    assert set(asked) == {burden.DECISION_H}
+    # One call per window per median: the median is of the windows, not of one read.
+    assert len(asked) == 2 * sum(EXPECTED_WINDOWS)
+
+
 # ---------------------------------------------------------------------------
 # The arguments handed to the sweep are the ones it USES.
 # ---------------------------------------------------------------------------
@@ -1253,6 +1290,21 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
             assert f"{first_rung:+.4f}" != f"{by_step[burden.DECISION_H - 1]:+.4f}"
         assert f"{record['controls']['identity_residual']:.2e}" in line
         assert str(args.out / f"burden_{arm}_seed{seed}.json") in line
+
+
+def test_the_cell_line_reads_its_burden_through_at_horizon(record, tmp_path, monkeypatch):
+    """The burden the line prints is the one place the measure phase reads a step
+    off a record rather than off an array, and it reads it through
+    `burden.at_horizon` like `burden_inputs` does.
+
+    THE MUTATION THIS EXISTS FOR: `record['burden_by_k'][last][record['decision_h']
+    - 1]` written by hand again.
+    """
+    asked = []
+    monkeypatch.setattr(script, "at_horizon", _sentinel_at_horizon(asked))
+    line = script._cell_line(record, tmp_path / "burden.json")
+    assert f"burden(k={record['ks'][-1]}) {SENTINEL:+.4f};" in line
+    assert asked == [record["decision_h"]]
 
 
 def test_main_takes_its_cells_and_directories_from_the_command_line(tmp_path, monkeypatch):
@@ -1917,6 +1969,26 @@ def test_burden_inputs_reads_every_field_from_its_own_key_at_the_decision_horizo
     args = _read_args(tmp_path, records)
     loaded = script.load_burden(args.out, READ_ARMS, READ_SEEDS)
     assert script.burden_inputs(loaded) == expected
+
+
+@pytest.mark.parametrize("decision_h", [burden.DECISION_H, 30])
+def test_burden_inputs_reads_every_rung_through_at_horizon(record, monkeypatch, decision_h):
+    """The burden and the compounding of every rung, in every cell, are read at the
+    record's decision horizon through `burden.at_horizon` -- the two fields are
+    separate sites, so a hand-written `[decision_h - 1]` on either is another
+    number than the sentinel in that field.
+
+    THE MUTATIONS THIS EXISTS FOR: `record["burden_by_k"][str(k)][decision_h - 1]`
+    and the same for `compounding_by_k`, each written by hand again.
+    """
+    asked = []
+    monkeypatch.setattr(script, "at_horizon", _sentinel_at_horizon(asked))
+    records = _records_from(record, _scenario("COPIES"), decision_h=decision_h)
+    inputs = script.burden_inputs(records)
+    for cell in inputs.cells.values():
+        assert cell.burden_by_k == {k: SENTINEL for k in REGROUNDING_KS}
+        assert cell.compounding_by_k == {k: SENTINEL for k in REGROUNDING_KS}
+    assert set(asked) == {decision_h}
 
 
 @pytest.mark.parametrize("field", ["decision_h", "ks"])
