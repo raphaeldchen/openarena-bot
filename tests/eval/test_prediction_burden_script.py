@@ -1804,17 +1804,58 @@ def test_read_phase_names_the_first_missing_cell_and_exits_eleven(record, tmp_pa
     assert not (args.out / "burden.txt").exists()
 
 
-def test_a_record_filed_under_another_cells_name_is_refused(record, tmp_path):
+@pytest.mark.parametrize(
+    "swap, first_file, record_says, other_file",
+    [
+        # Only the SEED differs: both files are `pixel_ae`. `load_burden` walks the
+        # plan arm by arm and seed by seed, so `seed1` is the first file it opens
+        # whose record disagrees; `seed2`, the other half of the swap, comes later.
+        pytest.param(
+            (("pixel_ae", 1), ("pixel_ae", 2)),
+            "burden_pixel_ae_seed1.json was read for pixel_ae seed 1",
+            "arm='pixel_ae' seed=2",
+            "burden_pixel_ae_seed2.json",
+            id="seed half",
+        ),
+        # Only the ARM differs: both records say seed 0. `pixel_ae` is first in the
+        # plan, so `burden_pixel_ae_seed0.json` -- which holds a `frozen_ssl` record
+        # -- is opened before `burden_frozen_ssl_seed0.json` (which holds pixel_ae's).
+        pytest.param(
+            (("pixel_ae", 0), ("frozen_ssl", 0)),
+            "burden_pixel_ae_seed0.json was read for pixel_ae seed 0",
+            "arm='frozen_ssl' seed=0",
+            "burden_frozen_ssl_seed0.json",
+            id="arm half",
+        ),
+    ],
+)
+def test_a_record_filed_under_another_cells_name_is_refused(
+    record, tmp_path, swap, first_file, record_says, other_file,
+):
     """A swapped pair of files would pool one cell under another's name with every
-    count still right."""
+    count still right.
+
+    THE MUTATIONS THIS EXISTS FOR, one per case: dropping the `arm` comparison from
+    `load_burden`'s filename check (the `arm half` case fails, and only it) and
+    dropping the `seed` comparison (the `seed half` case fails, and only it). Each
+    swap changes ONE of the two, so a check that tests the other cannot see it; the
+    seed swap alone, which this test was first written as, left the arm half
+    unpinned.
+
+    The message must name the FIRST file `load_burden` meets that disagrees --
+    `first_file` is spelled out here, in the plan's order, not read off the code --
+    and must not name the other file of the swap: asserting `a or b` would accept
+    either, and `"seed" in message` is true of any message that mentions a seed."""
     records = _records_from(record, _scenario("COPIES"))
-    records[("pixel_ae", 2)], records[("pixel_ae", 1)] = records[("pixel_ae", 1)], records[("pixel_ae", 2)]
+    one, other = swap
+    records[one], records[other] = records[other], records[one]
     args = _read_args(tmp_path, records)
     with pytest.raises(SystemExit) as caught:
         script.read_phase(args)
     message = str(caught.value)
-    assert "burden_pixel_ae_seed1.json" in message or "burden_pixel_ae_seed2.json" in message, message
-    assert "seed" in message and "arm='pixel_ae'" in message, message
+    assert message.startswith(first_file), message
+    assert f"but its record says {record_says}" in message, message
+    assert other_file not in message, message
 
 
 # --- what is written, and what is printed -----------------------------------
