@@ -673,8 +673,9 @@ def episode_bootstrap(labels: np.ndarray, bootstrap: int, seed: int):
     as it was drawn. The ruler for a ratio of medians, which has no sandwich
     standard error: resample the clusters, recompute.
 
-    PUBLIC because `eval.burden` consumes it. A fourth episode bootstrap in
-    this codebase would be the wrong answer; there are already three."""
+    PUBLIC because `clustered_interval` consumes it, and the tests build their
+    oracles from it. A fourth episode bootstrap in this codebase would be the
+    wrong answer; there are already three."""
     rng = default_rng(seed)
     groups = np.unique(labels)
     members = {group: np.flatnonzero(labels == group) for group in groups}
@@ -687,10 +688,92 @@ def percentile_interval(replicates: np.ndarray) -> tuple[float, float, float]:
     """Return (low, high, se) at the 2.5/97.5 percentiles, `se` the sample
     standard deviation with `ddof=1`, or NaN for a single replicate.
 
-    PUBLIC because `eval.burden` consumes it."""
+    PUBLIC because `clustered_interval` consumes it, and `test_burden` pins
+    `burden.CONFIDENCE` against it."""
     low, high = np.percentile(replicates, [2.5, 97.5])
     se = float(replicates.std(ddof=1)) if replicates.size > 1 else float("nan")
     return float(low), float(high), se
+
+
+def clustered_interval(
+    window_rows: np.ndarray,
+    groups: np.ndarray,
+    *,
+    h: int,
+    resamples: int,
+    seed: int,
+) -> tuple[float, float, float]:
+    """`(point, ci_low, ci_high)` for the mean of column `h` across windows.
+
+    THE RESAMPLING UNIT IS THE EPISODE. There are 229 windows over 24 episodes
+    on every shipped cell, and consecutive Doom frames are near-duplicates, so
+    a window-level bootstrap counts correlated observations as independent ones
+    and returns an interval several times too narrow. Measured on M3m's
+    `window_margin` rows, the episode-clustered standard error at h=1 is 1.26x
+    to 2.17x the iid one across the nine cells.
+
+    THE DIRECTION OF THAT ERROR MATTERS. An understated standard error makes a
+    quantity look MORE resolvable, so an iid ruler is the conservative choice
+    for a claim of non-resolvability and the dangerous one for a claim of
+    resolvability. M3n's verdict rests on claims of resolvability.
+
+    `seed` AND `resamples` ARE KEYWORD-REQUIRED WITH NO DEFAULTS. A defaulted
+    seed is how a previous milestone shipped every cell drawing the same
+    resamples; the point estimate is seed-free, so only the bounds can move,
+    and a reader cannot tell nine identical draws from nine independent ones
+    by looking.
+
+    `groups` must carry one label per window. A record whose ladder carried no
+    clustering stores `windows.episode` as null, and its own comment requires a
+    reader to refuse rather than treat every window as its own episode --
+    falling back to `arange(n)` here would convert this into the window-level
+    bootstrap the first paragraph rules out.
+
+    `window_rows` must be finite EVERYWHERE, not only in the column read at
+    `h`. A NaN that reaches the mean returns `(nan, nan, nan)` -- no exception,
+    no indication of which input was bad -- and that triple is the quantity a
+    verdict is read from, so a silent one is a silent wrong verdict.
+
+    GENERALISED FROM `burden.margin_interval` (M3m), which read only the
+    motion margin. Nothing about the resampling is margin-specific, and M3n
+    reads three different difference arrays through it per (k, h).
+
+    PUBLIC because `scripts/prediction_burden.py` consumes it, and M3n's
+    `scripts/motion_headroom.py` will. A second copy of this bootstrap would be
+    the wrong answer."""
+    window_rows = np.asarray(window_rows, dtype=np.float64)
+    groups = np.asarray(groups)
+    if window_rows.ndim != 2:
+        raise ValueError(
+            f"window_rows must be (windows, horizon); got {window_rows.shape}"
+        )
+    if not np.isfinite(window_rows).all():
+        raise ValueError("every window_rows value must be finite")
+    if groups.ndim != 1 or groups.size != window_rows.shape[0]:
+        raise ValueError(
+            "groups must carry one label per window; got "
+            f"{groups.shape} for {window_rows.shape[0]} windows"
+        )
+    if np.unique(groups).size < 2:
+        raise ValueError(
+            "an episode-clustered bootstrap needs at least two episodes; got "
+            f"{np.unique(groups).size}"
+        )
+    if resamples < 1:
+        raise ValueError(f"resamples must be >= 1, got {resamples}")
+    if not 1 <= h <= window_rows.shape[1]:
+        raise ValueError(
+            f"horizon step must be in 1..{window_rows.shape[1]}, got {h}"
+        )
+
+    column = window_rows[:, h - 1]
+    point = float(column.mean())
+    replicates = np.array([
+        float(column[index].mean())
+        for index in episode_bootstrap(groups, resamples, seed)
+    ])
+    low, high, _se = percentile_interval(replicates)
+    return point, low, high
 
 
 @dataclass(frozen=True)

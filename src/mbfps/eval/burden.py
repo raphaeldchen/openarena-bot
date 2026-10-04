@@ -34,7 +34,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from mbfps.eval.pooling import episode_bootstrap, percentile_interval
 from mbfps.eval.probe import position_error
 
 DECISION_H: int = 45
@@ -233,72 +232,6 @@ def motion_margin(window_targets: np.ndarray, curve_one: np.ndarray) -> np.ndarr
         one_step_persistence(window_targets), curve_one
     )
     return baseline - curve_one
-
-
-def margin_interval(
-    window_margin: np.ndarray,
-    groups: np.ndarray,
-    *,
-    h: int,
-    resamples: int = RESAMPLES,
-    seed: int,
-) -> tuple[float, float, float]:
-    """`(point, ci_low, ci_high)` for the mean margin at horizon step `h`.
-
-    THE RESAMPLING UNIT IS THE EPISODE. There are 229 windows over 24 episodes
-    on every shipped cell, and consecutive Doom frames are near-duplicates, so
-    a window-level bootstrap counts correlated observations as independent ones
-    and returns an interval several times too narrow.
-
-    `seed` IS KEYWORD-REQUIRED AND HAS NO DEFAULT. A defaulted seed is how a
-    previous milestone shipped every cell drawing the same resamples; the
-    point estimate is seed-free, so only the bounds can move, and a reader
-    cannot tell nine identical draws from nine independent ones by looking.
-
-    `groups` must carry one label per window. A record whose ladder carried no
-    clustering stores `windows.episode` as null, and its own comment requires a
-    reader to refuse rather than treat every window as its own episode --
-    falling back to `arange(n)` here would convert this into the window-level
-    bootstrap the first paragraph rules out.
-
-    `window_margin` must be finite EVERYWHERE, not only in the column read at
-    `h`. A NaN that reaches the mean returns `(nan, nan, nan)` -- no exception,
-    no indication of which input was bad -- and that triple is the quantity
-    Reading H's verdict is read from, so a silent one is a silent wrong verdict.
-    """
-    window_margin = np.asarray(window_margin, dtype=np.float64)
-    groups = np.asarray(groups)
-    if window_margin.ndim != 2:
-        raise ValueError(
-            f"window_margin must be (windows, horizon); got {window_margin.shape}"
-        )
-    if not np.isfinite(window_margin).all():
-        raise ValueError("every window_margin value must be finite")
-    if groups.ndim != 1 or groups.size != window_margin.shape[0]:
-        raise ValueError(
-            "groups must carry one label per window; got "
-            f"{groups.shape} for {window_margin.shape[0]} windows"
-        )
-    if np.unique(groups).size < 2:
-        raise ValueError(
-            "an episode-clustered bootstrap needs at least two episodes; got "
-            f"{np.unique(groups).size}"
-        )
-    if resamples < 1:
-        raise ValueError(f"resamples must be >= 1, got {resamples}")
-
-    column = window_margin[:, h - 1] if 1 <= h <= window_margin.shape[1] else None
-    if column is None:
-        raise ValueError(
-            f"horizon step must be in 1..{window_margin.shape[1]}, got {h}"
-        )
-    point = float(column.mean())
-    replicates = np.array([
-        float(column[index].mean())
-        for index in episode_bootstrap(groups, resamples, seed)
-    ])
-    low, high, _se = percentile_interval(replicates)
-    return point, low, high
 
 
 SEEDS_MINIMUM: int = 3

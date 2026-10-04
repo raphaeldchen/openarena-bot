@@ -47,7 +47,7 @@ import torch
 import torch.nn as nn
 
 from mbfps.data.episode import load_episode, save_episode
-from mbfps.eval import burden
+from mbfps.eval import burden, pooling
 from mbfps.eval.diagnostics import (
     REGROUNDING_KS, action_intervention_ladder, regrounding_sweep,
 )
@@ -431,7 +431,7 @@ def test_the_k_one_rung_is_each_windows_own_in_the_order_given(rig, record):
 def test_measure_cell_refuses_a_non_finite_baseline_by_name(rig, monkeypatch, bad):
     """`motion_margin` has a finiteness guard; the stacked subtraction does not,
     so the script carries its own. Without it the poisoned row reaches
-    `margin_interval`, which raises a bare ValueError that names neither array.
+    `clustered_interval`, which raises a bare ValueError that names neither array.
 
     THE MUTATION THIS EXISTS FOR: deleting the `np.isfinite(rows)` refusal.
     """
@@ -687,9 +687,9 @@ def test_the_interval_is_taken_at_the_cells_seed_and_the_draw_count_the_record_s
     for. And the cell's seed is 3, not 0, so a bootstrap seeded with anything
     else lands on different bounds.
 
-    THE MUTATIONS THIS EXISTS FOR: `margin_interval(..., seed=seed)` ->
+    THE MUTATIONS THIS EXISTS FOR: `clustered_interval(..., seed=seed)` ->
     `seed=0` (the bounds move), and `resamples=RESAMPLES` dropped from the call
-    (the default is `burden.RESAMPLES`, so the bounds move under the patch).
+    (`resamples` has no default, so the call raises TypeError).
     """
     monkeypatch.setattr(script, "RESAMPLES", 40)
     record = script.measure_cell(**_cell_kwargs(rig))
@@ -700,7 +700,7 @@ def test_the_interval_is_taken_at_the_cells_seed_and_the_draw_count_the_record_s
 
     def recompute(h, **over):
         options = dict(h=h, resamples=40, seed=SEED) | over
-        return burden.margin_interval(window_margin, groups, **options)
+        return pooling.clustered_interval(window_margin, groups, **options)
 
     reached = False
     for h in burden.REPORTED_H:
@@ -1288,7 +1288,7 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
         assert carried["resamples"] == burden.RESAMPLES
         h = burden.DECISION_H
         entry = carried["margin"][str(h)]
-        assert (entry["point"], entry["ci_low"], entry["ci_high"]) == burden.margin_interval(
+        assert (entry["point"], entry["ci_low"], entry["ci_high"]) == pooling.clustered_interval(
             np.asarray(carried["window_margin"]), np.asarray(carried["windows"]["episode"]),
             h=h, resamples=burden.RESAMPLES, seed=seed,
         ), (arm, seed)

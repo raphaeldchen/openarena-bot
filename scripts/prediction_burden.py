@@ -128,10 +128,10 @@ from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.burden import (
     ARMS_REQUIRED, CONFIDENCE, DECISION_H, IDENTITY_TOLERANCE, REPORTED_H, RESAMPLES,
     SEEDS_MINIMUM, BurdenArm, BurdenInputs, at_horizon, burden, compounding,
-    format_reading_burden, identity_residual, margin_interval, one_step_persistence,
-    reading_burden,
+    format_reading_burden, identity_residual, one_step_persistence, reading_burden,
 )
 from mbfps.eval.diagnostics import REGROUNDING_KS, regrounding_sweep
+from mbfps.eval.pooling import clustered_interval
 from mbfps.eval.probe import probe_targets
 from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
@@ -328,7 +328,7 @@ def measure_cell(
 
     THE STACKED MARGIN `rows - one` IS `motion_margin`'s definition, subtracted
     over every window at once. `motion_margin` has a shape and finiteness guard
-    behind it and the subtraction has none, and `margin_interval` would take a
+    behind it and the subtraction has none, and `clustered_interval` would take a
     NaN straight through to `(nan, nan, nan)` were it not for its own guard, so
     both operands are refused BY NAME here first. A test pins the stacked result
     to `motion_margin` window by window, which is what keeps the sign
@@ -387,7 +387,7 @@ def measure_cell(
     }
     margin = {}
     for h in REPORTED_H:
-        point, low, high = margin_interval(
+        point, low, high = clustered_interval(
             window_margin, labels, h=h, resamples=RESAMPLES, seed=seed,
         )
         margin[str(h)] = {"point": point, "ci_low": low, "ci_high": high}
