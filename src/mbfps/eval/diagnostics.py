@@ -1852,6 +1852,30 @@ class RegroundingSweep:
         )
 
 
+def ground_step(k: int, h: int) -> int:
+    """The 0-based horizon step the k-rung was last re-grounded at before `h`.
+
+    `0` means the last CONTEXT frame -- the state every segment-0 step is
+    imagined from -- not horizon step 1.
+
+    DERIVED FROM `regrounding_sweep`'s OWN SEGMENT RULE, quoted from its
+    docstring: segment `s` covers horizon steps `[s*k, min((s+1)*k, H))` and is
+    grounded on the posterior through frame `start + context + s*k`. The 1-based
+    step `h` sits in segment `(h - 1) // k`, so the grounding step is
+    `k * ((h - 1) // k)`.
+
+    Both arguments are CHECKED. At `h = 0` floor division gives `k * -1`, a
+    negative grounding step, which would index the floor's positions from the
+    END of the horizon and hold from the wrong frame -- a wrong number, not a
+    crash, and one that no shape test would catch.
+    """
+    if k < 1:
+        raise ValueError(f"re-grounding period must be >= 1, got {k}")
+    if h < 1:
+        raise ValueError(f"horizon step must be >= 1 (1-based), got {h}")
+    return k * ((h - 1) // k)
+
+
 @torch.no_grad()
 def regrounding_sweep(
     model,

@@ -43,6 +43,7 @@ from mbfps.eval.diagnostics import (
     Trajectories,
     action_intervention_ladder,
     action_shuffled_rollout,
+    ground_step,
     reference_trajectories,
     regrounding_sweep,
 )
@@ -3918,3 +3919,52 @@ def test_the_noise_reference_is_drawn_at_the_rollouts_temperature(tmp_path, devi
     assert sharp.noise_bitwise_real.all(), "at tau = 0 two draws must be the same trajectory"
     np.testing.assert_array_equal(sharp.noise_embedding, np.zeros_like(sharp.noise_embedding))
     assert sharp.noise_stream_restored.all()
+
+
+def test_ground_step_matches_the_sweeps_own_segment_rule():
+    """The segment boundary, derived from the sweep's docstring, not from the code.
+
+    `regrounding_sweep`'s docstring states that segment `s` covers horizon
+    steps `[s*k, min((s+1)*k, H))` and is grounded on the posterior through
+    frame `start + context + s*k`. The expected values below are built from
+    that sentence with an independent loop, so a mutation to `ground_step`
+    cannot move both sides.
+    """
+    horizon = 45
+    for k in (1, 2, 3, 5, 15, 45):
+        expected = {}
+        for s in range(0, (horizon + k - 1) // k):
+            for step0 in range(s * k, min((s + 1) * k, horizon)):
+                expected[step0 + 1] = s * k        # 1-based h -> grounding step
+        assert len(expected) == horizon
+        for h in range(1, horizon + 1):
+            assert ground_step(k, h) == expected[h], (
+                f"k={k} h={h}: {ground_step(k, h)} != {expected[h]}"
+            )
+
+
+def test_ground_step_is_zero_for_every_h_when_k_is_the_horizon():
+    """k=45 never re-grounds, so every step holds from the last context frame.
+
+    This is the reduction that makes hold_45 identical to persistence; if it
+    failed, `hold_45` would hold from inside the horizon and the far corner of
+    the ladder would stop being the gate's `beats_persistence`.
+    """
+    assert {ground_step(45, h) for h in range(1, 46)} == {0}
+
+
+def test_ground_step_is_zero_at_h_one_for_every_k():
+    """The h=1 column is k-invariant, which makes the one-step verdict k-free."""
+    assert {ground_step(k, 1) for k in (1, 3, 5, 15, 45)} == {0}
+
+
+def test_ground_step_refuses_a_nonpositive_k_or_h():
+    """`k * ((h - 1) // k)` returns a plausible number for h=0 and k<=0.
+
+    At h=0 Python's floor division gives `k * -1`, a NEGATIVE grounding step,
+    which would index the floor's positions from the end of the horizon and
+    silently hold from the wrong frame.
+    """
+    for bad_k, bad_h in ((0, 1), (-1, 1), (1, 0), (1, -3)):
+        with pytest.raises(ValueError):
+            ground_step(bad_k, bad_h)
