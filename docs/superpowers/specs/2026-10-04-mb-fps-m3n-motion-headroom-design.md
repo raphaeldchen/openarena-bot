@@ -266,7 +266,6 @@ readability gate reads rather than a value checked against a constant.
 
 | control | claim it pins |
 | --- | --- |
-| `trajectory_flag_divergence` | `keep_trajectories=True` leaves the sweep's curves bitwise unchanged |
 | `persistence_divergence` | `max abs(hold_45 - persistence_position)` |
 | `k_invariance_at_h1` | the three differences at `h=1` are identical across all five `k` |
 | `open_loop_divergence` | inherited from M3m — the k=45 rung reproduces `rssm_position` |
@@ -274,6 +273,14 @@ readability gate reads rather than a value checked against a constant.
 | `negative_headroom_steps` | the `(k, h)` cells with `headroom < 0`, recorded and judged by the gate |
 
 `floor_divergence` is carried forward from M3m's record schema unchanged.
+
+**The `keep_trajectories=True` claim is pinned without a second traversal.**
+`open_loop_divergence` and `floor_divergence` read the sweep's arms and its
+reference against the shipped M3c curves, which were measured with the flag
+OFF — so a bitwise match on both proves the flag moved neither. A dedicated
+`trajectory_flag_divergence` would require running every cell twice, doubling
+the run to establish what those two establish for free, and a unit test pins
+the same claim directly on a rig.
 
 ## 7. The run
 
