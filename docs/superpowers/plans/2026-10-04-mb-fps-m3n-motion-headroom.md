@@ -473,45 +473,68 @@ EOF
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `tests/eval/test_diagnostics.py`. The rig is the existing stochastic fake used by the other sweep tests in this module — reuse it; do not introduce a deterministic one.
+Add to `tests/eval/test_diagnostics.py`. **Use the rig that file already has**, not a new one: `write(tmp_path, synthetic_episode())` for the path, `real_model_and_probe()` for a REAL stochastic model and probe, the module-level `sweep(model, paths, probe, ks=..., device=device)` helper, the `rollout(...)` helper for `evaluate_rollout`, the `CONTEXT, HORIZON = 3, 5` constants imported from `tests/eval/test_rollout.py`, and the existing `device` fixture. `reference_trajectories` is public and already imported at line 47.
+
+`HORIZON` is **5**, not 45 — the synthetic episode is 20 frames. Every `k` below is expressed against `HORIZON` so nothing hardcodes a horizon the rig cannot reach.
 
 ```python
-def test_hold_position_at_k_equal_horizon_is_bitwise_persistence(sweep_rig):
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_hold_position_at_k_equals_the_horizon_is_bitwise_persistence(tmp_path, device):
     """The ladder's far corner IS the gate's beats_persistence criterion.
 
-    k=45 never re-grounds, so every step holds the probe of the last context
-    frame -- which is what `persistence_position` already is. Bitwise, not
-    approximately: both are `position_error` on the same two arrays.
+    k=HORIZON never re-grounds, so every step holds the probe of the last
+    context frame -- which is what `persistence_position` already is. Bitwise,
+    not approximately: both are `position_error` on the same two arrays.
+
+    On the REAL stochastic model, because against an oracle rig no random
+    number is drawn and every mutation that displaces the sampling stream is
+    invisible -- the reason the sibling self-check tests in this file say the
+    same thing.
     """
-    sweep = regrounding_sweep(**sweep_rig, ks=(1, 3, 45), horizon=45)
-    assert sweep.windows_total >= 2, "fixture must yield more than one window"
-    assert np.max(np.abs(
-        sweep.hold_position[45] - sweep.reference.persistence_position
-    )) == 0.0
-    assert sweep.persistence_divergence() == 0.0
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+
+    result = sweep(model, [path], probe, ks=(1, HORIZON), device=device)
+    assert result.windows_total >= 2, "fixture must yield more than one window"
+    np.testing.assert_array_equal(
+        result.hold_position[HORIZON], result.reference.persistence_position
+    )
+    assert result.persistence_divergence() == 0.0
 
 
-def test_hold_and_the_three_differences_are_k_invariant_at_h_one(sweep_rig):
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_hold_and_rung_curves_are_k_invariant_at_the_first_step(tmp_path, device):
     """At h=1 every k grounds at step 0 and imagines one step, so all k agree.
 
-    Checked on hold, rung and floor separately: if only their SUM agreed, a
-    compensating error in two of them would pass.
+    Checked on hold and rung SEPARATELY: if only their difference agreed, a
+    compensating error in both would pass. The rung half extends the property
+    `test_every_k_is_grounded_identically_at_the_first_horizon_step` already
+    pins, to the curve this task adds.
     """
-    sweep = regrounding_sweep(**sweep_rig, ks=(1, 3, 5, 15, 45), horizon=45)
-    holds = {k: sweep.hold_position[k][0] for k in sweep.ks}
-    rungs = {k: sweep.curve(k)[0] for k in sweep.ks}
-    assert max(holds.values()) - min(holds.values()) == 0.0
-    assert max(rungs.values()) - min(rungs.values()) == 0.0
-    assert sweep.k_invariance_at_h1() == 0.0
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+    ks = (1, 2, 3, HORIZON)
+
+    result = sweep(model, [path], probe, ks=ks, device=device)
+    holds = [result.hold_position[k][0] for k in ks]
+    rungs = [result.curve(k)[0] for k in ks]
+    assert len(np.unique(holds)) == 1, holds
+    assert len(np.unique(rungs)) == 1, rungs
+    assert result.k_invariance_at_h1() == 0.0
 
 
-def test_hold_position_holds_the_floors_own_position_from_the_grounding_step(sweep_rig):
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_hold_position_holds_the_floors_own_position_from_the_grounding_step(
+    tmp_path, device
+):
     """The expectation is rebuilt from the SEGMENT RULE, never from `ground_step`.
 
     Task 2's docstring-derived oracle is the ONLY independent guard on
-    `ground_step`'s interior, because both bitwise reductions in this file sit
-    at `g == 0` -- k=45 grounds every step at the context frame, and h=1
-    grounds at the context frame for every k. Neither ever exercises
+    `ground_step`'s interior, because both bitwise reductions above sit at
+    `g == 0` -- k=HORIZON grounds every step at the context frame, and h=1
+    grounds there for every k. Neither ever exercises
     `positions_real[:, g - 1]` for `g > 0`.
 
     So if this test called `ground_step` to build its expectation, a wrong
@@ -525,66 +548,50 @@ def test_hold_position_holds_the_floors_own_position_from_the_grounding_step(swe
     steps `[s*k, min((s+1)*k, H))` and grounds on the posterior through step
     `s*k` -- with no floor division anywhere, and asserts that steps grounding
     INSIDE the horizon were actually reached.
+
+    `reference_trajectories` rather than `_diagnose`: it is the public entry
+    point, and it DRAWS the noise reference where the sweep does not, so a
+    bitwise match here also pins the two passes to the same floor.
     """
-    k, horizon = 4, 45       # 4 is not a divisor of 45: the last segment is ragged
-    sweep = regrounding_sweep(**sweep_rig, ks=(k,), horizon=horizon)
-    passed = _diagnose(
-        sweep_rig["model"], sweep_rig["val_paths"],
-        sweep_rig["embedding_probe_weights"],
-        arms={}, context=5, horizon=horizon, seed=0,
-        device=None, feature_backbone=None,
-        noise_reference=False, keep_trajectories=True,
+    k = 2                      # not a divisor of HORIZON=5: the last segment is ragged
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+
+    result = sweep(model, [path], probe, ks=(k, HORIZON), device=device)
+    kept = reference_trajectories(
+        model, [path], probe, context=CONTEXT, horizon=HORIZON, seed=0,
+        device=device, feature_backbone=None,
     )
-    expected = np.zeros((passed.windows_total, horizon))
+
+    expected = np.zeros((kept.windows_total, HORIZON))
     covered, grounded_inside = set(), 0
-    for s in range(0, (horizon + k - 1) // k):
-        for step0 in range(s * k, min((s + 1) * k, horizon)):
+    for s in range(0, (HORIZON + k - 1) // k):
+        for step0 in range(s * k, min((s + 1) * k, HORIZON)):
             held = (
-                passed.positions_at_context if s == 0
-                else passed.positions_real[:, s * k - 1]
+                kept.positions_at_context if s == 0
+                else kept.positions_real[:, s * k - 1]
             )
-            expected[:, step0] = position_error(
-                held, passed.true_positions[:, step0]
-            )
+            expected[:, step0] = position_error(held, kept.true_positions[:, step0])
             covered.add(step0)
             grounded_inside += 0 if s == 0 else 1
-    assert len(covered) == horizon, "the oracle must cover every horizon step"
-    assert grounded_inside == horizon - k, (
-        f"{horizon - k} of {horizon} steps must ground INSIDE the horizon, or "
+    assert len(covered) == HORIZON, "the oracle must cover every horizon step"
+    assert grounded_inside == HORIZON - k, (
+        f"{HORIZON - k} of {HORIZON} steps must ground INSIDE the horizon, or "
         "this test only re-checks the g == 0 case the two reductions already pin"
     )
     assert expected.std() > 0.0, "fixture must produce a non-constant hold curve"
-    assert np.max(np.abs(sweep.window_hold_position[k] - expected)) == 0.0
-
-
-def test_keep_trajectories_leaves_the_sweeps_curves_bitwise_unchanged(sweep_rig):
-    """The flag's docstring claims it draws nothing from the stream. Checked.
-
-    The sweep now always passes keep_trajectories=True, so this compares its
-    rung curves against a direct `_diagnose` with the flag False and the same
-    arms, seed and stream. Any divergence means the sweep's shipped numbers
-    moved when the flag was turned on.
-    """
-    sweep = regrounding_sweep(**sweep_rig, ks=(1, 45), horizon=45)
-    without = _diagnose(
-        sweep_rig["model"], sweep_rig["val_paths"],
-        sweep_rig["embedding_probe_weights"],
-        arms={k: _segmented_arm(sweep_rig["model"], k) for k in (1, 45)},
-        context=5, horizon=45, seed=0, device=None, feature_backbone=None,
-        noise_reference=False, keep_trajectories=False,
-    )
-    for k in (1, 45):
-        assert np.max(np.abs(
-            sweep.window_position[k] - without.arms[k]["position"]
-        )) == 0.0
+    np.testing.assert_array_equal(result.window_hold_position[k], expected)
 ```
 
-`sweep_rig` and `_segmented_arm` are the fixture and helper the existing sweep tests in this module already use. Read them before writing; if `_segmented_arm` has no public form, assert the last test against `sweep.reference.rssm_position` and the shipped `evaluate_rollout` instead, which is the same claim via `open_loop_divergence`.
+**The `keep_trajectories=True` control needs no new test.** Two tests already in this file compare the sweep against `evaluate_rollout`, which never sets the flag: `test_the_sweep_at_k_equals_the_horizon_is_bitwise_the_open_loop_rollout` and `test_the_sweeps_floor_and_persistence_are_bitwise_the_rollouts`. Once `regrounding_sweep` passes the flag, those two exercise the flag-on path and will fail if it moved the arms or the reference. Confirm in your report that both still pass on both devices, and name them as the control.
+
+**If the third test does not match bitwise**, report the magnitude and STOP — do not relax it to a tolerance. A divergence there means the sweep's floor and `reference_trajectories`' floor are different measurements, which would be a finding about existing code rather than about this task, and it is the controller's to adjudicate.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-.venv/bin/python -m pytest tests/eval/test_diagnostics.py -k "hold_position or k_invariant or keep_trajectories_leaves" -v
+.venv/bin/python -m pytest tests/eval/test_diagnostics.py -k "hold_position or k_invariant" -v
 ```
 
 Expected: FAIL with `AttributeError: 'RegroundingSweep' object has no attribute 'hold_position'`.
