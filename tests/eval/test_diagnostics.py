@@ -3959,7 +3959,7 @@ def test_ground_step_is_zero_at_h_one_for_every_k():
 
 
 def test_ground_step_refuses_a_nonpositive_k_or_h():
-    """`k * ((h - 1) // k)` returns a plausible number for h=0 and k<=0.
+    """`k * ((h - 1) // k)` returns a plausible number for h<=0 and k<0.
 
     At h=0 Python's floor division gives `k * -1`, a NEGATIVE grounding step,
     which would index the floor's positions from the end of the horizon and

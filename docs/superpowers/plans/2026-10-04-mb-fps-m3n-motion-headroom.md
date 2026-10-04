@@ -506,31 +506,53 @@ def test_hold_and_the_three_differences_are_k_invariant_at_h_one(sweep_rig):
 
 
 def test_hold_position_holds_the_floors_own_position_from_the_grounding_step(sweep_rig):
-    """The expected value is rebuilt from the kept trajectories, not the sweep.
+    """The expectation is rebuilt from the SEGMENT RULE, never from `ground_step`.
 
-    `_diagnose` is called directly with keep_trajectories=True and the hold
-    curve is reconstructed from `positions_real`, `positions_at_context` and
-    `true_positions` with an independent loop over `ground_step`. A mutation
-    inside `regrounding_sweep` cannot move this expectation, which is the
-    failure mode M3m hit twice.
+    Task 2's docstring-derived oracle is the ONLY independent guard on
+    `ground_step`'s interior, because both bitwise reductions in this file sit
+    at `g == 0` -- k=45 grounds every step at the context frame, and h=1
+    grounds at the context frame for every k. Neither ever exercises
+    `positions_real[:, g - 1]` for `g > 0`.
+
+    So if this test called `ground_step` to build its expectation, a wrong
+    interior mapping would move BOTH sides and nothing in the milestone would
+    catch it. That is the self-referential expectation M3m hit twice, and both
+    times the test caught one side of a two-sided mutation and missed the
+    other.
+
+    The loop below therefore enumerates segments FORWARD from
+    `regrounding_sweep`'s own docstring rule -- segment `s` covers horizon
+    steps `[s*k, min((s+1)*k, H))` and grounds on the posterior through step
+    `s*k` -- with no floor division anywhere, and asserts that steps grounding
+    INSIDE the horizon were actually reached.
     """
-    k = 3
-    sweep = regrounding_sweep(**sweep_rig, ks=(k,), horizon=45)
+    k, horizon = 4, 45       # 4 is not a divisor of 45: the last segment is ragged
+    sweep = regrounding_sweep(**sweep_rig, ks=(k,), horizon=horizon)
     passed = _diagnose(
         sweep_rig["model"], sweep_rig["val_paths"],
         sweep_rig["embedding_probe_weights"],
-        arms={}, context=5, horizon=45, seed=0,
+        arms={}, context=5, horizon=horizon, seed=0,
         device=None, feature_backbone=None,
         noise_reference=False, keep_trajectories=True,
     )
-    expected = np.zeros((passed.windows_total, 45))
-    for h in range(1, 46):
-        g = ground_step(k, h)
-        held = (
-            passed.positions_at_context if g == 0
-            else passed.positions_real[:, g - 1]
-        )
-        expected[:, h - 1] = position_error(held, passed.true_positions[:, h - 1])
+    expected = np.zeros((passed.windows_total, horizon))
+    covered, grounded_inside = set(), 0
+    for s in range(0, (horizon + k - 1) // k):
+        for step0 in range(s * k, min((s + 1) * k, horizon)):
+            held = (
+                passed.positions_at_context if s == 0
+                else passed.positions_real[:, s * k - 1]
+            )
+            expected[:, step0] = position_error(
+                held, passed.true_positions[:, step0]
+            )
+            covered.add(step0)
+            grounded_inside += 0 if s == 0 else 1
+    assert len(covered) == horizon, "the oracle must cover every horizon step"
+    assert grounded_inside == horizon - k, (
+        f"{horizon - k} of {horizon} steps must ground INSIDE the horizon, or "
+        "this test only re-checks the g == 0 case the two reductions already pin"
+    )
     assert expected.std() > 0.0, "fixture must produce a non-constant hold curve"
     assert np.max(np.abs(sweep.window_hold_position[k] - expected)) == 0.0
 
