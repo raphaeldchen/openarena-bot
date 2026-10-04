@@ -163,7 +163,18 @@ error at `h=1` is **1.26x to 2.17x** the iid one, mean 1.66x:
 | random_vit_seed2 | 8.7132 | 12.2143 | 1.40x |
 
 (`sqrt(229/24) = 3.09x` is the ceiling, reached only if windows within an
-episode were perfectly correlated.)
+episode were perfectly correlated. For equal-sized episodes the SE ratio is at
+most `sqrt(m)` in `m` windows per episode, so a fixture with four windows per
+episode cannot exceed 2x by design.)
+
+Re-derivable, and identical on both of M3m's record sets:
+
+```python
+rows = np.array(record["window_margin"]); lab = np.array(record["windows"]["episode"])
+iid  = rows[:, 0].std(ddof=1) / np.sqrt(rows.shape[0])
+reps = np.array([rows[i, 0].mean() for i in episode_bootstrap(lab, 2000, 0)])
+inflation = percentile_interval(reps)[2] / iid
+```
 
 The direction matters. An understated standard error makes a quantity look MORE
 resolvable, so it is the conservative choice for a claim of *non*-resolvability
