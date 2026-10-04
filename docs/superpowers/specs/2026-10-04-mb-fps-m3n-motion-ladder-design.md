@@ -346,11 +346,28 @@ them — but its Reading H path returns a pointer to M3n instead of a verdict.
 
 ## 10. New code
 
-    src/mbfps/eval/motion.py        statistic, reading, formatter
-    scripts/motion_ladder.py        measure / read / all phases, protocol check, seeds gate
+    src/mbfps/eval/headroom.py        statistic, reading, formatter
+    scripts/motion_headroom.py        measure / read / all phases, protocol check, seeds gate
 
-Mirrors M3m's split. Reuses `pooling.episode_bootstrap` and
-`pooling.percentile_interval`, which M3m made public for exactly this.
+Named for the quantity M3n introduces, following the house pattern
+(`burden.py`, `capacity.py`, `retention.py`, `width.py` are each named for
+their statistic).
+
+**`src/mbfps/eval/motion.py` and `scripts/latent_motion.py` are M3i's and are
+not touched.** An earlier draft of this spec named `src/mbfps/eval/motion.py`
+for M3n, which would have clobbered a shipped module — the same hazard class as
+M3i overwriting M3h's brief directory. `src/mbfps/eval/ladder.py` is also
+already taken.
+
+Reuses `pooling.episode_bootstrap` and `pooling.percentile_interval`, which M3m
+made public for exactly this, and `pooling.clustered_interval` — M3m's
+`burden.margin_interval`, which is *already* an episode-clustered bootstrap over
+an arbitrary `(windows, horizon)` array. §3.5's ruler is that function
+generalised and rehoused, not new machinery.
+
+Exit codes 47 and 48 are confirmed free: 43 and 44 are
+`scripts/latent_capacity.py`'s, 45 and 46 are `scripts/prediction_burden.py`'s,
+and nothing in `scripts/` uses a higher number.
 
 ## 11. What each outcome licenses
 
