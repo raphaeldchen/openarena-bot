@@ -688,8 +688,12 @@ def percentile_interval(replicates: np.ndarray) -> tuple[float, float, float]:
     """Return (low, high, se) at the 2.5/97.5 percentiles, `se` the sample
     standard deviation with `ddof=1`, or NaN for a single replicate.
 
-    PUBLIC because `clustered_interval` consumes it, and `test_burden` pins
-    `burden.CONFIDENCE` against it."""
+    PUBLIC because `clustered_interval` consumes it, and the tests pin the
+    `CONFIDENCE` labels against it: `test_burden` for `burden.CONFIDENCE`,
+    `test_motion_headroom_script` for `headroom.CONFIDENCE`. The percentiles are
+    HARD-CODED, not derived from either label, and `pool_ratio` and
+    `paired_ratio_contrast` take them too; moving them moves all three callers
+    and fails both pins."""
     low, high = np.percentile(replicates, [2.5, 97.5])
     se = float(replicates.std(ddof=1)) if replicates.size > 1 else float("nan")
     return float(low), float(high), se

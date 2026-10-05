@@ -80,6 +80,20 @@ IDENTITY_TOLERANCE: float = 1e-9
 residual on the shipped curves is 1.421e-14, about five orders below."""
 
 CONFIDENCE: float = 0.95
+"""A LABEL, NOT A PARAMETER. It records which interval `pooling.percentile_interval`
+returns -- the 2.5/97.5 percentiles are hard-coded there, and nothing reads this
+constant to draw an interval. Changing it changes what every record SAYS, not a
+single bound. It is recorded beside the intervals so a reader can tell the level
+without opening the estimator, which is exactly why a record that names a level
+the estimator did not take is worse than a record that names none.
+
+`percentile_interval` has three callers in `pooling` (`clustered_interval`,
+`pool_ratio`, `paired_ratio_contrast`) and `burden.CONFIDENCE` is labelled against
+it too, so the percentiles are not this module's to parameterise.
+`test_the_recorded_confidence_is_the_level_the_estimator_takes`, in
+`tests/eval/test_motion_headroom_script.py`, is what keeps the label and the
+percentiles in step: change either alone and it fails."""
+
 RESAMPLES: int = 2000
 """The verdict's episode-clustered bootstrap. 229 windows over 24 episodes on
 every shipped cell; see `pooling.clustered_interval` for why the unit is the
@@ -495,8 +509,9 @@ def format_reading_headroom(
         "  Behind that gate: skill resolvably positive means the one-step map",
         "  beats holding; deficit resolvably positive means it is not yet",
         "  indistinguishable from perfect.",
-        f"  Intervals are episode-clustered bootstraps at {CONFIDENCE:.2f} over "
-        f"{RESAMPLES} resamples.",
+        f"  Intervals are episode-clustered bootstraps over {RESAMPLES} resamples; "
+        f"{CONFIDENCE:.2f} is the LABEL of the fixed percentile pair "
+        "`pooling.percentile_interval` takes, not a setting.",
         "",
     ]
     return "\n".join(lines)

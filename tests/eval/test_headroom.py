@@ -1023,6 +1023,24 @@ def _legend_sentences():
     return [s.strip().rstrip(".") for s in flat.split(". ") if s.strip()]
 
 
+def test_the_legend_calls_the_level_a_label_of_the_estimators_percentiles_not_a_setting():
+    """`CONFIDENCE` labels the percentile pair `pooling.percentile_interval` takes;
+    nothing reads it to draw an interval. A legend that said "bootstraps at 0.95"
+    read as the parameter that produced the bounds, so the sentence now says what
+    the number is. The level is printed from the module's own constant, and the
+    percentiles are not restated here as a second literal.
+
+    THE MUTATION THIS EXISTS FOR: restoring "episode-clustered bootstraps at
+    {CONFIDENCE:.2f} over ..." in `format_reading_headroom`."""
+    stated = [s for s in _legend_sentences() if "episode-clustered" in s]
+    assert len(stated) == 1, stated
+    sentence = stated[0]
+    assert f"{CONFIDENCE:.2f} is the LABEL" in sentence
+    assert "not a setting" in sentence
+    assert f"over {RESAMPLES} resamples" in sentence
+    assert f"at {CONFIDENCE:.2f}" not in sentence
+
+
 def test_the_formatter_conditions_every_directional_sentence_on_the_gate():
     """No unconditional claim that a sign means a verdict.
 

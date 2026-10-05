@@ -439,7 +439,7 @@ def measure_cell(
         "reported_h": list(REPORTED_H),
         "decision_k": DECISION_K,
         "decision_h": DECISION_H,
-        "confidence": CONFIDENCE,
+        "confidence": CONFIDENCE,  # a label for the estimator's fixed percentiles, not a setting
         "resamples": RESAMPLES,
         "identity_tolerance": IDENTITY_TOLERANCE,
         "secondary_sigmas": SECONDARY_SIGMAS,
