@@ -2386,3 +2386,179 @@ EOF
 ```
 
 Replace the subject with what the run actually found before committing. A subject asserting more than the data supports is the defect M3l shipped and had to amend: its commit subject claimed equality where only `<=` held, and the commit body forbade the sentence the subject made.
+
+---
+
+## Task 8 results
+
+**Verdict: `NO_MAJORITY`, exit 48.** Nine cells, bar 5: `AT_COPYING` 4,
+`UNREADABLE` 4, `AT_PERFECT` 1, `BETWEEN` 0, `AMBIGUOUS` 0.
+
+Run: `48f9938`, suite green at `1b94868` (**3021 passed, 0 failed, 39m21s** —
+the only commit between them edits this plan, so the code is identical).
+Records at `runs/m3n_motion/`, nine of them, `record_git_sha ca3e140` (the
+study checkpoints' own sha, the same nine M3m read) and `git_sha 48f9938`.
+Wall clock **18.2 min** from first record to last, 2.28 min/cell, so about
+**20.5 min** for all nine — against M3m's measured 19m20s for its comparable
+nine-cell re-measure. Measured from record mtimes, not estimated.
+
+### Controls, all nine cells
+
+| control | result |
+| --- | --- |
+| `persistence_divergence` | **0.0** in 9 of 9 |
+| `k_invariance_at_h1` | **0.0** in 9 of 9 |
+| `open_loop_divergence` | **0.0** in 9 of 9 |
+| `floor_divergence` | **0.0** in 9 of 9 |
+| `identity_residual` | 5.68e-14 to 1.14e-13, four orders under `IDENTITY_TOLERANCE` |
+
+Compared with `!= 0.0`, not `> 0`. The four exact zeros also carry the
+`keep_trajectories=True` claim: the shipped M3c curves were measured with the
+flag off, so a bitwise match on the arms and the reference proves turning it on
+moved neither.
+
+`negative_headroom_steps` is non-empty in **9 of 9** — 2 to 12 of the 225
+`(k, h)` cells per record have a negative headroom POINT. So a perfect
+predictor scoring worse than copying is not a quirk of one cell; it happens
+somewhere in every one, which is why the share is gated rather than printed.
+
+### The decision cell, `(k=1, h=1)`
+
+| cell | headroom | skill | deficit | placement |
+| --- | --- | --- | --- | --- |
+| frozen_ssl_seed0 | +3.170 [−1.335, +7.678] | +1.716 [−2.992, +6.550] | +1.454 [−0.107, +2.941] | UNREADABLE |
+| frozen_ssl_seed1 | +9.807 [+3.233, +16.672] | +4.694 [−0.423, +10.325] | +5.113 [+1.095, +9.555] | AT_COPYING |
+| frozen_ssl_seed2 | +3.068 [+0.033, +6.228] | +0.257 [−2.203, +2.715] | +2.811 [+0.378, +5.500] | AT_COPYING |
+| pixel_ae_seed0 | +11.824 [+5.370, +18.173] | +4.451 [−0.334, +9.413] | +7.372 [+3.202, +11.747] | AT_COPYING |
+| pixel_ae_seed1 | +0.576 [−2.033, +3.746] | +0.402 [−1.145, +1.928] | +0.174 [−2.311, +3.446] | UNREADABLE |
+| pixel_ae_seed2 | +6.739 [+1.865, +11.844] | +0.852 [−3.832, +5.810] | +5.887 [+2.406, +9.572] | AT_COPYING |
+| random_vit_seed0 | +3.050 [−1.175, +7.494] | −0.072 [−3.428, +3.563] | +3.122 [+0.600, +5.953] | UNREADABLE |
+| random_vit_seed1 | +5.811 [+2.360, +9.378] | +4.223 [+0.786, +7.809] | +1.588 [−1.019, +4.356] | AT_PERFECT |
+| random_vit_seed2 | +3.921 [−1.877, +9.155] | +0.787 [−3.299, +4.870] | +3.134 [−2.977, +9.183] | UNREADABLE |
+
+Every headroom and skill POINT estimate above reproduces, to the printed
+digits, the values derived independently from M3m's nine records before this
+script existed — two code paths, one answer.
+
+### The finding the ruler withdrew
+
+**`skill(1, 1)` has a positive point estimate in 8 of 9 cells and is
+resolvably positive in 1.** Only `random_vit_seed1` clears, at `ci_low +0.786`.
+
+That is the whole result. Before the run, the point estimates said the one-step
+map beats holding in 8 of 9 cells by 0.26 to 4.69 map units. With an
+episode-clustered interval on the paired per-window differences, 8 of those 9
+intervals contain zero. Across the full `REPORTED_H` grid — 90 cells — `skill`
+is resolvably positive in **7**, spread over five different cells, none of them
+at more than two horizons: `frozen_ssl_seed0` at h=2, `pixel_ae_seed1` at h=3
+and 5, `pixel_ae_seed2` at h=2 and 3, `random_vit_seed1` at h=1,
+`random_vit_seed2` at h=5. Four cells never clear at any horizon. (I first
+wrote 6 here, counted off the printed table; the record says 7.)
+
+**`deficit` is resolvable in 5 of 9 at `(1,1)`** and in 2 of 9 at `(1,45)`. So
+where the gate passes, the model is usually resolvably WORSE than a perfect
+one-step predictor while not resolvably BETTER than a copying one. That pair is
+the `AT_COPYING` placement, and it is 4 of the 5 readable cells.
+
+**The gate fails in 4 of 9.** In those cells a perfect one-step predictor
+cannot be told from a copying one, so no statement about the model is available
+at `(1,1)` — the instrument, not the model, is what stops the reading.
+
+### §13: M3m's claim, re-reported — and my own prediction about it was wrong
+
+M3m's claim was about `burden(1)` at **`DECISION_H = 45`**, not at h=1. At
+`(k=1, h=45)` on M3n's records:
+
+- under M3m's own bar, `|point| > 2 x iid SE`: resolvable in **0 of 9** —
+  reproducing M3m's "not resolvable from zero in 9 of 9 cells" exactly
+- under the episode-clustered 95% percentile interval: resolvable in **2 of 9**
+  (`frozen_ssl_seed1` [+1.109, +12.300], `pixel_ae_seed2` [+0.045, +11.148])
+
+**§3.5 and §13 predicted the opposite direction and were wrong about it.** They
+argued the clustered ruler is materially wider — 1.26x to 2.17x — so a claim of
+resolvability made with the iid SE is overstated. That factor was measured on
+M3m's `window_margin`, and §13 said in as many words that it was "cited to
+establish that the effect is real and of this order, not to rescale M3m's
+numbers by analogy." The caveat was right and the expectation was not: on M3n's
+rows the clustered interval resolves MORE cells, not fewer.
+
+A plausible reason, stated as a hypothesis rather than a finding:
+`window_margin` carries the ground-truth one-step displacement, which is
+correlated within an episode, while M3n's three differences are each
+model-minus-model on the same window, so the episode-level component cancels in
+the same subtraction that cancels the readout error. If that is right, then the
+pairing which makes the statistic readable is also what removes the clustering
+the clustered ruler exists to handle.
+
+**This is not settled here, and the records cannot settle it.** They store mean
+curves and the episode labels, not the per-window difference rows, so the
+bootstrap replicate SD cannot be recomputed from them. A normal-approximation
+proxy, `(ci_high - ci_low) / (2 x 1.96)` against the recorded iid SE, reads
+0.49x to 1.33x with means near 1.0 — but a percentile interval's width is not
+1.96 sigma for a skewed statistic, so that proxy is an indication, not a
+measurement. **Carrying the per-window difference rows, or the replicate SD, is
+the one thing M3o should add to this record schema.**
+
+The clustered interval remains the right instrument: it assumes nothing about
+independence. What changes is that its justification here is that it measures
+the resampling distribution, not that it is more conservative.
+
+### §14 by-product: the k=45 column is the gate's `gap_closed` profile
+
+| cell | h=1 | 2 | 3 | 5 | 8 | 10 | 15 | 20 | 30 | 45 | first h < 0 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| frozen_ssl_seed0 | 54.1% | 25.9% | 19.6% | 36.1% | 12.7% | −12.7% | −47.9% | −41.6% | −46.7% | −85.2% | 10 |
+| frozen_ssl_seed1 | 47.9% | 35.5% | 15.0% | −10.5% | −20.3% | −35.2% | −56.4% | −57.1% | −78.2% | −64.7% | 5 |
+| frozen_ssl_seed2 | 8.4% | −22.6% | −44.1% | −133.3% | −166.7% | −172.9% | −146.7% | −98.2% | −67.8% | −64.9% | 2 |
+| pixel_ae_seed0 | 37.6% | 27.1% | 29.0% | 18.8% | 3.0% | −14.4% | −32.1% | −50.2% | −85.7% | −116.3% | 9 |
+| pixel_ae_seed1 | 69.8% | 339.5% | −335.7% | −79.3% | −74.4% | −78.5% | −48.3% | −33.7% | −48.2% | −58.8% | 3 |
+| pixel_ae_seed2 | 12.6% | 42.6% | 14.7% | 1.0% | −25.9% | −32.1% | −41.3% | −58.7% | −63.4% | −67.4% | 6 |
+| random_vit_seed0 | −2.4% | 15.1% | −5.9% | −49.4% | −76.0% | −58.7% | −50.0% | −45.9% | −38.5% | −44.2% | 1 |
+| random_vit_seed1 | 72.7% | 64.5% | 60.4% | 25.6% | 9.6% | 1.2% | −21.1% | −29.0% | −33.0% | −38.8% | 11 |
+| random_vit_seed2 | 20.1% | 45.7% | 75.7% | 48.3% | 21.4% | 16.1% | 10.0% | −6.4% | −41.1% | −54.5% | 17 |
+
+The M3 gate has read this surface at `h=45` alone for thirteen milestones,
+where every cell is −38.8% to −116.3%. The zero crossing is at **h=1 to h=17**,
+and `pixel_ae_seed1`'s `+339.5%` then `−335.7%` at h=2 and h=3 is the
+denominator crossing zero, not a reading. These are point estimates with no
+interval; the gated version of the same quantity is the `share` column above.
+
+### What exit 48 licenses — and a gap in §11
+
+**§11's table has four rows and does not cover `NO_MAJORITY`.** That is a
+defect in the spec, not a surprise in the data: the reading has five per-cell
+outcomes and two run-level ones, and §11 enumerated four. What the run
+actually licenses:
+
+- **The objective change is NOT indicated.** `AT_PERFECT` — the one outcome
+  §11 says would license it — holds in 1 of 9 cells. The reading that all
+  remaining error is compounding is not available.
+- **`BETWEEN` is empty**, so §11's "fix one-step quality first" is not
+  licensed either. Nothing established that the one-step map has skill to
+  improve.
+- **In 8 of 9 cells there is no evidence the one-step map beats copying** — in
+  4 because it resolvably does not, in 4 because the instrument cannot tell.
+  Those are different statements and must not be pooled: `UNREADABLE` is about
+  the probe, `AT_COPYING` about the model. What they share is only that neither
+  supports propagating a one-step skill to longer horizons.
+- **The probe is at its limit.** A perfect one-step predictor beats a copying
+  one by 0.576 to 11.824 map units against readout errors of 131 to 259, and
+  that margin is not resolvable from zero in 4 of 9 cells. Every candidate
+  change to the objective would be graded by this same probe, so §11's
+  `UNREADABLE` row — "redirect to the readout rather than to training" — is the
+  closest fit to what happened, reached by a split rather than a majority.
+
+### §12: the three things M3n does not answer, against what it found
+
+- **Whether a multi-step objective helps.** Still unanswered, and now the prior
+  is worse: the one-step map it would propagate is not resolvably better than
+  copying in any cell but one.
+- **The M3 exit gate.** Unmoved. `beats_persistence`, `band_is_usable` and
+  `filtering_beats_embedding` still fail; `gap_closed(45)` is negative in 9 of
+  9. M3n gave the k=45 corner its first per-cell interval and did not move it.
+- **Why one-step skill varies across seeds.** Reported, unexplained, and now
+  largely moot. The point estimates recover −2.4% to 72.7% of the available
+  headroom, a spread that looks worth explaining — but `skill`'s interval
+  contains zero in 8 of those 9 cells, so the per-cell shares are not
+  resolvable from zero and most of the apparent spread is not a measured
+  difference between seeds.
