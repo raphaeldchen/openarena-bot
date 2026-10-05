@@ -1678,6 +1678,30 @@ def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(re
     assert f"{victims[0][0]} seed {victims[0][1]} lacks git_sha" in message, message
 
 
+@pytest.mark.parametrize("field, bad", [
+    ("step", "not-a-number"),
+    ("ks", ["1", "x"]),
+])
+def test_a_protocol_value_that_cannot_be_read_is_refused_by_name_not_a_value_error(
+    record, field, bad,
+):
+    """A record whose protocol field is PRESENT but unreadable -- `int("not-a-number")`
+    raises `ValueError`, not `KeyError` -- is refused by name, as one that lacks the
+    field is. `_pick`'s docstring promises "a bare `KeyError` would not say which",
+    and a bare `ValueError` says it no better; `scripts/motion_headroom.py`'s `_pick`
+    catches it, and this one is held to the same contract.
+
+    THE MUTATION THIS EXISTS FOR: narrowing `_pick`'s `except` back to
+    `(KeyError, TypeError)`. The victim sorts last and the message is asserted, so
+    a refusal that names no cell and no field does not pass."""
+    records = _records_from(record, _spec(MIXED))
+    records[LAST_CELL][field] = bad
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert f"random_vit seed 2 lacks {field}" in message, message
+
+
 def test_an_empty_pool_is_refused_by_name():
     for call in (script.require_one_protocol, script.format_superseded_margin):
         with pytest.raises(SystemExit, match="no burden record"):

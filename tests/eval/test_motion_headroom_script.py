@@ -2362,6 +2362,28 @@ def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(
     assert "frozen_ssl seed 1" in message and f"lacks {lacking}" in message, message
 
 
+@pytest.mark.parametrize("field, bad", [
+    ("step", "not-a-number"),
+    ("ks", ["1", "x"]),
+])
+def test_a_protocol_value_that_cannot_be_read_is_refused_by_name_not_a_value_error(
+    hand_record, field, bad,
+):
+    """A record whose protocol field is PRESENT but unreadable -- `int("not-a-number")`
+    raises `ValueError`, not `KeyError` -- is refused by name, as one that lacks the
+    field is. `scripts/prediction_burden.py`'s `_pick` makes the same promise and
+    was held to the same contract after it was found to catch one exception fewer.
+
+    THE MUTATION THIS EXISTS FOR: narrowing `_pick`'s `except` to
+    `(KeyError, TypeError)`."""
+    records = _records_from(hand_record, _spec(["BETWEEN"] * 9))
+    records[SECOND_CELL][field] = bad
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_protocol(records)
+    message = str(caught.value)
+    assert f"frozen_ssl seed 1 lacks {field}" in message, message
+
+
 def test_read_phase_refuses_records_that_disagree_on_the_protocol_and_writes_nothing(
     hand_record, tmp_path,
 ):

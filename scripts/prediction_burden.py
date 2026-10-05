@@ -590,7 +590,7 @@ def _pick(cell, field: str, pick, record: dict):
     file that is not one -- a bare `KeyError` would not say which."""
     try:
         return pick(record)
-    except (KeyError, TypeError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise SystemExit(
             f"{cell[0]} seed {cell[1]} lacks {field}: it is not a burden record "
             "this script wrote"

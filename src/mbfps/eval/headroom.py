@@ -448,7 +448,7 @@ of line."""
 
 
 def _row(values, widths) -> str:
-    return "".join(str(v).ljust(w) for v, w in zip(values, widths))
+    return "".join(str(v).ljust(w) for v, w in zip(values, widths, strict=True))
 
 
 def _interval(i: Interval) -> str:

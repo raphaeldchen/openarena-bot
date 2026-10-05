@@ -872,6 +872,34 @@ def _floats(column):
     return [float(x) for x in re.findall(r"[+-]\d+\.\d{3}", column)]
 
 
+@pytest.mark.parametrize("which", ["columns", "widths"])
+def test_a_column_list_and_a_width_list_of_different_lengths_raise_instead_of_truncating(
+    monkeypatch, which,
+):
+    """`_row` zips the values against the widths, and an unchecked `zip` stops at the
+    shorter of the two: a `READING_COLUMNS` and a `READING_WIDTHS` that disagree in
+    length would print a table with a column silently missing, header and rows alike,
+    and the table would still look like a table. `strict=True` turns that into a
+    `ValueError` where the mismatch is made. (`burden`'s, `capacity`'s and
+    `retention`'s `_row` siblings have it; this was the one that did not.)
+
+    Both directions are tried because the two lists are separate constants that a
+    change can lengthen or shorten independently.
+
+    THE MUTATION THIS EXISTS FOR: dropping `strict=True` from `_row`'s `zip`. The
+    existing shape assertions on the formatted table would also notice a missing
+    column, but only by inspecting its output; this one pins the raise itself."""
+    cells = _nine(["BETWEEN"] * 9)
+    inputs = _inputs(cells)
+    reading = reading_headroom(inputs)
+    if which == "columns":
+        monkeypatch.setattr(module, "READING_COLUMNS", READING_COLUMNS[:-1])
+    else:
+        monkeypatch.setattr(module, "READING_WIDTHS", READING_WIDTHS[:-1])
+    with pytest.raises(ValueError, match="zip"):
+        format_reading_headroom(reading, inputs)
+
+
 def test_the_formatter_prints_one_aligned_row_per_cell_and_names_the_decision_cell():
     """Row count, alignment, the (k, h) the table is read at, and what is where.
 
