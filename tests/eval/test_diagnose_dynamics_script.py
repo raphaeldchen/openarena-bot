@@ -77,6 +77,12 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
         np.asarray(v, float) + spreads.get(k, 1.0),
     ])
     floor = np.asarray(reference.floor_position, float)
+    # The hold baseline as the real sweep carries it: at k == horizon it IS the
+    # reference's persistence curve and at h=1 it is the same for every k. Two
+    # windows straddle it, as they straddle the floor, and each is its own
+    # episode so a clustered interval over these rows has two clusters rather
+    # than none. Nothing in this module reads them.
+    persistence = np.asarray(reference.persistence_position, float)
     return RegroundingSweep(
         ks=tuple(k_curves),
         horizon=reference.rssm_position.size,
@@ -85,6 +91,11 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
         angle={k: np.asarray(v, dtype=float) / 10.0 for k, v in k_curves.items()},
         window_position={k: rows(k, v) for k, v in k_curves.items()},
         window_floor_position=np.stack([floor - 0.5, floor + 0.5]),
+        hold_position={k: persistence.copy() for k in k_curves},
+        window_hold_position={
+            k: np.stack([persistence - 0.5, persistence + 0.5]) for k in k_curves
+        },
+        window_episode=np.array([0, 1]),
         windows_total=2,
     )
 
