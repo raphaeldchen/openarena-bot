@@ -24,11 +24,13 @@ def test_the_three_differences_satisfy_the_identity_exactly():
     that is already representable. The residual is exactly 0.0, and the test
     says so with `==`.
 
-    `pytest.approx(rel=1e-6)` here would be the wrong tool: a `np.sum`-for-
-    `np.max` mutation inside `triple_residual` changes the result in the 7th
-    significant figure, and M3m nearly shipped exactly that tolerance against
-    exactly that mutation. (This fixture cannot tell `sum` from `max` -- every
-    step's residual is 0.0 -- which is what the next test is for.)
+    `pytest.approx(rel=1e-6)` here would be the wrong tool: real data barely
+    separates `np.sum` from `np.max` (8 of 9 shipped k=45 cells give 0.0 under
+    both, the ninth 1.421e-14 against 5.684e-14), so a tolerance wide enough to
+    pass it accepts the `np.sum` mutant inside `triple_residual`, and M3m
+    nearly shipped exactly that tolerance against exactly that mutation. (This
+    fixture cannot tell `sum` from `max` either -- every step's residual is 0.0
+    -- which is what the next test is for.)
     """
     rng = np.random.default_rng(0)
     floor = 100.0 + rng.uniform(0.0, 150.0, size=45)
@@ -148,6 +150,40 @@ def test_each_difference_has_the_sign_and_the_operands_the_spec_gives():
     assert deficit(rung, floor)[0] == 3.0
 
 
+def test_deficit_is_burden_on_a_spread_of_values():
+    """`deficit`'s docstring says it is IDENTICAL to M3m's `burden(k, h)`.
+
+    Neither function calls the other, deliberately -- `deficit` is named for its
+    role on M3n's axis -- so nothing but this test notices if one is edited and
+    the other is not. `np.array_equal` is exact: both compute `rung - floor`.
+
+    The fixture must make a mutation to EITHER function move the comparison. A
+    constant input would not: with every deficit equal and positive, an `abs`
+    changes nothing and neither does reversing or shifting the steps. Here the
+    floors span a real range, and the deficits have both signs and no ties, so
+    a swap of operands, an `abs`, a reversal, a dropped term and a constant
+    offset each give a different array.
+    """
+    rng = np.random.default_rng(1)
+    floor = 100.0 + rng.uniform(0.0, 150.0, size=45)
+    rung = floor + rng.uniform(-3.0, 5.0, size=45)
+
+    gap = rung - floor
+    assert np.ptp(floor) > 50.0, "fixture must span a real range of floors"
+    assert (gap > 0).any() and (gap < 0).any(), "deficits of both signs"
+    assert len(np.unique(gap)) == gap.size, "no two steps tie"
+
+    got, reference = deficit(rung, floor), burden.burden(rung, floor)
+    assert np.array_equal(got, reference)
+
+    # What the comparison can see: each of these edits would have broken it.
+    assert not np.array_equal(got, burden.burden(floor, rung)), "operand order"
+    assert not np.array_equal(got, np.abs(reference)), "sign"
+    assert not np.array_equal(got, reference + 1e-3), "offset"
+    assert not np.array_equal(got, reference[::-1]), "step order"
+    assert not np.array_equal(got, rung), "dropped term"
+
+
 def test_each_difference_is_signed_not_a_magnitude():
     """A negative value is returned as negative.
 
@@ -223,6 +259,24 @@ def _references(source: str, name: str) -> list[ast.AST]:
     return found
 
 
+def _float_literals(source: str, value: float) -> list[ast.Constant]:
+    """Every float literal in `source` equal to `value`, wherever it sits.
+
+    `_references` finds a NAME. Writing the number out in place of the name
+    (`hold - floor - 0.0 * 3.9694722203504225`) reaches the same quantity
+    without ever mentioning the name, so a count of name references alone is
+    blind to it. Only `float` constants count: the digits that appear inside a
+    docstring are a `str` constant and are not arithmetic.
+    """
+    return [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, float)
+        and node.value == value
+    ]
+
+
 def test_the_reference_finder_sees_a_use_inside_a_function_body():
     """Positive control for the check below, so that it cannot pass vacuously.
 
@@ -245,14 +299,38 @@ def test_the_reference_finder_sees_a_use_inside_a_function_body():
     assert len(used) == 1, "a use inside a function body must be a Load"
 
 
+def test_the_literal_finder_sees_a_bare_float_in_arithmetic():
+    """Positive control for the literal count below, so it cannot pass vacuously.
+
+    Each source writes the number out instead of naming a constant. The finder
+    must flag the use however it is spelled, and must NOT flag the same digits
+    sitting in a docstring, which is how the real module mentions the value.
+    """
+    defined_only = "X: float = 1.5\n\ndef f(a):\n    return a\n"
+    used_in_arithmetic = "X: float = 1.5\n\ndef f(a):\n    return a - 0.0 * 1.5\n"
+    used_negated = "X: float = 1.5\n\ndef f(a):\n    return a + -1.5\n"
+    used_in_exponent_form = "X: float = 1.5\n\ndef f(a):\n    return a * 15e-1\n"
+    only_in_a_docstring = 'X: float = 1.5\n\ndef f(a):\n    """1.5"""\n    return a\n'
+
+    assert len(_float_literals(defined_only, 1.5)) == 1
+    assert len(_float_literals(used_in_arithmetic, 1.5)) == 2
+    assert len(_float_literals(used_negated, 1.5)) == 2
+    assert len(_float_literals(used_in_exponent_form, 1.5)) == 2
+    assert len(_float_literals(only_in_a_docstring, 1.5)) == 1
+
+
 def test_the_displacement_constant_is_recorded_and_unused():
     """3.9694722203504225 appears in no arithmetic in this module.
 
     It is the ground-truth quantity M3m's design mistook for a probe-space
     scale, kept so a reader of the record can see it plays no part. An unused
     constant cannot be caught by a value, so the guard reads the module's
-    syntax tree: the ONLY reference to `DISPLACEMENT_RECORDED_ONLY` anywhere in
-    the file is the assignment that defines it.
+    syntax tree. Two things must both be true: the ONLY reference to the NAME
+    `DISPLACEMENT_RECORDED_ONLY` anywhere in the file is the assignment that
+    defines it, and the ONLY float literal equal to 3.9694722203504225 is that
+    assignment's right-hand side. The second is not redundant with the first:
+    `hold - floor - 0.0 * 3.9694722203504225` uses the quantity without ever
+    naming the constant, and passed the name check alone.
 
     The guard is a count over `ast` nodes, not a slice of the source text. A
     text slice comes back empty if the surrounding docstring is edited, and an
@@ -275,6 +353,21 @@ def test_the_displacement_constant_is_recorded_and_unused():
     assert isinstance(definition, ast.Name)
     assert isinstance(definition.ctx, ast.Store)
     assert DISPLACEMENT_RECORDED_ONLY == 3.9694722203504225
+
+    literals = _float_literals(inspect.getsource(module), 3.9694722203504225)
+    assert len(literals) == 1, (
+        f"expected exactly the defining literal; found {len(literals)} "
+        f"at lines {[n.lineno for n in literals]}"
+    )
+    (assignment,) = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.AnnAssign)
+        and isinstance(n.target, ast.Name)
+        and n.target.id == name
+    ]
+    assert (literals[0].lineno, literals[0].col_offset) == (
+        assignment.value.lineno, assignment.value.col_offset
+    ), "the one literal must be the one in the defining assignment"
 
 
 def test_reported_h_and_the_decision_cell_are_the_spec_values():
