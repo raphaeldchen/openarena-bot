@@ -88,8 +88,9 @@ without opening the estimator, which is exactly why a record that names a level
 the estimator did not take is worse than a record that names none.
 
 `percentile_interval` has three callers in `pooling` (`clustered_interval`,
-`pool_ratio`, `paired_ratio_contrast`) and `burden.CONFIDENCE` is labelled against
-it too, so the percentiles are not this module's to parameterise.
+`pool_ratio`, `paired_ratio_contrast`), so the percentiles are not this module's to
+parameterise. (M3m's `burden.CONFIDENCE` was labelled against it too, until it was
+removed with the interval it described.)
 `test_the_recorded_confidence_is_the_level_the_estimator_takes`, in
 `tests/eval/test_motion_headroom_script.py`, is what keeps the label and the
 percentiles in step: change either alone and it fails."""

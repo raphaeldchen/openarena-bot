@@ -1801,7 +1801,7 @@ class RegroundingSweep:
 
     REQUIRED, because every interval M3n reads is clustered on these. M3m had
     to recover them by walking the validation episodes A SECOND TIME in
-    `baseline_rows`, and `scripts/prediction_burden.py:215-218` records the
+    `baseline_rows`, whose docstring in `scripts/prediction_burden.py` records the
     hazard that came with it: `diagnostics` numbers episodes AFTER skipping a
     too-short one, so the two walks disagree once such an episode precedes
     another. M3n needs no second walk -- every array it reads comes from this

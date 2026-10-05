@@ -1,8 +1,9 @@
-"""M3m's measure phase: the ladder, the model-free baseline, one record per cell.
+"""M3m's measure phase: the ladder, the model-free baseline, one record per cell -- and
+the retired read phase, which prints the margin the old records stored and refuses.
 
 EVERY NUMBER IN THESE TESTS COMES FROM THE REAL CALL PATH. `measure_cell` runs
 the real `regrounding_sweep` against the oracle-family models `test_rollout.py`
-and `test_diagnostics.py` already use, so a record's margin can only have been
+and `test_diagnostics.py` already use, so a record's burden can only have been
 produced by the code that produces it. The fakes are confined to what needs nine
 20,000-step checkpoints -- `load_cell` and `prepare_cell` -- and each of those is
 made to BEHAVE (refuse a directory that lacks the checkpoint, hand back a model
@@ -20,9 +21,8 @@ RECOGNISABLE, so the record can be asked which pass it carries.
 THE RIG IS CHOSEN SO THAT NO ASSERTION IS DECIDED BY THE FIXTURE.
 
   * The agent WOBBLES about a straight line rather than moving along one. On a
-    straight line the true displacement and the k=1 rung are both one constant
-    step, the margin is exactly zero in every window, and `one - rows` is the
-    same array as `rows - one`.
+    straight line the true displacement is one constant step in every window, so
+    a baseline cut one frame late reads the same rows as one cut on time.
   * The probe is a linear fit over every episode, so the floor is a few map
     units and not zero, and the wobble gives each window its own displacement.
   * Nine episodes whose window counts are 1, 2, 0, 1, 3, 2, 1, 2, 1. The zero is
@@ -73,6 +73,13 @@ script = _load()
 
 CONTEXT, HORIZON = 5, 45
 NEED = CONTEXT + HORIZON
+GATE_H = 45
+"""The M3 gate's own horizon, which the base control and the rulers are read at. A
+literal here, not `script.DECISION_H`: an expected value never comes from the thing
+under test, and a drifted constant must not be able to move both sides."""
+REPORTED_HORIZONS = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)
+"""The reporting grid M3m's records carry a margin at, spelled out for the same
+reason as `GATE_H`."""
 CPU = torch.device("cpu")
 SEED = 3
 
@@ -223,8 +230,10 @@ def _canonical(labels) -> np.ndarray:
 
 
 def test_the_exit_codes_are_this_milestones_own():
-    """39/40 are M3j's, 41/42 M3k's, 43/44 M3l's. A collision would make two
-    tools report different failures under one number."""
+    """39/40 are M3j's, 41/42 M3k's, 43/44 M3l's, and 45/46 are this script's, now
+    HISTORICAL: nothing returns them, because the reading that did is retired. They
+    stay defined so that a number M3m reported is not reissued to another failure,
+    and because the exit-code registry test holds them."""
     assert script.EXIT_CONTROL_BROKEN == 45
     assert script.EXIT_UNREADABLE == 46
 
@@ -335,10 +344,11 @@ def test_measure_cell_refuses_a_baseline_that_does_not_align_with_the_sweep(
     rig, monkeypatch,
 ):
     """THE MUTATION THIS EXISTS FOR: deleting the `rows.shape != one.shape`
-    refusal in `measure_cell`, after which a baseline cut on a different window
-    rule subtracts row-for-row against the wrong windows and produces a
-    plausible, wrong margin. With the check gone the subtraction raises a numpy
-    broadcasting error instead of this refusal, so the test sees the difference.
+    refusal in `measure_cell`. It is the ONLY tie between the baseline's loop and
+    the sweep's: nothing subtracts the two arrays any more, so with the refusal gone
+    a baseline cut on a different window rule is no longer stopped by a numpy
+    broadcasting error. It is written into the record instead -- the base control's
+    median then taken over windows that are not the sweep's.
 
     Both directions: one window too few and one too many.
     """
@@ -364,50 +374,23 @@ def test_measure_cell_refuses_a_baseline_that_does_not_align_with_the_sweep(
 # ---------------------------------------------------------------------------
 
 
-def test_the_stacked_margin_equals_motion_margin_window_by_window(rig, record):
-    """The script subtracts stacked arrays for speed; `motion_margin` is the
-    definition, and the k=1 rung it is given here is `_expected_k_one_rungs`'s
-    closed form, NOT a call of the sweep. If the two disagree the stacked path is
-    wrong.
-
-    Not a second sweep: `regrounding_sweep` is called once inside `measure_cell`
-    and once by a test, so a row order the sweep itself got wrong -- `sorted()`
-    inside it, two episodes swapped -- would be the same wrong order on both sides
-    and this comparison would pass. Windows the closed form takes in the given
-    order are what make it a reference.
-
-    THE MUTATION THIS EXISTS FOR: `one - rows` instead of `rows - one` in
-    `measure_cell`, which flips the sign of the quantity Reading H's verdict is
-    read from and leaves every shape and every interval intact. The wobble gives
-    the margin both signs and a mean absolute value near 4 map units, so the
-    flipped array is far from the right one in most windows.
-    """
-    one = _expected_k_one_rungs(rig)
-    targets = _window_targets(rig.paths)
-    margin = np.asarray(record["window_margin"], dtype=np.float64)
-    assert margin.shape == one.shape == (len(targets), HORIZON)
-    assert (margin > 0).any() and (margin < 0).any(), "the fixture must give both signs"
-    for w, window in enumerate(targets):
-        expected = burden.motion_margin(window, one[w])
-        np.testing.assert_allclose(margin[w], expected, rtol=0, atol=1e-12, err_msg=f"window {w}")
-
-
 def test_the_k_one_rung_is_each_windows_own_in_the_order_given(rig, record):
     """Row `w` of the sweep is the window row `w` of the baseline is cut from, by
     VALUE. The shape refusal sees only a count that drifted, and a reorder that
     keeps the shape -- two episodes with the same number of windows swapped, or
     `sorted()` on names that happen to give the same block sizes -- passes it.
 
-    The sweep's own k=1 rows, a second call of it, and the margin the record
-    carries are each asked against `_expected_k_one_rungs`, which does not call
-    the sweep. The record's `window_margin` is `rows - one`, so it must equal the
-    baseline's rows minus the closed form; that pins `one` INSIDE `measure_cell`
-    as well as inside the sweep.
+    The sweep's own k=1 rows, a second call of it, and the k=1 rung the record
+    carries are each asked against `_expected_k_one_rungs`, which does not call the
+    sweep. And the baseline curve the record carries is asked against the baseline
+    computed here, window by window, from the episodes' own targets.
 
-    THE MUTATIONS THIS EXISTS FOR, none of which `test_the_stacked_margin...` saw
-    while its expectation came from a second sweep: `val_paths = sorted(val_paths)`
-    inside `regrounding_sweep`; two equal-count episodes (0 and 3, one window each)
-    swapped inside it; and rows 0 and 3 of `one` swapped inside `measure_cell`.
+    THE MUTATIONS THIS EXISTS FOR, none of which a comparison against a second
+    sweep could see: `val_paths = sorted(val_paths)` inside `regrounding_sweep`, and
+    two equal-count episodes (0 and 3, one window each) swapped inside it -- the
+    same wrong order on both sides of that comparison, a different one from the closed
+    form. (Swapping rows of `one` inside `measure_cell` is no longer expressible:
+    nothing there reads its values but the finiteness refusal.)
     """
     expected = _expected_k_one_rungs(rig)
     assert expected.shape == (sum(EXPECTED_WINDOWS), HORIZON)
@@ -418,20 +401,22 @@ def test_the_k_one_rung_is_each_windows_own_in_the_order_given(rig, record):
     one = _independent_sweep(rig).window_position[1]
     np.testing.assert_allclose(one, expected, rtol=1e-6, atol=1e-9)
 
-    rows = np.stack([burden.one_step_persistence(w) for w in _window_targets(rig.paths)])
-    np.testing.assert_allclose(
-        np.asarray(record["window_margin"]), rows - expected, rtol=1e-6, atol=1e-9,
-    )
     np.testing.assert_allclose(
         record["curves"]["rungs"]["1"], expected.mean(axis=0), rtol=1e-6, atol=1e-9,
+    )
+    rows = np.stack([burden.one_step_persistence(w) for w in _window_targets(rig.paths)])
+    assert rows.shape == expected.shape
+    np.testing.assert_allclose(
+        record["curves"]["one_step_persistence"], rows.mean(axis=0), rtol=1e-6, atol=1e-9,
     )
 
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
 def test_measure_cell_refuses_a_non_finite_baseline_by_name(rig, monkeypatch, bad):
-    """`motion_margin` has a finiteness guard; the stacked subtraction does not,
-    so the script carries its own. Without it the poisoned row reaches
-    `clustered_interval`, which raises a bare ValueError that names neither array.
+    """The baseline's rows become the base control's median and the recorded
+    `one_step_persistence` curve. Without the refusal a poisoned row is written into
+    that curve -- `study.write_record` nulls it, and the read meets a hole instead of
+    the cause; with it the run stops before a record is written, naming the array.
 
     THE MUTATION THIS EXISTS FOR: deleting the `np.isfinite(rows)` refusal.
     """
@@ -451,9 +436,10 @@ def test_measure_cell_refuses_a_non_finite_baseline_by_name(rig, monkeypatch, ba
 
 @pytest.mark.parametrize("bad", [np.nan, np.inf])
 def test_measure_cell_refuses_a_non_finite_k_one_rung_by_name(rig, monkeypatch, bad):
-    """The same refusal on the other operand. The sweep's MEAN curves stay
-    finite here -- only the retained per-window rows are poisoned -- which is the
-    case the stacked subtraction would carry silently into every interval.
+    """The same refusal on the sweep's side. The sweep's MEAN curves stay finite
+    here -- only the retained per-window rows are poisoned -- and those rows are
+    what the two rulers are computed from, so without the refusal the poison is
+    carried into the record by whichever step of them it sits in.
 
     THE MUTATION THIS EXISTS FOR: deleting the `np.isfinite(one)` refusal.
     """
@@ -507,9 +493,10 @@ def test_the_baseline_is_taken_after_the_sweep_and_never_before_it(rig, monkeypa
 def test_measure_cell_refuses_a_protocol_the_reading_cannot_be_taken_from(
     rig, monkeypatch, over, match,
 ):
-    """The status is read at `DECISION_H` and every margin is read off the k=1
-    rung. Refused by name before any pass is paid for, rather than as an
-    IndexError or a KeyError after the sweep.
+    """The base control and the rulers are read at `DECISION_H`, and every
+    compounding and every ruler is read off the k=1 rung. Refused by name before
+    any pass is paid for, rather than as an IndexError or a KeyError after the
+    sweep.
 
     "BEFORE ANY PASS" IS ASKED, NOT ASSUMED: the sweep and the baseline are
     replaced by functions that fail the test if they are called, so the refusal
@@ -537,35 +524,33 @@ def test_measure_cell_refuses_a_protocol_the_reading_cannot_be_taken_from(
 # ---------------------------------------------------------------------------
 
 
-def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
-    """M3l shipped a headline interval whose DRAW COUNT was not on the record,
-    so the permanent artefact could not be audited for it. Both the level and
-    the count are recorded here from the start.
+def test_the_record_carries_every_protocol_parameter_it_was_taken_at(record):
+    """The record states the horizon its controls were read at, the ladder, the
+    grid, the tolerance the identity control was taken at, and the split -- so the
+    permanent artefact can be audited for each.
 
     THE MUTATION THIS EXISTS FOR: dropping any of these keys. It pins that each
-    is PRESENT and AGREES WITH the shipped constant, and nothing more: a literal
-    that equals the constant -- `"confidence": 0.95` -- passes it, which is the
-    one thing it cannot see. WHERE EACH VALUE IS READ FROM is pinned elsewhere:
+    is PRESENT and AGREES WITH the shipped value, and nothing more: a literal that
+    equals the constant -- `"decision_h": 45` -- passes it, which is the one thing it
+    cannot see. WHERE EACH VALUE IS READ FROM is pinned by
+    `test_each_protocol_constant_is_recorded_from_the_modules_own_name`.
 
-      `resamples`
-          test_the_interval_is_taken_at_the_cells_seed_and_the_draw_count_the_record_states
-      `confidence`, `decision_h`, `reported_h`, `identity_tolerance`, `split_seed`
-          test_each_protocol_constant_is_recorded_from_the_modules_own_name
+    The expected values are literals, and `DECISION_H`'s is asserted against one
+    (`GATE_H`): it is a constant this script holds since M3n removed the one in
+    `burden`, so a drifted copy must not be able to move both sides.
     """
-    assert record["confidence"] == burden.CONFIDENCE
-    assert record["resamples"] == burden.RESAMPLES
-    assert record["decision_h"] == burden.DECISION_H
-    assert tuple(record["reported_h"]) == burden.REPORTED_H
+    assert script.DECISION_H == GATE_H
+    assert record["decision_h"] == GATE_H
+    assert tuple(record["reported_h"]) == REPORTED_HORIZONS
     assert tuple(record["ks"]) == tuple(REGROUNDING_KS)
-    assert record["identity_tolerance"] == burden.IDENTITY_TOLERANCE
+    assert record["identity_tolerance"] == 1e-9
     assert record["split_seed"] == SPLIT_SEED
     assert record["device"] == "cpu"
     assert record["git_sha"] == git_sha()
     for key in (
-        "arm", "seed", "margin", "controls", "base_control", "burden_by_k",
-        "compounding_by_k", "curves", "windows", "git_sha", "step",
-        "kl_rate_above_free_bits", "kl_dyn_max", "window_margin", "episodes",
-        "context", "horizon", "torch_version", "rulers",
+        "arm", "seed", "controls", "base_control", "burden_by_k", "compounding_by_k",
+        "curves", "windows", "git_sha", "step", "kl_rate_above_free_bits", "kl_dyn_max",
+        "episodes", "context", "horizon", "torch_version", "rulers",
     ):
         assert key in record, key
     assert (record["arm"], record["seed"]) == ("pixel_ae", SEED)
@@ -575,7 +560,6 @@ def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
 @pytest.mark.parametrize(
     "constant, patched, key, expected",
     [
-        ("CONFIDENCE", 0.9, "confidence", 0.9),
         ("DECISION_H", 30, "decision_h", 30),
         ("REPORTED_H", (1, 7, 45), "reported_h", [1, 7, 45]),
         ("IDENTITY_TOLERANCE", 1e-3, "identity_tolerance", 1e-3),
@@ -585,23 +569,19 @@ def test_the_record_carries_every_protocol_parameter_the_reading_uses(record):
 def test_each_protocol_constant_is_recorded_from_the_modules_own_name(
     rig, monkeypatch, constant, patched, key, expected,
 ):
-    """The record states the constant THE MODULE HOLDS, checked the way the
-    `RESAMPLES` test checks its own: the module's name is patched to a value the
-    shipped constant is not, and the record must follow it.
+    """The record states the constant THE MODULE HOLDS: the module's name is patched
+    to a value the shipped constant is not, and the record must follow it.
 
-    Comparing a record to `burden.CONFIDENCE` cannot do this. A literal `0.95`
-    EQUALS it, so recording one passes every test that compares against the
-    shipped value; only a patched module attribute tells a literal from a read.
-    The brief's mutation for `confidence` also changed `burden.CONFIDENCE`, which
-    makes it a two-file mutation the single-constant docstring never described.
+    Comparing a record to the shipped value cannot do this. A literal `45` EQUALS it,
+    so recording one passes every test that compares against the shipped value; only
+    a patched module attribute tells a literal from a read.
 
     THE MUTATIONS THIS EXISTS FOR, one per case, each a literal where the module's
-    constant stood, each of which survived all 50 tests: `"confidence": 0.95`,
-    `"decision_h": 45`, `"reported_h": [1, 2, 3, 5, 8, 10, 15, 20, 30, 45]`,
-    `"identity_tolerance": 1e-9`, `"split_seed": 0`. (`resamples` is the sixth, and
-    is pinned by its own patching test.) `DECISION_H` and `REPORTED_H` are also
-    read by the measurement itself, so the patched values are ones the protocol
-    guard still accepts at the cell's horizon of 45.
+    constant stood: `"decision_h": 45`, `"reported_h": [1, 2, 3, 5, 8, 10, 15, 20,
+    30, 45]`, `"identity_tolerance": 1e-9`, `"split_seed": 0`. `DECISION_H` is also
+    read by the measurement itself (the base control and the rulers) and `REPORTED_H`
+    by the protocol guard, so the patched values are ones the guard still accepts at
+    the cell's horizon of 45.
     """
     assert getattr(script, constant) != patched
     monkeypatch.setattr(script, constant, patched)
@@ -664,63 +644,14 @@ def test_the_record_names_its_episodes_and_clusters_its_windows(rig, record):
     ).tolist() == list(EXPECTED_WINDOWS)
 
 
-def test_the_record_keeps_a_margin_interval_at_every_reported_horizon(record):
-    assert sorted(int(h) for h in record["margin"]) == sorted(burden.REPORTED_H)
-    window_margin = np.asarray(record["window_margin"])
-    for h, entry in record["margin"].items():
-        assert entry["ci_low"] <= entry["point"] <= entry["ci_high"], h
-        # Never a zero-width interval: that would make the line above pass for
-        # any point at all.
-        assert entry["ci_low"] < entry["ci_high"], h
-        assert entry["point"] == pytest.approx(window_margin[:, int(h) - 1].mean(), abs=1e-12)
-
-
-def test_the_interval_is_taken_at_the_cells_seed_and_the_draw_count_the_record_states(
-    rig, monkeypatch,
-):
-    """What the record SAYS about its interval is what the interval USED, checked
-    by recomputing every interval from the record's own margins.
-
-    A small `RESAMPLES` is patched in, so the recomputation can tell the stated
-    count from `burden.RESAMPLES`'s 2000: a record that states one count and
-    draws another is exactly what the permanent artefact could not be audited
-    for. And the cell's seed is 3, not 0, so a bootstrap seeded with anything
-    else lands on different bounds.
-
-    THE MUTATIONS THIS EXISTS FOR: `clustered_interval(..., seed=seed)` ->
-    `seed=0` (the bounds move), and `resamples=RESAMPLES` dropped from the call
-    (`resamples` has no default, so the call raises TypeError).
-    """
-    monkeypatch.setattr(script, "RESAMPLES", 40)
-    record = script.measure_cell(**_cell_kwargs(rig))
-    assert record["resamples"] == 40
-
-    window_margin = np.asarray(record["window_margin"])
-    groups = np.asarray(record["windows"]["episode"])
-
-    def recompute(h, **over):
-        options = dict(h=h, resamples=40, seed=SEED) | over
-        return pooling.clustered_interval(window_margin, groups, **options)
-
-    reached = False
-    for h in burden.REPORTED_H:
-        entry = record["margin"][str(h)]
-        assert (entry["point"], entry["ci_low"], entry["ci_high"]) == recompute(h), h
-        # The fixture REACHES the mutations: a different seed, and the shipped
-        # draw count, each give different bounds at some horizon.
-        other_seed = recompute(h, seed=0)
-        other_draws = recompute(h, resamples=burden.RESAMPLES)
-        reached = reached or other_seed[1:] != recompute(h)[1:] or other_draws[1:] != recompute(h)[1:]
-    assert reached
-
-
 def test_the_record_survives_a_round_trip_through_write_record(rig, record, tmp_path):
     """A record that is not identical before and after the write is a record the
     read phase would read differently from what was measured -- most
     treacherously through the keys, which JSON turns into strings."""
     written = script.write_record(tmp_path / "burden.json", record)
+    assert written["nonfinite"] == {}, "a measured cell must hold no non-finite value"
     assert {k: v for k, v in written.items() if k != "nonfinite"} == record
-    assert load_record(tmp_path / "burden.json")["margin"] == record["margin"]
+    assert load_record(tmp_path / "burden.json")["curves"]["rungs"] == record["curves"]["rungs"]
 
 
 # ---------------------------------------------------------------------------
@@ -852,13 +783,13 @@ def test_the_base_control_is_the_two_medians_at_the_decision_horizon(rig, record
     floor from a separate call of the sweep."""
     sweep = _independent_sweep(rig)
     displacement = [
-        burden.one_step_persistence(window)[burden.DECISION_H - 1]
+        burden.one_step_persistence(window)[GATE_H - 1]
         for window in _window_targets(rig.paths)
     ]
     base = record["base_control"]
     assert base["displacement_median"] == pytest.approx(float(np.median(displacement)), abs=1e-12)
     assert base["floor_median"] == pytest.approx(
-        float(np.median(sweep.window_floor_position[:, burden.DECISION_H - 1])), abs=1e-12,
+        float(np.median(sweep.window_floor_position[:, GATE_H - 1])), abs=1e-12,
     )
     assert base["displacement_median"] != base["floor_median"]
 
@@ -900,12 +831,12 @@ def test_the_rulers_are_the_sweeps_own_paired_standard_errors(rig, record):
     """
     sweep = _independent_sweep(rig)
     last = REGROUNDING_KS[-1]
-    floor_margin, paired = _expected_rulers(sweep, last, burden.DECISION_H)
+    floor_margin, paired = _expected_rulers(sweep, last, GATE_H)
     assert record["rulers"]["floor_margin_standard_error"] == floor_margin
     assert record["rulers"]["paired_standard_error"] == paired
     assert all(type(v) is float for v in record["rulers"].values())
 
-    h = burden.DECISION_H - 1
+    h = GATE_H - 1
     unpaired = {k: float(sweep.curve_standard_error(k)[h]) for k in REGROUNDING_KS}
     for name, ruler in (("floor_margin", floor_margin), ("paired", paired)):
         for k, spread in unpaired.items():
@@ -951,9 +882,9 @@ def test_the_paired_ruler_belongs_to_the_last_rung_the_table_prints(rig):
         seed=SEED, device=CPU, feature_backbone=None,
     )
     record = script.measure_cell(**_cell_kwargs(rig, ks=ks))
-    floor_margin, paired = _expected_rulers(sweep, 3, burden.DECISION_H)
+    floor_margin, paired = _expected_rulers(sweep, 3, GATE_H)
     assert record["rulers"]["paired_standard_error"] == paired
-    assert paired != _expected_rulers(sweep, 45, burden.DECISION_H)[1]
+    assert paired != _expected_rulers(sweep, 45, GATE_H)[1]
     assert record["rulers"]["floor_margin_standard_error"] == floor_margin
 
 
@@ -993,7 +924,7 @@ def test_measure_cell_reads_every_horizon_step_through_at_horizon(rig, monkeypat
     assert record["rulers"] == {
         "floor_margin_standard_error": SENTINEL, "paired_standard_error": SENTINEL,
     }
-    assert set(asked) == {burden.DECISION_H}
+    assert set(asked) == {GATE_H}
     # One call per window per median -- the median is of the windows, not of one
     # read -- and one per ruler.
     assert len(asked) == 2 * sum(EXPECTED_WINDOWS) + 2
@@ -1251,16 +1182,14 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
     THE SEED IS BOUND TWICE, because the cells' seeds are 1 and 2 (`PHASE_SEEDS`).
     The file NAME carries the cell's seed -- a name that carried 0 would write
     the second and third seed of every arm over one file, which the listing below
-    is the only thing to see -- and the record carries it too, as `seed` and as
-    the seed its bootstrap interval was drawn at. The interval is recomputed from
-    the record's own margins at the cell's seed and must be the one written, and
-    the two seeds of one arm, which share a model and so a point estimate, must
-    not share an interval.
+    is the only thing to see -- and the record carries it too, as `seed`.
 
     THE MUTATIONS THIS EXISTS FOR, each of which the one-seed-0 fixture let
     through with every test green: `measure_phase` handing `measure_cell`
-    `seed=0` instead of `cell.seed`, and `burden_record_path(args.out, cell.arm,
-    0)` instead of `cell.seed`.
+    `seed=0` instead of `cell.seed` (the record's `seed` reads 0), and
+    `burden_record_path(args.out, cell.arm, 0)` instead of `cell.seed` (the listing
+    loses two files). Neither is seen through the numbers: the models here draw no
+    random number, so the seed moves nothing but the label.
 
     The checkpoint is looked for in `args.source`: the fake `prepare_cell`
     refuses a directory that does not hold it, and `args.out` does not.
@@ -1285,20 +1214,7 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
         assert carried["kl_dyn_max"] == study["kl_dyn_max"]
         assert carried["record_git_sha"] == study["git_sha"]
         assert carried["git_sha"] == git_sha()
-        assert carried["resamples"] == burden.RESAMPLES
-        h = burden.DECISION_H
-        entry = carried["margin"][str(h)]
-        assert (entry["point"], entry["ci_low"], entry["ci_high"]) == pooling.clustered_interval(
-            np.asarray(carried["window_margin"]), np.asarray(carried["windows"]["episode"]),
-            h=h, resamples=burden.RESAMPLES, seed=seed,
-        ), (arm, seed)
-    for arm in ("pixel_ae", "frozen_ssl"):
-        first, second = (records[(arm, seed)]["margin"][str(burden.DECISION_H)] for seed in PHASE_SEEDS)
-        # Reached: same model, same windows, so the point is shared and ONLY the
-        # seed can move the bounds. If they coincided the recomputation above
-        # would pass for any seed at all.
-        assert first["point"] == second["point"], arm
-        assert (first["ci_low"], first["ci_high"]) != (second["ci_low"], second["ci_high"]), arm
+        assert "margin" not in carried, (arm, seed)
 
 
 def test_the_record_carries_the_reference_prepare_cell_verified(tmp_path, monkeypatch):
@@ -1391,7 +1307,7 @@ def test_the_phase_measures_a_repeated_arm_once(tmp_path, monkeypatch):
     assert prepared_for == [("pixel_ae", 1)]
 
 
-def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
+def test_the_cell_line_prints_the_burden_and_the_controls_and_no_margin(
     tmp_path, monkeypatch, capsys,
 ):
     args, _ = _phase_env(tmp_path, monkeypatch)
@@ -1401,23 +1317,23 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
     last = str(REGROUNDING_KS[-1])
     for line, (arm, seed) in zip(lines, CELLS):
         record = load_record(args.out / f"burden_{arm}_seed{seed}.json")
-        margin = record["margin"][str(burden.DECISION_H)]
         assert line.startswith(f"{arm} seed {seed}:"), line
-        for number in (margin["point"], margin["ci_low"], margin["ci_high"]):
-            assert f"{number:+.4f}" in line
-        # The burden printed is the LAST rung's, read at `DECISION_H`: the rung and
+        # No margin and no interval: the statistic is retired, and a line that still
+        # printed one would be a number in the log that the record no longer holds.
+        assert "margin" not in line, line
+        # The burden printed is the LAST rung's, read at `GATE_H`: the rung and
         # the step are each written out here rather than read back off the record.
         by_step = record["burden_by_k"][last]
-        printed = f"burden(k={last}) {by_step[burden.DECISION_H - 1]:+.4f};"
+        printed = f"burden(k={last}) {by_step[GATE_H - 1]:+.4f};"
         assert printed in line, line
-        # Reached: step 1 and step `DECISION_H` read differently, so a line that
+        # Reached: step 1 and step `GATE_H` read differently, so a line that
         # printed the first step fails; and on the drifting arm the first rung and
         # the last do too (on the exact oracle every rung is the same, so there the
         # rung is told apart only by the `k=` label above).
-        assert f"{by_step[0]:+.4f}" != f"{by_step[burden.DECISION_H - 1]:+.4f}"
+        assert f"{by_step[0]:+.4f}" != f"{by_step[GATE_H - 1]:+.4f}"
         if arm == "pixel_ae":
-            first_rung = record["burden_by_k"]["1"][burden.DECISION_H - 1]
-            assert f"{first_rung:+.4f}" != f"{by_step[burden.DECISION_H - 1]:+.4f}"
+            first_rung = record["burden_by_k"]["1"][GATE_H - 1]
+            assert f"{first_rung:+.4f}" != f"{by_step[GATE_H - 1]:+.4f}"
         assert f"{record['controls']['identity_residual']:.2e}" in line
         assert str(args.out / f"burden_{arm}_seed{seed}.json") in line
 
@@ -1425,7 +1341,7 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
 def test_the_cell_line_reads_its_burden_through_at_horizon(record, tmp_path, monkeypatch):
     """The burden the line prints is the one place the measure phase reads a step
     off a record rather than off an array, and it reads it through
-    `burden.at_horizon` like `burden_inputs` does.
+    `burden.at_horizon`, the one place the 0- and 1-indexing differ is written.
 
     THE MUTATION THIS EXISTS FOR: `record['burden_by_k'][last][record['decision_h']
     - 1]` written by hand again.
@@ -1450,26 +1366,23 @@ def test_main_takes_its_cells_and_directories_from_the_command_line(tmp_path, mo
 
 
 # ---------------------------------------------------------------------------
-# The read phase: nine records pooled into Reading H.
+# The read phase, retired: nine records, printed superseded, then refused.
 #
 # THE POOL IS THE REAL RECORD, RELABELLED. Every cell starts as a deep copy of
 # the record `measure_cell` writes (`record`), so the schema is the writer's own,
 # and only the fields the read phase READS are then overwritten, each from a
-# formula in the cell's index `c`. Nothing the reading reads is shared between
-# two cells, and the expected `BurdenInputs` is built from the same formulas --
-# never from the records, and never through `script.burden_inputs`.
+# formula in the cell's index `c`: the stored `margin` the table prints, and the
+# decision horizon it is read at. The expected table is built from the same
+# formulas -- never from the records, and never through the script's formatter.
 #
 #   * Three arms x seeds 0, 1, 2: nine cells, no two alike in any number read.
 #     The arms are given in `ARMS` order, whose index is NOT `sorted()` order
 #     (`frozen_ssl` sorts first), so a read that sorts or enumerates differently
-#     reads another cell's numbers.
-#   * `burden_by_k[k][j]` and `compounding_by_k[k][j]` hold a value that depends
-#     on the cell, the rung AND the step, so a read at the wrong step, the wrong
-#     rung, the wrong cell, or from the other array is a different number.
+#     prints another cell's numbers on a row.
 #   * The margin at every reported horizon but the decision horizon is a decoy
 #     (about a thousand), so a read at the wrong horizon is not a plausible one.
-#   * The decision horizon is also read at 30 and 20, not only 45: at 45 the
-#     step index is the LAST one, where `[h - 1]` and `[-1]` are one element.
+#   * The decision horizon is also read at 30, not only 45: at 45 the step is the
+#     LAST one, where `[h - 1]` and `[-1]` are one element.
 # ---------------------------------------------------------------------------
 
 
@@ -1479,27 +1392,6 @@ FIRST_CELL, SECOND_CELL, LAST_CELL = ("frozen_ssl", 0), ("frozen_ssl", 1), ("ran
 """`sorted()` order of the nine cells -- the order `require_one_protocol` walks.
 The LAST sorts after every other cell, so a check that looks at only the first
 record or the first two sees nothing wrong with it."""
-
-KINDS = {
-    # what each arm's three seeds clear at the decision horizon, in seed order:
-    # "up" = the whole interval above 0, "down" = at or below 0, "straddle" = neither
-    "PREDICTS_MOTION": {
-        "pixel_ae": ("up", "up", "up"),
-        "frozen_ssl": ("up", "straddle", "up"),
-        "random_vit": ("down", "straddle", "down"),
-    },
-    "COPIES": {
-        "pixel_ae": ("down", "down", "straddle"),
-        "frozen_ssl": ("up", "up", "straddle"),
-        "random_vit": ("down", "down", "down"),
-    },
-    "INDETERMINATE": {
-        "pixel_ae": ("up", "up", "straddle"),
-        "frozen_ssl": ("down", "down", "up"),
-        "random_vit": ("straddle", "straddle", "up"),
-    },
-}
-BROKEN_CONTROLS = {"identity_residual": 1e-3, "open_loop_divergence": 0.25, "k_one_is_floor": True}
 
 
 def _margin_triple(kind: str, c: int) -> tuple[float, float, float]:
@@ -1514,104 +1406,34 @@ def _margin_triple(kind: str, c: int) -> tuple[float, float, float]:
     return point, point - 0.25, point + 0.25
 
 
-def _burden_value(c: int, k: int, h: int) -> float:
-    return 100.0 * c + k + h / 64.0
-
-
-def _compounding_value(c: int, k: int, h: int) -> float:
-    return c / 4.0 + k / 8.0 + h / 256.0
-
-
-def _spec(kinds_by_arm, *, broken=None, stationary=None) -> dict:
-    """The numbers the reading reads, per cell, from nothing but the cell's index.
-
-    `broken=(cell, control)` misses one known answer in one cell and
-    `stationary=cell` makes one cell's agent move less than the readout's error."""
+def _spec(kinds_by_arm) -> dict:
+    """The stored margin each cell carries, from nothing but the cell's index."""
     spec = {}
     for a, (arm, kinds) in enumerate(kinds_by_arm.items()):
         for seed, kind in zip(READ_SEEDS, kinds, strict=True):
             c = a * len(READ_SEEDS) + seed
-            floor = 3.0 + c / 16.0
             point, low, high = _margin_triple(kind, c)
-            spec[(arm, seed)] = {
-                "c": c, "point": point, "low": low, "high": high,
-                "identity_residual": (c + 1) * 2.0 ** -50,
-                "open_loop_divergence": 0.0, "k_one_is_floor": False,
-                "displacement_median": floor + 5.0 + c / 8.0, "floor_median": floor,
-            }
-    if broken is not None:
-        cell, control = broken
-        spec[cell][control] = BROKEN_CONTROLS[control]
-    if stationary is not None:
-        spec[stationary]["displacement_median"] = spec[stationary]["floor_median"] - 0.5
+            spec[(arm, seed)] = {"c": c, "point": point, "low": low, "high": high}
     return spec
 
 
-def _scenario(status: str, **over) -> dict:
-    """A spec that `burden.reading_burden` reads as `status`. The two refusals
-    sit on top of a pool that would otherwise read PREDICTS_MOTION, which is what
-    makes them refusals and not readings."""
-    if status == "UNRESOLVED_CONTROL":
-        over.setdefault("broken", (LAST_CELL, "identity_residual"))
-    elif status == "UNREADABLE":
-        over.setdefault("stationary", LAST_CELL)
-    kinds = KINDS["PREDICTS_MOTION" if status in ("UNRESOLVED_CONTROL", "UNREADABLE") else status]
-    return _spec(kinds, **over)
-
-
-def _records_from(base, spec, *, decision_h=burden.DECISION_H, ks=REGROUNDING_KS) -> dict:
+def _records_from(base, spec, *, decision_h=GATE_H) -> dict:
+    """The record the measure phase wrote, relabelled per cell, WITH the `margin`
+    that phase no longer writes -- which is what the nine on disk carry."""
     records = {}
     for (arm, seed), cell in spec.items():
-        c = cell["c"]
         record = copy.deepcopy(base)
-        record.update(arm=arm, seed=seed, decision_h=decision_h, ks=list(ks))
+        record.update(arm=arm, seed=seed, decision_h=decision_h)
         record["margin"] = {
             str(h): (
                 {"point": cell["point"], "ci_low": cell["low"], "ci_high": cell["high"]}
                 if h == decision_h
                 else {"point": 1000.0 + h, "ci_low": 999.0 + h, "ci_high": 1001.0 + h}
             )
-            for h in burden.REPORTED_H
-        }
-        steps = range(1, HORIZON + 1)
-        record["burden_by_k"] = {str(k): [_burden_value(c, k, h) for h in steps] for k in ks}
-        record["compounding_by_k"] = {
-            str(k): [_compounding_value(c, k, h) for h in steps] for k in ks
-        }
-        record["controls"] = {
-            **record["controls"],
-            "identity_residual": cell["identity_residual"],
-            "open_loop_divergence": cell["open_loop_divergence"],
-            "k_one_is_floor": cell["k_one_is_floor"],
-        }
-        record["base_control"] = {
-            "displacement_median": cell["displacement_median"],
-            "floor_median": cell["floor_median"],
+            for h in REPORTED_HORIZONS
         }
         records[(arm, seed)] = record
     return records
-
-
-def _expected_inputs(spec, *, decision_h=burden.DECISION_H, ks=REGROUNDING_KS):
-    """What `burden_inputs` must return, built from the spec alone. The window
-    counts are the rig's own (`EXPECTED_WINDOWS`), not read back off a record."""
-    return burden.BurdenInputs(
-        cells={
-            cell: burden.BurdenArm(
-                arm=cell[0], seed=cell[1], margin=s["point"], margin_low=s["low"],
-                margin_high=s["high"],
-                burden_by_k={k: _burden_value(s["c"], k, decision_h) for k in ks},
-                compounding_by_k={k: _compounding_value(s["c"], k, decision_h) for k in ks},
-                identity_residual=s["identity_residual"],
-                open_loop_divergence=s["open_loop_divergence"],
-                k_one_is_floor=s["k_one_is_floor"],
-                displacement_median=s["displacement_median"], floor_median=s["floor_median"],
-                clusters=sum(1 for n in EXPECTED_WINDOWS if n), rows=sum(EXPECTED_WINDOWS),
-            )
-            for cell, s in spec.items()
-        },
-        decision_h=decision_h, ks=tuple(ks),
-    )
 
 
 def _read_args(tmp_path, records, *, arms=READ_ARMS, seeds=READ_SEEDS):
@@ -1628,125 +1450,44 @@ def _named_cells(message: str, cells) -> set:
     return {(arm, seed) for arm, seed in cells if f"{arm} seed {seed}" in message}
 
 
-STATUSES = ("PREDICTS_MOTION", "COPIES", "INDETERMINATE", "UNRESOLVED_CONTROL", "UNREADABLE")
+MIXED = {
+    # what each arm's three stored margins look like at the decision horizon:
+    # whole interval above 0, whole interval at or below 0, or straddling it. The
+    # signs differ across cells so that a column printed with the wrong format
+    # (`+` dropped, a minus lost) is a different string, and `_margin_triple`
+    # gives every cell its own value.
+    "pixel_ae": ("down", "down", "straddle"),
+    "frozen_ssl": ("up", "up", "straddle"),
+    "random_vit": ("down", "down", "down"),
+}
+STORED_COLUMNS = ("arm", "seed", "margin", "ci_low", "ci_high")
+STORED_WIDTHS = (13, 6, 11, 11, 11)
 
 
-def test_the_read_fixtures_reach_the_status_they_are_named_for_and_sort_as_stated(record):
-    """The fixtures' own check, taken from `reading_burden` over inputs built
-    from the spec alone: a pool that read some other status than its name would
-    make every exit-code test below test the wrong thing."""
-    for status in STATUSES:
-        spec = _scenario(status)
-        assert burden.reading_burden(_expected_inputs(spec)).status == status, status
-    # The refusals sit on a pool that decides on its own.
-    assert burden.reading_burden(
-        _expected_inputs(_spec(KINDS["PREDICTS_MOTION"]))
-    ).status == "PREDICTS_MOTION"
-    cells = sorted(_records_from(record, _scenario("COPIES")))
-    assert (cells[0], cells[1], cells[-1]) == (FIRST_CELL, SECOND_CELL, LAST_CELL)
-    assert cells != [(a, s) for a in READ_ARMS for s in READ_SEEDS], "ARMS order must not be sorted()"
-    assert sum(1 for n in EXPECTED_WINDOWS if n) == 8 and sum(EXPECTED_WINDOWS) == 13
+def _stored_row(values) -> str:
+    """One printed row, spelled out here from the spec: right-aligned, unseparated,
+    at the widths the header fixes -- not taken from the script's own constants."""
+    return "".join(f"{str(v):>{w}}" for v, w in zip(values, STORED_WIDTHS, strict=True))
 
 
-# --- READ_EXITS --------------------------------------------------------------
+def _expected_stored_table(spec) -> list[str]:
+    """Header and one row per cell in `sorted()` order, from the spec alone."""
+    rows = [_stored_row(STORED_COLUMNS)]
+    for (arm, seed), cell in sorted(spec.items()):
+        rows.append(_stored_row((
+            arm, seed, f"{cell['point']:+.4f}", f"{cell['low']:+.4f}", f"{cell['high']:+.4f}",
+        )))
+    return rows
 
 
-def test_read_exits_are_the_two_refusal_statuses_each_to_its_own_number():
-    """THE MUTATION THIS EXISTS FOR: swapping 45 and 46, which would report a
-    broken estimator as an unreadable plan. The numbers are literals here rather
-    than `script.EXIT_*`, so a swap of the two CONSTANTS' own definitions is
-    caught as well as a swap of the two values in the table."""
-    assert script.READ_EXITS == {"UNRESOLVED_CONTROL": 45, "UNREADABLE": 46}
-    assert script.READ_EXITS == {
-        "UNRESOLVED_CONTROL": script.EXIT_CONTROL_BROKEN,
-        "UNREADABLE": script.EXIT_UNREADABLE,
-    }
+def _read_refusal(args, capsys) -> tuple[str, str]:
+    """`read_phase` over `args`: what it printed and what it was refused with."""
+    with pytest.raises(SystemExit) as caught:
+        script.read_phase(args)
+    return capsys.readouterr().out, str(caught.value)
 
 
-@pytest.mark.parametrize(
-    "status, code",
-    [("PREDICTS_MOTION", 0), ("COPIES", 0), ("INDETERMINATE", 0),
-     ("UNRESOLVED_CONTROL", 45), ("UNREADABLE", 46)],
-)
-def test_read_phase_returns_the_exit_of_the_status_the_records_read(
-    record, tmp_path, capsys, status, code,
-):
-    """Every status from real records through the real read phase. A decisive
-    status is a READING and exits 0 (a milestone that exited non-zero on a
-    finding would make "the run worked" and "the news was good" one signal); the
-    refusals exit with their own number, and the output says WHICH status
-    produced it, so a swapped pair is a different line and not only a different
-    number."""
-    records = _records_from(record, _scenario(status))
-    args = _read_args(tmp_path, records)
-    assert script.read_phase(args) == code
-    out = capsys.readouterr().out
-    written = sorted(p.name for p in args.out.iterdir())
-    if code == 0:
-        assert f"verdict: {status.replace('_', ' ')} -- decided by:" in out, out
-        assert written == sorted(
-            [f"burden_{arm}_seed{seed}.json" for arm, seed in records] + ["burden.txt"]
-        )
-    else:
-        assert status in out, out
-        assert "verdict:" not in out, "a refusal is not a reading"
-        assert "burden.txt" not in written
-
-
-@pytest.mark.parametrize("control", sorted(BROKEN_CONTROLS))
-def test_each_missed_control_alone_is_a_broken_control_that_names_its_cell(
-    record, tmp_path, capsys, control,
-):
-    """Each of the three known answers, missed ALONE in the cell that sorts last
-    of nine. Three controls and one `UNRESOLVED_CONTROL`: a record read with one
-    control taken from another's key, or a flag defaulted, passes the two tests
-    above and fails here. The refusal names that cell and no other."""
-    spec = _scenario("PREDICTS_MOTION", broken=(LAST_CELL, control))
-    args = _read_args(tmp_path, _records_from(record, spec))
-    assert script.read_phase(args) == 45
-    out = capsys.readouterr().out
-    assert _named_cells(out, spec) == {LAST_CELL}, out
-    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
-
-
-def test_a_stationary_cell_is_unreadable_and_named(record, tmp_path, capsys):
-    spec = _scenario("PREDICTS_MOTION", stationary=SECOND_CELL)
-    args = _read_args(tmp_path, _records_from(record, spec))
-    assert script.read_phase(args) == 46
-    out = capsys.readouterr().out
-    assert _named_cells(out, spec) == {SECOND_CELL}, out
-    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
-
-
-@pytest.mark.parametrize("seeds", [(0, 1), (1, 2), (2,)])
-def test_an_arm_short_of_the_minimum_seeds_is_unreadable_not_a_raise(
-    record, tmp_path, capsys, seeds,
-):
-    """A narrowed SEED plan is `reading_burden`'s business and comes back as
-    `UNREADABLE`, naming each short arm with its count; it does not raise. The
-    pool itself is sound -- every cell clears, none is stationary, no control is
-    missed -- so the only thing that can produce 46 here is the seed count, and
-    the three arms are named, not one."""
-    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")), seeds=seeds)
-    assert script.read_phase(args) == 46
-    out = capsys.readouterr().out
-    for arm in READ_ARMS:
-        assert f"{arm} carries {len(seeds)} seed(s), fewer than {burden.SEEDS_MINIMUM}" in out, out
-    assert "burden.txt" not in [p.name for p in args.out.iterdir()]
-
-
-def test_read_phase_writes_nothing_when_it_refuses(record, tmp_path, capsys):
-    """A refusal must leave no burden.txt behind to be mistaken for a reading.
-
-    THE MUTATION THIS EXISTS FOR: writing `burden.txt` before the status is
-    checked. Asked of BOTH refusals, with the exit code asserted so the file is
-    absent because the refusal was reached and not because something else
-    stopped first."""
-    for status in ("UNRESOLVED_CONTROL", "UNREADABLE"):
-        args = _read_args(tmp_path / status, _records_from(record, _scenario(status)))
-        assert script.read_phase(args) == script.READ_EXITS[status], status
-        assert not (args.out / "burden.txt").exists(), status
-        capsys.readouterr()
+# --- records changed in the one way a refusal names ---------------------------
 
 
 def _overwrite_record(args, cell, new) -> None:
@@ -1755,117 +1496,14 @@ def _overwrite_record(args, cell, new) -> None:
     write_record(args.out / f"burden_{cell[0]}_seed{cell[1]}.json", new)
 
 
-def _make_control_broken(args, record) -> None:
-    _overwrite_record(
-        args, LAST_CELL, _records_from(record, _scenario("UNRESOLVED_CONTROL"))[LAST_CELL],
-    )
-
-
-def _make_unreadable(args, record) -> None:
-    _overwrite_record(
-        args, LAST_CELL, _records_from(record, _scenario("UNREADABLE"))[LAST_CELL],
-    )
-
-
 def _make_protocol_disagree(args, record) -> None:
-    odd = _records_from(record, _scenario("PREDICTS_MOTION"))[LAST_CELL]
+    odd = _records_from(record, _spec(MIXED))[LAST_CELL]
     DISAGREEMENTS["git_sha"](odd)
     _overwrite_record(args, LAST_CELL, odd)
 
 
 def _make_cell_missing(args, record) -> None:
     (args.out / f"burden_{LAST_CELL[0]}_seed{LAST_CELL[1]}.json").unlink()
-
-
-def _make_plan_too_narrow(args, record) -> None:
-    args.arms = ["pixel_ae"]
-
-
-STALE_REFUSALS = {
-    # name: (what to change after a good read, what the second read does)
-    "UNRESOLVED_CONTROL": (_make_control_broken, 45),
-    "UNREADABLE": (_make_unreadable, 46),
-    "a missing cell": (_make_cell_missing, script.EXIT_NO_CHECKPOINTS),
-    "a protocol disagreement": (_make_protocol_disagree, SystemExit),
-    "a plan too narrow to read": (_make_plan_too_narrow, SystemExit),
-}
-
-
-@pytest.mark.parametrize("refusal", sorted(STALE_REFUSALS))
-def test_a_refusal_removes_the_burden_txt_an_earlier_read_left_and_nothing_else(
-    record, tmp_path, capsys, monkeypatch, refusal,
-):
-    """A reading from an earlier read of the SAME directory is not a reading of
-    what is there now. If it survived a refusal, `burden.txt` would sit beside a
-    line saying none was written, and nothing in the directory would say which of
-    the two a later reader holds.
-
-    THE MUTATIONS THIS EXISTS FOR: removing the unlink; making it conditional on
-    reaching the status check (so only the two numbered refusals clear it, and a
-    named `SystemExit` or a missing cell leave the file); and an unlink that
-    reaches past `--out`. A successful read comes first, so the file is a real
-    reading and its absence afterwards is the refusal's doing; the SECOND read is
-    asked in the same directory, over records changed in the one way each case
-    names.
-
-    Three things sit where an over-wide unlink would find them: a `burden.txt`
-    beside the output directory, one in the current directory, and a `.txt` file
-    that is not `burden.txt` inside it. The directory must hold exactly what it
-    held before the second read, less `burden.txt`."""
-    change, outcome = STALE_REFUSALS[refusal]
-    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")))
-    stale = args.out / "burden.txt"
-    assert script.read_phase(args) == 0
-    assert "verdict: PREDICTS MOTION -- decided by:" in stale.read_text()
-    capsys.readouterr()
-
-    cwd = tmp_path / "cwd"
-    cwd.mkdir()
-    monkeypatch.chdir(cwd)
-    bystanders = [tmp_path / "burden.txt", cwd / "burden.txt", args.out / "notes.txt"]
-    for bystander in bystanders:
-        bystander.write_text("not this one")
-
-    change(args, record)
-    before = sorted(p.name for p in args.out.iterdir())
-    assert "burden.txt" in before
-    if isinstance(outcome, int):
-        assert script.read_phase(args) == outcome
-        out = capsys.readouterr().out
-        if outcome in (45, 46):
-            assert "no reading was taken, so no burden.txt was written" in out, out
-        assert "verdict:" not in out
-    else:
-        with pytest.raises(outcome):
-            script.read_phase(args)
-
-    assert not stale.exists(), "the reading an earlier read left is still there"
-    assert sorted(p.name for p in args.out.iterdir()) == [n for n in before if n != "burden.txt"]
-    for bystander in bystanders:
-        assert bystander.exists(), f"{bystander} was removed: it is not --out's burden.txt"
-        assert bystander.read_text() == "not this one", bystander
-
-
-def test_a_contradiction_between_the_decisive_statuses_propagates_and_writes_nothing(
-    record, tmp_path,
-):
-    """`reading_burden` raises when two arms clear motion and two clear copies,
-    and that is an arm count that has outgrown the bar -- an operator or shape
-    error, not something found in the data. It must come out of `read_phase` as
-    the ValueError it is: not caught into a status, not an exit number.
-
-    THE MUTATION THIS EXISTS FOR: a `try/except ValueError` around the reading
-    that returns `EXIT_UNREADABLE`. Four arms, which `read_phase` does not
-    forbid -- it takes its arms from the command line and does not check them
-    against `ARMS`."""
-    four = {
-        "pixel_ae": ("up", "up", "up"), "frozen_ssl": ("up", "up", "up"),
-        "random_vit": ("down", "down", "down"), "fourth_arm": ("down", "down", "down"),
-    }
-    args = _read_args(tmp_path, _records_from(record, _spec(four)), arms=tuple(four))
-    with pytest.raises(ValueError, match="contradict"):
-        script.read_phase(args)
-    assert not (args.out / "burden.txt").exists()
 
 
 # --- require_one_protocol ----------------------------------------------------
@@ -1882,8 +1520,6 @@ DISAGREEMENTS = {
     "ks": lambda r: r.__setitem__("ks", r["ks"][:-1] + [r["ks"][-1] + 1]),
     "decision_h": lambda r: r.__setitem__("decision_h", r["decision_h"] - 1),
     "reported_h": lambda r: r.__setitem__("reported_h", r["reported_h"][:-1]),
-    "confidence": lambda r: r.__setitem__("confidence", 0.9),
-    "resamples": lambda r: r.__setitem__("resamples", r["resamples"] + 1),
     "identity_tolerance": lambda r: r.__setitem__("identity_tolerance", r["identity_tolerance"] * 10),
     "episodes.val": lambda r: r["episodes"].__setitem__("val", r["episodes"]["val"][::-1]),
     "windows.episode": lambda r: r["windows"]["episode"].__setitem__(
@@ -1894,7 +1530,7 @@ DISAGREEMENTS = {
 
 REQUIRED_PROTOCOL_FIELDS = {
     "git_sha", "step", "context", "horizon", "ks", "decision_h", "reported_h",
-    "confidence", "resamples", "identity_tolerance", "split_seed", "device",
+    "identity_tolerance", "split_seed", "device",
 }
 
 
@@ -1921,7 +1557,7 @@ def test_one_record_that_disagrees_on_any_protocol_field_is_refused_naming_it(
     second is the one a loop that starts one record too late misses. The message
     names the field AND the odd cell, and it names exactly two cells -- a message
     listing all nine would satisfy `victim in message` for any victim at all."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     DISAGREEMENTS[field](records[victim])
     with pytest.raises(SystemExit) as caught:
         script.require_one_protocol(records)
@@ -1935,7 +1571,7 @@ def _long_episode_pool(record, odd) -> dict:
     """The nine records, every one describing 150 windows labelled `0..149`, and the
     LAST cell's labels then changed as `odd` says (`{index: label}`). 150 labels
     is far past what one printed line holds."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     for cell in records.values():
         cell["windows"]["episode"] = list(range(150))
     for index, label in odd.items():
@@ -1999,7 +1635,7 @@ def test_a_short_disagreement_is_still_printed_in_full(record):
     one more thing to look up.
 
     THE MUTATION THIS EXISTS FOR: taking the index form for every sequence."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     reference = [int(k) for k in records[FIRST_CELL]["ks"]]
     odd = reference[:-1] + [reference[-1] + 1]
     records[LAST_CELL]["ks"] = odd
@@ -2012,7 +1648,7 @@ def test_a_pool_that_agrees_on_the_protocol_is_accepted_whatever_else_differs(re
     """Nothing but the table is compared. The per-cell numbers, the cell's own
     training provenance and its label all differ between cells by construction;
     comparing any of them would refuse the real nine."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     for index, cell in enumerate(sorted(records)):
         records[cell]["record_git_sha"] = f"trained-at-{index}"
         records[cell]["kl_dyn_max"] = 1.0 + index
@@ -2032,7 +1668,7 @@ def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(re
     the message assertion (`lacks git_sha`), not the raise. `all` is the case where
     the default raises nothing at all: every record lacks `git_sha`, the nine agree
     on `None` and pool with no refusal."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     victims = {"first": [FIRST_CELL], "last": [LAST_CELL], "all": sorted(records)}[lacking]
     for cell in victims:
         del records[cell]["git_sha"]
@@ -2043,7 +1679,7 @@ def test_a_record_without_a_protocol_field_is_refused_by_name_not_a_key_error(re
 
 
 def test_an_empty_pool_is_refused_by_name():
-    for call in (script.require_one_protocol, script.burden_inputs):
+    for call in (script.require_one_protocol, script.format_superseded_margin):
         with pytest.raises(SystemExit, match="no burden record"):
             call({})
 
@@ -2052,15 +1688,15 @@ def test_read_phase_refuses_records_that_disagree_on_the_protocol(record, tmp_pa
     """THE WIRING, not the function: `require_one_protocol` is tested above in
     isolation, and deleting its one call from `read_phase` leaves every one of
     those green. `git_sha` is the field the check once omitted: the records
-    below differ in nothing else, so no other comparison -- `burden_inputs`'s
-    own, `reading_burden`'s -- can refuse them in its place.
+    below differ in nothing else, so no other comparison -- the formatter's own
+    agreement check is on `decision_h` alone -- can refuse them in its place.
 
     THE MUTATIONS THIS EXISTS FOR: deleting the `require_one_protocol(records)`
     call from `read_phase`, and dropping `git_sha` from `_PROTOCOL_FIELDS`. The
     victim sorts LAST, so a first-record-only check sees nothing; and nothing is
-    written, because a pool that cannot be read must leave no artefact claiming
-    it was."""
-    records = _records_from(record, _scenario("PREDICTS_MOTION"))
+    printed first, because a pool that is not one measurement must not be shown
+    as one table."""
+    records = _records_from(record, _spec(MIXED))
     victim = sorted(records)[-1]
     assert victim == LAST_CELL
     records[victim]["git_sha"] = "0" * 40
@@ -2070,109 +1706,32 @@ def test_read_phase_refuses_records_that_disagree_on_the_protocol(record, tmp_pa
     message = str(caught.value)
     assert "random_vit seed 2" in message and "git_sha" in message, message
     assert not (args.out / "burden.txt").exists()
-    assert "verdict:" not in capsys.readouterr().out
+    assert capsys.readouterr().out == ""
 
 
-# --- burden_inputs -----------------------------------------------------------
+def test_the_formatter_refuses_a_pool_that_disagrees_on_the_decision_horizon(record):
+    """One table holds ONE decision horizon for nine cells, so the pick is made where
+    it is taken and does not depend on `require_one_protocol` having run first: a
+    first-record pick would read every other cell at a horizon its own record does
+    not name.
 
-
-@pytest.mark.parametrize(
-    "status, decision_h, ks",
-    [(status, burden.DECISION_H, REGROUNDING_KS) for status in STATUSES]
-    + [("COPIES", 30, REGROUNDING_KS), ("INDETERMINATE", 20, (1, 3, 7))],
-)
-def test_burden_inputs_reads_every_field_from_its_own_key_at_the_decision_horizon(
-    record, tmp_path, status, decision_h, ks,
-):
-    """Compared with `BurdenInputs` built from the spec's formulas -- not from the
-    records, and not by `reading_burden` -- both in memory and after a round trip
-    through the files the measure phase writes.
-
-    At `decision_h=30` and `20` the horizon step is not the last one: a read at
-    `[-1]` or at `[h]` is another number, where at 45 `[-1]` and `[h - 1]` are the
-    same element. The margin is read at the DECISION horizon of the records, and
-    the rungs are the records' own `ks`, whose last one is not 45 in the third."""
-    spec = _scenario(status)
-    records = _records_from(record, spec, decision_h=decision_h, ks=ks)
-    expected = _expected_inputs(spec, decision_h=decision_h, ks=ks)
-    assert script.burden_inputs(records) == expected
-    args = _read_args(tmp_path, records)
-    loaded = script.load_burden(args.out, READ_ARMS, READ_SEEDS)
-    assert script.burden_inputs(loaded) == expected
-
-
-@pytest.mark.parametrize("decision_h", [burden.DECISION_H, 30])
-def test_burden_inputs_reads_every_rung_through_at_horizon(record, monkeypatch, decision_h):
-    """The burden and the compounding of every rung, in every cell, are read at the
-    record's decision horizon through `burden.at_horizon` -- the two fields are
-    separate sites, so a hand-written `[decision_h - 1]` on either is another
-    number than the sentinel in that field.
-
-    THE MUTATIONS THIS EXISTS FOR: `record["burden_by_k"][str(k)][decision_h - 1]`
-    and the same for `compounding_by_k`, each written by hand again.
-    """
-    asked = []
-    monkeypatch.setattr(script, "at_horizon", _sentinel_at_horizon(asked))
-    records = _records_from(record, _scenario("COPIES"), decision_h=decision_h)
-    inputs = script.burden_inputs(records)
-    for cell in inputs.cells.values():
-        assert cell.burden_by_k == {k: SENTINEL for k in REGROUNDING_KS}
-        assert cell.compounding_by_k == {k: SENTINEL for k in REGROUNDING_KS}
-    assert set(asked) == {decision_h}
-
-
-@pytest.mark.parametrize("field", ["decision_h", "ks"])
-def test_burden_inputs_refuses_a_pool_that_disagrees_on_the_one_value_it_takes(record, field):
-    """`BurdenInputs` holds ONE decision horizon and ONE ladder for nine cells, so
-    the pick is made where it is taken, and does not depend on
-    `require_one_protocol` having run first."""
-    records = _records_from(record, _scenario("COPIES"))
-    DISAGREEMENTS[field](records[LAST_CELL])
+    THE MUTATION THIS EXISTS FOR: `int(items[0][1]["decision_h"])` without the
+    agreement check in front of it. The odd record sorts last."""
+    records = _records_from(record, _spec(MIXED))
+    DISAGREEMENTS["decision_h"](records[LAST_CELL])
     with pytest.raises(SystemExit) as caught:
-        script.burden_inputs(records)
+        script.format_superseded_margin(records)
     message = str(caught.value)
-    assert f"disagree on {field}:" in message and "random_vit seed 2" in message, message
+    assert "disagree on decision_h:" in message and "random_vit seed 2" in message, message
 
 
 # --- the plan, and loading ---------------------------------------------------
 
 
-def test_read_phase_refuses_a_plan_narrower_than_the_bar_before_loading_anything(tmp_path):
-    """`--arms pixel_ae` cannot be read: Reading H needs `ARMS_REQUIRED` arms, and
-    falling through would print INDETERMINATE under a sentence about one arm --
-    a status the plan produced and the data did not. It raises, and BEFORE the
-    records are looked for: the directory below does not exist, so a plan check
-    made after the load would return 11 instead.
-
-    `--arms a a a` is ONE arm: counting the list would let it through."""
-    for arms in (["pixel_ae"], ["pixel_ae", "pixel_ae", "pixel_ae"]):
-        args = types.SimpleNamespace(out=tmp_path / "absent", arms=arms, seeds=[0, 1, 2])
-        with pytest.raises(SystemExit) as caught:
-            script.read_phase(args)
-        message = str(caught.value)
-        assert f"ARMS_REQUIRED={burden.ARMS_REQUIRED}" in message, message
-        assert "1 arm(s)" in message, message
-
-
-def test_two_arms_of_the_nine_are_a_readable_plan_and_only_they_are_pooled(
-    record, tmp_path, capsys,
-):
-    """Two arms is the bar, so it is readable; and the third arm's records are
-    on disk and outside the plan, so they must not be pooled."""
-    args = _read_args(
-        tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")),
-        arms=("pixel_ae", "frozen_ssl"),
-    )
-    assert script.read_phase(args) == 0
-    out = capsys.readouterr().out
-    assert "in 2 of 2 arms (frozen_ssl, pixel_ae)" in out, out
-    assert "random_vit" not in out
-
-
 def test_read_phase_names_the_first_missing_cell_and_exits_eleven(record, tmp_path, capsys):
     """Two cells are missing; the one the PLAN reaches first is the one named,
     and nothing is written."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     del records[SECOND_CELL], records[LAST_CELL]
     args = _read_args(tmp_path, records)
     assert script.read_phase(args) == script.EXIT_NO_CHECKPOINTS
@@ -2180,6 +1739,26 @@ def test_read_phase_names_the_first_missing_cell_and_exits_eleven(record, tmp_pa
     assert "NO CELL" in out and "frozen_ssl seed 1" in out and "random_vit seed 2" not in out, out
     assert "--phase measure" in out
     assert not (args.out / "burden.txt").exists()
+    assert "SUPERSEDED" not in out, "a pool with a hole is not printed as a table"
+
+
+def test_only_the_planned_cells_are_read_and_printed(record, tmp_path, capsys):
+    """The plan names the cells, and the records on disk outside it are not pooled:
+    `--arms pixel_ae` is a legitimate thing to want from an old record, and the third
+    arm's files are there and must not appear. No arm or seed minimum applies --
+    those belonged to a verdict.
+
+    THE MUTATION THIS EXISTS FOR: pooling whatever `burden_*.json` the directory
+    holds, which prints nine rows for a plan of three."""
+    spec = _spec(MIXED)
+    args = _read_args(tmp_path, _records_from(record, spec), arms=("pixel_ae",))
+    out, _ = _read_refusal(args, capsys)
+    planned = {cell: spec[cell] for cell in spec if cell[0] == "pixel_ae"}
+    assert len(planned) == 3
+    lines = out.splitlines()
+    at = lines.index(_expected_stored_table(planned)[0])
+    assert lines[at : at + 4] == _expected_stored_table(planned)
+    assert "frozen_ssl" not in out and "random_vit" not in out
 
 
 @pytest.mark.parametrize(
@@ -2224,7 +1803,7 @@ def test_a_record_filed_under_another_cells_name_is_refused(
     `first_file` is spelled out here, in the plan's order, not read off the code --
     and must not name the other file of the swap: asserting `a or b` would accept
     either, and `"seed" in message` is true of any message that mentions a seed."""
-    records = _records_from(record, _scenario("COPIES"))
+    records = _records_from(record, _spec(MIXED))
     one, other = swap
     records[one], records[other] = records[other], records[one]
     args = _read_args(tmp_path, records)
@@ -2239,55 +1818,13 @@ def test_a_record_filed_under_another_cells_name_is_refused(
 # --- what is written, and what is printed -----------------------------------
 
 
-def test_burden_txt_is_the_formatters_text_byte_for_byte_and_stdout_is_the_same_string(
-    record, tmp_path, capsys,
-):
-    """THE MUTATIONS THIS EXISTS FOR: `write_text(text.rstrip())`, and `print(text)`
-    on a string that already ends in a newline. Both are invisible to a test that
-    compares two reads of the SAME code (each read strips the same bytes), so the
-    expected text is built here, from the spec, by the formatter -- not by the
-    read phase -- and compared with the file and with stdout separately.
-
-    The precondition is asserted: the text ends in exactly one newline, which is
-    what `rstrip()` would lose and `print()` would double."""
-    spec = _scenario("PREDICTS_MOTION")
-    inputs = _expected_inputs(spec)
-    expected = burden.format_reading_burden(burden.reading_burden(inputs), inputs)
-    assert expected.endswith("\n") and not expected.endswith("\n\n")
-    args = _read_args(tmp_path, _records_from(record, spec))
-    assert script.read_phase(args) == 0
-    assert (args.out / "burden.txt").read_bytes() == expected.encode()
-    assert capsys.readouterr().out == expected
-
-
-def test_the_reading_is_byte_identical_on_two_reads(record, tmp_path):
-    """The point of the two-phase split: a reading reproducible from the records
-    without a GPU. Two independent reads, in two directories, of the same nine
-    records.
-
-    THE MUTATION THIS EXISTS FOR: `rstrip()` on the text. Two reads of the SAME
-    code strip the same bytes and agree with each other, so agreement alone
-    cannot see it -- both files are ALSO compared with the formatter's text,
-    built here from the spec, which ends in the newline `rstrip()` would lose."""
-    spec = _scenario("PREDICTS_MOTION")
-    inputs = _expected_inputs(spec)
-    expected = burden.format_reading_burden(burden.reading_burden(inputs), inputs).encode()
-    assert expected.endswith(b"\n") and not expected.endswith(b"\n\n")
-    records = _records_from(record, spec)
-    first, second = _read_args(tmp_path / "a", records), _read_args(tmp_path / "b", records)
-    assert script.read_phase(first) == script.read_phase(second) == 0
-    a, b = (first.out / "burden.txt").read_bytes(), (second.out / "burden.txt").read_bytes()
-    assert a == b
-    assert a == expected
-
-
 # --- main: the three phases --------------------------------------------------
 
 
 def _main(monkeypatch, argv, *, measure=0, read=0):
     """`main(argv)` with BOTH phases replaced by recorders, returning
-    `(status, phases_run)`. What this pins is the WIRING: which phase runs, in
-    which order, and whether a failed measure stops the read."""
+    `(status, phases_run)`. What this pins is the WIRING: which phase the flag runs,
+    and whose status comes back."""
     ran = []
 
     def fake_measure(args):
@@ -2303,29 +1840,23 @@ def _main(monkeypatch, argv, *, measure=0, read=0):
     return script.main(argv), ran
 
 
-def test_main_runs_the_phases_the_flag_names_and_returns_the_last_status(monkeypatch):
+def test_main_runs_the_phase_the_flag_names_and_returns_that_phases_status(monkeypatch):
+    """Each phase alone, and each phase's own status: `read` answers 11 here so that
+    a status taken from the other phase is a different number."""
     assert _main(monkeypatch, ["--phase", "measure"]) == (0, ["measure"])
     assert _main(monkeypatch, ["--phase", "read"]) == (0, ["read"])
-    assert _main(monkeypatch, ["--phase", "all"]) == (0, ["measure", "read"])
-    assert _main(monkeypatch, ["--phase", "read"], read=45) == (45, ["read"])
-    assert _main(monkeypatch, ["--phase", "all"], read=46) == (46, ["measure", "read"])
-
-
-def test_a_failed_measure_stops_phase_all_before_it_reads(monkeypatch):
-    """A measure that returned 14 wrote no record for its cell, and a read after
-    it would be over a pool missing that cell."""
-    assert _main(monkeypatch, ["--phase", "all"], measure=14, read=0) == (14, ["measure"])
+    assert _main(monkeypatch, ["--phase", "read"], read=11) == (11, ["read"])
+    assert _main(monkeypatch, ["--phase", "measure"], measure=14, read=0) == (14, ["measure"])
 
 
 @pytest.mark.parametrize("status", [11, 12, 14, 30])
 def test_a_failed_measure_is_the_exit_status_of_phase_measure_too(monkeypatch, status):
-    """`--phase measure` has no read after it, and that is exactly where a failed
-    measure's status could be dropped on the floor: the guard that stops the read
-    in `--phase all` is also what RETURNS the status, and a `--phase measure` that
-    fell through to `EXIT_OK` would print a success after a refused 30-minute run.
+    """`--phase measure` is the only phase that pays for anything, and a refused cell
+    is exactly where its status could be dropped on the floor: a `main` that returned
+    `EXIT_OK` after it would print a success after a refused 30-minute run.
 
-    THE MUTATION THIS EXISTS FOR: narrowing `main`'s `if status != EXIT_OK:` to
-    `and args.phase == "all"`. The statuses are the literals `measure_phase` can
+    THE MUTATION THIS EXISTS FOR: `return measure_phase(args)` -> `measure_phase(args)`
+    followed by `return EXIT_OK`. The statuses are the literals `measure_phase` can
     return (11, 12, 14 from the shared cell checks, 30 from the self-check), not
     `script.EXIT_*`, and `read` is made to answer 0 so a status that was read from
     the wrong phase is a different number."""
@@ -2336,7 +1867,8 @@ def test_a_failed_measure_is_the_exit_status_of_phase_measure_too(monkeypatch, s
 
 def test_the_default_phase_is_read_and_the_parser_names_the_three():
     """A default of `measure` would make a bare invocation pay for nine cells of
-    GPU time; `read` costs none and refuses by name when there are no records."""
+    GPU time; `read` costs none, prints the superseded margin of the records there
+    are, and refuses by name when there are none."""
     args = script._parser().parse_args([])
     assert args.phase == "read"
     assert script.PHASES == ("all", "measure", "read")
@@ -2346,90 +1878,280 @@ def test_the_default_phase_is_read_and_the_parser_names_the_three():
     assert caught.value.code == 2
 
 
-def test_phase_all_refuses_a_plan_it_could_not_read_before_measuring_anything(monkeypatch):
-    """`--phase all --arms pixel_ae` would be the whole measure followed by a
-    refusal at the read. `--phase measure` is allowed the same plan: the
-    milestone's smoke is one cell."""
-    ran = []
-    monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
-    with pytest.raises(SystemExit) as caught:
-        script.main(["--phase", "all", "--arms", "pixel_ae"])
-    assert f"ARMS_REQUIRED={burden.ARMS_REQUIRED}" in str(caught.value)
-    assert ran == []
-    assert _main(monkeypatch, ["--phase", "measure", "--arms", "pixel_ae"]) == (0, ["measure"])
-
-
-@pytest.mark.parametrize(
-    "seeds, distinct",
-    [
-        pytest.param(
-            [str(i) for i in range(burden.SEEDS_MINIMUM - 1)], burden.SEEDS_MINIMUM - 1,
-            id="one short of the minimum",
-        ),
-        pytest.param(["5"], 1, id="one seed"),
-        # `--seeds a a a` is ONE seed: counting the list would let it through, and
-        # the read would then find an arm with one seed.
-        pytest.param(["5"] * burden.SEEDS_MINIMUM, 1, id="enough listed, one distinct"),
-    ],
-)
-def test_phase_all_refuses_too_few_seeds_before_measuring_anything(
-    monkeypatch, seeds, distinct,
-):
-    """`--phase all --seeds 0 1` would measure all six cells and then come back 46:
-    every arm carries two seeds, and `reading_burden` refuses an arm short of
-    `SEEDS_MINIMUM`. The plan is known at the start, so the refusal is made there.
-
-    THE MUTATIONS THIS EXISTS FOR: dropping the check from `main`; counting the
-    seeds as listed instead of as distinct (the third case); and making the
-    check `<=` (see the boundary test below). It raises BY NAME rather than
-    returning 46 -- the numbered exits report what was found in the data -- and
-    `ran == []` is what says it came BEFORE the measure, not after it."""
-    ran = []
-    monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
-    monkeypatch.setattr(script, "read_phase", lambda args: ran.append("read") or 0)
-    with pytest.raises(SystemExit) as caught:
-        script.main(["--phase", "all", "--seeds", *seeds])
-    message = str(caught.value)
-    assert f"SEEDS_MINIMUM={burden.SEEDS_MINIMUM}" in message, message
-    assert f"{distinct} seed(s)" in message, message
-    assert ran == []
-
-
-def test_a_seed_plan_short_of_the_minimum_is_refused_only_where_it_would_waste_a_measure(
-    monkeypatch,
-):
-    """The seed check belongs to `--phase all` and to nothing else.
-
-    `--phase measure` is the milestone's smoke and may run one seed. `--phase read`
-    must REACH `read_phase` with a short plan, because that is where the short-arm
-    46 comes from (`test_an_arm_short_of_the_minimum_seeds_is_unreadable_not_a_raise`
-    drives it): a check in front of it would make the status unreachable. And
-    exactly `SEEDS_MINIMUM` seeds is a plan -- the boundary a `<=` would refuse.
-
-    THE MUTATIONS THIS EXISTS FOR: applying the check to `--phase measure` (the
-    first line fails), applying it to `--phase read` (the second), and `<=` for `<`
-    (the third)."""
-    short = ["--seeds", *(str(i) for i in range(burden.SEEDS_MINIMUM - 1))]
-    assert _main(monkeypatch, ["--phase", "measure", *short]) == (0, ["measure"])
-    assert _main(monkeypatch, ["--phase", "read", *short], read=46) == (46, ["read"])
-    enough = ["--seeds", *(str(i) for i in range(burden.SEEDS_MINIMUM))]
-    assert _main(monkeypatch, ["--phase", "all", *enough]) == (0, ["measure", "read"])
-
-
 def test_main_reads_the_arms_seeds_and_directory_the_command_line_names(
     monkeypatch, record, tmp_path, capsys,
 ):
     """The flag names reach the fields `read_phase` reads, through the real read
-    phase. The measure phase is made unreachable: a `--phase read` that fell into
-    it would load the real checkpoints from `--source`'s default."""
+    phase: two of the three arms are asked for and only they are printed, and a
+    second directory with no flag but `--out` prints all three (the default plan).
+    The measure phase is made unreachable: a `--phase read` that fell into it would
+    load the real checkpoints from `--source`'s default."""
     def forbidden(args):
         raise AssertionError("--phase read reached the measure phase")
 
     monkeypatch.setattr(script, "measure_phase", forbidden)
-    args = _read_args(tmp_path, _records_from(record, _scenario("PREDICTS_MOTION")))
+    args = _read_args(tmp_path, _records_from(record, _spec(MIXED)))
     argv = ["--phase", "read", "--out", str(args.out), "--arms", "pixel_ae", "frozen_ssl",
             "--seeds", "0", "1", "2"]
-    assert script.main(argv) == 0
-    assert "in 2 of 2 arms" in capsys.readouterr().out
-    broken = _read_args(tmp_path / "broken", _records_from(record, _scenario("UNRESOLVED_CONTROL")))
-    assert script.main(["--phase", "read", "--out", str(broken.out)]) == 45
+    with pytest.raises(SystemExit) as caught:
+        script.main(argv)
+    assert "scripts/motion_headroom.py" in str(caught.value)
+    out = capsys.readouterr().out
+    assert "pixel_ae" in out and "frozen_ssl" in out and "random_vit" not in out
+
+    everything = _read_args(tmp_path / "all", _records_from(record, _spec(MIXED)))
+    with pytest.raises(SystemExit):
+        script.main(["--phase", "read", "--out", str(everything.out)])
+    out = capsys.readouterr().out
+    assert all(arm in out for arm in READ_ARMS)
+
+
+# ---------------------------------------------------------------------------
+# M3n retired the motion statistic: no new margin, and a read that refuses.
+# ---------------------------------------------------------------------------
+
+
+def test_the_record_carries_no_motion_margin_or_the_interval_it_was_drawn_with(record, tmp_path):
+    """New records must not carry a `margin`. Old records keep theirs and stay
+    readable; the point is to stop producing new contaminated numbers.
+
+    ASKED OF THE WRITTEN RECORD'S KEYS, not of the source text of `measure_cell`:
+    a source search for "margin" fails on any comment that uses the word, and says
+    nothing about what the function returns. And top-level keys only -- the
+    rulers are named `floor_margin_standard_error`, the margin over the FLOOR,
+    which is `burden(1)`'s ruler and survives.
+
+    `window_margin` is the per-window array the intervals were drawn from, and
+    `confidence` / `resamples` describe an estimator that no longer runs: a record
+    that names a level and a draw count for an interval it does not hold is worse
+    than one that names neither.
+
+    THE MUTATIONS THIS EXISTS FOR: restoring the `margin` loop (which carries the
+    other three with it), and restoring any one of the four keys alone.
+
+    The fixture is a REAL record, shown by the ladder keys it carries: a record
+    that was empty would pass every absence below.
+    """
+    for kept in ("curves", "burden_by_k", "compounding_by_k", "controls", "base_control", "rulers"):
+        assert kept in record, kept
+    for gone in ("margin", "window_margin", "confidence", "resamples"):
+        assert gone not in record, gone
+    written = script.write_record(tmp_path / "burden.json", record)
+    assert "margin" not in load_record(tmp_path / "burden.json")
+    assert "margin" not in written
+
+
+def test_the_script_no_longer_holds_what_only_reading_h_used():
+    """The pieces of the verdict that lived HERE go with it: the table that built
+    `BurdenInputs`, the exit map from its two refusal statuses, and the two plan
+    checks that existed so a verdict could be taken.
+
+    `EXIT_CONTROL_BROKEN` and `EXIT_UNREADABLE` stay as constants (45 and 46):
+    they are in the exit-code registry, and a number M3m reported must not be
+    reissued to another failure.
+    """
+    for gone in (
+        "burden_inputs", "READ_EXITS", "require_readable_plan",
+        "require_seeds_for_a_verdict",
+    ):
+        assert not hasattr(script, gone), f"{gone} must be removed"
+    assert (script.EXIT_CONTROL_BROKEN, script.EXIT_UNREADABLE) == (45, 46)
+
+
+def test_the_read_phase_prints_the_stored_margin_of_every_cell_and_then_refuses(
+    record, tmp_path, capsys,
+):
+    """Reading H is retired. The records stay readable, so the margin each one
+    STORED is printed -- every cell, at the decision horizon, in `sorted()` order
+    -- and then the read refuses by name, `SystemExit` and status 1.
+
+    THE FIXTURE DISCRIMINATES: nine cells, each with its own point and bounds, and
+    a decoy of about a thousand at every other horizon, so a margin read at the
+    wrong horizon, from another cell, or from another key is a different number.
+    Distinct values are asserted rather than assumed.
+
+    THE EXPECTED TABLE IS BUILT FROM THE SPEC, not by the script.
+    """
+    spec = _spec(MIXED)
+    assert len({(c["point"], c["low"], c["high"]) for c in spec.values()}) == 9
+    args = _read_args(tmp_path, _records_from(record, spec))
+    out, message = _read_refusal(args, capsys)
+    lines = out.splitlines()
+    at = lines.index(_expected_stored_table(spec)[0])
+    assert lines[at : at + 10] == _expected_stored_table(spec)
+    assert "motion_headroom" in message
+
+
+def test_the_stored_margin_is_printed_under_a_legend_that_says_it_is_superseded_and_why(
+    record, tmp_path, capsys,
+):
+    """A reader of an old record is not left to rediscover the contamination.
+
+    `motion_margin` subtracted the k=1 rung, read through the probe, from the true
+    one-step displacement, a ground-truth quantity: on M3m's nine cells the median
+    floor error alone was 88.29-224.36 against a displacement of 3.97, so the
+    readout dominated the difference 22.2x-56.5x. A negative stored margin is that
+    error, and the legend must NOT tell the reader it means the model copies --
+    the sentence that made this hazard.
+
+    The figures are M3m's own, quoted from its plan; they are a claim about those
+    nine cells and the legend says so. The test pins the substance of each of the
+    four things the legend has to say, not its wording.
+    """
+    args = _read_args(tmp_path, _records_from(record, _spec(MIXED)))
+    out, _ = _read_refusal(args, capsys)
+    assert out.startswith("--- SUPERSEDED"), out
+    legend = out[out.index(_expected_stored_table(_spec(MIXED))[-1]):]
+    lowered = legend.lower()
+    assert "superseded" in lowered
+    assert "22.2x-56.5x" in legend
+    assert "88.29-224.36" in legend and "3.97" in legend
+    assert "readout error" in lowered
+    assert "does not mean the one-step map copies" in lowered
+    assert "scripts/motion_headroom.py" in legend
+    # A refusal is not a reading: no status, no verdict line, nothing that claims
+    # one of the old four.
+    for claim in ("verdict:", "PREDICTS", "COPIES", "INDETERMINATE", "UNREADABLE"):
+        assert claim not in out, claim
+
+
+def test_the_refusal_names_the_replacement_and_says_no_reading_was_taken(
+    record, tmp_path, capsys,
+):
+    """The message the operator is refused with is what the exit carries, so it
+    must name the script that replaced the reading, and say that nothing was
+    taken or written."""
+    args = _read_args(tmp_path, _records_from(record, _spec(MIXED)))
+    _, message = _read_refusal(args, capsys)
+    assert "scripts/motion_headroom.py" in message
+    assert "Reading H is retired" in message
+    assert "no burden.txt" in message
+
+
+def _make_no_change(args, record) -> None:
+    """The retirement itself: the records are fine, and the read refuses anyway."""
+
+
+UNTOUCHED_AFTER = {
+    # name: (what to change first, what the read does -- an exit number, or SystemExit)
+    "the retirement": (_make_no_change, SystemExit),
+    "a missing cell": (_make_cell_missing, script.EXIT_NO_CHECKPOINTS),
+    "a protocol disagreement": (_make_protocol_disagree, SystemExit),
+}
+
+
+@pytest.mark.parametrize("exit_way", sorted(UNTOUCHED_AFTER))
+def test_the_retired_read_writes_nothing_and_removes_nothing(
+    record, tmp_path, capsys, monkeypatch, exit_way,
+):
+    """The records directory is as shared as `runs/` is: a read that unlinked a
+    `burden.txt` an EARLIER read left would delete an artefact the M3m spec may
+    cite, to protect a reader from a reading this script can no longer take.
+
+    THE MUTATIONS THIS EXISTS FOR: writing `burden.txt` (a refusal is not a
+    reading), and the old `unlink(missing_ok=True)` at the top of `read_phase`, which
+    every way out of the function used to pass through. Asked of all three ways out
+    -- the retirement, a missing cell, a protocol disagreement -- so an unlink moved
+    to any one of them is seen. The directory must hold, byte for byte, exactly what
+    it held, and three bystanders -- a `burden.txt` beside `--out` and one in the
+    current directory, and a `.txt` that is not `burden.txt` inside it -- are asked
+    about as well, which an over-wide unlink would find.
+
+    The one change a case makes is a record REMOVED or REWRITTEN, so `before` is
+    taken after it."""
+    change, outcome = UNTOUCHED_AFTER[exit_way]
+    args = _read_args(tmp_path, _records_from(record, _spec(MIXED)))
+    earlier = args.out / "burden.txt"
+    earlier.write_text("a reading an earlier read left\n")
+    (args.out / "notes.txt").write_text("not a reading\n")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    bystanders = [tmp_path / "burden.txt", cwd / "burden.txt"]
+    for bystander in bystanders:
+        bystander.write_text("not this one")
+
+    change(args, record)
+    before = {p.name: p.read_bytes() for p in args.out.iterdir()}
+    assert "burden.txt" in before
+    if isinstance(outcome, int):
+        assert script.read_phase(args) == outcome
+    else:
+        with pytest.raises(outcome):
+            script.read_phase(args)
+    capsys.readouterr()
+
+    assert {p.name: p.read_bytes() for p in args.out.iterdir()} == before
+    for bystander in bystanders:
+        assert bystander.read_text() == "not this one", bystander
+
+
+def test_a_directory_with_no_earlier_reading_is_left_without_one(record, tmp_path, capsys):
+    """The other half: the retirement is not a reading, so it must not CREATE a
+    `burden.txt` where there was none."""
+    args = _read_args(tmp_path, _records_from(record, _spec(MIXED)))
+    before = sorted(p.name for p in args.out.iterdir())
+    _read_refusal(args, capsys)
+    assert sorted(p.name for p in args.out.iterdir()) == before
+    assert "burden.txt" not in before
+
+
+def test_the_margin_is_read_at_the_decision_horizon_the_records_name(record, tmp_path, capsys):
+    """The decision horizon is the RECORDS', and at 30 the step is not the last
+    one: a read at 45, at the first horizon, or at the largest key is another
+    number. Every other horizon carries a decoy near a thousand."""
+    spec = _spec(MIXED)
+    records = _records_from(record, spec, decision_h=30)
+    args = _read_args(tmp_path, records)
+    out, _ = _read_refusal(args, capsys)
+    assert "horizon 30" in out.splitlines()[0]
+    lines = out.splitlines()
+    assert lines[1 : 1 + 10] == _expected_stored_table(spec)
+
+
+def test_a_record_written_after_the_retirement_is_printed_as_carrying_no_margin(
+    record, tmp_path, capsys,
+):
+    """The measure phase no longer writes a `margin`, so a record it wrote has
+    none to print. The read does not raise a bare `KeyError`: the cell is listed,
+    its three columns say so, and the legend names what the dash means. Cells that
+    DO carry one are unaffected -- only one of the nine is stripped.
+
+    THE MUTATION THIS EXISTS FOR: `record["margin"]` where `record.get("margin")`
+    stood, which crashes on every record the retired measure phase writes."""
+    spec = _spec(MIXED)
+    records = _records_from(record, spec)
+    stripped = sorted(records)[4]
+    del records[stripped]["margin"]
+    args = _read_args(tmp_path, records)
+    out, _ = _read_refusal(args, capsys)
+    table = _expected_stored_table(spec)
+    table[1 + 4] = _stored_row((stripped[0], stripped[1], "-", "-", "-"))
+    lines = out.splitlines()
+    at = lines.index(table[0])
+    assert lines[at : at + 10] == table
+    assert "no margin" in out.lower()
+
+    # ... and a pool where every record has one does not print that line.
+    full = _read_args(tmp_path / "full", _records_from(record, spec))
+    out, _ = _read_refusal(full, capsys)
+    assert "no margin" not in out.lower()
+
+
+def test_phase_all_is_refused_by_name_before_anything_is_measured(monkeypatch):
+    """`--phase all` was the measure and then the read. The read is retired, so
+    `all` would pay for every cell and then refuse. It is refused instead, BY NAME
+    and BEFORE the first cell, pointing at the two things that still work.
+
+    `ran == []` is what says it came before the measure and not after it. The
+    other two phases are unaffected."""
+    ran = []
+    monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
+    monkeypatch.setattr(script, "read_phase", lambda args: ran.append("read") or 0)
+    with pytest.raises(SystemExit) as caught:
+        script.main(["--phase", "all"])
+    message = str(caught.value)
+    assert "scripts/motion_headroom.py" in message and "--phase measure" in message, message
+    assert ran == []
+    assert _main(monkeypatch, ["--phase", "measure"]) == (0, ["measure"])
+    assert _main(monkeypatch, ["--phase", "read"]) == (0, ["read"])

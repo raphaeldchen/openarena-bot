@@ -688,12 +688,12 @@ def percentile_interval(replicates: np.ndarray) -> tuple[float, float, float]:
     """Return (low, high, se) at the 2.5/97.5 percentiles, `se` the sample
     standard deviation with `ddof=1`, or NaN for a single replicate.
 
-    PUBLIC because `clustered_interval` consumes it, and the tests pin the
-    `CONFIDENCE` labels against it: `test_burden` for `burden.CONFIDENCE`,
-    `test_motion_headroom_script` for `headroom.CONFIDENCE`. The percentiles are
-    HARD-CODED, not derived from either label, and `pool_ratio` and
-    `paired_ratio_contrast` take them too; moving them moves all three callers
-    and fails both pins."""
+    PUBLIC because `clustered_interval` consumes it, and a test pins the
+    `CONFIDENCE` label against it: `test_motion_headroom_script` for
+    `headroom.CONFIDENCE`. (M3m's `burden.CONFIDENCE` was the other, and went with
+    the interval it labelled.) The percentiles are HARD-CODED, not derived from the
+    label, and `pool_ratio` and `paired_ratio_contrast` take them too; moving them
+    moves all three callers and fails that pin."""
     low, high = np.percentile(replicates, [2.5, 97.5])
     se = float(replicates.std(ddof=1)) if replicates.size > 1 else float("nan")
     return float(low), float(high), se
@@ -742,9 +742,9 @@ def clustered_interval(
     motion margin. Nothing about the resampling is margin-specific, and M3n
     reads three different difference arrays through it per (k, h).
 
-    PUBLIC because `scripts/prediction_burden.py` consumes it, and M3n's
-    `scripts/motion_headroom.py` will. A second copy of this bootstrap would be
-    the wrong answer."""
+    PUBLIC because M3n's `scripts/motion_headroom.py` consumes it, as
+    `scripts/prediction_burden.py` did for M3m's margin until that statistic was
+    removed. A second copy of this bootstrap would be the wrong answer."""
     window_rows = np.asarray(window_rows, dtype=np.float64)
     groups = np.asarray(groups)
     if window_rows.ndim != 2:

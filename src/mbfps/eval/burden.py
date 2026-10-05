@@ -1,4 +1,4 @@
-"""The prediction-burden decomposition -- milestone M3m.
+"""The prediction-burden ladder -- milestone M3m's decomposition, kept by M3n.
 
 M3l refuted the bottleneck lever: the latent carries at most 1.11% of its
 160-bit ceiling. That left the OBJECTIVE lever, standing by elimination. The
@@ -16,10 +16,27 @@ observation corrects the rollout, over `diagnostics.REGROUNDING_KS` -- and `h`
 is the HORIZON STEP. Both were called `k` in an early draft of the spec. Write
 `burden(k, h)`.
 
+WHERE THE MOTION STATISTIC WENT. This module once also held M3m's
+`motion_margin` -- the true one-step displacement minus the k=1 rung -- and
+Reading H, the status read from it. Both were removed in M3n, and
+`eval.headroom` is what replaced them: its three differences are all taken in
+probe space, on the same windows, over one denominator. `motion_margin`
+subtracted a probe-space model error (a median floor error of 88-224 map units on
+M3m's nine cells) from a ground-truth displacement (3.97), so the readout error
+dominated the difference 22.2x-56.5x, the base control failed 9 of 9 and Reading H
+shipped UNREADABLE. It was removed rather than deprecated, because a live
+function whose legend says a reading of -116 means COPIES is a standing trap,
+and conditioning its legend was the right fix only while the records had to stay
+readable. What is left is the ladder -- `burden`, `compounding`,
+`identity_residual` and what they share -- which was right and which `headroom`
+builds on: its `deficit` IS `burden`, and it imports `checked_pair` and
+`strict_majority` from here. M3m's records still carry the `margin` they stored,
+and `scripts/prediction_burden.py --phase read` prints it under a legend saying
+it is superseded and why.
+
 This module loads no checkpoint, touches no device and reads no file: every
-number Reading H reports is a function of arrays, so it is testable without a
-GPU. `scripts/prediction_burden.py` owns the model, the device and the record
-schema.
+number it returns is a function of arrays, so it is testable without a GPU.
+`scripts/prediction_burden.py` owns the model, the device and the record schema.
 
 IT IS NOT TORCH-FREE IN ITS IMPORT GRAPH, and that is deliberate. It imports
 `probe.position_error` so that the position metric has ONE definition, and
@@ -30,27 +47,14 @@ destroyed a signal once, when the model and the floor were probed through
 differently fitted pipelines. One shared definition beats a clean import.
 """
 
-from dataclasses import dataclass
-
 import numpy as np
 
 from mbfps.eval.probe import position_error
 
-DECISION_H: int = 45
-"""The horizon the status is read at -- the M3 gate's own horizon.
-
-Not a free choice: `gap_closed(45)` is the criterion that has failed since M3c,
-so a reading at any other horizon would answer a question the gate does not
-ask. It must appear in `REPORTED_H`, or the status would be read at a horizon
-the table never prints.
-"""
-
 REPORTED_H: tuple[int, ...] = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)
-"""The reporting grid, as raw levels, so a reader may apply a different horizon
-rather than inheriting `DECISION_H`."""
-
-ARMS_REQUIRED: int = 2
-"""Of three. Matches every milestone from M3i onward."""
+"""The reporting grid, as raw levels, so a reader may apply any horizon on it
+rather than being handed one. `headroom.REPORTED_H` repeats it unchanged, so the
+two milestones' tables sit on the same grid."""
 
 IDENTITY_TOLERANCE: float = 1e-9
 """The bound on the decomposition's floating-point residual.
@@ -86,15 +90,6 @@ near 5e6 reach 2.9802322387695312e-08, about thirty times this tolerance;
 `test_the_identity_residual_is_measured_and_its_tolerance_is_reachable` pins
 exactly that.
 """
-
-CONFIDENCE: float = 0.95
-"""The interval's level. `pooling.percentile_interval` takes the 2.5/97.5
-percentiles, so this constant DESCRIBES that function rather than configuring
-it -- a test pins the two together, because a record that names a level the
-estimator did not take is worse than a record that names none."""
-
-RESAMPLES: int = 2000
-"""Episode draws per interval. `pooling.pool_ratio` uses the same count."""
 
 
 def at_horizon(curve: np.ndarray, h: int) -> float:
@@ -211,9 +206,11 @@ def scored_targets(window_targets: np.ndarray) -> np.ndarray:
 def one_step_persistence(window_targets: np.ndarray) -> np.ndarray:
     """The error of predicting each scored frame by the frame before it.
 
-    This IS the true one-step displacement -- ground truth, no model involved,
-    which is what makes `motion_margin` a level rather than a difference of two
-    estimates.
+    This IS the true one-step displacement -- ground truth, no model involved.
+    M3m subtracted the k=1 rung from it, and that statistic is gone (see the
+    module docstring); it is read now only by the script's base control and
+    recorded as a curve, and its median, `headroom.DISPLACEMENT_RECORDED_ONLY`, is
+    used by no statistic.
 
     NOT the recorded `persistence_position`. That copies the position at `t`,
     the last frame the OPEN LOOP saw, so comparing it with the k=1 rung -- which
@@ -226,22 +223,12 @@ def one_step_persistence(window_targets: np.ndarray) -> np.ndarray:
     return position_error(window_targets[:-1], scored)
 
 
-def motion_margin(window_targets: np.ndarray, curve_one: np.ndarray) -> np.ndarray:
-    """`one_step_persistence - the k=1 rung`, per horizon step.
-
-    Positive means one prior step from a posterior-grounded state beats
-    assuming the agent did not move.
-    """
-    baseline, curve_one = checked_pair(
-        one_step_persistence(window_targets), curve_one
-    )
-    return baseline - curve_one
-
-
 SEEDS_MINIMUM: int = 3
-"""An arm with fewer seeds is refused by name rather than tallied.
+"""The seed bar M3m's Reading H refused an arm below, by name, rather than
+tallying it. Nothing in this module enforces it now that Reading H is gone;
+`headroom.SEEDS_MINIMUM` is the copy M3n's reading enforces.
 
-`strict_majority(1) == 1`, so without this a single lucky cell would establish
+`strict_majority(1) == 1`, so without a bar a single lucky cell would establish
 an arm -- the M3j trap where `--arms random_vit` printed a row reading
 `clears = up` beside a verdict of NO DIFFERENCE.
 """
@@ -256,339 +243,3 @@ def strict_majority(n: int) -> int:
     if n < 1:
         raise ValueError(f"a majority needs at least one seed, got {n}")
     return n // 2 + 1
-
-
-@dataclass(frozen=True)
-class BurdenArm:
-    """One cell: one arm at one seed, at `DECISION_H`."""
-
-    arm: str
-    seed: int
-    margin: float
-    margin_low: float
-    margin_high: float
-    burden_by_k: dict[int, float]
-    compounding_by_k: dict[int, float]
-    identity_residual: float
-    open_loop_divergence: float
-    k_one_is_floor: bool
-    displacement_median: float
-    floor_median: float
-    clusters: int
-    rows: int
-
-    def __post_init__(self) -> None:
-        if self.margin_low > self.margin_high:
-            raise ValueError(
-                f"{self.arm} seed {self.seed}: an interval cannot have "
-                f"ci_low {self.margin_low} above ci_high {self.margin_high}"
-            )
-
-    @property
-    def controls_ok(self) -> bool:
-        """Every known answer hit. Checked before any status is tallied."""
-        return (
-            abs(self.identity_residual) <= IDENTITY_TOLERANCE
-            and self.open_loop_divergence == 0.0
-            and not self.k_one_is_floor
-        )
-
-    @property
-    def base_ok(self) -> bool:
-        """True motion exceeds the readout's own error, so a margin is
-        detectable at all. Self-calibrating: a ratio of two measured
-        quantities, not a magic constant."""
-        return self.displacement_median > self.floor_median
-
-
-@dataclass(frozen=True)
-class BurdenInputs:
-    cells: dict[tuple[str, int], BurdenArm]
-    decision_h: int
-    ks: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class BurdenStatus:
-    status: str
-    rule: str
-    arms_motion: tuple[str, ...]
-    arms_copies: tuple[str, ...]
-    seeds_total: dict[str, int]
-
-
-def _fall_through_rule(
-    arms_motion: tuple[str, ...], arms_copies: tuple[str, ...],
-    decision_h: int, n_arms: int,
-) -> str:
-    """The `INDETERMINATE` sentence, built from the two tallies it is a verdict on.
-
-    THE CONDITION IS THAT NEITHER TALLY REACHED `ARMS_REQUIRED`, and nothing
-    stronger. The first draft said "the motion_margin interval straddles 0",
-    which holds only when no arm cleared; it was printed verbatim when one arm
-    cleared motion alone and when two arms cleared in opposite directions, where
-    the clearing arms' intervals do not straddle anything. So the sentence
-    reports what DID clear, and names which of three situations this is: no arm
-    clearing either way, the clearing arms all pointing one way but too few, or
-    the arms splitting. The second and third are different results and the
-    artefact has to let a reader tell them apart.
-
-    The sentence ships in `burden.txt`; its wording is specification.
-    """
-    def tally(arms: tuple[str, ...]) -> str:
-        return f"{len(arms)} of {n_arms} arms ({', '.join(arms) or 'none'})"
-
-    if arms_motion and arms_copies:
-        situation = (
-            "the arms clear in opposite directions, so the reading is split, "
-            "not merely short"
-        )
-    elif arms_motion or arms_copies:
-        short = ARMS_REQUIRED - len(arms_motion or arms_copies)
-        situation = (
-            "every arm that clears does so in the same direction, and the "
-            f"reading falls short of the bar by {short} arm(s)"
-        )
-    else:
-        situation = (
-            "no arm has a strict majority of its seeds clearing 0 in either "
-            "direction"
-        )
-    return (
-        f"neither decisive status reaches {ARMS_REQUIRED} arms at horizon "
-        f"{decision_h}. An arm clears motion when the whole motion_margin "
-        "interval is above 0, and copies when it is at or below 0, in a "
-        f"strict majority of its seeds. Here motion is cleared by "
-        f"{tally(arms_motion)} and copies by {tally(arms_copies)}: "
-        f"{situation}. This status is the fall-through, not a bar that was "
-        "cleared, so it arrived by default rather than by evidence and "
-        "licenses no positive claim in either direction"
-    )
-
-
-def reading_burden(inputs: BurdenInputs) -> BurdenStatus:
-    """Reading H: is the rollout compounding, or did the one-step map never
-    learn motion?
-
-    PRECEDENCE. `UNRESOLVED_CONTROL` outranks everything: a reading taken from
-    an estimator that missed a known answer is not a weaker reading, it is not
-    a reading. `UNREADABLE` comes next, because a cell where the agent barely
-    moved would read COPIES for a reason that has nothing to do with the
-    objective. Only then are the two decisive statuses tallied, and
-    `INDETERMINATE` is the fall-through.
-
-    THE TWO DECISIVE STATUSES CANNOT BOTH REACH THE BAR AT THREE ARMS. With
-    `ARMS_REQUIRED = 2` and three arms, 2 + 2 > 3, and no arm sits in both
-    tallies (an interval cannot be both above 0 and at or below 0). That is a
-    fact about the arm COUNT, not about the statuses: with four arms, two
-    clearing motion and two clearing copies is a contradiction, and an order of
-    checks would resolve it by statement order rather than by evidence. So it
-    raises, naming both sets. It is unreachable today and becomes reachable only
-    if the arm count grows; if it does, the reading has to be redesigned, not
-    patched with a preference.
-
-    An EMPTY cell set raises too: it has no arm to read or to name, so neither
-    the control check nor the short-arm refusal can catch it, and it would
-    otherwise fall through to INDETERMINATE under a sentence about "0 arms".
-
-    THE ASYMMETRY, AND WHERE IT HOLDS. Both decisive statuses are levels against
-    an exactly known baseline -- the true one-step displacement -- measured on
-    the same windows. That makes a reading in EITHER direction evidence ONLY IN A
-    CELL THE BASE CONTROL ADMITS, where the median true one-step displacement
-    exceeds the median floor error. The margin subtracts a probe-space quantity
-    (the k=1 rung) from a ground-truth one that pays no readout error, so it
-    carries the readout error with it: outside the gate a negative margin IS
-    that error, and a perfect one-step predictor would read negative too. On M3m's
-    own nine cells the gate refused all nine, and the margin sat within 0.1% to
-    5.8% of the value a perfect predictor would have read (`## Task 7 results`,
-    in the plan). That is why `UNREADABLE` outranks both statuses above, and why
-    the sentences below are conditioned on it. Inside the gate this is the
-    structural difference from M3k, whose statistic spoke in one direction only,
-    and from M3l, whose `bits_carried` upper-bounds the joint and was
-    trustworthy only below a cut.
-    """
-    if not inputs.cells:
-        raise ValueError(
-            "Reading H was given an empty cell set: there is no arm to read, "
-            "so no status can be taken and none is returned"
-        )
-    by_arm: dict[str, list[BurdenArm]] = {}
-    for cell in inputs.cells.values():
-        by_arm.setdefault(cell.arm, []).append(cell)
-    seeds_total = {arm: len(cells) for arm, cells in by_arm.items()}
-
-    broken = sorted(
-        f"{c.arm} seed {c.seed}" for c in inputs.cells.values() if not c.controls_ok
-    )
-    if broken:
-        return BurdenStatus(
-            status="UNRESOLVED_CONTROL",
-            rule=(
-                "a control with a known answer was missed in "
-                f"{', '.join(broken)}: the identity residual must stay within "
-                f"{IDENTITY_TOLERANCE:g}, the k=45 rung must reproduce the "
-                "record bitwise (open_loop_divergence 0.0), and the k=1 rung "
-                "must sit strictly above the floor. A reading taken from an "
-                "estimator that missed a known answer is not a weaker reading, "
-                "it is not a reading"
-            ),
-            arms_motion=(), arms_copies=(), seeds_total=seeds_total,
-        )
-
-    stationary = sorted(
-        f"{c.arm} seed {c.seed}" for c in inputs.cells.values() if not c.base_ok
-    )
-    short = sorted(arm for arm, n in seeds_total.items() if n < SEEDS_MINIMUM)
-    if stationary or short:
-        causes = []
-        if stationary:
-            causes.append(
-                "the median true one-step displacement does not exceed the "
-                f"median floor error in {', '.join(stationary)}, so no method "
-                "could detect motion prediction there"
-            )
-        if short:
-            causes.append(
-                "; ".join(
-                    f"{arm} carries {seeds_total[arm]} seed(s), fewer than "
-                    f"{SEEDS_MINIMUM}" for arm in short
-                )
-                + ", and an arm short of the minimum is refused by name rather "
-                "than tallied"
-            )
-        return BurdenStatus(
-            status="UNREADABLE", rule="; ".join(causes),
-            arms_motion=(), arms_copies=(), seeds_total=seeds_total,
-        )
-
-    def clearing(predicate) -> tuple[str, ...]:
-        return tuple(sorted(
-            arm for arm, cells in by_arm.items()
-            if sum(1 for c in cells if predicate(c)) >= strict_majority(len(cells))
-        ))
-
-    arms_motion = clearing(lambda c: c.margin_low > 0.0)
-    arms_copies = clearing(lambda c: c.margin_high <= 0.0)
-
-    if len(arms_motion) >= ARMS_REQUIRED and len(arms_copies) >= ARMS_REQUIRED:
-        raise ValueError(
-            f"PREDICTS_MOTION ({', '.join(arms_motion)}) and COPIES "
-            f"({', '.join(arms_copies)}) each reach {ARMS_REQUIRED} arms at "
-            f"horizon {inputs.decision_h}: the two decisive statuses "
-            "contradict each other, and the reading cannot be taken. No arm "
-            f"is in both tallies, so both reach {ARMS_REQUIRED} only with at "
-            f"least {2 * ARMS_REQUIRED} arms, and there are {len(by_arm)}: "
-            "the arm count has outgrown the bar"
-        )
-
-    if len(arms_motion) >= ARMS_REQUIRED:
-        return BurdenStatus(
-            status="PREDICTS_MOTION",
-            rule=(
-                f"the whole motion_margin interval clears 0 at horizon "
-                f"{inputs.decision_h} in {len(arms_motion)} of "
-                f"{len(by_arm)} arms ({', '.join(arms_motion)}), each in a "
-                "strict majority of its seeds: one prior step from the true "
-                "state beats assuming the agent did not move, so the one-step "
-                "map predicts real motion and what fails is rolling it "
-                "forward. The readout error pushes this margin NEGATIVE -- a "
-                "perfect one-step predictor still pays it while the "
-                "ground-truth baseline does not -- so clearing 0 is a "
-                "conservative result rather than a flattered one, and the base "
-                "control passed in every cell. A multi-step or overshooting "
-                "objective is the indicated intervention"
-            ),
-            arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
-        )
-    if len(arms_copies) >= ARMS_REQUIRED:
-        return BurdenStatus(
-            status="COPIES",
-            rule=(
-                f"the whole motion_margin interval sits at or below 0 at "
-                f"horizon {inputs.decision_h} in {len(arms_copies)} of "
-                f"{len(by_arm)} arms ({', '.join(arms_copies)}), each in a "
-                "strict majority of its seeds: one prior step from the TRUE "
-                "state is no better than assuming stillness, and the base "
-                "control passed in every cell (the median true one-step "
-                "displacement exceeds the median floor error), so that "
-                "margin is not only the readout error. A longer-horizon term "
-                "cannot rescue this and the target itself must change"
-            ),
-            arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
-        )
-    return BurdenStatus(
-        status="INDETERMINATE",
-        rule=_fall_through_rule(
-            arms_motion, arms_copies, inputs.decision_h, len(by_arm)
-        ),
-        arms_motion=arms_motion, arms_copies=arms_copies, seeds_total=seeds_total,
-    )
-
-
-READING_COLUMNS: tuple[str, ...] = (
-    "arm", "seed", "margin", "ci_low", "ci_high", "burden_k", "comp_k", "clears",
-)
-"""`burden_k` and `comp_k` are `burden(k = ks[-1], h = decision_h)`: the rung of
-the ladder is the LAST re-grounding period and the horizon is the decision
-horizon, and both happen to be 45 in production. The labels carry neither
-number, because a header is a constant and the values are not -- a label saying
-`45` would not say which axis, and would lie the day `ks[-1]` changed. The
-legend, which is built per call, states both."""
-READING_WIDTHS: tuple[int, ...] = (13, 6, 11, 11, 11, 11, 11, 17)
-
-
-def _row(values, widths) -> str:
-    return "".join(f"{str(v):>{w}}" for v, w in zip(values, widths, strict=True))
-
-
-def format_reading_burden(reading: BurdenStatus, inputs: BurdenInputs) -> str:
-    """Reading H as `burden.txt` carries it, byte for byte.
-
-    Every number in the caption and the legend is interpolated from the module
-    -- the decision horizon, the identity tolerance, the arm bar -- so a
-    constant that drifts cannot leave a stale literal behind. M3l shipped a
-    legend saying "floor exactly 0" over a 1e-9 check and ~1e-13 values, and it
-    is still an open follow-up.
-    """
-    lines = [
-        f"--- Reading H: the prediction burden at horizon {inputs.decision_h} "
-        f"(re-grounding periods k = {', '.join(str(k) for k in inputs.ks)})",
-        _row(READING_COLUMNS, READING_WIDTHS),
-    ]
-    for (arm, seed), cell in sorted(inputs.cells.items()):
-        clears = (
-            "motion" if cell.margin_low > 0.0
-            else "copies" if cell.margin_high <= 0.0
-            else "-"
-        )
-        lines.append(_row(
-            (
-                arm, seed,
-                f"{cell.margin:+.4f}", f"{cell.margin_low:+.4f}",
-                f"{cell.margin_high:+.4f}",
-                f"{cell.burden_by_k[inputs.ks[-1]]:+.4f}",
-                f"{cell.compounding_by_k[inputs.ks[-1]]:+.4f}",
-                clears,
-            ),
-            READING_WIDTHS,
-        ))
-    lines += [
-        "  margin = the true one-step displacement minus the k=1 rung, so "
-        "POSITIVE means one prior step from the true state beats assuming the "
-        "agent did not move. The displacement is ground truth but the rung is "
-        "read through the probe, so the margin carries the readout error: a "
-        "reading in EITHER direction is evidence only where the base control "
-        "passed, the median true one-step displacement exceeding the median "
-        f"floor error at horizon {inputs.decision_h}, and below that gate a "
-        "negative margin is the readout error",
-        f"  {READING_COLUMNS[5]}/{READING_COLUMNS[6]} = "
-        f"burden(k={inputs.ks[-1]}, h={inputs.decision_h}) and "
-        f"compounding(k={inputs.ks[-1]}, h={inputs.decision_h}), where k is the "
-        "re-grounding period, the last of those listed above, and h is the "
-        "horizon step; compounding(k=1) is 0 by construction and the identity "
-        f"residual is held within {IDENTITY_TOLERANCE:g}",
-        f"  a status needs a strict majority of each arm's seeds in at least "
-        f"{ARMS_REQUIRED} of {len(reading.seeds_total)} arms",
-        f"  verdict: {reading.status.replace('_', ' ')} -- decided by: {reading.rule}",
-    ]
-    return "\n".join(lines) + "\n"

@@ -784,8 +784,8 @@ def test_each_recorded_constant_moves_when_the_modules_own_name_moves(
 
 def test_the_recorded_confidence_is_the_level_the_estimator_takes():
     """`CONFIDENCE` describes `pooling.percentile_interval`; it does not configure
-    it, and the record states it beside every interval. `test_burden.py` pins
-    `burden.CONFIDENCE` against the estimator and nothing pinned `headroom`'s, so a
+    it, and the record states it beside every interval. `test_burden.py` once pinned
+    `burden.CONFIDENCE` against the estimator, and nothing pinned `headroom`'s, so a
     change to the percentiles would leave every M3n record naming a level the
     estimator did not take -- the defect M3l shipped and then fixed.
 
