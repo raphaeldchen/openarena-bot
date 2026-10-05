@@ -113,13 +113,17 @@ def at_horizon(curve: np.ndarray, h: int) -> float:
     return float(curve[h - 1])
 
 
-def _checked_pair(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def checked_pair(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Both curves as finite float64 of equal length.
 
     NumPy broadcasts a length-1 array against a length-45 one without
     complaint, so a curve read from the wrong record key would yield a
     full-length result that is nonsense. The length check is the only thing
     standing between that and a plausible-looking table.
+
+    PUBLIC because `eval.headroom` consumes it. A second shape guard in this
+    codebase would be the wrong answer; `headroom`, `skill` and `deficit` all
+    pass through this one.
     """
     left = np.asarray(left, dtype=np.float64)
     right = np.asarray(right, dtype=np.float64)
@@ -142,7 +146,7 @@ def burden(curve_k: np.ndarray, floor: np.ndarray) -> np.ndarray:
     above the floor. `RegroundingSweep.is_bitwise_the_floor(1)` is the check,
     and it reads False on all nine shipped cells.
     """
-    curve_k, floor = _checked_pair(curve_k, floor)
+    curve_k, floor = checked_pair(curve_k, floor)
     return curve_k - floor
 
 
@@ -154,7 +158,7 @@ def compounding(curve_k: np.ndarray, curve_one: np.ndarray) -> np.ndarray:
     `burden(k) - burden(1)`, and computing it against the floor instead would
     silently return `burden(k)` and make the k=1 control read nonzero.
     """
-    curve_k, curve_one = _checked_pair(curve_k, curve_one)
+    curve_k, curve_one = checked_pair(curve_k, curve_one)
     return curve_k - curve_one
 
 
@@ -228,7 +232,7 @@ def motion_margin(window_targets: np.ndarray, curve_one: np.ndarray) -> np.ndarr
     Positive means one prior step from a posterior-grounded state beats
     assuming the agent did not move.
     """
-    baseline, curve_one = _checked_pair(
+    baseline, curve_one = checked_pair(
         one_step_persistence(window_targets), curve_one
     )
     return baseline - curve_one

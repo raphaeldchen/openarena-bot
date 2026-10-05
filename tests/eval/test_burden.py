@@ -272,7 +272,7 @@ def test_the_decomposition_refuses_a_nonfinite_value_in_the_right_operand(bad):
 
 
 def test_the_curves_are_coerced_to_float64_before_they_are_subtracted():
-    """`_checked_pair` promises finite float64. An unsigned-integer curve left
+    """`checked_pair` promises finite float64. An unsigned-integer curve left
     uncoerced WRAPS instead of going negative -- uint8 1 - 2 is 255 -- and a
     plain list has no `.shape` for the length guard to read.
 
@@ -465,7 +465,7 @@ def test_motion_margin_refuses_a_broadcastable_curve_and_a_nonfinite_value():
     otherwise flow into the per-window mean and surface as a NaN interval with
     no indication of which input was bad.
 
-    THE MUTATION THIS EXISTS FOR: replacing the shared `_checked_pair` call
+    THE MUTATION THIS EXISTS FOR: replacing the shared `checked_pair` call
     with a bare length comparison, which keeps the length test green and loses
     the finiteness guard.
     """
