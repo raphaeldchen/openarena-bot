@@ -22,7 +22,7 @@
 - `src/mbfps/eval/rollout.py`, `src/mbfps/eval/probe.py` and `scripts/trust_horizon.py` are **unchanged by this milestone**. Verify with `git diff --stat` at the end of every task.
 - Exact constants, copied verbatim: `REPORTED_H = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)`, `DECISION_K = 1`, `DECISION_H = 1`, `IDENTITY_TOLERANCE = 1e-9`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SECONDARY_SIGMAS = 2`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `EXIT_UNREADABLE_HEADROOM = 47`, `EXIT_NO_MAJORITY = 48`. Protocol: `context = 5`, `horizon = 45`. `REGROUNDING_KS = (1, 3, 5, 15, 45)` is inherited from `diagnostics.py`, not redefined.
 - The strict-majority bar is **computed**, never stored. The spec's "CELLS_REQUIRED = 5" is the value `strict_majority(9)` returns; `burden.strict_majority`'s own docstring forbids storing it, because 5 is a majority at 9 cells and a minority at 11.
-- `_spread` returns **one** standard error. Anything recorded as a 2-SE figure doubles it, as `scripts/diagnose_dynamics.py:1430` does. Mislabelling one SE as two in M3m produced the opposite conclusion from the correct one.
+- `RegroundingSweep.standard_error` returns **one** standard error. Anything recorded as a 2-SE figure doubles it, as `scripts/diagnose_dynamics.py:1430` does. Mislabelling one SE as two in M3m produced the opposite conclusion from the correct one.
 - The median true one-step displacement, `3.9694722203504225`, is **recorded and used by no statistic**. It is the quantity M3m's design mistook for a probe-space scale.
 
 ### Test pre-commitments (every task)
@@ -454,7 +454,7 @@ EOF
 `hold_k(h)` needs the floor's probe-space positions per window per step. `_diagnose(..., keep_trajectories=True)` has kept them since M3d as `positions_real`, `positions_at_context` and `true_positions`, all on the canonical pass — which is the right scope, because `RegroundingSweep.reference` is documented as "the ONE floor and persistence every k is read against."
 
 **Files:**
-- Modify: `src/mbfps/eval/diagnostics.py:1743-1761` (the `RegroundingSweep` dataclass), `:1776-1823` (add two self-check methods near `curve_standard_error` / `_spread`), `:1933-1948` (`regrounding_sweep`'s `_diagnose` call and the `RegroundingSweep` construction)
+- Modify: `src/mbfps/eval/diagnostics.py:1743-1761` (the `RegroundingSweep` dataclass), `:1776-1823` (add two self-check methods near `curve_standard_error` / `RegroundingSweep.standard_error`), `:1933-1948` (`regrounding_sweep`'s `_diagnose` call and the `RegroundingSweep` construction)
 - Test: `tests/eval/test_diagnostics.py`
 
 **Interfaces:**
@@ -991,8 +991,8 @@ every shipped cell; see `pooling.clustered_interval` for why the unit is the
 episode and why the direction of that error matters here specifically."""
 
 SECONDARY_SIGMAS: int = 2
-"""Multiplier applied to `RegroundingSweep._spread` for the RECORDED secondary
-figure, which decides nothing. `_spread` returns ONE standard error and
+"""Multiplier applied to `RegroundingSweep.standard_error` for the RECORDED secondary
+figure, which decides nothing. `RegroundingSweep.standard_error` returns ONE standard error and
 `scripts/diagnose_dynamics.py:1430` doubles it; mislabelling one as two in M3m
 produced the opposite conclusion from the correct one, and the wrong one was
 the more interesting-sounding."""
@@ -1888,7 +1888,7 @@ def measure_cell(
             rows["headroom"] - (rows["skill"] + rows["deficit"])
         ))))
         secondary[k] = {
-            name: (SECONDARY_SIGMAS * RegroundingSweep._spread(array)).tolist()
+            name: (SECONDARY_SIGMAS * RegroundingSweep.standard_error(array)).tolist()
             for name, array in rows.items()
         }
         intervals[k] = {}

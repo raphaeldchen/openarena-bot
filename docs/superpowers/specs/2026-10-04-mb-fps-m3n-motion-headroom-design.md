@@ -137,15 +137,34 @@ lies entirely above 0.
 
 Both properties are load-bearing and neither alone is enough.
 
-**Paired**, because the readout error is what the fix exists to cancel. The
-hold baseline and the rung are both downstream of the same posterior latent, so
-per window their difference is of order the predicted displacement — units —
-while either error alone is 130–260. Differencing per window first, then
-averaging, keeps that cancellation; averaging first and differencing the means
-throws it away.
+**Paired**, because the readout error is what the fix exists to cancel.
+Differencing per window first, then averaging, keeps that cancellation;
+averaging first and differencing the means throws it away.
+
+**How exactly the cancellation holds depends on `g = ground_step(k, h)`, and
+this was measured rather than assumed.**
+
+- **At `g == 0`** — every `h <= k`, which includes the whole `k=45` column and
+  the entire `h=1` row, and therefore **the decision cell** — the hold baseline
+  and the rung descend from the *same* posterior latent. Their per-window
+  difference is of order the predicted displacement, units, while either error
+  alone is 130–260.
+- **At `g > 0`** the rung's own re-grounding `observe` draws fresh categorical
+  samples, and the floor's `observe` runs at a different point in the same
+  stream. Measured on the test rig at `k=2`: the two latents' `z` differ in
+  28 of 32 groups at step 2 and 32 of 32 at step 4, with `h` differing by up to
+  0.3. So `skill(k, h)` there carries a sampling-redraw term on top of the
+  readout difference. The readout error still largely cancels — both sides are
+  the same probe on the same pipeline — but the clean "units, not hundreds"
+  statement is established only at `g == 0`.
+
+The decision cell is `(k=1, h=1)`, where `g == 0`, so the verdict rests on the
+exact case. The rest of the `(k, h)` surface is reported, and a reader comparing
+columns should know that the `g > 0` cells are noisier for this reason and not
+only because the horizon is longer.
 
 **Episode-clustered**, because the 229 windows come from 24 episodes at 3 to 10
-windows each, and `_spread` divides by `sqrt(229)` as though they were
+windows each, and `RegroundingSweep.standard_error` divides by `sqrt(229)` as though they were
 independent draws. Measured on the one per-window array M3m shipped
 (`window_margin`, 229 x 45, all nine cells), the episode-clustered standard
 error at `h=1` is **1.26x to 2.17x** the iid one, mean 1.66x:
@@ -179,9 +198,9 @@ inflation = percentile_interval(reps)[2] / iid
 The direction matters. An understated standard error makes a quantity look MORE
 resolvable, so it is the conservative choice for a claim of *non*-resolvability
 and the dangerous one for a claim of resolvability. M3n's verdict rests on
-claims of resolvability, which is why it cannot use `_spread`.
+claims of resolvability, which is why it cannot use `RegroundingSweep.standard_error`.
 
-`paired_standard_error` from `_spread` is still **recorded**, as a cheaper
+`paired_standard_error` from `RegroundingSweep.standard_error` is still **recorded**, as a cheaper
 secondary figure with its understatement documented in the record, so the two
 rulers can be compared. It does not decide anything.
 
@@ -231,7 +250,7 @@ fields' `(n_windows, horizon, 2)`.
 Positions stay internal to the sweep; it exports errors, which is the shape it
 already has.
 
-**Rulers become per-h, and are doubled.** `_spread`
+**Rulers become per-h, and are doubled.** `RegroundingSweep.standard_error`
 (`src/mbfps/eval/diagnostics.py:1813`) already reduces over windows and returns
 a `(horizon,)` array. M3m's record carried two scalars
 (`floor_margin_standard_error = 2.654`, `paired_standard_error = 10.293` on
@@ -239,7 +258,7 @@ a `(horizon,)` array. M3m's record carried two scalars
 decision horizon alone. M3n records the full array for each of the three
 differences.
 
-`_spread` returns **one** SE. Where it is recorded as a secondary figure it is
+`RegroundingSweep.standard_error` returns **one** SE. Where it is recorded as a secondary figure it is
 doubled, as `scripts/diagnose_dynamics.py:1430` does. This is written down
 because mislabelling one SE as two in M3m produced the opposite conclusion from
 the correct one, and the wrong one was the more interesting-sounding.
@@ -253,7 +272,7 @@ the correct one, and the wrong one was the more interesting-sounding.
     IDENTITY_TOLERANCE = 1e-9
     CONFIDENCE       = 0.95     # the verdict's clustered bootstrap interval
     RESAMPLES        = 2000
-    SECONDARY_SIGMAS = 2        # the recorded _spread figure only; decides nothing
+    SECONDARY_SIGMAS = 2        # the recorded standard_error figure only; decides nothing
     SEEDS_MINIMUM    = 3
     CELLS_REQUIRED   = 5        # strict majority of nine; implies >= 2 arms,
                                 # since no arm holds more than 3 cells
@@ -418,7 +437,7 @@ probe.
 
 ## 13. Re-reporting M3m's resolvability under the clustered ruler
 
-M3m's SE multiples were computed with `_spread`, which §3.5 shows understates
+M3m's SE multiples were computed with `RegroundingSweep.standard_error`, which §3.5 shows understates
 the standard error by 1.26x to 2.17x on the one per-window array it shipped.
 M3n measures `deficit`, which *is* `burden`, with per-window rows — so it
 re-reports M3m's two headline resolvability claims under the clustered ruler at
