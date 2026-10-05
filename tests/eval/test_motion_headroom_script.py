@@ -654,6 +654,23 @@ def test_each_recorded_constant_moves_when_the_modules_own_name_moves(
         assert all(set(by_h) == {"1", "2", "45"} for by_h in record["share"].values())
 
 
+def test_the_recorded_confidence_is_the_level_the_estimator_takes():
+    """`CONFIDENCE` describes `pooling.percentile_interval`; it does not configure
+    it, and the record states it beside every interval. `test_burden.py` pins
+    `burden.CONFIDENCE` against the estimator and nothing pinned `headroom`'s, so a
+    change to the percentiles would leave every M3n record naming a level the
+    estimator did not take -- the defect M3l shipped and then fixed.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `[2.5, 97.5]` -> `[5.0, 95.0]` in
+    `pooling.percentile_interval`."""
+    replicates = np.arange(10001, dtype=np.float64)
+    low, high, _ = pooling.percentile_interval(replicates)
+    tail = (1.0 - H.CONFIDENCE) / 2.0
+    assert low == pytest.approx(np.percentile(replicates, 100 * tail))
+    assert high == pytest.approx(np.percentile(replicates, 100 * (1 - tail)))
+    assert (low, high) == (250.0, 9750.0)
+
+
 def test_the_interval_is_drawn_at_the_draw_count_the_record_states(hand, monkeypatch):
     """The record's `resamples` is what the bootstrap USED. With the constant at
     7 the interval equals the recomputation at 7 draws and not at 2000.
