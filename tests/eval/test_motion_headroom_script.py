@@ -459,6 +459,48 @@ def test_the_clean_sweep_reads_every_control_at_exactly_its_known_answer(hand, h
     assert script.broken_controls(controls) == []
 
 
+def test_the_identity_residual_is_judged_against_the_modules_own_tolerance(
+    hand_record, monkeypatch,
+):
+    """`broken_controls` holds the residual to `IDENTITY_TOLERANCE` -- the name the
+    module holds, so a patched value moves the line. With it at 1e-5 a residual of
+    1e-6 passes (it would fail against a literal 1e-09) and one of 1e-4 does not.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `IDENTITY_TOLERANCE` -> the
+    literal `1e-09` in `broken_controls`."""
+    monkeypatch.setattr(script, "IDENTITY_TOLERANCE", 1e-5)
+    controls = copy.deepcopy(hand_record["controls"])
+    controls["identity_residual"] = 1e-6
+    assert script.broken_controls(controls) == []
+    controls["identity_residual"] = 1e-4
+    assert len(script.broken_controls(controls)) == 1
+
+
+def test_the_protocol_check_reads_the_modules_own_decision_cell_and_grid(hand, monkeypatch):
+    """The refusal before any pass is paid for reads `DECISION_K`, `DECISION_H` and
+    `REPORTED_H` from the module, not as literals: each is patched to a value the
+    protocol then cannot satisfy, with the sweep replaced by one that raises if it
+    is reached.
+
+    THE MUTATIONS THIS EXISTS FOR, each run against it, one per case: `DECISION_K`
+    -> `1` in the `ks` check; `*REPORTED_H` -> `45` and `DECISION_H` -> `1` in the
+    horizon check."""
+    def unreachable(*args, **kwargs):
+        raise AssertionError("the sweep was run for a protocol that cannot be read")
+
+    monkeypatch.setattr(script, "regrounding_sweep", unreachable)
+    for name, value, said in (
+        ("DECISION_K", 2, "omits k=2"),
+        ("REPORTED_H", (1, 60), "up to 60"),
+        ("DECISION_H", 50, "DECISION_H=50"),
+    ):
+        with monkeypatch.context() as patch:
+            patch.setattr(script, name, value)
+            with pytest.raises(SystemExit) as caught:
+                script.measure_cell(**_cell_kwargs(reference=copy.deepcopy(hand.reference)))
+        assert said in str(caught.value), (name, str(caught.value))
+
+
 def test_the_identity_residual_is_the_largest_over_the_ks_not_the_first_the_last_or_the_sum(
     hand, monkeypatch,
 ):
@@ -2140,6 +2182,34 @@ def test_a_control_that_missed_its_known_answer_is_refused_by_name_whatever_its_
     message = str(caught.value)
     assert "frozen_ssl seed 1" in message and name in message, message
     assert not (tmp_path / "headroom.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "name", [*script.ZERO_CONTROLS, "identity_residual"],
+)
+def test_a_nan_control_is_refused_as_that_control_without_help_from_the_nonfinite_map(
+    hand_record, tmp_path, monkeypatch, name,
+):
+    """A NaN control is ALSO refused by the sanitiser's `nonfinite` map, because a
+    record written with a NaN in it carries that map -- so every read-phase test
+    that goes through `write_record` has a second line of defence behind the
+    comparison it means to test, and a `> 0` that let the NaN through would be
+    caught by the wrong check. Here the loader hands the read phase records with
+    the NaN in the control and an EMPTY map, which `load_record` cannot produce, so
+    the refusal can only be the control's own comparison.
+
+    THE MUTATIONS THIS EXISTS FOR, each run against it: a zero control read with
+    `> 0`, and the identity residual read with `residual > IDENTITY_TOLERANCE`."""
+    records = _records_from(hand_record, _spec(["BETWEEN"] * 9))
+    for record in records.values():
+        record["nonfinite"] = {}
+    records[SECOND_CELL]["controls"][name] = NAN
+    monkeypatch.setattr(script, "load_headroom", lambda directory, arms, seeds: records)
+    with pytest.raises(SystemExit) as caught:
+        script.read_phase(_read_args(tmp_path))
+    message = str(caught.value)
+    assert "frozen_ssl seed 1" in message and f"{name}=nan" in message, message
+    assert "non-finite" not in message
 
 
 @pytest.mark.parametrize("bad", [NAN, H.IDENTITY_TOLERANCE * 2, INF], ids=["nan", "above", "inf"])
