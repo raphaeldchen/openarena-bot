@@ -24,6 +24,7 @@
 - The strict-majority bar is **computed**, never stored. The spec's "CELLS_REQUIRED = 5" is the value `strict_majority(9)` returns; `burden.strict_majority`'s own docstring forbids storing it, because 5 is a majority at 9 cells and a minority at 11.
 - `RegroundingSweep.standard_error` returns **one** standard error. Anything recorded as a 2-SE figure doubles it, as `scripts/diagnose_dynamics.py:1430` does. Mislabelling one SE as two in M3m produced the opposite conclusion from the correct one.
 - The median true one-step displacement, `3.9694722203504225`, is **recorded and used by no statistic**. It is the quantity M3m's design mistook for a probe-space scale.
+- **The read phase must print `reading.rule`, not only `reading.verdict`.** `NO_MAJORITY` now has two causes under exit 48 — no placement reached the bar, and a placement reached it but spanned fewer than `ARMS_REQUIRED` arms — and only the rule line distinguishes them.
 - **Read every sweep control with `!= 0.0`, never with `> 0`.** `persistence_divergence` and `k_invariance_at_h1` propagate NaN through `np.ptp` and `np.max` by design, so a bad row surfaces as NaN rather than as a large number — and `nan > 0` is **False**, so a `> 0` test reports a broken measurement as passing. Binds `measure_cell`'s assembly, the read phase, and Task 8's control check.
 
 ### Test pre-commitments (every task)
@@ -1010,9 +1011,15 @@ the more interesting-sounding."""
 SEEDS_MINIMUM: int = 3
 ARMS_REQUIRED: int = 2
 """An arm with fewer than `SEEDS_MINIMUM` seeds is refused by name rather than
-tallied. `ARMS_REQUIRED` is satisfied automatically by the strict-majority bar
-over nine cells -- no arm holds more than three -- and is stated anyway so the
-protection M3m carried is visibly not dropped."""
+tallied, and so is a plan with fewer than `ARMS_REQUIRED` arms. A verdict whose
+WINNING cells do not span `ARMS_REQUIRED` arms is returned as NO_MAJORITY with a
+rule line saying so -- the inputs were legal and the arms simply did not agree,
+which is not a caller error.
+
+Both checks exist because neither covers the other: one arm with three seeds
+passes a cell-count bar, and arms of 3, 3 and 9 pass an arm-count bar while the
+nine-seed arm carries the majority alone. M3j's trap was a single-arm
+invocation."""
 
 DISPLACEMENT_RECORDED_ONLY: float = 3.9694722203504225
 """The median true one-step displacement on the shipped split. RECORDED AND
@@ -1631,9 +1638,10 @@ them.
 The majority bar is computed, not stored: strict_majority returns 5 at nine
 cells and 6 at eleven. The test carries an eleven-cell case so the
 stored-constant mutation fails by value rather than passing unnoticed at
-nine. ARMS_REQUIRED needs no separate check -- no arm holds more than three
-of nine cells, so any five span two arms -- and the docstring says why there
-is no `if` against it.
+nine. ARMS_REQUIRED is enforced by two checks that do not cover each other:
+a plan with fewer than two arms is refused by name, and a verdict whose
+winning cells span fewer than two arms comes back as NO_MAJORITY with a rule
+line saying so.
 
 Every directional sentence in the legend is conditioned on the gate in the
 same breath as the sign, so it cannot be quoted without its condition. M3m
