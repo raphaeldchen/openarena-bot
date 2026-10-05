@@ -2015,6 +2015,30 @@ def test_the_stored_margin_is_printed_under_a_legend_that_says_it_is_superseded_
         assert claim not in out, claim
 
 
+def test_stdout_is_the_formatters_text_with_one_trailing_newline_and_reproducible(
+    record, tmp_path, capsys,
+):
+    """The table's CONTENT is pinned from the spec above; this pins the WIRING: what
+    is printed is the formatter's text, byte for byte, which ends in exactly one
+    newline, and the same on a second read of the same records. Two reads in two
+    directories, so a read that depended on anything but the records is a different
+    string.
+
+    THE MUTATIONS THIS EXISTS FOR: `print(text)` on a string that already ends in a
+    newline, which doubles it, and `rstrip()` on the text, which loses it. Both are
+    invisible to a test that compares the table's LINES, and to one that compares two
+    reads of the same code (each strips the same bytes). The precondition is asserted:
+    the formatter's text ends in exactly one newline."""
+    records = _records_from(record, _spec(MIXED))
+    expected = script.format_superseded_margin(records)
+    assert expected.endswith("\n") and not expected.endswith("\n\n")
+    first = _read_args(tmp_path / "a", records)
+    second = _read_args(tmp_path / "b", records)
+    out_first, _ = _read_refusal(first, capsys)
+    out_second, _ = _read_refusal(second, capsys)
+    assert out_first == out_second == expected
+
+
 def test_the_refusal_names_the_replacement_and_says_no_reading_was_taken(
     record, tmp_path, capsys,
 ):
