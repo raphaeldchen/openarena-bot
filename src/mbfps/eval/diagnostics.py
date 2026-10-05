@@ -1906,16 +1906,24 @@ class RegroundingSweep:
         construction rather than by a choice of k. (The floor is one array
         shared by every k, so there is no across-k spread in it to check.)
 
+        Read from the per-WINDOW rows, which are what the differences and the
+        bootstrap consume, not from the curves: two ks can agree in the mean
+        and disagree window by window, and only the rows show it.
+
+        The spread is `np.ptp`, so a NaN in any row is a NaN result -- a failed
+        check -- where Python's `max` and `min` skip a NaN according to its
+        position and `max([1.0, nan, 1.0]) - min([1.0, nan, 1.0])` is a passing
+        0.0.
+
         The hold and the rung are checked separately. Checking only their
-        difference would pass a compensating error in the two.
+        difference would pass a shift common to both, which leaves the
+        difference unchanged.
         """
-        spreads = []
-        for series in (
-            [self.hold_position[k][0] for k in self.ks],
-            [self.curve(k)[0] for k in self.ks],
-        ):
-            spreads.append(max(series) - min(series))
-        return float(max(spreads))
+        spreads = [
+            np.ptp(np.stack([rows[k][:, 0] for k in self.ks]), axis=0).max()
+            for rows in (self.window_hold_position, self.window_position)
+        ]
+        return float(np.max(spreads))
 
     def is_bitwise_the_floor(self, k: int, metric: str = "position") -> bool:
         """SELF-CHECK 2's alarm: did this k's curve collapse onto the floor.
@@ -2051,7 +2059,9 @@ def regrounding_sweep(
     )
     window_hold = {}
     for k in ks:
-        rows = np.empty_like(result.arms[k]["position"])
+        # NaN, not `empty_like`: a column a later edit forgets to write must
+        # read as NaN in the output rather than as whatever the allocator left.
+        rows = np.full(result.arms[k]["position"].shape, np.nan)
         for h in range(1, horizon + 1):
             g = ground_step(k, h)
             # `positions_real[:, j]` is horizon step `j + 1` (the probe of the
