@@ -72,6 +72,8 @@ SEED = 3
 """The cell's seed. It is neither 0 nor `BOOTSTRAP_SEED`, so a bootstrap drawn at
 the cell's seed, at 0, or at the bootstrap seed are three different draws."""
 BOOTSTRAP_SEED = 7
+"""The run's BASE seed, `--bootstrap-seed`. No interval is drawn at it: each cell
+draws at `script.cell_bootstrap_seed(BOOTSTRAP_SEED, arm, seed)`."""
 SMALL = 40
 """A draw count the tests patch in, so recomputing an interval costs milliseconds
 and so a record can be told to have used the PATCHED count and not 2000."""
@@ -209,9 +211,20 @@ def hand_record(hand):
         return _hand_measure(patch, copy.deepcopy(hand))
 
 
-def _interval(rows, groups, h, *, resamples=SMALL, seed=BOOTSTRAP_SEED) -> dict:
+HAND_CELL = ("pixel_ae", SEED)
+"""The `(arm, seed)` `_cell_kwargs` builds every fixture record for."""
+
+
+def _cell_seed(cell=HAND_CELL) -> int:
+    """The seed `cell`'s intervals are drawn at, from the run's base seed."""
+    return script.cell_bootstrap_seed(BOOTSTRAP_SEED, *cell)
+
+
+def _interval(rows, groups, h, *, resamples=SMALL, seed=None) -> dict:
+    """`clustered_interval` at `seed`, which defaults to the fixture cell's own
+    derived seed -- the one its record's intervals were drawn at."""
     point, low, high = pooling.clustered_interval(
-        rows, groups, h=h, resamples=resamples, seed=seed,
+        rows, groups, h=h, resamples=resamples, seed=_cell_seed() if seed is None else seed,
     )
     return {"point": point, "ci_low": low, "ci_high": high}
 
@@ -268,6 +281,118 @@ def test_the_record_path_separates_seeds_and_arms(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The per-cell bootstrap seed: nine cells, nine independent resamplings.
+# ---------------------------------------------------------------------------
+
+NINE_CELLS = tuple(
+    (arm, seed) for arm in ("pixel_ae", "frozen_ssl", "random_vit") for seed in (0, 1, 2)
+)
+"""The shipped plan, spelled out. A test iterating `ARMS` x `SEEDS` would shrink
+with either one."""
+
+
+@pytest.mark.parametrize("base", [0, BOOTSTRAP_SEED, 12345])
+def test_the_derived_seed_differs_for_every_one_of_the_nine_cells(base):
+    """The verdict counts nine cells as nine independent readings, and cells that
+    resample the same episode draws are one reading nine times. Every `(arm, seed)`
+    gets its own seed at each of three bases, base 0 being the CLI default.
+
+    THE MUTATIONS THIS EXISTS FOR, each run against it: returning `base_seed`
+    unchanged (the shipped defect), and dropping `arm` or `seed` from the digest --
+    either leaves three or nine cells on one seed."""
+    derived = {cell: script.cell_bootstrap_seed(base, *cell) for cell in NINE_CELLS}
+    assert len(derived) == 9
+    assert len(set(derived.values())) == 9, derived
+    assert base not in derived.values()
+
+
+def test_the_derived_seed_is_stable_and_is_not_drawn_from_python_hash():
+    """The same `(base, arm, seed)` is the same integer on every call, process and
+    platform, so any single interval of a record reproduces from the record. The
+    two literals are what `zlib.crc32` of `b"base:arm:seed"` returns; a `hash()`
+    swapped back in is salted per process (`PYTHONHASHSEED`) and misses them, as
+    does any other digest.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `zlib.crc32(...)` ->
+    `hash(...) & 0xFFFFFFFF`."""
+    assert script.cell_bootstrap_seed(0, "pixel_ae", 0) == 235428016
+    assert script.cell_bootstrap_seed(7, "frozen_ssl", 2) == 3554091843
+    assert script.cell_bootstrap_seed(0, "pixel_ae", 0) == script.cell_bootstrap_seed(
+        0, "pixel_ae", 0,
+    )
+    for cell in NINE_CELLS:
+        value = script.cell_bootstrap_seed(0, *cell)
+        assert isinstance(value, int) and 0 <= value < 2**32, cell
+
+
+def test_the_derived_seed_moves_when_the_base_moves_for_every_cell():
+    """`--bootstrap-seed` must stay a lever: a different base is a different run,
+    for every cell, not only for one.
+
+    THE MUTATION THIS EXISTS FOR, run against it: leaving `base_seed` out of the
+    digest, which makes every run of the script draw the same nine seeds."""
+    for cell in NINE_CELLS:
+        assert script.cell_bootstrap_seed(0, *cell) != script.cell_bootstrap_seed(1, *cell), cell
+        assert script.cell_bootstrap_seed(7, *cell) != script.cell_bootstrap_seed(8, *cell), cell
+
+
+def test_one_cell_draws_every_interval_at_its_one_derived_seed(hand, monkeypatch):
+    """The independence that matters is BETWEEN cells. Within a cell all three
+    differences at every `(k, h)` are drawn at the cell's one seed, and it is the
+    derived one -- not the base, and not the cell's own `seed`.
+
+    THE MUTATIONS THIS EXISTS FOR, each run against it: `seed=cell_seed` ->
+    `seed=bootstrap_seed`, and deriving a fresh seed per `(k, h)`."""
+    drawn = []
+    real = script.clustered_interval
+
+    def spy(*args, **kwargs):
+        drawn.append(kwargs["seed"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(script, "clustered_interval", spy)
+    record = _hand_measure(monkeypatch, copy.deepcopy(hand))
+    assert len(drawn) == len(HAND_KS) * len(H.REPORTED_H) * 3
+    assert set(drawn) == {record["cell_bootstrap_seed"]} == {_cell_seed()}
+
+
+def test_two_cells_on_the_same_rows_share_every_point_estimate_and_not_their_bounds(
+    hand, monkeypatch,
+):
+    """The point estimate is seed-free, so on identical rows two cells must agree
+    on every `point` exactly and may differ only in the bounds. That is what tells
+    nine independent draws from nine identical ones: with the seed shared, every
+    bound would be equal too, and a reader could not see it.
+
+    The rows are the SAME OBJECT for both cells, so a difference in a bound is the
+    seed and nothing else. The decision cell is where it is asserted for all three
+    differences, on both bounds; the control is the same cell measured twice, which
+    must be identical to the last bit.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `seed=cell_seed` ->
+    `seed=bootstrap_seed`, under which the bounds below are equal."""
+    first = _hand_measure(monkeypatch, copy.deepcopy(hand), arm="pixel_ae", seed=0)
+    second = _hand_measure(monkeypatch, copy.deepcopy(hand), arm="frozen_ssl", seed=1)
+    again = _hand_measure(monkeypatch, copy.deepcopy(hand), arm="pixel_ae", seed=0)
+    assert first["cell_bootstrap_seed"] != second["cell_bootstrap_seed"]
+    assert first["bootstrap_seed"] == second["bootstrap_seed"] == BOOTSTRAP_SEED
+    assert first["intervals"] == again["intervals"]
+
+    moved = 0
+    for k in HAND_KS:
+        for h in H.REPORTED_H:
+            for name in ("headroom", "skill", "deficit"):
+                a = first["intervals"][str(k)][str(h)][name]
+                b = second["intervals"][str(k)][str(h)][name]
+                assert a["point"] == b["point"], (k, h, name)
+                moved += (a["ci_low"], a["ci_high"]) != (b["ci_low"], b["ci_high"])
+                if (k, h) == (H.DECISION_K, H.DECISION_H):
+                    assert a["ci_low"] != b["ci_low"], name
+                    assert a["ci_high"] != b["ci_high"], name
+    assert moved > 0
+
+
+# ---------------------------------------------------------------------------
 # measure_cell, over a sweep whose rows the test wrote.
 # ---------------------------------------------------------------------------
 
@@ -312,22 +437,24 @@ def test_every_interval_is_the_clustered_interval_of_its_own_rows_at_every_k_and
     hand, monkeypatch,
 ):
     """Each of the three differences at every (k, h), recomputed here from the
-    hand-built rows by `pooling.clustered_interval` at the BOOTSTRAP seed and the
-    draw count the record states, and compared with `==`.
+    hand-built rows by `pooling.clustered_interval` at THE CELL'S DERIVED seed and
+    the draw count the record states, and compared with `==`.
 
-    The cell's seed (3), 0 and the bootstrap seed (7) are three different draws,
-    and so are `SMALL` and the shipped 2000: the reached check below shows the
-    bounds move under each, so an equality that survives is the interval read
-    from the right seed, the right count, the right rows and the right clusters.
+    The cell's seed (3), 0, the run's base seed (7) and the derived seed are four
+    different draws, and so are `SMALL` and the shipped 2000: the reached check
+    below shows the bounds move under each, so an equality that survives is the
+    interval read from the right seed, the right count, the right rows and the
+    right clusters.
 
-    THE MUTATIONS THIS EXISTS FOR, each run against it: `seed=bootstrap_seed` ->
-    `seed=seed` and `-> seed=0` in the `clustered_interval` call, `h=h` -> `h=1`,
-    and `groups` -> `np.arange(n)`.
+    THE MUTATIONS THIS EXISTS FOR, each run against it: `seed=cell_seed` ->
+    `seed=bootstrap_seed` (the base, which is what every cell drew at before the
+    derivation), `-> seed=seed` and `-> seed=0` in the `clustered_interval` call,
+    `h=h` -> `h=1`, and `groups` -> `np.arange(n)`.
     """
     record = _hand_measure(monkeypatch, copy.deepcopy(hand))
     assert record["resamples"] == SMALL
     assert set(record["intervals"]) == {str(k) for k in HAND_KS}
-    reached = {"seed": False, "zero": False, "draws": False, "groups": False}
+    reached = {"seed": False, "zero": False, "base": False, "draws": False, "groups": False}
     for k in HAND_KS:
         rows = _rows(hand, k)
         assert set(record["intervals"][str(k)]) == {str(h) for h in H.REPORTED_H}
@@ -340,11 +467,12 @@ def test_every_interval_is_the_clustered_interval_of_its_own_rows_at_every_k_and
                 moved = lambda **over: _interval(array, HAND_GROUPS, h, **over) != expected
                 reached["seed"] |= moved(seed=SEED)
                 reached["zero"] |= moved(seed=0)
+                reached["base"] |= moved(seed=BOOTSTRAP_SEED)
                 reached["draws"] |= moved(resamples=2000)
                 reached["groups"] |= (
                     pooling.clustered_interval(
                         array, np.arange(len(HAND_GROUPS)), h=h, resamples=SMALL,
-                        seed=BOOTSTRAP_SEED,
+                        seed=_cell_seed(),
                     )[1:] != (expected["ci_low"], expected["ci_high"])
                 )
     assert all(reached.values()), reached
@@ -703,6 +831,8 @@ def test_the_record_carries_the_training_numbers_and_provenance_of_its_own_cell(
     assert record["device"] == "cpu"
     assert (record["arm"], record["seed"]) == ("pixel_ae", SEED)
     assert record["bootstrap_seed"] == BOOTSTRAP_SEED
+    assert record["cell_bootstrap_seed"] == _cell_seed(("pixel_ae", SEED))
+    assert record["cell_bootstrap_seed"] != BOOTSTRAP_SEED
     assert (record["context"], record["horizon"]) == (CONTEXT, HORIZON)
     assert record["split_seed"] == SPLIT_SEED
     assert record["ks"] == list(HAND_KS)
@@ -768,8 +898,8 @@ def test_the_record_has_the_brief_schema_less_the_key_write_record_owns(hand_rec
         "arm", "seed", "step", "git_sha", "record_git_sha", "torch_version", "device",
         "context", "horizon", "ks", "reported_h", "decision_k", "decision_h",
         "confidence", "resamples", "identity_tolerance", "secondary_sigmas",
-        "bootstrap_seed", "split_seed", "displacement_median", "episodes", "windows",
-        "curves", "intervals", "share", "secondary", "controls",
+        "bootstrap_seed", "cell_bootstrap_seed", "split_seed", "displacement_median",
+        "episodes", "windows", "curves", "intervals", "share", "secondary", "controls",
         "kl_dyn_max", "kl_rate_above_free_bits",
     }
     assert set(hand_record["curves"]) == {
@@ -1031,7 +1161,7 @@ def test_the_rig_discriminates_hold_rung_and_floor_window_by_window(rig):
     for rows in (hold - floor, hold - rung, rung - floor):
         assert rows[:, 0].std() > 0.0
     point, low, high = pooling.clustered_interval(
-        hold - rung, labels, h=1, resamples=SMALL, seed=BOOTSTRAP_SEED,
+        hold - rung, labels, h=1, resamples=SMALL, seed=_cell_seed(),
     )
     assert low < high
 
@@ -1078,8 +1208,8 @@ def test_every_real_interval_is_drawn_from_the_sweeps_rows_at_the_stated_seed(
 ):
     """The 150 intervals of the shipped run -- five rungs, ten horizons, three
     differences -- recomputed from a second sweep the test ran, at the shipped
-    2000 draws and the bootstrap seed. Compared with `==`: same rows, same seed,
-    same draws, same bits."""
+    2000 draws and the cell's derived seed. Compared with `==`: same rows, same
+    seed, same draws, same bits."""
     assert real_record["resamples"] == H.RESAMPLES == 2000
     sweep = _independent_sweep(rig)
     for k in REGROUNDING_KS:
@@ -1370,7 +1500,8 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
     bootstrap seed is 7: in the file NAME, in the record (`seed`), and in the
     sweep the cell's model was run through. The decision cell's intervals are
     recomputed from a second sweep the test runs at the CELL'S seed and drawn at
-    the BOOTSTRAP seed, and must be the ones written.
+    the seed derived from the BOOTSTRAP seed and that cell's `(arm, seed)`, and
+    must be the ones written.
 
     THE MUTATIONS THIS EXISTS FOR, each run against it, each of which a
     one-seed-0 fixture lets through: `measure_phase` handing `measure_cell`
@@ -1391,6 +1522,7 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
         study = STUDY[(arm, seed)]
         assert (carried["arm"], carried["seed"]) == (arm, seed)
         assert carried["bootstrap_seed"] == BOOTSTRAP_SEED
+        assert carried["cell_bootstrap_seed"] == _cell_seed((arm, seed)), (arm, seed)
         assert carried["step"] == study["steps"], (arm, seed)
         assert carried["kl_rate_above_free_bits"] == study["kl_rate_above_free_bits"]
         assert carried["kl_dyn_max"] == study["kl_dyn_max"]
@@ -1404,7 +1536,7 @@ def test_the_phase_writes_one_labelled_record_per_cell_from_that_cells_own_model
         )
         rows = _rows(sweep, 1)
         for name, array in rows.items():
-            expected = _interval(array, sweep.window_episode, 1)
+            expected = _interval(array, sweep.window_episode, 1, seed=_cell_seed((arm, seed)))
             assert carried["intervals"]["1"]["1"][name] == expected, (arm, seed, name)
             seen.add((arm, seed, name, tuple(expected.values())))
     assert len(seen) == len(CELLS) * 3
@@ -1470,6 +1602,7 @@ def test_the_phase_hands_the_ks_and_the_bootstrap_seed_it_was_given_to_the_cell(
     record = load_record(args.out / "headroom_pixel_ae_seed2.json")
     assert record["ks"] == [1, 45]
     assert record["bootstrap_seed"] == 11
+    assert record["cell_bootstrap_seed"] == script.cell_bootstrap_seed(11, "pixel_ae", 2)
     assert set(record["curves"]["rungs"]) == {"1", "45"}
 
 

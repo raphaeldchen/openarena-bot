@@ -18,8 +18,12 @@ a literal that survives the tests):
                 VERIFIED against the study record, and, per k, the sweep's rung
                 and hold-baseline means.
   intervals     `(point, ci_low, ci_high)` of `headroom`, `skill` and `deficit`
-                at every k and every `REPORTED_H`, episode-clustered, drawn at
-                `--bootstrap-seed`. No per-window rows are kept: they are 13 x 45
+                at every k and every `REPORTED_H`, episode-clustered, drawn at the
+                cell's own `cell_bootstrap_seed`, which `cell_bootstrap_seed()`
+                derives from `--bootstrap-seed` and the cell's `(arm, seed)`: the
+                nine cells must not resample the same episode draws, because the
+                verdict counts them as nine independent readings. Both seeds are
+                recorded. No per-window rows are kept: they are 13 x 45
                 x 15 numbers, and the intervals are the record.
   share         `skill / headroom` as a POINT ESTIMATE, or null where `headroom`'s
                 interval is not above zero. Presentation: the verdict reads the
@@ -112,6 +116,7 @@ import importlib.util
 import math
 import sys
 import types
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -209,6 +214,37 @@ def headroom_record_path(out: Path, arm: str, seed: int) -> Path:
     return Path(out) / f"headroom_{arm}_seed{seed}.json"
 
 
+def cell_bootstrap_seed(base_seed: int, arm: str, seed: int) -> int:
+    """The seed one cell's bootstrap intervals are drawn at: a pure function of
+    the run's base seed and the cell's identity.
+
+    WHY IT EXISTS. The verdict is a strict majority across nine cells, and a
+    majority count reads the cells as independent. Drawn at ONE shared seed,
+    every cell and every `(k, h)` within it resamples the same 2000 draws of the
+    same 24 episodes, so their resampling noise is perfectly correlated: a draw
+    that happens to favour one side tilts all nine the same way, and the count
+    reads one coin flip nine times. `pooling.clustered_interval` documents this
+    hazard against a DEFAULTED seed, and one explicit seed for all nine is the
+    same failure with the default spelled out. The point estimate is seed-free,
+    so only the bounds move, and a reader cannot tell nine identical draws from
+    nine independent ones by looking.
+
+    Within a cell every `(k, h)` keeps that cell's ONE seed. The independence
+    that matters is between cells, and the cell's own intervals are then
+    reproducible from the record alone: `bootstrap_seed` is the run's base,
+    `cell_bootstrap_seed` is what `clustered_interval` was handed.
+
+    WHY NOT `hash()`. Python salts `hash(str)` per process (`PYTHONHASHSEED`), so
+    the same cell would draw different resamples on every run and no record would
+    reproduce. `zlib.crc32` over the UTF-8 bytes of `"base:arm:seed"` is the same
+    unsigned 32-bit integer on every process and platform, and `numpy`'s
+    `default_rng` mixes it through `SeedSequence`, so adjacent integers still
+    start unrelated streams. Collisions among nine cells are possible in
+    principle at 32 bits; a test pins that none occurs at the shipped base.
+    """
+    return zlib.crc32(f"{int(base_seed)}:{arm}:{int(seed)}".encode("utf-8"))
+
+
 def broken_controls(controls: dict) -> list[str]:
     """The controls that missed their known answer, each as `name=value`.
 
@@ -300,6 +336,12 @@ def measure_cell(
     same probe, so the floor, the hold and the rungs are all read through one
     embedding probe.
 
+    `bootstrap_seed` IS THE RUN'S BASE, NOT THE SEED THE INTERVALS ARE DRAWN AT.
+    Every interval of this cell, at every `(k, h)`, is drawn at
+    `cell_bootstrap_seed(bootstrap_seed, arm, seed)`, so the nine cells resample
+    independent episode draws; the record carries both, and the base is the one
+    `_PROTOCOL_FIELDS` compares across records.
+
     THE THREE DIFFERENCES GO THROUGH `eval.headroom`'s OWN FUNCTIONS, which hold the
     sign convention and the shape and finiteness guard in one place. The guard
     raises a bare ValueError that names neither the cell nor the array, so the
@@ -331,6 +373,7 @@ def measure_cell(
     )
     groups = np.asarray(sweep.window_episode)
     floor_rows = sweep.window_floor_position
+    cell_seed = cell_bootstrap_seed(bootstrap_seed, arm, seed)
 
     named = [("the floor", floor_rows)]
     for k in ks:
@@ -371,7 +414,7 @@ def measure_cell(
             cell: dict = {}
             for name, array in rows.items():
                 point, low, high = clustered_interval(
-                    array, groups, h=h, resamples=RESAMPLES, seed=bootstrap_seed,
+                    array, groups, h=h, resamples=RESAMPLES, seed=cell_seed,
                 )
                 cell[name] = {"point": point, "ci_low": low, "ci_high": high}
             intervals[k][h] = cell
@@ -401,6 +444,7 @@ def measure_cell(
         "identity_tolerance": IDENTITY_TOLERANCE,
         "secondary_sigmas": SECONDARY_SIGMAS,
         "bootstrap_seed": bootstrap_seed,
+        "cell_bootstrap_seed": cell_seed,
         "split_seed": SPLIT_SEED,
         "displacement_median": DISPLACEMENT_RECORDED_ONLY,
         "episodes": {"val": [Path(p).name for p in val_paths]},
@@ -552,8 +596,9 @@ builds and code versions pool into one finding with no refusal at all.
 `step`, `context`, `horizon` and `split_seed` say WHICH checkpoints, over which
 windows, on which split; `ks`, `reported_h`, `decision_k` and `decision_h` say what
 was read off them; `confidence`, `resamples`, `secondary_sigmas`,
-`identity_tolerance` and `bootstrap_seed` are what each interval, figure and
-control was taken at. All are written from the measure phase's own constants and
+`identity_tolerance` and `bootstrap_seed` (the run's BASE; each cell's own
+`cell_bootstrap_seed` differs between cells by construction and is not compared)
+are what each interval, figure and control was taken at. All are written from the measure phase's own constants and
 arguments, so two records of one run cannot disagree on them and a disagreement is
 a mixed pool. `episodes.val` and `windows.episode` say the rows were the same: the
 cells pooled into one reading must describe the same windows.
@@ -965,7 +1010,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ks", nargs="+", action=_Ints, default=list(REGROUNDING_KS),
                         help="the re-grounding periods; must include 1 and the horizon")
     parser.add_argument("--bootstrap-seed", type=int, default=0,
-                        help="the seed every interval is drawn at; recorded in each cell")
+                        help="the run's base seed; each cell draws its intervals at "
+                             "cell_bootstrap_seed(base, arm, seed), and both are "
+                             "recorded in the cell")
     parser.add_argument("--phase", choices=PHASES, default=PHASES[-1])
     return parser
 
