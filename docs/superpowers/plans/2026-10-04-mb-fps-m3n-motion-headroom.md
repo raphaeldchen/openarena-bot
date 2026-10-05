@@ -1383,8 +1383,12 @@ class HeadroomCell:
         positive `skill` and an unresolvable `deficit`, which without the gate
         reads `AT_PERFECT` -- a verdict about a model, taken on a cell where a
         perfect predictor is indistinguishable from a copying one. One of the
-        nine shipped cells is in that regime: `pixel_ae_seed1`'s headroom at
-        h=1 is 0.575649 map units against a readout error of 259.06.
+        nine shipped cells looks likely to be in that regime, though the
+        shipped records cannot settle it: `pixel_ae_seed1`'s headroom POINT
+        ESTIMATE at h=1 is 0.575649 map units against a readout error of
+        259.06, and at h=2 it is NEGATIVE at -0.641206. The h=2 sign is
+        decisive on its own; whether the h=1 interval straddles zero is one of
+        the things this milestone measures.
 
         `AMBIGUOUS` is reachable WITH a resolvable headroom. The gate
         establishes only that the two ends are separated, not that the ruler is

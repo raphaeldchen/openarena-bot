@@ -416,8 +416,12 @@ and nothing in `scripts/` uses a higher number.
 | `UNREADABLE`, exit 47 | the probe, not the model, is the limit; M3o redirects to the readout rather than to training |
 
 `UNREADABLE` is a real possibility, not a formality. `pixel_ae_seed1`'s
-`headroom(45, 1)` is 0.575649 map units: a perfect one-step predictor beats a
-copying one by about half a map unit there, against a readout error of 259.06.
+`headroom(45, 1)` POINT ESTIMATE is 0.575649 map units: a perfect one-step
+predictor beats a copying one by about half a map unit there, against a readout
+error of 259.06. Whether its *interval* straddles zero the shipped records
+cannot say — they carry no per-window hold curve, so M3n measures it. What they
+do settle is that the same cell's `headroom(45, 2)` is **negative**, at
+−0.641206, which fails the gate outright.
 If several cells land in that regime, M3n's answer is that this instrument
 cannot see one step — still worth knowing before committing thirteen hours,
 because every candidate change to the objective would be graded by the same
