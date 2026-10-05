@@ -57,9 +57,11 @@ Write `headroom(k, h)`, never `headroom(45)`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
-from mbfps.eval.burden import checked_pair
+from mbfps.eval.burden import checked_pair, strict_majority
 
 REPORTED_H: tuple[int, ...] = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)
 """The horizon steps the record publishes. Inherited from M3m unchanged, so the
@@ -186,3 +188,250 @@ def triple_residual(
     whole = headroom(hold, floor)
     parts = skill(hold, rung) + deficit(rung, floor)
     return float(np.max(np.abs(whole - parts)))
+
+
+PLACEMENTS: tuple[str, ...] = (
+    "BETWEEN", "AT_PERFECT", "AT_COPYING", "AMBIGUOUS", "UNREADABLE",
+)
+"""Where one cell's one-step map sits on the copying-to-perfect axis.
+
+`UNREADABLE` is about the INSTRUMENT, the other four about the model. It is in
+the same tuple because it is a per-cell outcome and a majority of it is a
+verdict -- M3n's exit 47 -- rather than a missing value."""
+
+NO_MAJORITY: str = "NO_MAJORITY"
+"""No placement held a strict majority of the cells. M3n's exit 48."""
+
+
+@dataclass(frozen=True)
+class Interval:
+    """A point estimate and an episode-clustered bootstrap interval."""
+
+    point: float
+    ci_low: float
+    ci_high: float
+
+    def resolvably_positive(self) -> bool:
+        """The whole interval lies above zero.
+
+        `ci_low > 0.0`, strictly. An interval whose lower bound is exactly 0.0
+        does not exclude zero, and the whole two-sided reading is a question
+        about exclusion.
+        """
+        return self.ci_low > 0.0
+
+
+@dataclass(frozen=True)
+class HeadroomCell:
+    """One cell -- one arm at one seed -- at ONE (k, h)."""
+
+    arm: str
+    seed: int
+    headroom: Interval
+    skill: Interval
+    deficit: Interval
+    clusters: int
+    """Distinct episodes behind the bootstrap. Carried because an interval
+    drawn from one cluster is not an interval, and the script refuses on it
+    rather than printing it."""
+
+    def placement(self) -> str:
+        """This cell's member of `PLACEMENTS`.
+
+        THE GATE RUNS FIRST, and the order is load-bearing rather than tidy. A
+        cell whose `headroom` straddles zero can still have a resolvably
+        positive `skill` and an unresolvable `deficit`, which without the gate
+        reads `AT_PERFECT` -- a verdict about a model, taken on a cell where a
+        perfect predictor is indistinguishable from a copying one.
+
+        This is not hypothetical. `pixel_ae_seed1`'s `headroom(k=45, h)` on the
+        shipped record is +0.575649 at h=1 and -0.641206 at h=2, against a
+        floor of 259.06 map units at h=1. The h=2 point estimate is below zero,
+        so the gate refuses it there on the point alone. Whether the h=1
+        interval excludes zero is not in that record, which carries no
+        per-window hold curve; this docstring does not claim it.
+
+        `AMBIGUOUS` is reachable WITH a resolvable headroom. The gate
+        establishes only that the two ends are separated, not that the ruler is
+        fine enough to locate a point between them.
+        """
+        if not self.headroom.resolvably_positive():
+            return "UNREADABLE"
+        has_skill = self.skill.resolvably_positive()
+        has_deficit = self.deficit.resolvably_positive()
+        if has_skill and has_deficit:
+            return "BETWEEN"
+        if has_skill:
+            return "AT_PERFECT"
+        if has_deficit:
+            return "AT_COPYING"
+        return "AMBIGUOUS"
+
+
+@dataclass(frozen=True)
+class HeadroomInputs:
+    """The pooled cells, with the (k, h) they were all read at."""
+
+    cells: dict[tuple[str, int], HeadroomCell]
+    decision_k: int
+    decision_h: int
+    ks: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class HeadroomStatus:
+    """The verdict, the rule it was reached by, and the full tally."""
+
+    verdict: str
+    rule: str
+    tally: dict[str, tuple[tuple[str, int], ...]]
+    """Placement -> the (arm, seed) cells voting for it, sorted by (arm,
+    seed) whatever order the input dict was built in. Every placement present
+    as a key, including those with no votes, so a reader can tell "no cell read
+    AT_COPYING" from "AT_COPYING was not considered"."""
+
+
+def reading_headroom(inputs: HeadroomInputs) -> HeadroomStatus:
+    """Place the one-step map, by strict majority of the cells.
+
+    REFUSES rather than falls through on an arm short of `SEEDS_MINIMUM`.
+    `strict_majority(1) == 1`, so without that refusal a single lucky cell
+    would establish an arm -- the M3j trap, where `--arms random_vit` printed a
+    row reading `clears = up` beside a verdict of NO DIFFERENCE.
+
+    THE BAR IS COMPUTED. `strict_majority(len(cells))` returns 5 at nine cells
+    and 6 at eleven, so storing 5 would be a majority at one cell count and a
+    minority at another; M3l's design was reworked for exactly that.
+
+    `ARMS_REQUIRED` needs no separate check at nine cells in three arms: no arm
+    holds more than three, so any five cells span at least two arms. The
+    constant is still defined, and this paragraph is why there is no `if`
+    against it.
+    """
+    if not inputs.cells:
+        raise ValueError("reading_headroom needs at least one cell")
+    by_arm: dict[str, set[int]] = {}
+    for arm, seed in inputs.cells:
+        by_arm.setdefault(arm, set()).add(seed)
+    short = {arm: sorted(s) for arm, s in by_arm.items() if len(s) < SEEDS_MINIMUM}
+    if short:
+        raise ValueError(
+            f"every arm needs SEEDS_MINIMUM={SEEDS_MINIMUM} seeds before a "
+            f"placement is tallied; got {short}"
+        )
+
+    tally: dict[str, list[tuple[str, int]]] = {name: [] for name in PLACEMENTS}
+    for key, cell in sorted(inputs.cells.items()):
+        tally[cell.placement()].append(key)
+    frozen = {name: tuple(votes) for name, votes in tally.items()}
+
+    needed = strict_majority(len(inputs.cells))
+    winners = [name for name in PLACEMENTS if len(frozen[name]) >= needed]
+    assert len(winners) <= 1, (
+        f"two placements cannot both hold a strict majority of {len(inputs.cells)} "
+        f"cells; got {winners} -- the partition is broken"
+    )
+    at = f"k = {inputs.decision_k}, h = {inputs.decision_h}"
+    if not winners:
+        counts = ", ".join(f"{n}={len(frozen[n])}" for n in PLACEMENTS)
+        return HeadroomStatus(
+            verdict=NO_MAJORITY,
+            rule=(
+                f"no placement reached {needed} of {len(inputs.cells)} cells at "
+                f"{at} ({counts})"
+            ),
+            tally=frozen,
+        )
+    verdict = winners[0]
+    return HeadroomStatus(
+        verdict=verdict,
+        rule=(
+            f"{verdict} in {len(frozen[verdict])} of {len(inputs.cells)} cells at "
+            f"{at} (strict majority {needed}, computed from the cells present)"
+        ),
+        tally=frozen,
+    )
+
+
+READING_COLUMNS: tuple[str, ...] = (
+    "cell", "clusters", "headroom", "skill", "deficit", "share", "placement",
+)
+READING_WIDTHS: tuple[int, ...] = (22, 10, 30, 30, 30, 9, 12)
+"""`_interval` prints 28 characters for any value below 1000 in magnitude
+(`+8.3f` three times, two brackets, a comma and two spaces). The three interval
+columns are 30 wide so each ends in a space; at 24 every row ran 12 characters
+past the header and the columns after the first interval were out of line."""
+
+
+def _row(values, widths) -> str:
+    return "".join(str(v).ljust(w) for v, w in zip(values, widths))
+
+
+def _interval(i: Interval) -> str:
+    return f"{i.point:+8.3f} [{i.ci_low:+8.3f},{i.ci_high:+8.3f}]"
+
+
+def format_reading_headroom(
+    reading: HeadroomStatus, inputs: HeadroomInputs
+) -> str:
+    """The table, the verdict, and a legend that is conditioned on the gate.
+
+    EVERY DIRECTIONAL SENTENCE IS CONDITIONAL. M3m shipped "both directions are
+    sound" unconditionally in three places its own results refuted -- a
+    docstring, the legend written into `burden.txt`, and spec 3.3, which the
+    next milestone would have inherited. A sign here means something only
+    behind the headroom gate, and the legend says so in the same breath as the
+    sign, so the sentence cannot be quoted without its condition.
+
+    The `share` column is a POINT ESTIMATE WITH NO INTERVAL, printed only where
+    the gate passed. It needs none: the verdict is two-sided on the two
+    differences, so the share is presentation. Where the gate failed it prints
+    `--`, never a number, because `headroom` crosses zero inside the reported
+    grid on a real cell: `pixel_ae_seed1`'s `headroom(k=45, h)` is 0.575649 at
+    h=1 and -0.641206 at h=2, and the share reads +339.5% at h=2 then -335.7%
+    at h=3.
+    """
+    at = f"k = {inputs.decision_k}, h = {inputs.decision_h}"
+    lines = [
+        f"M3n motion headroom -- the one-step map between copying and perfect, at {at}",
+        "",
+        _row(READING_COLUMNS, READING_WIDTHS),
+    ]
+    for (arm, seed), cell in sorted(inputs.cells.items()):
+        placement = cell.placement()
+        share = (
+            f"{cell.skill.point / cell.headroom.point * 100:7.1f}%"
+            if placement != "UNREADABLE" else "--"
+        )
+        lines.append(_row(
+            (
+                f"{arm}_seed{seed}", cell.clusters,
+                _interval(cell.headroom), _interval(cell.skill),
+                _interval(cell.deficit), share, placement,
+            ),
+            READING_WIDTHS,
+        ))
+    lines += [
+        "",
+        f"verdict: {reading.verdict}",
+        f"rule:    {reading.rule}",
+        "",
+        "legend",
+        "  headroom = hold - floor, what a PERFECT predictor wins over copying.",
+        "  skill    = hold - rung,  what the model wins over copying.",
+        "  deficit  = rung - floor, M3m's burden -- the distance to perfect.",
+        "  skill + deficit == headroom at every step, to float rounding; the hold",
+        "  term cancels. The interval ends do not add: each is a percentile of",
+        "  its own resamples.",
+        "  A cell is read ONLY IF headroom is resolvably above zero. Where it is",
+        "  not, a perfect predictor is indistinguishable from a copying one, so",
+        "  the sign of skill carries no claim about the model and the share is",
+        "  printed as `--` rather than as a number.",
+        "  Behind that gate: skill resolvably positive means the one-step map",
+        "  beats holding; deficit resolvably positive means it is not yet",
+        "  indistinguishable from perfect.",
+        f"  Intervals are episode-clustered bootstraps at {CONFIDENCE:.2f} over "
+        f"{RESAMPLES} resamples.",
+        "",
+    ]
+    return "\n".join(lines)
