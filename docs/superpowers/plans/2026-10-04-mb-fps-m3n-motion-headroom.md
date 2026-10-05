@@ -793,7 +793,7 @@ EOF
 - Test: `tests/eval/test_headroom.py`
 
 **Interfaces:**
-- Consumes: `burden.at_horizon(curve, h)`, `burden._checked_pair(left, right)` — the shape guard M3m's ladder uses to refuse mismatched curves. Re-export nothing; import what is needed.
+- Consumes: `burden.at_horizon(curve, h)`, `burden.checked_pair(left, right)` — the shape guard M3m's ladder uses to refuse mismatched curves. Re-export nothing; import what is needed.
 - Produces:
   ```python
   REPORTED_H: tuple[int, ...] = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)
@@ -974,7 +974,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from mbfps.eval.burden import _checked_pair
+from mbfps.eval.burden import checked_pair
 
 REPORTED_H: tuple[int, ...] = (1, 2, 3, 5, 8, 10, 15, 20, 30, 45)
 """The horizon steps the record publishes. Inherited from M3m unchanged, so the
@@ -1031,7 +1031,7 @@ def headroom(hold: np.ndarray, floor: np.ndarray) -> np.ndarray:
     predictor cannot be told from a copying one, and nothing between them can
     be placed either.
     """
-    hold, floor = _checked_pair(hold, floor)
+    hold, floor = checked_pair(hold, floor)
     return hold - floor
 
 
@@ -1044,7 +1044,7 @@ def skill(hold: np.ndarray, rung: np.ndarray) -> np.ndarray:
     error they share cancels in this difference -- which is the entire reason
     this statistic is readable where `motion_margin` was not.
     """
-    hold, rung = _checked_pair(hold, rung)
+    hold, rung = checked_pair(hold, rung)
     return hold - rung
 
 
@@ -1057,7 +1057,7 @@ def deficit(rung: np.ndarray, floor: np.ndarray) -> np.ndarray:
     from zero means the rung is statistically indistinguishable from a perfect
     one-step predictor.
     """
-    rung, floor = _checked_pair(rung, floor)
+    rung, floor = checked_pair(rung, floor)
     return rung - floor
 
 
@@ -1094,7 +1094,7 @@ Apply each mutation, clear caches, run, confirm the named test fails, restore:
 | `triple_residual`: `np.max` -> `np.sum` | `test_triple_residual_reports_the_worst_step_not_their_sum` |
 | `triple_residual`: `np.max` -> `np.mean` | `test_triple_residual_reports_the_worst_step_not_their_sum` |
 | `skill`: `hold - rung` -> `rung - hold` | `test_skill_is_positive_when_the_rung_beats_the_hold_baseline` |
-| `headroom`: drop the `_checked_pair` call | `test_mismatched_curve_lengths_are_refused` |
+| `headroom`: drop the `checked_pair` call | `test_mismatched_curve_lengths_are_refused` |
 
 Record each observed failure message in the report.
 
@@ -1479,7 +1479,7 @@ def reading_headroom(inputs: HeadroomInputs) -> HeadroomStatus:
     )
 ```
 
-Add `from dataclasses import dataclass` and `from mbfps.eval.burden import _checked_pair, strict_majority` to the module's imports.
+Add `from dataclasses import dataclass` and `from mbfps.eval.burden import checked_pair, strict_majority` to the module's imports.
 
 Note: `winners` can hold at most one name, because `PLACEMENTS` partitions the
 cells and two disjoint sets cannot each exceed half. Do not add a tie branch;
@@ -2075,13 +2075,13 @@ EOF
 The replacement now demonstrably exists, which is the spec's own argument for removing rather than deprecating.
 
 **Files:**
-- Modify: `src/mbfps/eval/burden.py` — remove `motion_margin`, `DECISION_H`, `ARMS_REQUIRED`, `CONFIDENCE`, `RESAMPLES`, `BurdenArm`, `BurdenInputs`, `BurdenStatus`, `_fall_through_rule`, `reading_burden`, `READING_COLUMNS`, `READING_WIDTHS`, `_row`, `format_reading_burden`. **Keep** `at_horizon`, `_checked_pair`, `burden`, `compounding`, `identity_residual`, `scored_targets`, `one_step_persistence`, `strict_majority`, `SEEDS_MINIMUM`, `REPORTED_H`, `IDENTITY_TOLERANCE`.
+- Modify: `src/mbfps/eval/burden.py` — remove `motion_margin`, `DECISION_H`, `ARMS_REQUIRED`, `CONFIDENCE`, `RESAMPLES`, `BurdenArm`, `BurdenInputs`, `BurdenStatus`, `_fall_through_rule`, `reading_burden`, `READING_COLUMNS`, `READING_WIDTHS`, `_row`, `format_reading_burden`. **Keep** `at_horizon`, `checked_pair`, `burden`, `compounding`, `identity_residual`, `scored_targets`, `one_step_persistence`, `strict_majority`, `SEEDS_MINIMUM`, `REPORTED_H`, `IDENTITY_TOLERANCE`.
 - Modify: `scripts/prediction_burden.py` — stop computing `margin` in the measure phase; the read phase prints the stored `margin` from existing records under a superseded legend and points at M3n.
 - Modify: `tests/eval/test_burden.py`, `tests/eval/test_prediction_burden_script.py`
 
 **Interfaces:**
 - Consumes: nothing new
-- Produces: `burden.py` reduced to the ladder. `headroom.py` imports `_checked_pair` and `strict_majority` from it, so those two must survive — verify by running `tests/eval/test_headroom.py` after the removal.
+- Produces: `burden.py` reduced to the ladder. `headroom.py` imports `checked_pair` and `strict_majority` from it, so those two must survive — verify by running `tests/eval/test_headroom.py` after the removal.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2111,14 +2111,14 @@ def test_the_contaminated_statistic_is_gone_from_the_module():
 def test_the_ladder_survives_the_removal():
     """`burden`, `compounding` and `identity_residual` were right and stay.
 
-    M3n's `deficit` IS `burden`, and `headroom.py` imports `_checked_pair` and
+    M3n's `deficit` IS `burden`, and `headroom.py` imports `checked_pair` and
     `strict_majority` from here, so a removal that took them would break the
     replacement.
     """
     from mbfps.eval import burden as module
 
     for kept in (
-        "at_horizon", "_checked_pair", "burden", "compounding",
+        "at_horizon", "checked_pair", "burden", "compounding",
         "identity_residual", "scored_targets", "one_step_persistence",
         "strict_majority", "SEEDS_MINIMUM", "REPORTED_H",
         "IDENTITY_TOLERANCE",
@@ -2213,7 +2213,7 @@ that headroom.py exists converts a corrected error into a standing trap.
 
 The ladder stays untouched -- burden, compounding, identity_residual -- and
 is what the module now is. M3n's deficit IS burden; headroom.py imports
-_checked_pair and strict_majority from here.
+checked_pair and strict_majority from here.
 
 prediction_burden stops computing margin for new records. Old records keep
 theirs and still print, under a legend that says it is superseded and why,
