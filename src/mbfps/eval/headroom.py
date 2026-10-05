@@ -76,8 +76,12 @@ That makes the one-step verdict k-free by construction, which is a control
 rather than an assumption."""
 
 IDENTITY_TOLERANCE: float = 1e-9
-"""`triple_residual` above this is a plumbing fault, not rounding. The observed
-residual on the shipped curves is 1.421e-14, about five orders below."""
+"""`triple_residual` above this is a plumbing fault, not rounding. The shipped run
+observes 5.684e-14 to 1.137e-13 across its nine cells -- the identity taken on
+the per-window rows, max over all five ks -- about four orders below. (1.421e-14
+is the same identity on M3m's MEAN curves at k=45 alone, five orders below; it is
+the figure the module docstring and `triple_residual` cite, and the two are not
+the same measurement.)"""
 
 CONFIDENCE: float = 0.95
 """A LABEL, NOT A PARAMETER. It records which interval `pooling.percentile_interval`
@@ -98,7 +102,7 @@ percentiles in step: change either alone and it fails."""
 RESAMPLES: int = 2000
 """The verdict's episode-clustered bootstrap. 229 windows over 24 episodes on
 every shipped cell; see `pooling.clustered_interval` for why the unit is the
-episode and why the direction of that error matters here specifically."""
+episode, and why its width is measured per quantity rather than inferred from M3m's."""
 
 SECONDARY_SIGMAS: int = 2
 """Multiplier applied to `RegroundingSweep.standard_error` for the RECORDED secondary

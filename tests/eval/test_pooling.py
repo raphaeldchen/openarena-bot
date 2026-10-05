@@ -970,7 +970,9 @@ def test_clustered_interval_refuses_a_nonfinite_value_outside_the_read_column():
 def test_the_interval_clusters_on_episodes_and_requires_its_seed():
     """The resampling unit is the EPISODE, not the window: 229 windows over 24
     episodes, and consecutive Doom frames are near-duplicates, so a
-    window-level bootstrap returns an interval several times too narrow.
+    window-level bootstrap counts correlated observations as independent ones
+    (1.26x to 2.17x too narrow on M3m's `window_margin`, and no claim about any
+    other quantity).
 
     THE MUTATION THIS EXISTS FOR, TWICE OVER: resampling windows instead of
     episodes narrows the interval; and `seed: int = 0` lets every cell share

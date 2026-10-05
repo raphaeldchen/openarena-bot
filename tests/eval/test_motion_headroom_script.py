@@ -2491,9 +2491,14 @@ def test_a_record_carrying_any_non_finite_value_is_refused_for_the_one_it_is(
 
 
 def test_negative_headroom_steps_are_recorded_and_do_not_stop_the_read(hand_record, tmp_path, capsys):
-    """`negative_headroom_steps` is a recorded list that the readability gate
-    reads, not a control checked against a constant: a record carrying a long
-    list still reads."""
+    """`negative_headroom_steps` is a recorded diagnostic with no reader: not a
+    control checked against a constant (`broken_controls` iterates the zero
+    controls and `identity_residual`), and not the readability gate either, which
+    is the headroom INTERVAL's `ci_low`, whereas the list is built from the
+    headroom POINT. A record carrying a long list therefore still reads.
+
+    What this shows is that the list does not stop the read. It does not show
+    that anything consults it, and nothing does."""
     records = _records_from(hand_record, _spec(["BETWEEN"] * 9))
     for record in records.values():
         record["controls"]["negative_headroom_steps"] = [[1, 2], [1, 8], [3, 5]]

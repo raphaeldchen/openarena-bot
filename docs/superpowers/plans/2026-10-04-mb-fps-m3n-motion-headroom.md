@@ -2417,10 +2417,22 @@ Compared with `!= 0.0`, not `> 0`. The four exact zeros also carry the
 flag off, so a bitwise match on the arms and the reference proves turning it on
 moved neither.
 
-`negative_headroom_steps` is non-empty in **9 of 9** — 2 to 12 of the 225
-`(k, h)` cells per record have a negative headroom POINT. So a perfect
-predictor scoring worse than copying is not a quirk of one cell; it happens
-somewhere in every one, which is why the share is gated rather than printed.
+`negative_headroom_steps` is non-empty in **9 of 9**, with `2, 4, 4, 4, 5, 6,
+6, 8, 12` entries — 2 to 12 of the **50** `(k, h)` cells it is built over (5 ks
+x 10 `REPORTED_H`: the list is filled inside `for h in REPORTED_H`,
+`scripts/motion_headroom.py:413-426`), each with a negative headroom POINT; over
+the full **225**-cell surface (5 ks x 45 steps, counted from each record's
+`curves` as `holds[k] - floor_position < 0`) the counts are `25, 28, 33, 39,
+41, 44, 45, 53, 64`, which is 11% to 28% of every record's surface, median 18%.
+**This sentence is a correction.** It first read "2 to 12 of the 225 `(k, h)`
+cells", which is wrong either way it is read: 225 is not the list's
+denominator (50 is, so the rate was understated 4.5x), and 2 to 12 is not the
+surface's count (25 to 64: 372 negative cells across the nine records against
+the 51 listed, so "1% to 5%" understated the surface about sevenfold). So a
+perfect predictor scoring worse than copying is not a quirk of one cell, and
+not a rare event within one: it happens somewhere in every cell, at about a
+fifth of all `(k, h)` steps, which is why the share is gated rather than
+printed.
 
 ### The decision cell, `(k=1, h=1)`
 
@@ -2520,8 +2532,25 @@ the resampling distribution, not that it is more conservative.
 The M3 gate has read this surface at `h=45` alone for thirteen milestones,
 where every cell is −38.8% to −116.3%. The zero crossing is at **h=1 to h=17**,
 and `pixel_ae_seed1`'s `+339.5%` then `−335.7%` at h=2 and h=3 is the
-denominator crossing zero, not a reading. These are point estimates with no
-interval; the gated version of the same quantity is the `share` column above.
+denominator crossing zero, not a reading.
+
+**That `+339.5%` is also the one cell where this table is more permissive than
+the project's own `gap_closed`.** `gap_closed` (`src/mbfps/eval/rollout.py:65-72`)
+returns NaN for a non-positive band, and the band here is `headroom(45, 2) =
+−0.641206`, so `gap_closed` returns NaN at that cell. The table prints the
+ratio of two negatives (skill −2.177 over headroom −0.641), which carries the
+sign of a model that closes the band when the model is worse than copying: the
+flip the non-positive-band policy exists to prevent, and the one that would pass
+the gate's `gap_closed > 0`. Running `gap_closed` over each record's
+`persistence_position`, `rssm_position` and `floor_position` reproduces the
+other 89 of the 90 cells to the printed digit and returns NaN at this one. Read
+it as NaN.
+
+These are point estimates with no interval. The gated version of the same
+quantity is the `share` field in each record (`share[k][h]`, null where
+`headroom`'s interval is not above zero) and the `share` column of
+`runs/m3n_motion/headroom.txt`, which prints it at `(1,1)` only, as `--` where
+the gate fails. Neither is shown in the tables in this section.
 
 ### What exit 48 licenses — and a gap in §11
 
@@ -2536,11 +2565,18 @@ actually licenses:
 - **`BETWEEN` is empty**, so §11's "fix one-step quality first" is not
   licensed either. Nothing established that the one-step map has skill to
   improve.
-- **In 8 of 9 cells there is no evidence the one-step map beats copying** — in
-  4 because it resolvably does not, in 4 because the instrument cannot tell.
-  Those are different statements and must not be pooled: `UNREADABLE` is about
-  the probe, `AT_COPYING` about the model. What they share is only that neither
-  supports propagating a one-step skill to longer horizons.
+- **In 8 of 9 cells there is no resolvable evidence the one-step map beats
+  copying**, for two reasons that are different statements and must not be
+  pooled. In 4 (`AT_COPYING`) the instrument works — a perfect predictor
+  resolvably beats copying — and `skill`'s interval still contains zero. That is
+  a failure to find skill, not a finding that there is none: its upper bounds
+  (+10.325, +2.715, +9.413, +5.810) say how much is NOT excluded, and nothing
+  here establishes that the map does not predict motion. In 4 (`UNREADABLE`) the
+  instrument cannot tell a perfect predictor from a copying one, so no statement
+  about the model is available at `(1,1)` at all. `UNREADABLE` is about the
+  probe; `AT_COPYING` is about how far one cell's interval reaches. What they
+  share is only that neither supports propagating a one-step skill to longer
+  horizons.
 - **The probe is at its limit.** A perfect one-step predictor beats a copying
   one by 0.576 to 11.824 map units against readout errors of 131 to 259, and
   that margin is not resolvable from zero in 4 of 9 cells. Every candidate

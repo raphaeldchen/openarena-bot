@@ -114,7 +114,7 @@ copying one, so nothing between them can be placed either.
 | `skill > 0` | `deficit > 0` | verdict | meaning |
 | --- | --- | --- | --- |
 | yes | yes | `BETWEEN` | real one-step skill *and* a real one-step deficit |
-| yes | no | `AT_PERFECT` | as good as the readout permits |
+| yes | no | `AT_PERFECT` | not resolvably worse than perfect |
 | no | yes | `AT_COPYING` | not resolvably better than predicting no motion |
 | no | no | `AMBIGUOUS` | ruler too coarse to place it |
 
@@ -196,14 +196,34 @@ reps = np.array([rows[i, 0].mean() for i in episode_bootstrap(lab, 2000, 0)])
 inflation = percentile_interval(reps)[2] / iid
 ```
 
-The direction matters. An understated standard error makes a quantity look MORE
-resolvable, so it is the conservative choice for a claim of *non*-resolvability
-and the dangerous one for a claim of resolvability. M3n's verdict rests on
-claims of resolvability, which is why it cannot use `RegroundingSweep.standard_error`.
+**What this table does and does not license.** It establishes that the iid
+standard error is not the resampling distribution of `window_margin`'s mean at
+`h=1`: the windows are not independent draws, and the clustered figure is
+1.26x to 2.17x larger. It does NOT establish that the clustered interval is
+wider than the iid one on M3n's rows, and no direction follows from it. A first
+draft of this section drew one: that an iid ruler overstates resolvability, so a
+claim of resolvability made with it is the dangerous one. The run refuted that
+(plan, Task 8 results, "§13"): at `(k=1, h=45)` the clustered interval resolves
+`deficit` in 2 of 9 cells where M3m's iid `2 x SE` bar resolves 0 of 9.
+
+The reason the factor does not transfer is a difference of quantity, not of
+degree. `window_margin` carries the ground-truth one-step displacement, which is
+correlated within an episode, so it clusters. M3n's three differences are each
+model-minus-model on the SAME window; an episode-level component common to both
+terms can cancel in the subtraction, in the same step that cancels the readout
+error. That is a hypothesis, and the shipped records cannot test it (they store
+mean curves, not the per-window difference rows). Whether the clustered interval
+is wider, narrower or about equal to the iid one is MEASURED per quantity, and
+the 1.26x to 2.17x is not a prior for any quantity but the one it was taken on.
+
+The clustered bootstrap is therefore chosen for what it assumes, not for which
+way it errs: it measures the resampling distribution of the paired difference
+and assumes nothing about independence across windows. That is why M3n's
+verdict does not use `RegroundingSweep.standard_error`, which assumes it.
 
 `paired_standard_error` from `RegroundingSweep.standard_error` is still **recorded**, as a cheaper
-secondary figure with its understatement documented in the record, so the two
-rulers can be compared. It does not decide anything.
+secondary figure (doubled, see §4), so a reader can set the two rulers side by
+side on the same cell. It does not decide anything.
 
 ### 3.4 The reported share
 
@@ -243,10 +263,22 @@ it is the flag that costs memory — `post_logits` is
 `(n_windows, context + horizon, groups, classes)` against the trajectory
 fields' `(n_windows, horizon, 2)`.
 
-**`RegroundingSweep` gains two fields**, parallel to the existing pair:
+**`RegroundingSweep` gains three fields.** Two are parallel to the existing pair:
 
     hold_position: dict[int, np.ndarray]          # mean curve per k
     window_hold_position: dict[int, np.ndarray]   # per-window rows per k
+
+and the third is not a curve but a label:
+
+    window_episode: np.ndarray                    # per window, the contributing episode it was cut from
+
+The third is load-bearing. Every interval M3n reads is clustered on it, and
+carrying it on the sweep is what REMOVES M3m's documented episode-numbering
+mismatch rather than documenting it. M3m recovered the labels by walking the
+validation episodes a second time in `baseline_rows`, and `diagnostics` numbers
+episodes AFTER skipping a too-short one, so the two walks disagree once such an
+episode precedes another. M3n needs no second walk: every array it reads comes
+from this one sweep, in this one order, and the labels are `_Pass`'s own.
 
 Positions stay internal to the sweep; it exports errors, which is the shape it
 already has.
@@ -291,16 +323,22 @@ part in the reading.
 ## 6. Controls
 
 The first four are required to be exactly `0.0`; `identity_residual` is held to
-`IDENTITY_TOLERANCE`; `negative_headroom_steps` is a recorded list that the
-readability gate reads rather than a value checked against a constant.
+`IDENTITY_TOLERANCE`; `negative_headroom_steps` is a recorded diagnostic with no
+reader. The readability gate is `Interval.resolvably_positive` on the `headroom`
+interval, reached through `placement`, and `broken_controls` iterates the zero
+controls and `identity_residual`, so neither reads the list. It is also built on a
+different criterion than the gate, the `headroom` POINT being below zero rather
+than the interval's `ci_low` failing to clear it, so it is not a proxy for the
+gate either. It is written for a reader of the record, as `displacement_median`,
+`secondary.iid_2se` and `cell_bootstrap_seed` are, and checked against nothing.
 
 | control | claim it pins |
 | --- | --- |
 | `persistence_divergence` | `max abs(hold_45 - persistence_position)` |
 | `k_invariance_at_h1` | the three differences at `h=1` are identical across all five `k` |
 | `open_loop_divergence` | inherited from M3m — the k=45 rung reproduces `rssm_position` |
-| `identity_residual` | `skill + deficit == headroom`, tolerance 1e-9, observed 1.421e-14 |
-| `negative_headroom_steps` | the `(k, h)` cells with `headroom < 0`, recorded and judged by the gate |
+| `identity_residual` | `skill + deficit == headroom` on the per-window rows, max over all five `k`, tolerance 1e-9; observed 5.684e-14 to 1.137e-13 across the nine shipped cells (the 1.421e-14 of §3.1 is the same identity on M3m's mean curves at k=45 alone) |
+| `negative_headroom_steps` | the `(k, h)` among the 5 `k` x 10 `REPORTED_H` = 50 whose `headroom` POINT is below zero; recorded, read by nothing |
 
 `floor_divergence` is carried forward from M3m's record schema unchanged.
 
@@ -410,10 +448,20 @@ and nothing in `scripts/` uses a higher number.
 
 | majority verdict | what it licenses |
 | --- | --- |
-| `AT_PERFECT` | the one-step map is as good as the readout permits; all remaining error is compounding, and a multi-step or overshooting objective is the indicated intervention |
+| `AT_PERFECT` | the map is resolvably better than copying, and the ruler cannot tell it from a perfect one-step predictor: `deficit`'s interval contains zero, so a one-step deficit up to its upper bound is NOT excluded. That is the instrument failing to find a deficit, not a measurement that there is none. It makes compounding the live candidate for the remaining error, and a multi-step or overshooting objective the indicated next test; it does not establish that all remaining error is compounding |
 | `BETWEEN` | a real one-step deficit; fix one-step quality before paying ~13h of training for a multi-step objective |
-| `AT_COPYING` | the map genuinely does not predict motion — M3m's original hypothesis, now on a fair ruler |
+| `AT_COPYING` | the map is not resolvably better than predicting no motion (`skill`'s interval contains zero), while the model is resolvably worse than a perfect one-step predictor (`deficit`'s interval lies above zero). That is the ruler failing to find skill, not a finding that there is none: `skill`'s upper bound is how much skill is NOT excluded. It does not establish that the map does not predict motion, so it neither confirms nor refutes M3m's original hypothesis. It licenses only that a one-step skill cannot be taken as the premise for a longer horizon |
 | `UNREADABLE`, exit 47 | the probe, not the model, is the limit; M3o redirects to the readout rather than to training |
+
+Every `not resolvably` above is a statement about an interval, which is a statement
+about the ruler. None of them is a claim that the quantity is zero, and a row that
+reads as one has overstated what its predicate establishes. The shipped run is the
+worked case: the four cells that read `AT_COPYING` have `skill` points of +4.694,
++0.257, +4.451 and +0.852 with upper bounds +10.325, +2.715, +9.413 and +5.810, so
+in each of them a one-step gain up to that bound is not excluded (2.7 to 10.3 map
+units, by cell). `random_vit_seed1`, the one `AT_PERFECT` cell, has `deficit`
++1.588 [-1.019, +4.356]: not resolvably worse than perfect, which is not the same
+as being at perfect.
 
 `UNREADABLE` is a real possibility, not a formality. `pixel_ae_seed1`'s
 `headroom(45, 1)` POINT ESTIMATE is 0.575649 map units: a perfect one-step
@@ -441,25 +489,47 @@ probe.
 
 ## 13. Re-reporting M3m's resolvability under the clustered ruler
 
-M3m's SE multiples were computed with `RegroundingSweep.standard_error`, which §3.5 shows understates
-the standard error by 1.26x to 2.17x on the one per-window array it shipped.
-M3n measures `deficit`, which *is* `burden`, with per-window rows — so it
-re-reports M3m's two headline resolvability claims under the clustered ruler at
-no extra cost:
+M3m's SE multiples were computed with `RegroundingSweep.standard_error`, which
+assumes the windows are independent draws. §3.5 shows that assumption fails on
+the one per-window array M3m shipped: the clustered standard error there is
+1.26x to 2.17x the iid one. M3n measures `deficit`, which *is* `burden`, with
+per-window rows, so it can re-report one of M3m's two headline resolvability
+claims under the clustered ruler at no extra cost. It cannot re-report the other.
 
 - **"`burden(1)` is not resolvable from zero at 2 SE in 9 of 9 cells, max 1.94
-  SE."** A claim of non-resolvability made with an understated SE is
-  conservative, so this stands and strengthens.
-- **"`compounding(45)` is resolvable at 5.56-11.63 SE."** A claim of
-  resolvability made with an understated SE is overstated. The direction is
-  safe — even dividing by the largest inflation measured, 5.56/2.17 = 2.56,
-  still clears 2 — but the headline multiples are too large and M3n should
-  publish the corrected ones.
+  SE."** RE-REPORTED, AND IT DOES NOT STAND. A first draft of this bullet said
+  it "stands and strengthens", on the argument that an understated SE is
+  conservative for a claim of non-resolvability. That argument needed the
+  clustered interval to be wider on this quantity, which §3.5 does not
+  establish, and the run found the opposite. At `(k=1, h=45)` on M3n's records,
+  M3m's own bar (`|point| > 2 x iid SE`) reproduces **0 of 9** resolvable, and the
+  clustered 95% interval resolves `deficit` in **2 of 9**: `frozen_ssl_seed1`
+  [+1.109, +12.300] and `pixel_ae_seed2` [+0.045, +11.148]. The better ruler
+  contradicts M3m's claim in two cells.
+- **"`compounding(45)` is resolvable at 5.56-11.63 SE."** NOT RE-REPORTED, AND
+  M3n'S COMMITMENT TO IT IS WITHDRAWN. A first draft said M3n "should publish
+  the corrected" multiples. M3n did not, and its records cannot support it:
+  `compounding(45)` is `rung_45 - rung_1`, the shipped records keep mean curves
+  only, with no per-window rung rows, and so no clustered interval on that
+  difference is derivable from them. The draft's further argument, that the
+  direction is safe because 5.56/2.17 = 2.56 still clears 2, divided M3m's
+  multiples by a factor measured on a different quantity, which §3.5 now says
+  does not transfer, and it is withdrawn with the commitment.
+
+  **Handed to M3o, conditionally and with the one change it needs.** The
+  re-report becomes possible when the record carries the per-window difference
+  rows (or at least the bootstrap replicate SD) for `rung_45 - rung_1`: the same
+  schema change the plan's Task 8 results recommend for the interval-width
+  question in §3.5. If M3o does not make that change, the item is dropped, not
+  carried forward again. Until then nothing in M3n or its records owes it.
 
 The inflation factors in §3.5 are measured on `window_margin`, a different
-quantity with its own clustering structure. They are cited to establish that
-the effect is real and of this order, not to rescale M3m's numbers by analogy.
-M3n measures the factors it reports.
+quantity with its own clustering structure, and they do not transfer to M3n's
+model-minus-model rows. They are cited as the measurement for `window_margin`
+only and are not used to rescale any of M3m's numbers by analogy. What M3n
+reports on its own rows is an interval, not an inflation factor: the shipped
+records store the interval and not the replicate SD, so a factor on M3n's own
+rows is not derivable from them either.
 
 ## 14. By-product worth recording
 

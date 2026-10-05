@@ -35,8 +35,15 @@ a literal that survives the tests):
                 across-k spread at h=1 (0.0), the k=horizon rung against the
                 verified reference (0.0), the sweep's floor against the verified
                 reference's (0.0), and the identity residual (below
-                `IDENTITY_TOLERANCE`) -- plus `negative_headroom_steps`, a list the
-                gate reads, not a value checked against a constant.
+                `IDENTITY_TOLERANCE`) -- plus `negative_headroom_steps`, a recorded
+                diagnostic with NO READER. The gate is `resolvably_positive` on
+                the headroom interval, reached through `placement`, and
+                `broken_controls` iterates the zero controls and the identity
+                residual; neither looks at this list. It is built from the
+                headroom POINT being below zero, a different criterion than the
+                gate's. Like `displacement_median`, `secondary.iid_2se` and
+                `cell_bootstrap_seed`, it is written for a reader of the record
+                and checked against nothing.
   nonfinite     NOT a field `measure_cell` sets. `study.write_record` owns the
                 top-level key `nonfinite` (the map from the dotted path of each
                 non-finite value it nulled to the token it came from) and RAISES
@@ -254,7 +261,7 @@ def broken_controls(controls: dict) -> list[str]:
     goes on to print a verdict about a model from rows nobody could trust.
 
     THE IDENTITY RESIDUAL IS HELD TO `IDENTITY_TOLERANCE`, not to zero -- it is
-    rounding noise, 1.421e-14 on the shipped curves -- and is written `not
+    rounding noise, 5.684e-14 to 1.137e-13 on the shipped run -- and is written `not
     residual <= tolerance` for the same reason: `nan > tolerance` is also False.
     """
     broken = [

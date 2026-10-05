@@ -711,15 +711,30 @@ def clustered_interval(
 
     THE RESAMPLING UNIT IS THE EPISODE. There are 229 windows over 24 episodes
     on every shipped cell, and consecutive Doom frames are near-duplicates, so
-    a window-level bootstrap counts correlated observations as independent ones
-    and returns an interval several times too narrow. Measured on M3m's
-    `window_margin` rows, the episode-clustered standard error at h=1 is 1.26x
-    to 2.17x the iid one across the nine cells.
+    a window-level bootstrap counts correlated observations as independent ones.
+    Measured on M3m's `window_margin` rows, the episode-clustered standard
+    error at h=1 is 1.26x to 2.17x the iid one across the nine cells (mean
+    1.66x; `sqrt(229/24) = 3.09x` is the ceiling, reached only if windows within
+    an episode were perfectly correlated).
 
-    THE DIRECTION OF THAT ERROR MATTERS. An understated standard error makes a
-    quantity look MORE resolvable, so an iid ruler is the conservative choice
-    for a claim of non-resolvability and the dangerous one for a claim of
-    resolvability. M3n's verdict rests on claims of resolvability.
+    THAT FACTOR IS A MEASUREMENT OF `window_margin` AND OF NOTHING ELSE. It is
+    not a prior for the array passed here, and no direction for "clustered
+    versus iid" follows from it. `window_margin` carries the ground-truth
+    displacement, which is correlated within an episode; a model-minus-model
+    difference on the same window can cancel that episode-level component in
+    the subtraction. M3n's three differences are of that kind, and the direction
+    the factor predicts did not hold for them: at (k=1, h=45) the clustered
+    interval resolved `deficit` in 2 of 9 cells where M3m's iid `2 x SE` bar
+    resolved 0 of 9 (`docs/superpowers/plans/2026-10-04-mb-fps-m3n-motion-headroom.md`,
+    "Task 8 results"). Whether an iid ruler overstates resolvability depends on
+    whether its standard error is the smaller of the two, which is a thing to
+    MEASURE per quantity, not to assume.
+
+    THE JUSTIFICATION IS THEREFORE WHAT THE INTERVAL ASSUMES, NOT WHICH WAY IT
+    ERRS. Resampling whole episodes measures the resampling distribution of a
+    statistic whose windows are not independent, and assumes nothing about how
+    large that dependence is. It is not chosen because it is more
+    conservative, and no caller should cite it as though it were.
 
     `seed` AND `resamples` ARE KEYWORD-REQUIRED WITH NO DEFAULTS. A defaulted
     seed is how a previous milestone shipped every cell drawing the same
