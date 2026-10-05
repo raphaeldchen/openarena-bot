@@ -669,6 +669,114 @@ def test_no_cells_is_refused():
         reading_headroom(_inputs([]))
 
 
+@pytest.mark.parametrize("seeds", [1, 3, 9])
+def test_one_arm_is_refused_by_name_whatever_its_seed_count(seeds):
+    """A verdict from one arm is the M3j trap, and three seeds does not escape it.
+
+    At three and nine seeds the arm clears `SEEDS_MINIMUM`, so the seeds refusal
+    does not fire and only the arm count can refuse. Every cell reads BETWEEN,
+    so without the refusal a verdict comes back -- `BETWEEN in 3 of 3 cells
+    (strict majority 2)` at three seeds. That is what the previous milestone
+    printed for `--arms random_vit`. Nine seeds is tried too: the refusal is
+    about how many arms there are, not about how few cells. At one seed BOTH
+    refusals apply, and the arm count is the one reported (it is checked first),
+    so a lone short arm is named as the missing arm rather than as a short one.
+    """
+    assert ARMS_REQUIRED == 2
+    cells = [_cell("random_vit", s, *_TRIPLES["BETWEEN"]) for s in range(seeds)]
+    with pytest.raises(ValueError, match="ARMS_REQUIRED") as raised:
+        reading_headroom(_inputs(cells))
+    message = str(raised.value)
+    assert "ARMS_REQUIRED=2" in message
+    assert str(["random_vit"]) in message, "the refusal names the arm that is present"
+    assert "SEEDS_MINIMUM" not in message, "the seeds refusal did not fire"
+
+
+def test_exactly_arms_required_arms_is_enough():
+    """Two arms of three seeds each read; the bound is `<`, not `<=`.
+
+    Every other test with three arms would pass a refusal at `<=`, so this is
+    the one that pins the boundary. Six cells, bar 4, all BETWEEN.
+    """
+    cells = [
+        _cell(arm, s, *_TRIPLES["BETWEEN"])
+        for arm in ("frozen_ssl", "pixel_ae") for s in (0, 1, 2)
+    ]
+    reading = reading_headroom(_inputs(cells))
+    assert reading.verdict == "BETWEEN"
+    assert "BETWEEN in 6 of 6 cells" in reading.rule
+
+
+def _unbalanced(winner_arm_names, other_names):
+    """Arms of 3, 3 and 9 seeds: `frozen_ssl` and `pixel_ae` small, `random_vit` large."""
+    return _layout(
+        [("frozen_ssl", (0, 1, 2)), ("pixel_ae", (0, 1, 2)), ("random_vit", tuple(range(9)))],
+        list(other_names) + list(winner_arm_names),
+    )
+
+
+@pytest.mark.parametrize("winner", PLACEMENTS)
+def test_a_majority_carried_by_one_arm_alone_is_no_majority_not_an_error(winner):
+    """The unbalanced plan the arm-count check passes, and what the second returns.
+
+    Arms of 3, 3 and 9 seeds: three arms, every one at `SEEDS_MINIMUM` or above,
+    so neither refusal fires. The nine-seed arm reads `winner` in all nine
+    cells and the six others read AMBIGUOUS (BETWEEN when `winner` is
+    AMBIGUOUS), so `winner` holds 9 of 15 cells against a bar of 8 -- a numeric
+    majority from one arm.
+
+    The result is a STATUS and not a `ValueError`. The inputs were legal and
+    the arms simply did not agree, which is a finding about the data and
+    reaches exit 48 as `NO_MAJORITY` does; an exception would read as a
+    malformed plan. The rule says the placement held a numeric majority and
+    spanned one arm, so it cannot be mistaken for `no placement reached` -- the
+    other way of getting here. The tally keeps the nine votes: it is what was
+    measured. Every placement is tried, UNREADABLE too, because a verdict of
+    `UNREADABLE` from one arm is as much one arm's finding as the others.
+    """
+    other = "AMBIGUOUS" if winner != "AMBIGUOUS" else "BETWEEN"
+    cells = _unbalanced([winner] * 9, [other] * 6)
+    assert burden.strict_majority(15) == 8
+    reading = reading_headroom(_inputs(cells))
+    assert reading.verdict == "NO_MAJORITY"
+    assert len(reading.tally[winner]) == 9, "the tally is what was measured"
+    assert {arm for arm, _ in reading.tally[winner]} == {"random_vit"}
+    assert "no placement reached" not in reading.rule
+    assert f"{winner} held a numeric majority (9 of 15 cells" in reading.rule
+    assert "spanned only 1 arm (random_vit)" in reading.rule
+    assert "ARMS_REQUIRED=2" in reading.rule
+
+
+def test_the_arm_check_counts_arms_not_cells_per_arm():
+    """Eight cells of the nine-seed arm and one of another span two arms: a verdict.
+
+    Pins what `reading_headroom`'s docstring says about check 2, so the claim
+    cannot drift from the behaviour. It is the check as specified -- the winning
+    cells must span `ARMS_REQUIRED` arms -- and so it reads one cell from a
+    second arm as spanning it. That is a limit of the rule rather than an
+    endorsement: nine of fifteen cells is a verdict here although the nine-seed
+    arm reads BETWEEN in eight of its nine alone. A rule that asked more of the
+    second arm would fail this test, deliberately.
+    """
+    cells = _unbalanced(["BETWEEN"] * 8 + ["AMBIGUOUS"], ["AMBIGUOUS"] * 5 + ["BETWEEN"])
+    reading = reading_headroom(_inputs(cells))
+    assert len(reading.tally["BETWEEN"]) == 9
+    assert {arm for arm, _ in reading.tally["BETWEEN"]} == {"pixel_ae", "random_vit"}
+    assert reading.verdict == "BETWEEN"
+
+
+def test_a_majority_spanning_two_arms_is_a_verdict():
+    """Five of nine over two arms carries; the second check is `< ARMS_REQUIRED`.
+
+    The five winning cells are three of `frozen_ssl` and two of `pixel_ae`, so
+    they span exactly `ARMS_REQUIRED` arms. A check written as `<=` would refuse
+    this, and the one-arm cases above would not notice.
+    """
+    reading = reading_headroom(_inputs(_nine(["BETWEEN"] * 5 + ["AMBIGUOUS"] * 4)))
+    assert {arm for arm, _ in reading.tally["BETWEEN"]} == {"frozen_ssl", "pixel_ae"}
+    assert reading.verdict == "BETWEEN"
+
+
 def test_the_tally_and_the_table_do_not_depend_on_the_order_cells_were_built_in():
     """Votes are listed sorted by (arm, seed) however the dict was filled.
 

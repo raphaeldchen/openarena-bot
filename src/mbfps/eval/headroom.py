@@ -93,11 +93,22 @@ produced the opposite conclusion from the correct one, and the wrong one was
 the more interesting-sounding."""
 
 SEEDS_MINIMUM: int = 3
-ARMS_REQUIRED: int = 2
 """An arm with fewer than `SEEDS_MINIMUM` seeds is refused by name rather than
-tallied. `ARMS_REQUIRED` is satisfied automatically by the strict-majority bar
-over nine cells -- no arm holds more than three -- and is stated anyway so the
-protection M3m carried is visibly not dropped."""
+tallied: `reading_headroom` raises `ValueError`."""
+
+ARMS_REQUIRED: int = 2
+"""`reading_headroom` enforces this twice, and neither check covers the other.
+
+  1. Fewer than `ARMS_REQUIRED` arms present: `ValueError`, naming the arms.
+     That is a verdict from one arm, the shape `--arms random_vit` built in
+     M3j.
+  2. A strict majority whose winning cells span fewer than `ARMS_REQUIRED`
+     arms: `NO_MAJORITY`, not an error. Arms of 3, 3 and 9 seeds pass the first
+     check, and the nine-seed arm alone reaches the bar of 8 at fifteen cells.
+
+The strict-majority bar does not stand in for either: it counts cells, not
+arms, and the 3x3 shape that makes five cells span two arms is one shape the
+function accepts out of many."""
 
 DISPLACEMENT_RECORDED_ONLY: float = 3.9694722203504225
 """The median true one-step displacement on the shipped split. RECORDED AND
@@ -200,7 +211,9 @@ the same tuple because it is a per-cell outcome and a majority of it is a
 verdict -- M3n's exit 47 -- rather than a missing value."""
 
 NO_MAJORITY: str = "NO_MAJORITY"
-"""No placement held a strict majority of the cells. M3n's exit 48."""
+"""No verdict was drawn: either no placement held a strict majority of the
+cells, or one did and its cells spanned fewer than `ARMS_REQUIRED` arms. The
+`rule` line says which. M3n's exit 48."""
 
 
 @dataclass(frozen=True)
@@ -232,8 +245,11 @@ class HeadroomCell:
     deficit: Interval
     clusters: int
     """Distinct episodes behind the bootstrap. Carried because an interval
-    drawn from one cluster is not an interval, and the script refuses on it
-    rather than printing it."""
+    drawn from one cluster is not an interval, and printed beside the intervals
+    in the `clusters` column. Nothing in this module refuses on it: `placement`
+    and `reading_headroom` never read it, so a one-cluster cell is placed like
+    any other, and a caller that wants the refusal has to make it before
+    building the cell."""
 
     def placement(self) -> str:
         """This cell's member of `PLACEMENTS`.
@@ -244,12 +260,24 @@ class HeadroomCell:
         reads `AT_PERFECT` -- a verdict about a model, taken on a cell where a
         perfect predictor is indistinguishable from a copying one.
 
-        This is not hypothetical. `pixel_ae_seed1`'s `headroom(k=45, h)` on the
-        shipped record is +0.575649 at h=1 and -0.641206 at h=2, against a
-        floor of 259.06 map units at h=1. The h=2 point estimate is below zero,
-        so the gate refuses it there on the point alone. Whether the h=1
-        interval excludes zero is not in that record, which carries no
-        per-window hold curve; this docstring does not claim it.
+        The tests construct that case; the shipped record does not show it.
+        What the record does show is the premise behind it: `headroom` changes
+        sign inside the reported grid on a real cell. `pixel_ae_seed1` at k=45:
+
+            h=1: headroom +0.575649  skill +0.4020  deficit +0.1737
+            h=2: headroom -0.641206  skill -2.1768  deficit +1.5356
+            h=3: headroom +0.798695  skill -2.6812  deficit +3.4799
+
+        A perfect predictor wins 0.58, then loses 0.64, then wins 0.80, against
+        a floor of 259.06 map units at h=1. That is what makes the gate
+        load-bearing rather than tidy. It is NOT a measured case of a skill-
+        positive cell reading `AT_PERFECT`: the h=2 skill is negative, so
+        without the gate that step would read `AT_COPYING` or `AMBIGUOUS`,
+        by whether its deficit interval excludes zero. The h=2 point estimate
+        is below zero, so on any interval that contains its own point the gate
+        refuses it. Whether the h=1 interval excludes zero is not in that
+        record, which carries no per-window hold curve; this docstring does
+        not claim it.
 
         `AMBIGUOUS` is reachable WITH a resolvable headroom. The gate
         establishes only that the two ends are separated, not that the ruler is
@@ -303,16 +331,38 @@ def reading_headroom(inputs: HeadroomInputs) -> HeadroomStatus:
     and 6 at eleven, so storing 5 would be a majority at one cell count and a
     minority at another; M3l's design was reworked for exactly that.
 
-    `ARMS_REQUIRED` needs no separate check at nine cells in three arms: no arm
-    holds more than three, so any five cells span at least two arms. The
-    constant is still defined, and this paragraph is why there is no `if`
-    against it.
+    `ARMS_REQUIRED` IS ENFORCED, by two checks, because neither covers the
+    other. The bar counts cells and not arms, so it cannot stand in for either:
+    one arm of three seeds returns `BETWEEN in 3 of 3 cells`, and arms of 3, 3
+    and 9 let the nine-seed arm reach the bar of 8 alone.
+
+      1. FEWER THAN `ARMS_REQUIRED` ARMS PRESENT raises `ValueError` naming the
+         arms that are. The plan itself is malformed. It is checked before
+         `SEEDS_MINIMUM`, so a lone short arm is reported as the missing arm.
+      2. A MAJORITY WHOSE CELLS SPAN FEWER THAN `ARMS_REQUIRED` ARMS returns
+         `NO_MAJORITY`, and does NOT raise. The inputs were legal -- every arm
+         met `SEEDS_MINIMUM` and there were enough arms -- and the data simply
+         did not agree across arms, which is a finding and reaches exit 48 as
+         one. The `rule` says the placement held a numeric majority and
+         spanned only that many arms, so it cannot be read as the other way to
+         `NO_MAJORITY`, `no placement reached`. The tally still carries every
+         vote. It applies to every placement, `UNREADABLE` included: that
+         verdict is also one arm's finding when only one arm reads it.
+
+    Check 2 counts the arms the winning cells come from, not how many cells
+    each contributes. Eight cells of a nine-seed arm and one cell of another
+    span two arms and are a verdict.
     """
     if not inputs.cells:
         raise ValueError("reading_headroom needs at least one cell")
     by_arm: dict[str, set[int]] = {}
     for arm, seed in inputs.cells:
         by_arm.setdefault(arm, set()).add(seed)
+    if len(by_arm) < ARMS_REQUIRED:
+        raise ValueError(
+            f"a verdict needs ARMS_REQUIRED={ARMS_REQUIRED} arms; "
+            f"got {sorted(by_arm)}"
+        )
     short = {arm: sorted(s) for arm, s in by_arm.items() if len(s) < SEEDS_MINIMUM}
     if short:
         raise ValueError(
@@ -343,6 +393,20 @@ def reading_headroom(inputs: HeadroomInputs) -> HeadroomStatus:
             tally=frozen,
         )
     verdict = winners[0]
+    winning_arms = sorted({arm for arm, _ in frozen[verdict]})
+    if len(winning_arms) < ARMS_REQUIRED:
+        return HeadroomStatus(
+            verdict=NO_MAJORITY,
+            rule=(
+                f"{verdict} held a numeric majority ({len(frozen[verdict])} of "
+                f"{len(inputs.cells)} cells at {at}, strict majority {needed}) "
+                f"but spanned only {len(winning_arms)} "
+                f"{'arm' if len(winning_arms) == 1 else 'arms'} "
+                f"({', '.join(winning_arms)}); ARMS_REQUIRED={ARMS_REQUIRED} "
+                f"arms must agree"
+            ),
+            tally=frozen,
+        )
     return HeadroomStatus(
         verdict=verdict,
         rule=(
@@ -357,10 +421,11 @@ READING_COLUMNS: tuple[str, ...] = (
     "cell", "clusters", "headroom", "skill", "deficit", "share", "placement",
 )
 READING_WIDTHS: tuple[int, ...] = (22, 10, 30, 30, 30, 9, 12)
-"""`_interval` prints 28 characters for any value below 1000 in magnitude
-(`+8.3f` three times, two brackets, a comma and two spaces). The three interval
-columns are 30 wide so each ends in a space; at 24 every row ran 12 characters
-past the header and the columns after the first interval were out of line."""
+"""`_interval` prints 28 characters for any value below 1000 in magnitude:
+`+8.3f` three times (24), two brackets (2), a comma (1) and one space (1). The
+three interval columns are 30 wide so each ends in a space; at 24 every row ran
+12 characters past the header and the columns after the first interval were out
+of line."""
 
 
 def _row(values, widths) -> str:
