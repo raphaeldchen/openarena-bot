@@ -40,8 +40,8 @@ quantity, not a constant, and it varies **20.5×** across the nine cells
 (0.575649 to 11.824 map units at h=1).
 
 The same mistake is available one level up: normalising M3n's margin by
-3.9694722203504225 produces an apparent bimodal split across cells (four near
-100%, five at 6–43%) that dissolves entirely under the correct denominator
+3.9694722203504225 produces an apparent bimodal split across cells (three cells at 106–118%, five at
+6.5–43.2%, and one at −1.8% in neither group) that dissolves entirely under the correct denominator
 (−2.4% to 72.7%, unimodal, mean 35.6%). The pattern was the constant denominator,
 not the model.
 
@@ -356,7 +356,7 @@ pre-commitment rather than as advice.
    file to check that a test bites.
 7. Exact equality where exact equality is load-bearing. M3m's identity test
    nearly shipped `pytest.approx(rel=1e-6)` against a `sum`-vs-`max` mutation
-   whose gap is in the 7th significant figure — which the tolerance would have
+   which the tolerance would have
    accepted.
 
 Test command: `.venv/bin/python -m pytest`. The exit-code registry test in

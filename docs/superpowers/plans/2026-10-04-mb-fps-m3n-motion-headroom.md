@@ -35,7 +35,7 @@ Each is a defect class this arc has shipped. They are requirements, not advice.
 3. **The fake model is stochastic.** With a deterministic fake, `seed`, `device` and `feature_backbone` go unbound and a seed mutation reads a difference of 0.0.
 4. **Every test calls the code under test.** M3m shipped a test that asserted a tautology over random numbers and would have passed against an empty file.
 5. **Docstrings name only mutations the fixture can reach.** Six instances in this arc named a mutation inexpressible at that scope or never reached.
-6. **Exact equality where exactness is load-bearing.** M3m nearly shipped `pytest.approx(rel=1e-6)` against a `sum`-vs-`max` mutation whose gap is in the 7th significant figure.
+6. **Exact equality where exactness is load-bearing.** M3m nearly shipped `pytest.approx(rel=1e-6)` against a `sum`-vs-`max` mutation it would have accepted. Measured on M3n's own k=45 column, 8 of 9 cells have a residual of exactly 0.0 under both reductions and the ninth separates them by only 4x (1.421e-14 against 5.684e-14) — so a *relative* tolerance is the wrong instrument regardless of the gap's size, and the fixture must be built to separate the two rather than relying on real data to do it.
 
 ---
 
@@ -946,7 +946,8 @@ measured, not constant, and varies 20.5x across the nine cells.
 
 THE SAME MISTAKE IS AVAILABLE ONE LEVEL UP. Normalising this module's `skill`
 by 3.9694722203504225 produces an apparent bimodal split across the nine cells
-(four near 100%, five at 6-43%) that dissolves entirely under `headroom`
+(three cells at 106-118%, five at 6.5-43.2%, and one at -1.8%
+belonging to neither) that dissolves entirely under `headroom`
 (-2.4% to 72.7%, unimodal). The pattern was the constant denominator.
 
 THE THREE DIFFERENCES, all probe-space, all per (k, h):
@@ -964,7 +965,7 @@ the copying end and the perfect end is `skill > 0` and `deficit > 0`: two
 differences, no denominator. A denominator would matter, because `headroom`
 crosses zero inside the reported grid on a real cell -- `pixel_ae_seed1` reads
 0.575649 at h=1 and -0.641206 at h=2, so the normalised share there prints
-+339.5% then -335.7%.
++339.5% at h=2 then -335.7% at h=3.
 
 BOTH AXES ARE NAMED. `k` is the re-grounding period, `h` the horizon step.
 Write `headroom(k, h)`, never `headroom(45)`.
@@ -990,7 +991,7 @@ rather than an assumption."""
 
 IDENTITY_TOLERANCE: float = 1e-9
 """`triple_residual` above this is a plumbing fault, not rounding. The observed
-residual on the shipped curves is 1.421e-14, seven orders below."""
+residual on the shipped curves is 1.421e-14, about five orders below."""
 
 CONFIDENCE: float = 0.95
 RESAMPLES: int = 2000
@@ -1114,7 +1115,7 @@ That identity is why the reading carries no ratio. The two-sided test
 against copying and perfect is skill > 0 and deficit > 0, two differences,
 no denominator -- which matters because headroom crosses zero inside the
 reported grid on pixel_ae_seed1 (0.575649 at h=1, -0.641206 at h=2), where
-the normalised share prints +339.5% then -335.7%.
+the normalised share prints +339.5% at h=2 then -335.7% at h=3.
 
 triple_residual takes the max, not the sum: the gap between them on real
 data is in the 7th significant figure, so approx(rel=1e-6) would accept the
@@ -1527,7 +1528,8 @@ def format_reading_headroom(
     the gate passed. It needs none: the verdict is two-sided on the two
     differences, so the share is presentation. Where the gate failed it prints
     `--`, never a number, because `headroom` crosses zero inside the reported
-    grid on a real cell and the ratio there reads +339.5% then -335.7%.
+    grid on a real cell: `pixel_ae_seed1`'s headroom is 0.575649 at h=1 and
+    -0.641206 at h=2, and the share reads +339.5% at h=2 then -335.7% at h=3.
     """
     at = f"k = {inputs.decision_k}, h = {inputs.decision_h}"
     lines = [
@@ -1914,7 +1916,7 @@ def measure_cell(
             # None, never a number, where the gate failed. `headroom` crosses
             # zero inside the reported grid on a real cell -- pixel_ae_seed1
             # reads 0.575649 at h=1 and -0.641206 at h=2 -- and the ratio there
-            # prints +339.5% then -335.7%.
+            # prints +339.5% at h=2 then -335.7% at h=3.
             share[k][h] = (
                 cell["skill"]["point"] / hd["point"]
                 if hd["ci_low"] > 0.0 else None
