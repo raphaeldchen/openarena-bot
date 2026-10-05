@@ -575,29 +575,39 @@ def test_a_strict_majority_at_nine_cells_is_five():
     assert "no placement reached 5 of 9 cells" in missed.rule
 
 
-def test_the_majority_bar_moves_with_the_cell_count_eleven_cells_need_six():
-    """Six of eleven carries; FIVE of eleven does not. The bar is computed.
+def test_five_of_eleven_cells_is_not_a_majority():
+    """FIVE of eleven does not carry. This is the case a stored `5` fails by value.
 
     At nine cells the bar is 5, so a stored `5` and `strict_majority(len(...))`
-    agree on every nine-cell fixture. At eleven the bar is 6. The six-cell case
-    alone would not tell them apart (6 >= 5), so it is the FIVE-cell case that
-    does the work: a stored 5 reads it as a majority, the computed bar does not.
-    Its other six cells are split three and three, so nothing else carries.
+    agree on every nine-cell fixture. At eleven the bar is 6, and five cells of
+    one placement is a minority that a stored 5 would call a majority: it would
+    return `BETWEEN` here where the computed bar returns `NO_MAJORITY`. The
+    other six cells are split three and three, so nothing else carries and the
+    verdict is read off this one placement's count.
     """
     assert burden.strict_majority(9) == 5 and burden.strict_majority(11) == 6
 
+    names = ["BETWEEN"] * 5 + ["AMBIGUOUS"] * 3 + ["AT_COPYING"] * 3
+    five = reading_headroom(_inputs(_eleven(names)))
+    assert [len(five.tally[n]) for n in PLACEMENTS] == [5, 0, 3, 3, 0]
+    assert five.verdict == "NO_MAJORITY"
+    assert "no placement reached 6 of 11 cells" in five.rule
+
+
+def test_six_of_eleven_cells_is_a_majority():
+    """Six of eleven carries, and the five that do not are not counted in.
+
+    Alone this case does not separate a stored `5` from the computed bar (6 >= 5
+    both ways); a stored 5 fails it only INCIDENTALLY, because both placements
+    clear 5 and the partition assertion fires. The five-cell case above is the
+    one that fails by value. This one is what stops the bar being set too HIGH:
+    a stored 7 reads six of eleven as no majority.
+    """
     six = reading_headroom(_inputs(_eleven(["BETWEEN"] * 6 + ["AMBIGUOUS"] * 5)))
     assert six.verdict == "BETWEEN"
     assert len(six.tally["BETWEEN"]) == 6
     assert "BETWEEN in 6 of 11 cells" in six.rule
     assert "strict majority 6" in six.rule
-
-    five = reading_headroom(
-        _inputs(_eleven(["BETWEEN"] * 5 + ["AMBIGUOUS"] * 3 + ["AT_COPYING"] * 3))
-    )
-    assert [len(five.tally[n]) for n in PLACEMENTS] == [5, 0, 3, 3, 0]
-    assert five.verdict == "NO_MAJORITY"
-    assert "no placement reached 6 of 11 cells" in five.rule
 
 
 @pytest.mark.parametrize("winner", PLACEMENTS)
