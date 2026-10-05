@@ -1763,14 +1763,29 @@ class RegroundingSweep:
     the rung's last re-grounding step, held forward and scored on the same
     frames as the rung.
 
-    The copying end of M3n's axis. Both the rung and this baseline descend from
-    the SAME posterior latent, so per window their difference is of order the
-    model's predicted displacement -- units -- while either error alone is
-    130-260. That is the whole mechanism: the probe's readout error cancels in
-    the DIFFERENCE, not in either error, which is why M3m's `motion_margin`
-    was unfixable by better statistics. It subtracted a ground-truth
-    displacement, so there was no common latent for anything to cancel
-    against.
+    The copying end of M3n's axis. How exactly the probe's readout error
+    cancels in `hold - rung` depends on `g = ground_step(k, h)`.
+
+    At `g == 0` the rung and this baseline descend from the SAME posterior
+    latent, so per window their difference is of order the model's predicted
+    displacement -- units -- while either error alone is 130-260. `g == 0`
+    covers every `h <= k`: the whole `k == horizon` column, the entire h=1 row,
+    and so the milestone's decision cell `(k=1, h=1)`. There the readout error
+    cancels in the DIFFERENCE, not in either error, which is why M3m's
+    `motion_margin` was unfixable by better statistics. It subtracted a
+    ground-truth displacement, so there was no common latent for anything to
+    cancel against.
+
+    At `g > 0` that is NOT exact. The rung's own re-grounding `observe` draws
+    fresh categorical samples, and the floor's `observe` runs at a different
+    point in the same stream, so the two latents are redraws of one another
+    rather than one tensor. Measured on the test rig at `k=2`, their `z`
+    differed in 28 of 32 groups at step 2 and 32 of 32 at step 4, with `h`
+    differing by up to 0.3. The difference there carries a sampling-redraw term
+    on top of the readout difference. The readout error still largely cancels
+    -- the same probe reads both sides -- but "units, not hundreds" is
+    established only at `g == 0`, and the `g > 0` cells are noisier for this
+    reason as well as for the longer horizon.
 
     At `k == horizon` this is bitwise `reference.persistence_position`
     (`persistence_divergence`), and at h=1 it is identical for every k
@@ -1854,10 +1869,12 @@ class RegroundingSweep:
 
         ONE standard error. A caller that reports a two-SE figure doubles it.
 
-        PUBLIC because `curve_standard_error`, `paired_standard_error` and
-        `floor_margin_standard_error` are built from it, and M3n's
-        `scripts/motion_headroom.py` will read it for the rows those three
-        cannot name. A second copy of this formula would be the wrong answer.
+        PUBLIC so that code outside this class can rule a difference the three
+        methods above do not name -- the hold-minus-rung rows,
+        `window_hold_position[k] - window_position[k]`, have no method of their
+        own -- with this formula rather than a copy of it. A second copy would
+        be the wrong answer: the rulers would then disagree about what one
+        standard error is.
         """
         if rows.shape[0] < 2:
             return np.zeros(rows.shape[1])
