@@ -1441,10 +1441,19 @@ def reading_headroom(inputs: HeadroomInputs) -> HeadroomStatus:
     and 6 at eleven, so storing 5 would be a majority at one cell count and a
     minority at another; M3l's design was reworked for exactly that.
 
-    `ARMS_REQUIRED` needs no separate check at nine cells in three arms: no arm
-    holds more than three, so any five cells span at least two arms. The
-    constant is still defined, and this paragraph is why there is no `if`
-    against it.
+    `ARMS_REQUIRED` IS ENFORCED, by two checks rather than none. An earlier
+    draft of this plan argued it needed no check, because at nine cells in
+    three arms no arm holds more than three and so any five cells span at
+    least two arms. That is true of the 3x3 shape and false of this function,
+    which accepts any shape the CLI's free-form `--arms` and `--seeds` can
+    build: one arm with three seeds returns a verdict from one arm, and arms
+    of 3, 3 and 9 let the nine-seed arm carry the majority alone. The M3j trap
+    was exactly `--arms random_vit`.
+
+    So: refuse when fewer than `ARMS_REQUIRED` arms are present, and refuse a
+    verdict whose winning cells do not span `ARMS_REQUIRED` arms. The first
+    catches the degenerate plan; the second catches the unbalanced one, which
+    the first does not.
     """
     if not inputs.cells:
         raise ValueError("reading_headroom needs at least one cell")
