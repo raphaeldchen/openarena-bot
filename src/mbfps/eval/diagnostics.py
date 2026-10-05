@@ -1758,6 +1758,55 @@ class RegroundingSweep:
     """The floor's OWN per-window rows, retained so that "k sits above the
     floor" has a paired ruler. Keeping only the floor's mean leaves the
     k-vs-floor margin with no correct standard error available at all."""
+    hold_position: dict[int, np.ndarray]
+    """Per k, the error of the HOLD baseline: the floor's own probe position at
+    the rung's last re-grounding step, held forward and scored on the same
+    frames as the rung.
+
+    The copying end of M3n's axis. How exactly the probe's readout error
+    cancels in `hold - rung` depends on `g = ground_step(k, h)`.
+
+    At `g == 0` the rung and this baseline descend from the SAME posterior
+    latent, so per window their difference is of order the model's predicted
+    displacement -- units -- while either error alone is 130-260. `g == 0`
+    covers every `h <= k`: the whole `k == horizon` column, the entire h=1 row,
+    and so the milestone's decision cell `(k=1, h=1)`. There the readout error
+    cancels in the DIFFERENCE, not in either error, which is why M3m's
+    `motion_margin` was unfixable by better statistics. It subtracted a
+    ground-truth displacement, so there was no common latent for anything to
+    cancel against.
+
+    At `g > 0` that is NOT exact. The rung's own re-grounding `observe` draws
+    fresh categorical samples, and the floor's `observe` runs at a different
+    point in the same stream, so the two latents are redraws of one another
+    rather than one tensor. Measured on the test rig at `k=2`, their `z`
+    differed in 28 of 32 groups at step 2 and 32 of 32 at step 4, with `h`
+    differing by up to 0.3. The difference there carries a sampling-redraw term
+    on top of the readout difference. The readout error still largely cancels
+    -- the same probe reads both sides -- but "units, not hundreds" is
+    established only at `g == 0`, and the `g > 0` cells are noisier for this
+    reason as well as for the longer horizon.
+
+    At `k == horizon` this is bitwise `reference.persistence_position`
+    (`persistence_divergence`), and at h=1 it is identical for every k
+    (`k_invariance_at_h1`)."""
+    window_hold_position: dict[int, np.ndarray]
+    """The hold baseline's OWN per-window rows, so `hold - rung` has a paired
+    ruler. Keeping only the mean leaves the margin with no correct standard
+    error available at all -- the same reason `window_floor_position` is
+    retained."""
+    window_episode: np.ndarray
+    """Per window, the index of the CONTRIBUTING episode it was cut from --
+    `_Pass`'s own labels, copied through.
+
+    REQUIRED, because every interval M3n reads is clustered on these. M3m had
+    to recover them by walking the validation episodes A SECOND TIME in
+    `baseline_rows`, whose docstring in `scripts/prediction_burden.py` records the
+    hazard that came with it: `diagnostics` numbers episodes AFTER skipping a
+    too-short one, so the two walks disagree once such an episode precedes
+    another. M3n needs no second walk -- every array it reads comes from this
+    sweep -- so carrying the labels here removes the mismatch rather than
+    documenting it."""
     windows_total: int
 
     def curve(self, k: int, metric: str = "position") -> np.ndarray:
@@ -1788,7 +1837,7 @@ class RegroundingSweep:
         """
         if metric != "position":
             raise KeyError(f"no per-window {metric!r} curves are retained")
-        return self._spread(self.window_position[k])
+        return self.standard_error(self.window_position[k])
 
     def paired_standard_error(self, k: int, other: int) -> np.ndarray:
         """The ruler for `curve(k) - curve(other)`.
@@ -1798,7 +1847,7 @@ class RegroundingSweep:
         the comparison is paired. The spread that a difference has to clear is
         therefore the spread of the per-window difference, not of either curve.
         """
-        return self._spread(self.window_position[k] - self.window_position[other])
+        return self.standard_error(self.window_position[k] - self.window_position[other])
 
     def floor_margin_standard_error(self, k: int) -> np.ndarray:
         """The ruler for `curve(k) - floor`, paired the same way.
@@ -1807,16 +1856,25 @@ class RegroundingSweep:
         measured on the same windows in the same traversal, so its per-window
         rows pair with this k's.
         """
-        return self._spread(self.window_position[k] - self.window_floor_position)
+        return self.standard_error(self.window_position[k] - self.window_floor_position)
 
     @staticmethod
-    def _spread(rows: np.ndarray) -> np.ndarray:
+    def standard_error(rows: np.ndarray) -> np.ndarray:
         """Standard error of the column means. Zeros on a single window.
 
         Zeros rather than NaN or inf: one window has no spread to estimate, and
         both of the alternatives propagate into the printed table -- a NaN as a
         hole, an inf as "nothing is resolvable" -- where a reader cannot tell
         them from a computed result.
+
+        ONE standard error. A caller that reports a two-SE figure doubles it.
+
+        PUBLIC so that code outside this class can rule a difference the three
+        methods above do not name -- the hold-minus-rung rows,
+        `window_hold_position[k] - window_position[k]`, have no method of their
+        own -- with this formula rather than a copy of it. A second copy would
+        be the wrong answer: the rulers would then disagree about what one
+        standard error is.
         """
         if rows.shape[0] < 2:
             return np.zeros(rows.shape[1])
@@ -1838,6 +1896,52 @@ class RegroundingSweep:
             )
         )
 
+    def persistence_divergence(self) -> float:
+        """SELF-CHECK: max |hold at k=horizon - persistence|. MUST be 0.0.
+
+        k=horizon never re-grounds, so `ground_step` returns 0 at every step and
+        the hold baseline is the probe of the last context frame held forward --
+        which is what `persistence_position` already is. A nonzero value means
+        the grounding index is wrong, and the ladder's far corner has stopped
+        being the M3 gate's `beats_persistence`.
+
+        Returns 0.0 when the sweep did not run k=horizon, because there is then
+        nothing to check and a NaN would print as a failure.
+        """
+        if self.horizon not in self.hold_position:
+            return 0.0
+        return float(np.max(np.abs(
+            self.hold_position[self.horizon] - self.reference.persistence_position
+        )))
+
+    def k_invariance_at_h1(self) -> float:
+        """SELF-CHECK: the largest across-k spread at h=1. MUST be 0.0.
+
+        At h=1 every k grounds at step 0 and the rung is one prior step from the
+        context posterior, so the hold baseline and the rung are both
+        k-independent there. This is what makes M3n's one-step verdict k-free by
+        construction rather than by a choice of k. (The floor is one array
+        shared by every k, so there is no across-k spread in it to check.)
+
+        Read from the per-WINDOW rows, which are what the differences and the
+        bootstrap consume, not from the curves: two ks can agree in the mean
+        and disagree window by window, and only the rows show it.
+
+        The spread is `np.ptp`, so a NaN in any row is a NaN result -- a failed
+        check -- where Python's `max` and `min` skip a NaN according to its
+        position and `max([1.0, nan, 1.0]) - min([1.0, nan, 1.0])` is a passing
+        0.0.
+
+        The hold and the rung are checked separately. Checking only their
+        difference would pass a shift common to both, which leaves the
+        difference unchanged.
+        """
+        spreads = [
+            np.ptp(np.stack([rows[k][:, 0] for k in self.ks]), axis=0).max()
+            for rows in (self.window_hold_position, self.window_position)
+        ]
+        return float(np.max(spreads))
+
     def is_bitwise_the_floor(self, k: int, metric: str = "position") -> bool:
         """SELF-CHECK 2's alarm: did this k's curve collapse onto the floor.
 
@@ -1850,6 +1954,30 @@ class RegroundingSweep:
         return bool(
             np.array_equal(self.curve(k, metric), getattr(self.reference, f"floor_{metric}"))
         )
+
+
+def ground_step(k: int, h: int) -> int:
+    """The 0-based horizon step the k-rung was last re-grounded at before `h`.
+
+    `0` means the last CONTEXT frame -- the state every segment-0 step is
+    imagined from -- not horizon step 1.
+
+    DERIVED FROM `regrounding_sweep`'s OWN SEGMENT RULE, quoted from its
+    docstring: segment `s` covers horizon steps `[s*k, min((s+1)*k, H))` and is
+    grounded on the posterior through frame `start + context + s*k`. The 1-based
+    step `h` sits in segment `(h - 1) // k`, so the grounding step is
+    `k * ((h - 1) // k)`.
+
+    Both arguments are CHECKED. At `h = 0` floor division gives `k * -1`, a
+    negative grounding step, which would index the floor's positions from the
+    END of the horizon and hold from the wrong frame -- a wrong number, not a
+    crash, and one that no shape test would catch.
+    """
+    if k < 1:
+        raise ValueError(f"re-grounding period must be >= 1, got {k}")
+    if h < 1:
+        raise ValueError(f"horizon step must be >= 1 (1-based), got {h}")
+    return k * ((h - 1) // k)
 
 
 @torch.no_grad()
@@ -1935,7 +2063,34 @@ def regrounding_sweep(
         arms={k: segmented(k) for k in ks}, context=context, horizon=horizon,
         seed=seed, device=device, feature_backbone=feature_backbone,
         noise_reference=False,
+        # The hold baseline needs the floor's own probe POSITIONS, not its
+        # errors, and these are the fields that carry them (M3d). The flag's
+        # docstring states the pass draws nothing from the stream and does only
+        # numpy on rows already in hand; `test_without_the_flag_the_pass_
+        # carries_no_trajectories_and_is_bitwise_what_it_was` holds it to that,
+        # and the two sweep-vs-`evaluate_rollout` bitwise tests (which never set
+        # the flag) now run through the flag-on path. `keep_latents` stays
+        # False: the stage decomposition is not read here, and it is the flag
+        # that would actually cost memory.
+        keep_trajectories=True,
     )
+    window_hold = {}
+    for k in ks:
+        # NaN, not `empty_like`: a column a later edit forgets to write must
+        # read as NaN in the output rather than as whatever the allocator left.
+        rows = np.full(result.arms[k]["position"].shape, np.nan)
+        for h in range(1, horizon + 1):
+            g = ground_step(k, h)
+            # `positions_real[:, j]` is horizon step `j + 1` (the probe of the
+            # floor's embedding at step h), so the floor's position AT grounding
+            # step `g >= 1` is column `g - 1`; `g == 0` is the last context
+            # frame, which has its own array.
+            held = (
+                result.positions_at_context if g == 0
+                else result.positions_real[:, g - 1]
+            )
+            rows[:, h - 1] = position_error(held, result.true_positions[:, h - 1])
+        window_hold[k] = rows
     return RegroundingSweep(
         ks=tuple(ks),
         horizon=horizon,
@@ -1944,5 +2099,8 @@ def regrounding_sweep(
         angle={k: result.arms[k]["angle"].mean(axis=0) for k in ks},
         window_position={k: result.arms[k]["position"] for k in ks},
         window_floor_position=result.reference_windows["floor_position"],
+        hold_position={k: rows.mean(axis=0) for k, rows in window_hold.items()},
+        window_hold_position=window_hold,
+        window_episode=result.window_episode,
         windows_total=result.windows_total,
     )

@@ -43,10 +43,11 @@ from mbfps.eval.diagnostics import (
     Trajectories,
     action_intervention_ladder,
     action_shuffled_rollout,
+    ground_step,
     reference_trajectories,
     regrounding_sweep,
 )
-from mbfps.eval.probe import apply_probe
+from mbfps.eval.probe import apply_probe, position_error
 from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
@@ -228,14 +229,27 @@ def rollout(model, paths, probe, *, device=None):
 # ---------------------------------------------------------------------------
 
 
-def _truth_slices(monkeypatch, module, run):
+def _truth_slices(monkeypatch, module, run, *, rows=None):
+    """Every truth slice `module` hands `probe_targets` while `run` executes.
+
+    `rows`, when given, keeps only the slices of exactly that many frames. The
+    sweep needs it: `regrounding_sweep` passes `keep_trajectories=True`, and
+    with that flag `_diagnose` makes ONE MORE one-row `probe_targets` call per
+    window to build `true_at_context` (the privileged position at the last
+    context frame). Those are not the window set -- they are one row each, and
+    a window set is `horizon` rows -- so counting them reports twice the
+    windows the sweep scored.
+    """
     seen: list[np.ndarray] = []
     real = module.probe_targets
-    monkeypatch.setattr(
-        module,
-        "probe_targets",
-        lambda privileged, keys: seen.append(np.asarray(privileged)) or real(privileged, keys),
-    )
+
+    def spy(privileged, keys):
+        privileged = np.asarray(privileged)
+        if rows is None or len(privileged) == rows:
+            seen.append(privileged)
+        return real(privileged, keys)
+
+    monkeypatch.setattr(module, "probe_targets", spy)
     run()
     return seen
 
@@ -277,7 +291,15 @@ def test_the_diagnostics_score_the_rollouts_exact_window_set(
         if diagnostic == "shuffle"
         else (lambda: sweep(OracleModel(), paths, probe, ks=(1, HORIZON)))
     )
-    got = _truth_slices(monkeypatch, diagnostics_module, run)
+    # The sweep alone sets `keep_trajectories=True`, so its pass also reads the
+    # one-row `true_at_context` slice per window (see `_truth_slices`). Keep
+    # only the full `horizon`-row slices, which ARE the scored window set. The
+    # shuffle takes no such flag and every one of its slices is a window, so it
+    # is left unfiltered: filtering it would only hide a stray slice.
+    got = _truth_slices(
+        monkeypatch, diagnostics_module, run,
+        rows=HORIZON if diagnostic == "sweep" else None,
+    )
 
     assert len(got) == len(expected) > 0
     for mine, theirs in zip(got, expected):
@@ -414,6 +436,141 @@ def test_every_k_is_grounded_identically_at_the_first_horizon_step(tmp_path, dev
     result = sweep(model, [path], probe, ks=ks, device=device)
     first = np.array([result.curve(k)[0] for k in ks])
     assert len(np.unique(first)) == 1, first
+
+
+# ---------------------------------------------------------------------------
+# The hold baseline (M3n): the floor's own probe position at the rung's last
+# re-grounding step, held forward. Two reductions pin its ends -- k=HORIZON is
+# the gate's persistence, and h=1 is k-free -- and a third rebuilds its
+# interior from the segment rule, because both reductions sit at g == 0.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_hold_position_at_k_equals_the_horizon_is_bitwise_persistence(tmp_path, device):
+    """The ladder's far corner IS the gate's beats_persistence criterion.
+
+    k=HORIZON never re-grounds, so every step holds the probe of the last
+    context frame -- which is what `persistence_position` already is. Bitwise,
+    not approximately: both are `position_error` on the same two arrays.
+
+    On the REAL stochastic model, because against an oracle rig no random
+    number is drawn and every mutation that displaces the sampling stream is
+    invisible -- the reason the sibling self-check tests in this file say the
+    same thing.
+    """
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+
+    result = sweep(model, [path], probe, ks=(1, HORIZON), device=device)
+    assert result.windows_total >= 2, "fixture must yield more than one window"
+    assert not np.array_equal(
+        result.hold_position[1], result.reference.persistence_position
+    ), "k=1 must hold from somewhere else, or the equality below is satisfied by anything"
+    np.testing.assert_array_equal(
+        result.hold_position[HORIZON], result.reference.persistence_position
+    )
+    assert result.persistence_divergence() == 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_the_hold_and_rung_curves_are_k_invariant_at_the_first_step(tmp_path, device):
+    """At h=1 every k grounds at step 0 and imagines one step, so all k agree.
+
+    Checked on hold and rung SEPARATELY: if only their difference agreed, a
+    compensating error in both would pass. The rung half extends the property
+    `test_every_k_is_grounded_identically_at_the_first_horizon_step` already
+    pins, to the curve this task adds.
+    """
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+    ks = (1, 2, 3, HORIZON)
+
+    result = sweep(model, [path], probe, ks=ks, device=device)
+    assert not np.array_equal(
+        result.hold_position[1], result.hold_position[HORIZON]
+    ), "the ks must hold from different steps somewhere, or invariance at h=1 is vacuous"
+    holds = [result.hold_position[k][0] for k in ks]
+    rungs = [result.curve(k)[0] for k in ks]
+    assert len(np.unique(holds)) == 1, holds
+    assert len(np.unique(rungs)) == 1, rungs
+    assert result.k_invariance_at_h1() == 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES, ids=[d.type for d in DEVICES])
+def test_hold_position_holds_the_floors_own_position_from_the_grounding_step(
+    tmp_path, device
+):
+    """The expectation is rebuilt from the SEGMENT RULE, never from `ground_step`.
+
+    Task 2's docstring-derived oracle is the ONLY independent guard on
+    `ground_step`'s interior, because both bitwise reductions above sit at
+    `g == 0` -- k=HORIZON grounds every step at the context frame, and h=1
+    grounds there for every k. Neither ever exercises
+    `positions_real[:, g - 1]` for `g > 0`.
+
+    So if this test called `ground_step` to build its expectation, a wrong
+    interior mapping would move BOTH sides and nothing in the milestone would
+    catch it. That is the self-referential expectation M3m hit twice, and both
+    times the test caught one side of a two-sided mutation and missed the
+    other.
+
+    The loop below therefore enumerates segments FORWARD from
+    `regrounding_sweep`'s own docstring rule -- segment `s` covers horizon
+    steps `[s*k, min((s+1)*k, H))` and grounds on the posterior through step
+    `s*k` -- with no floor division anywhere, and asserts that steps grounding
+    INSIDE the horizon were actually reached.
+
+    `reference_trajectories` rather than `_diagnose`: it is the public entry
+    point, and it DRAWS the noise reference where the sweep does not, so a
+    bitwise match here also pins the two passes to the same floor.
+    """
+    k = 2                      # not a divisor of HORIZON=5: the last segment is ragged
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    model = model.to(device)
+
+    result = sweep(model, [path], probe, ks=(k, HORIZON), device=device)
+    kept = reference_trajectories(
+        model, [path], probe, context=CONTEXT, horizon=HORIZON, seed=0,
+        device=device, feature_backbone=None,
+    )
+
+    expected = np.zeros((kept.windows_total, HORIZON))
+    covered = set()
+    s = 0
+    while s * k < HORIZON:
+        for step0 in range(s * k, min((s + 1) * k, HORIZON)):
+            held = (
+                kept.positions_at_context if s == 0
+                else kept.positions_real[:, s * k - 1]
+            )
+            expected[:, step0] = position_error(held, kept.true_positions[:, step0])
+            covered.add(step0)
+        s += 1
+    assert len(covered) == HORIZON, "the oracle must cover every horizon step"
+    # The guard READS THE DATA. The interior case indexes `positions_real[:, k - 1]`
+    # -- the posterior the first re-grounding hands the second segment -- so that
+    # column must differ, on every window, from the three things a wrong index
+    # would read instead: the context frame (the `g == 0` case the two reductions
+    # already pin) and the columns either side of it. If it did not, an off-by-one
+    # in the interior would return the same numbers and this test would pass on it.
+    # `k >= 2` so that `k - 2` names a real column rather than wrapping to the end.
+    assert 2 <= k < HORIZON, "the interior case needs a k that re-grounds inside the horizon"
+    interior = kept.positions_real[:, k - 1]
+    for name, other in (
+        ("positions_at_context", kept.positions_at_context),
+        ("positions_real[:, k - 2]", kept.positions_real[:, k - 2]),
+        ("positions_real[:, k]", kept.positions_real[:, k]),
+    ):
+        assert np.any(interior != other, axis=1).all(), (
+            f"positions_real[:, k - 1] equals {name} on some window, so a wrong "
+            "grounding index would score the same hold there"
+        )
+    assert expected.std() > 0.0, "fixture must produce a non-constant hold curve"
+    np.testing.assert_array_equal(result.window_hold_position[k], expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2563,6 +2720,15 @@ def _hand_built_sweep(window_curves: dict, floor_rows=None, horizon=None, angle=
     floor_rows = np.asarray(floor_rows, float)
     assert floor_rows.shape == (rows_n, steps)
     position = {k: rows.mean(axis=0) for k, rows in window_curves.items()}
+    persistence = np.full(steps, 99.0)
+    # The hold baseline as the real sweep carries it: at k == horizon it IS the
+    # persistence curve and at h=1 it is the same for every k, so both
+    # self-checks read 0.0 here as they do on a real traversal. The per-window
+    # rows straddle it by half-integers, so they differ across windows and their
+    # mean is exactly the curve. The two self-check tests below start from this
+    # clean baseline and move one thing at a time with `dataclasses.replace`, so
+    # what they read is the amount they moved and nothing else.
+    hold_rows = persistence + (np.arange(rows_n) - (rows_n - 1) / 2)[:, None]
     return RegroundingSweep(
         ks=tuple(window_curves),
         horizon=horizon,
@@ -2570,7 +2736,7 @@ def _hand_built_sweep(window_curves: dict, floor_rows=None, horizon=None, angle=
             horizon=np.arange(1, steps + 1),
             rssm_position=position[horizon],
             floor_position=floor_rows.mean(axis=0),
-            persistence_position=np.full(steps, 99.0),
+            persistence_position=persistence,
             rssm_angle=(position[horizon] if angle is None else np.asarray(angle, float)),
             floor_angle=np.zeros(steps),
             persistence_angle=np.full(steps, 44.0),
@@ -2579,6 +2745,11 @@ def _hand_built_sweep(window_curves: dict, floor_rows=None, horizon=None, angle=
         angle={k: rows.mean(axis=0) for k, rows in window_curves.items()},
         window_position=window_curves,
         window_floor_position=floor_rows,
+        hold_position={k: hold_rows.mean(axis=0) for k in window_curves},
+        window_hold_position={k: hold_rows.copy() for k in window_curves},
+        # One window per episode: as many clusters as windows, so a clustered
+        # interval over these rows is not a one-cluster degenerate.
+        window_episode=np.arange(rows_n),
         windows_total=rows_n,
     )
 
@@ -2610,6 +2781,105 @@ def test_the_open_loop_divergence_fires_on_an_angle_only_divergence(tmp_path):
     # Position agrees exactly; angle does not.
     np.testing.assert_array_equal(swept.curve(2), reference.rssm_position)
     assert swept.open_loop_divergence(reference) == pytest.approx(95.0)
+
+
+def test_the_persistence_divergence_fires_on_a_hold_that_is_off_by_a_known_amount():
+    """SELF-CHECK: max |hold at k=horizon - persistence|.
+
+    On a real traversal it is reachable only at 0.0 -- the bitwise reduction
+    holds -- so a body that returns 0.0 passes every sweep test that reads it.
+    Here `hold_position[horizon]` is moved by a known vector whose LARGEST
+    magnitude is the NEGATIVE entry, so the value is asserted exactly and a
+    check that dropped the `abs` would read 0.5 instead of 3.0.
+    """
+    swept = _hand_built_sweep({1: [[1.0, 2.0]], 2: [[3.0, 4.0]]})
+    assert swept.persistence_divergence() == 0.0, "the unmoved fixture must read clean"
+    off = swept.hold_position[swept.horizon] + np.array([0.5, -3.0])
+    moved = replace(swept, hold_position={**swept.hold_position, swept.horizon: off})
+    assert moved.persistence_divergence() == 3.0
+
+
+def _h1_sweep(*, hold_shift=(0.0, 0.0), rung_shift=(0.0, 0.0)):
+    """Three ks over two windows, identical at h=1 except that k=2's h=1 rows
+    are shifted window by window by the given amounts.
+
+    The moved k is the MIDDLE one, so a check that compared only the first and
+    last k would not see it, and it is not the horizon k, so the hold baseline's
+    equality with persistence is untouched. Dyadic shifts and values, so every
+    spread below is exact rather than approximate.
+    """
+    rung = {k: np.array([[1.0, 2.0, 3.0], [5.0, 6.0, 7.0]]) for k in (1, 2, 3)}
+    rung[2][:, 0] += rung_shift
+    swept = _hand_built_sweep(rung)
+    hold = {k: rows.copy() for k, rows in swept.window_hold_position.items()}
+    hold[2][:, 0] += hold_shift
+    return replace(
+        swept,
+        hold_position={k: rows.mean(axis=0) for k, rows in hold.items()},
+        window_hold_position=hold,
+    )
+
+
+def _h1_curve_spreads(swept):
+    """(hold, rung) across-k spread of the h=1 MEAN curves."""
+    return (
+        float(np.ptp([swept.hold_position[k][0] for k in swept.ks])),
+        float(np.ptp([swept.curve(k)[0] for k in swept.ks])),
+    )
+
+
+@pytest.mark.parametrize("moved", ["hold", "rung"])
+def test_the_k_invariance_check_fires_on_either_curve_moving_alone(moved):
+    """SELF-CHECK: the largest across-k spread at h=1.
+
+    A body that returns 0.0 passes every real-traversal test, because there the
+    spread IS 0.0. Each curve is moved alone and the OTHER is asserted still, so
+    the value read is the amount moved and each half of the check is shown to
+    fire on its own.
+    """
+    assert _h1_sweep().k_invariance_at_h1() == 0.0, "the unmoved fixture must read clean"
+    swept = _h1_sweep(**{f"{moved}_shift": (0.75, 0.75)})
+    assert _h1_curve_spreads(swept) == ((0.75, 0.0) if moved == "hold" else (0.0, 0.75))
+    assert swept.k_invariance_at_h1() == 0.75
+
+
+def test_the_k_invariance_check_fires_on_a_shift_common_to_hold_and_rung():
+    """The hold and the rung are checked SEPARATELY, and this is why.
+
+    Both move by the same amount at k=2, so `rung - hold` is the same at every
+    k and a check on the difference alone would read 0.0. The fixture asserts
+    that, so the claim in `k_invariance_at_h1`'s docstring is one a fixture
+    reaches rather than an assertion about nothing.
+    """
+    swept = _h1_sweep(hold_shift=(0.75, 0.75), rung_shift=(0.75, 0.75))
+    difference = [swept.curve(k)[0] - swept.hold_position[k][0] for k in swept.ks]
+    assert np.ptp(difference) == 0.0, "the difference must be k-invariant here"
+    assert swept.k_invariance_at_h1() == 0.75
+
+
+@pytest.mark.parametrize("moved", ["hold", "rung"])
+def test_the_k_invariance_check_reads_the_per_window_rows_and_not_their_means(moved):
+    """The differences and the bootstrap consume the ROWS, so two ks that agree
+    in the mean and disagree window by window are not k-invariant.
+
+    k=2's h=1 rows move by +0.75 on one window and -0.75 on the other: the mean
+    curve does not move at all, and the rows move by 0.75.
+    """
+    swept = _h1_sweep(**{f"{moved}_shift": (0.75, -0.75)})
+    assert _h1_curve_spreads(swept) == (0.0, 0.0), "the MEAN curves must still agree"
+    assert swept.k_invariance_at_h1() == 0.75
+
+
+@pytest.mark.parametrize("moved", ["hold", "rung"])
+def test_a_nan_in_either_curve_fails_the_k_invariance_check(moved):
+    """A NaN must read as NaN, never as a pass.
+
+    Python's `max`/`min` skip a NaN by its position: with the NaN in the middle,
+    `max([x, nan, x]) - min([x, nan, x])` is 0.0 -- a false pass on exactly the
+    sweep whose rows are broken. k=2 is the middle k.
+    """
+    swept = _h1_sweep(**{f"{moved}_shift": (np.nan, 0.0)})
+    assert np.isnan(swept.k_invariance_at_h1())
 
 
 def test_a_curves_own_spread_is_its_window_standard_error_at_its_own_k():
@@ -2809,6 +3079,26 @@ def test_an_episode_that_yields_no_window_does_not_consume_an_episode_label(tmp_
         "the skipped middle episode still consumed a label"
     )
     np.testing.assert_array_equal(result.window_episode, np.array([0, 0, 1, 1]))
+
+
+def test_the_sweep_carries_each_windows_contributing_episode_label(tmp_path):
+    """`window_episode` is what every interval M3n reads is clustered on, and no
+    other test reads a SWEEP's labels.
+
+    A single-episode fixture cannot tell zeros from correct -- its labels are
+    all 0 either way -- so this has three episodes and the TOO-SHORT one comes
+    first. `diagnostics` numbers episodes AFTER skipping it, so the labels count
+    contributing episodes: `[0, 0, 1]`. Numbering by position in `val_paths`
+    would read `[1, 1, 2]`, and a sweep that dropped the labels to zeros would
+    read `[0, 0, 0]`; neither is `[0, 0, 1]`.
+    """
+    lengths = (CONTEXT + HORIZON, T_SYNTHETIC, ONE_WINDOW)
+    episodes = [synthetic_episode(length=n) for n in lengths]
+    paths = [write(tmp_path, episode, index) for index, episode in enumerate(episodes)]
+    assert [len(window_starts(n, CONTEXT, HORIZON)) for n in lengths] == [0, 2, 1]
+    result = sweep(OracleModel(), paths, oracle_probe(episodes[1]), ks=(1, HORIZON))
+    assert result.windows_total == 3
+    np.testing.assert_array_equal(result.window_episode, np.array([0, 0, 1]))
 
 
 # ---------------------------------------------------------------------------
@@ -3158,8 +3448,10 @@ def test_without_the_flag_the_pass_carries_no_trajectories_and_is_bitwise_what_i
 
 
 def test_the_flag_is_keyword_only_and_off_by_default():
-    """Off by default so that the ladder and the sweep -- which never pass it
-    -- keep running the pass they pin bitwise against the records."""
+    """Off by default so that the ladder -- which never passes it -- keeps
+    running the pass it pins bitwise against the records. The sweep passes it
+    since M3n, for the hold baseline, and is held to the same records by its
+    two bitwise comparisons against `evaluate_rollout`."""
     parameter = inspect.signature(diagnostics_module._diagnose).parameters["keep_trajectories"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is False
@@ -3918,3 +4210,52 @@ def test_the_noise_reference_is_drawn_at_the_rollouts_temperature(tmp_path, devi
     assert sharp.noise_bitwise_real.all(), "at tau = 0 two draws must be the same trajectory"
     np.testing.assert_array_equal(sharp.noise_embedding, np.zeros_like(sharp.noise_embedding))
     assert sharp.noise_stream_restored.all()
+
+
+def test_ground_step_matches_the_sweeps_own_segment_rule():
+    """The segment boundary, derived from the sweep's docstring, not from the code.
+
+    `regrounding_sweep`'s docstring states that segment `s` covers horizon
+    steps `[s*k, min((s+1)*k, H))` and is grounded on the posterior through
+    frame `start + context + s*k`. The expected values below are built from
+    that sentence with an independent loop, so a mutation to `ground_step`
+    cannot move both sides.
+    """
+    horizon = 45
+    for k in (1, 2, 3, 5, 15, 45):
+        expected = {}
+        for s in range(0, (horizon + k - 1) // k):
+            for step0 in range(s * k, min((s + 1) * k, horizon)):
+                expected[step0 + 1] = s * k        # 1-based h -> grounding step
+        assert len(expected) == horizon
+        for h in range(1, horizon + 1):
+            assert ground_step(k, h) == expected[h], (
+                f"k={k} h={h}: {ground_step(k, h)} != {expected[h]}"
+            )
+
+
+def test_ground_step_is_zero_for_every_h_when_k_is_the_horizon():
+    """k=45 never re-grounds, so every step holds from the last context frame.
+
+    This is the reduction that makes hold_45 identical to persistence; if it
+    failed, `hold_45` would hold from inside the horizon and the far corner of
+    the ladder would stop being the gate's `beats_persistence`.
+    """
+    assert {ground_step(45, h) for h in range(1, 46)} == {0}
+
+
+def test_ground_step_is_zero_at_h_one_for_every_k():
+    """The h=1 column is k-invariant, which makes the one-step verdict k-free."""
+    assert {ground_step(k, 1) for k in (1, 3, 5, 15, 45)} == {0}
+
+
+def test_ground_step_refuses_a_nonpositive_k_or_h():
+    """`k * ((h - 1) // k)` returns a plausible number for h<=0 and k<0.
+
+    At h=0 Python's floor division gives `k * -1`, a NEGATIVE grounding step,
+    which would index the floor's positions from the end of the horizon and
+    silently hold from the wrong frame.
+    """
+    for bad_k, bad_h in ((0, 1), (-1, 1), (1, 0), (1, -3)):
+        with pytest.raises(ValueError):
+            ground_step(bad_k, bad_h)

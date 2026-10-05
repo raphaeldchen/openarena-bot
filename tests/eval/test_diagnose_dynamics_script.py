@@ -77,6 +77,12 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
         np.asarray(v, float) + spreads.get(k, 1.0),
     ])
     floor = np.asarray(reference.floor_position, float)
+    # The hold baseline as the real sweep carries it: at k == horizon it IS the
+    # reference's persistence curve and at h=1 it is the same for every k. Two
+    # windows straddle it, as they straddle the floor, and each is its own
+    # episode so a clustered interval over these rows has two clusters rather
+    # than none. Nothing in this module reads them.
+    persistence = np.asarray(reference.persistence_position, float)
     return RegroundingSweep(
         ks=tuple(k_curves),
         horizon=reference.rssm_position.size,
@@ -85,6 +91,11 @@ def _sweep(reference: RolloutResult, k_curves: dict, spreads=None) -> Regroundin
         angle={k: np.asarray(v, dtype=float) / 10.0 for k, v in k_curves.items()},
         window_position={k: rows(k, v) for k, v in k_curves.items()},
         window_floor_position=np.stack([floor - 0.5, floor + 0.5]),
+        hold_position={k: persistence.copy() for k in k_curves},
+        window_hold_position={
+            k: np.stack([persistence - 0.5, persistence + 0.5]) for k in k_curves
+        },
+        window_episode=np.array([0, 1]),
         windows_total=2,
     )
 
@@ -692,6 +703,31 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
                   "latent_retention", "latent_width", "latent_capacity", "trust_horizon"):
         clash = own & set(statuses(other).values())
         assert not clash, f"prediction_burden collides with {other} on {clash}"
+
+    headroom = statuses("motion_headroom")
+    reused_by_headroom = dict(reused)
+    shared_with_trust = {
+        name: value for name, value in headroom.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_headroom, (
+        f"motion_headroom shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_headroom} is shared on purpose"
+    )
+    assert len(set(headroom.values())) == len(headroom), headroom
+    assert 1 not in headroom.values() and 2 not in headroom.values()
+    assert headroom["EXIT_UNREADABLE_HEADROOM"] == 47
+    assert headroom["EXIT_NO_MAJORITY"] == 48
+    own = set(headroom.values()) - set(reused_by_headroom.values()) - {0}
+    assert own == {47, 48}
+    # 45 and 46 are M3m's, so 47 and 48 are the next two free numbers: asked of
+    # the tool that held the highest, so a later renumbering of either cannot pass.
+    assert own == {max(set(prediction.values()) - {0}) + 1, max(set(prediction.values()) - {0}) + 2}
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion",
+                  "latent_retention", "latent_width", "latent_capacity", "prediction_burden",
+                  "trust_horizon"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"motion_headroom collides with {other} on {clash}"
 
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
