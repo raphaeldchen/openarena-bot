@@ -24,6 +24,7 @@
 - The strict-majority bar is **computed**, never stored. The spec's "CELLS_REQUIRED = 5" is the value `strict_majority(9)` returns; `burden.strict_majority`'s own docstring forbids storing it, because 5 is a majority at 9 cells and a minority at 11.
 - `RegroundingSweep.standard_error` returns **one** standard error. Anything recorded as a 2-SE figure doubles it, as `scripts/diagnose_dynamics.py:1430` does. Mislabelling one SE as two in M3m produced the opposite conclusion from the correct one.
 - The median true one-step displacement, `3.9694722203504225`, is **recorded and used by no statistic**. It is the quantity M3m's design mistook for a probe-space scale.
+- **Read every sweep control with `!= 0.0`, never with `> 0`.** `persistence_divergence` and `k_invariance_at_h1` propagate NaN through `np.ptp` and `np.max` by design, so a bad row surfaces as NaN rather than as a large number — and `nan > 0` is **False**, so a `> 0` test reports a broken measurement as passing. Binds `measure_cell`'s assembly, the read phase, and Task 8's control check.
 
 ### Test pre-commitments (every task)
 
@@ -606,14 +607,21 @@ In `src/mbfps/eval/diagnostics.py`, after `window_floor_position` and its docstr
     the rung's last re-grounding step, held forward and scored on the same
     frames as the rung.
 
-    The copying end of M3n's axis. Both the rung and this baseline descend from
-    the SAME posterior latent, so per window their difference is of order the
-    model's predicted displacement -- units -- while either error alone is
-    130-260. That is the whole mechanism: the probe's readout error cancels in
-    the DIFFERENCE, not in either error, which is why M3m's `motion_margin`
-    was unfixable by better statistics. It subtracted a ground-truth
-    displacement, so there was no common latent for anything to cancel
-    against.
+    The copying end of M3n's axis. AT `g == 0` -- every `h <= k`, which is the
+    whole `k == horizon` column, the entire h=1 row, and M3n's decision cell --
+    the rung and this baseline descend from the SAME posterior latent, so per
+    window their difference is of order the model's predicted displacement,
+    units, while either error alone is 130-260. AT `g > 0` the rung's own
+    re-grounding `observe` draws fresh categorical samples and the floor's runs
+    elsewhere in the same stream, so the difference there also carries a
+    sampling-redraw term; measured on the rig at k=2, z differs in 28 of 32
+    groups at g=2 and 32 of 32 at g=4, max |dh| 0.305.
+
+    Whether the readout error also cancels at `g > 0` is NOT established. The
+    `g == 0` case is, and it is the one the verdict rests on. This is why M3m's
+    `motion_margin` was unfixable by better statistics: it subtracted a
+    ground-truth displacement, so there was no common latent for anything to
+    cancel against at any (k, h).
 
     At `k == horizon` this is bitwise `reference.persistence_position`
     (`persistence_divergence`), and at h=1 it is identical for every k

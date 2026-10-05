@@ -153,10 +153,11 @@ this was measured rather than assumed.**
   samples, and the floor's `observe` runs at a different point in the same
   stream. Measured on the test rig at `k=2`: the two latents' `z` differ in
   28 of 32 groups at step 2 and 32 of 32 at step 4, with `h` differing by up to
-  0.3. So `skill(k, h)` there carries a sampling-redraw term on top of the
-  readout difference. The readout error still largely cancels — both sides are
-  the same probe on the same pipeline — but the clean "units, not hundreds"
-  statement is established only at `g == 0`.
+  0.3 (window 0; window 1 gives 30 of 32 and 31 of 32, max |dh| 0.327). So
+  `skill(k, h)` there carries a sampling-redraw term on top of the readout
+  difference. Both sides are still the same probe on the same pipeline, so the
+  readout error may largely cancel there too — but that is **not measured**, and
+  the "units, not hundreds" statement is established only at `g == 0`.
 
 The decision cell is `(k=1, h=1)`, where `g == 0`, so the verdict rests on the
 exact case. The rest of the `(k, h)` surface is reported, and a reader comparing
@@ -250,8 +251,7 @@ fields' `(n_windows, horizon, 2)`.
 Positions stay internal to the sweep; it exports errors, which is the shape it
 already has.
 
-**Rulers become per-h, and are doubled.** `RegroundingSweep.standard_error`
-(`src/mbfps/eval/diagnostics.py:1813`) already reduces over windows and returns
+**Rulers become per-h, and are doubled.** `RegroundingSweep.standard_error` already reduces over windows and returns
 a `(horizon,)` array. M3m's record carried two scalars
 (`floor_margin_standard_error = 2.654`, `paired_standard_error = 10.293` on
 `frozen_ssl_seed0`) only because `scripts/prediction_burden.py` stored the
