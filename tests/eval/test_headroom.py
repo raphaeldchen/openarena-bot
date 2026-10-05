@@ -610,6 +610,52 @@ def test_six_of_eleven_cells_is_a_majority():
     assert "strict majority 6" in six.rule
 
 
+def _twelve(names):
+    return _layout([(arm, (0, 1, 2, 3)) for arm in _ARMS], names)
+
+
+@pytest.mark.parametrize("names, verdict, counts", [
+    # Exactly half and the rest scattered: the bar's one-too-low error reads
+    # this as a single winner, so it fails by VALUE (BETWEEN for NO_MAJORITY).
+    (["BETWEEN"] * 6 + ["AMBIGUOUS"] * 4 + ["AT_COPYING"] * 2, "NO_MAJORITY", [6, 0, 2, 4, 0]),
+    # An even split: the same error reads two winners and trips the partition
+    # assertion, so it fails by RAISING instead.
+    (["BETWEEN"] * 6 + ["AMBIGUOUS"] * 6, "NO_MAJORITY", [6, 0, 0, 6, 0]),
+    # One more than half: the bar is not too HIGH either.
+    (["BETWEEN"] * 7 + ["AMBIGUOUS"] * 5, "BETWEEN", [7, 0, 0, 5, 0]),
+], ids=["half-and-scatter", "even-split", "seven-of-twelve"])
+def test_the_bar_at_an_even_cell_count_excludes_a_tie_with_half(names, verdict, counts):
+    """Twelve cells is four seeds in three arms, which the CLI can build.
+
+    Every other majority test here is at an odd count (nine, eleven), and at an
+    odd `n` the correct bar `n // 2 + 1` equals `(n + 1) // 2` and equals
+    `strict_majority(n - 1)`. Those two forms are WRONG at an even `n`: at
+    twelve they give 6, which admits exactly half, where the bar is 7. So no
+    odd-count fixture can tell them from the right answer, and each survived
+    all of them until this one. The premise is asserted from the real function
+    so the test cannot quietly sit at a count where they agree.
+
+    The first row fails by value under either wrong form (it returns BETWEEN);
+    the second fails by raising, because two placements clear 6. The third is
+    the other side: seven of twelve carries, so the bar is not set too high, and
+    the rule prints the bar it used, so a wrong form shows there as `6` for `7`.
+    A `NO_MAJORITY` must also be the bar's -- `no placement reached 7 of 12` --
+    and not the arm-span rule, which is what would answer if the arm check were
+    doing the work.
+    """
+    assert burden.strict_majority(12) == 7
+    assert burden.strict_majority(12 - 1) == 6 == (12 + 1) // 2, "the wrong forms give 6"
+
+    reading = reading_headroom(_inputs(_twelve(names)))
+    assert [len(reading.tally[n]) for n in PLACEMENTS] == counts
+    assert reading.verdict == verdict
+    if verdict == "NO_MAJORITY":
+        assert reading.rule.startswith("no placement reached 7 of 12 cells")
+    else:
+        assert "BETWEEN in 7 of 12 cells" in reading.rule
+        assert "strict majority 7" in reading.rule
+
+
 @pytest.mark.parametrize("winner", PLACEMENTS)
 def test_every_placement_can_carry_the_majority_not_only_the_first(winner):
     """Five of nine carries whichever placement it is, UNREADABLE included.
@@ -865,6 +911,13 @@ def test_the_formatter_prints_one_aligned_row_per_cell_and_names_the_decision_ce
 
     header = next(l for l in text.splitlines() if l.startswith(READING_COLUMNS[0]))
     assert len(header) == sum(READING_WIDTHS)
+    # The labels, written out. `READING_COLUMNS` cannot be compared with itself:
+    # a swap of "skill" and "deficit" there changes the header and the constant
+    # together, and the checks below read the columns by hard-coded position, so
+    # the header would put the skill numbers under "deficit" and still pass.
+    assert header.split() == [
+        "cell", "clusters", "headroom", "skill", "deficit", "share", "placement",
+    ]
     for i, name in enumerate(READING_COLUMNS):
         assert header[_offsets()[i]:].startswith(name)
 
@@ -941,6 +994,35 @@ def test_the_formatter_prints_the_verdict_and_the_rule_it_was_reached_by():
     assert f"rule:    {reading.rule}\n" in text
 
 
+# The legend's sentences that name `skill` or `deficit`, or say what a sign or a
+# direction means, and do NOT contain "resolvably". Each is a definition, the
+# identity, or a statement that a sign carries NO claim. None says what a sign
+# means as a finding. Written out literally: a new sentence of this kind, in any
+# wording, fails `test_the_legend_has_no_unconditional_directional_sentence`
+# until someone adds it here, which is a visible decision and not an accident.
+_UNGATED_LEGEND_SENTENCES = (
+    "skill = hold - rung, what the model wins over copying",
+    "deficit = rung - floor, M3m's burden -- the distance to perfect",
+    "skill + deficit == headroom at every step, to float rounding; the hold term cancels",
+    "Where it is not, a perfect predictor is indistinguishable from a copying one, "
+    "so the sign of skill carries no claim about the model and the share is printed "
+    "as `--` rather than as a number",
+)
+_GATE_STATEMENT = "A cell is read ONLY IF headroom is resolvably above zero"
+_DIRECTIONAL = re.compile(
+    r"\b(skill|deficit|share|sign|positive|negative|above|below|beats|means?)\b",
+    re.IGNORECASE,
+)
+
+
+def _legend_sentences():
+    cells = _nine(["UNREADABLE"] * 9)
+    inputs = _inputs(cells)
+    text = format_reading_headroom(reading_headroom(inputs), inputs)
+    flat = " ".join(text.split("\nlegend\n", 1)[1].split())
+    return [s.strip().rstrip(".") for s in flat.split(". ") if s.strip()]
+
+
 def test_the_formatter_conditions_every_directional_sentence_on_the_gate():
     """No unconditional claim that a sign means a verdict.
 
@@ -954,6 +1036,7 @@ def test_the_formatter_conditions_every_directional_sentence_on_the_gate():
     first. The count of such claims is asserted (skill's and deficit's) so that
     deleting the claims cannot pass by leaving nothing to check. The table is
     nine UNREADABLE cells, so the verdict beside the legend is the gate's.
+    What stops an UNGATED sentence is the next test.
     """
     cells = _nine(["UNREADABLE"] * 9)
     inputs = _inputs(cells)
@@ -975,3 +1058,36 @@ def test_the_formatter_conditions_every_directional_sentence_on_the_gate():
     )
     assert "no claim about the model" in lowered
     assert "interval ends do not add" in lowered
+
+
+def test_the_legend_has_no_unconditional_directional_sentence():
+    """A sentence that says what a sign means, in ANY wording, must name the gate.
+
+    The test above inspects only sentences containing the literal "resolvably
+    positive", so a sentence phrased without it -- "A positive skill means the
+    model beats copying", "Skill above zero always means ..." -- was invisible
+    to it. That is the defect class M3m shipped three times: a directional
+    sentence that reads as unconditional and gets quoted without its condition.
+
+    Here the net is every sentence that names skill or deficit or uses a
+    directional word. A sentence in it is allowed only if it contains
+    "resolvably" AND is the gate's own statement, word for word, or says "behind
+    that gate"; or if it is one of the four pinned in `_UNGATED_LEGEND_SENTENCES`, which are
+    definitions, the identity, and the statement that the sign carries no claim.
+    The pinned sentences must ALL be present, so the pinning cannot rot into an
+    allow-list of sentences that no longer exist.
+    """
+    sentences = _legend_sentences()
+    caught = [s for s in sentences if _DIRECTIONAL.search(s)]
+    assert len(caught) >= 6, "the net must be finding the legend's sentences"
+    stray = []
+    for sentence in caught:
+        lowered = sentence.lower()
+        if "resolvably" in lowered:
+            if sentence == _GATE_STATEMENT or "behind that gate" in lowered:
+                continue
+        elif sentence in _UNGATED_LEGEND_SENTENCES:
+            continue
+        stray.append(sentence)
+    assert not stray, f"directional legend sentence(s) without the gate: {stray}"
+    assert all(p in sentences for p in _UNGATED_LEGEND_SENTENCES)
