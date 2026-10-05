@@ -229,14 +229,27 @@ def rollout(model, paths, probe, *, device=None):
 # ---------------------------------------------------------------------------
 
 
-def _truth_slices(monkeypatch, module, run):
+def _truth_slices(monkeypatch, module, run, *, rows=None):
+    """Every truth slice `module` hands `probe_targets` while `run` executes.
+
+    `rows`, when given, keeps only the slices of exactly that many frames. The
+    sweep needs it: `regrounding_sweep` passes `keep_trajectories=True`, and
+    with that flag `_diagnose` makes ONE MORE one-row `probe_targets` call per
+    window to build `true_at_context` (the privileged position at the last
+    context frame). Those are not the window set -- they are one row each, and
+    a window set is `horizon` rows -- so counting them reports twice the
+    windows the sweep scored.
+    """
     seen: list[np.ndarray] = []
     real = module.probe_targets
-    monkeypatch.setattr(
-        module,
-        "probe_targets",
-        lambda privileged, keys: seen.append(np.asarray(privileged)) or real(privileged, keys),
-    )
+
+    def spy(privileged, keys):
+        privileged = np.asarray(privileged)
+        if rows is None or len(privileged) == rows:
+            seen.append(privileged)
+        return real(privileged, keys)
+
+    monkeypatch.setattr(module, "probe_targets", spy)
     run()
     return seen
 
@@ -278,7 +291,15 @@ def test_the_diagnostics_score_the_rollouts_exact_window_set(
         if diagnostic == "shuffle"
         else (lambda: sweep(OracleModel(), paths, probe, ks=(1, HORIZON)))
     )
-    got = _truth_slices(monkeypatch, diagnostics_module, run)
+    # The sweep alone sets `keep_trajectories=True`, so its pass also reads the
+    # one-row `true_at_context` slice per window (see `_truth_slices`). Keep
+    # only the full `horizon`-row slices, which ARE the scored window set. The
+    # shuffle takes no such flag and every one of its slices is a window, so it
+    # is left unfiltered: filtering it would only hide a stray slice.
+    got = _truth_slices(
+        monkeypatch, diagnostics_module, run,
+        rows=HORIZON if diagnostic == "sweep" else None,
+    )
 
     assert len(got) == len(expected) > 0
     for mine, theirs in zip(got, expected):
