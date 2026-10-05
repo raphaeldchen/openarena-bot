@@ -832,9 +832,10 @@ def test_the_three_differences_satisfy_the_identity_exactly():
 
     The hold term cancels algebraically, so the only residual is float
     rounding. `pytest.approx(rel=1e-6)` here would ACCEPT a `np.sum`-for-`np.max`
-    mutation inside `triple_residual`, whose gap is in the 7th significant
-    figure -- M3m nearly shipped exactly that tolerance against exactly that
-    mutation.
+    mutation inside `triple_residual`. Measured on M3n's own k=45 column, 8 of 9 cells give exactly 0.0
+    under both reductions and the ninth separates them by 4x (1.421e-14 against
+    5.684e-14), so real data barely separates them: the FIXTURE has to. M3m nearly shipped
+    exactly that tolerance against exactly that mutation.
     """
     rng = np.random.default_rng(0)
     floor = 100.0 + rng.uniform(0.0, 150.0, size=45)
@@ -1069,9 +1070,10 @@ def triple_residual(
 
     `max`, NOT `sum` or `mean`: one bad step is a plumbing fault and summing
     would let 45 tiny roundings hide it while averaging would divide it away.
-    The gap between `max` and `sum` on real data is in the 7th significant
-    figure, so a test asserting this with `pytest.approx(rel=1e-6)` would
-    accept the `np.sum` mutant.
+    A test asserting this with `pytest.approx(rel=1e-6)` would accept the
+    `np.sum` mutant. Measured on M3n's own k=45 column, 8 of 9 cells give exactly 0.0
+    under both reductions and the ninth separates them by 4x (1.421e-14 against
+    5.684e-14), so real data barely separates them: the FIXTURE has to.
     """
     whole = headroom(hold, floor)
     parts = skill(hold, rung) + deficit(rung, floor)
@@ -1118,8 +1120,9 @@ reported grid on pixel_ae_seed1 (0.575649 at h=1, -0.641206 at h=2), where
 the normalised share prints +339.5% at h=2 then -335.7% at h=3.
 
 triple_residual takes the max, not the sum: the gap between them on real
-data is in the 7th significant figure, so approx(rel=1e-6) would accept the
-np.sum mutant. The test asserts exact equality for that reason.
+data barely separates the two -- 8 of 9 cells give exactly 0.0 under both and
+the ninth by 4x -- so approx(rel=1e-6) would accept the np.sum mutant and the
+fixture, not the data, has to separate them. The test asserts exact equality.
 
 3.9694722203504225 is defined and referenced nowhere, with a textual guard,
 because an unused constant cannot be caught by a value.
