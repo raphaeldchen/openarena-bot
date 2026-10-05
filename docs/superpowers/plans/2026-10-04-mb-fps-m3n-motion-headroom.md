@@ -1591,8 +1591,10 @@ def format_reading_headroom(
         "  Behind that gate: skill resolvably positive means the one-step map",
         "  beats holding; deficit resolvably positive means it is not yet",
         "  indistinguishable from perfect.",
-        f"  Intervals are episode-clustered bootstraps at {CONFIDENCE:.2f} over "
-        f"{RESAMPLES} resamples.",
+        f"  Intervals are episode-clustered bootstraps over {RESAMPLES} "
+        f"resamples. {CONFIDENCE:.2f} is a LABEL for the 2.5/97.5 percentiles "
+        "`pooling.percentile_interval` hard-codes, not a parameter that "
+        "produced them.",
         "",
     ]
     return "\n".join(lines)
@@ -1662,7 +1664,9 @@ EOF
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–5; `diagnostics.regrounding_sweep`, `diagnostics.REGROUNDING_KS`; `pooling.clustered_interval`
-- Produces: a CLI with `--phase {all,measure,read}`, `--out`, `--arms`, `--seeds`, `--ks`, `--bootstrap-seed`; `EXIT_UNREADABLE_HEADROOM = 47`, `EXIT_NO_MAJORITY = 48`; `headroom_record_path(out, arm, seed) -> Path`
+- Produces: a CLI with `--phase {all,measure,read}`, `--out`, `--arms`, `--seeds`, `--ks`, `--bootstrap-seed`; `EXIT_UNREADABLE_HEADROOM = 47`, `EXIT_NO_MAJORITY = 48`; `headroom_record_path(out, arm, seed) -> Path`; `cell_bootstrap_seed(base_seed, arm, seed) -> int`
+
+**`--bootstrap-seed` is the run's BASE, not the seed any interval is drawn at.** Each cell derives its own from `zlib.crc32` of `f"{base}:{arm}:{seed}"`, so the nine cells resample independently while staying exactly reproducible. One seed shared across all nine makes their resampling noise perfectly correlated, and the verdict is a strict majority over them — a draw favouring one side would tilt every cell the same way. `pooling.clustered_interval`'s docstring names this hazard: "a reader cannot tell nine identical draws from nine independent ones by looking." **Never `hash()`** — it is salted per process, so records would not reproduce.
 
 **Record schema** (one JSON per cell, every constant stored so none is a literal that survives the tests):
 
@@ -1675,7 +1679,7 @@ EOF
   "decision_k": 1, "decision_h": 1,
   "confidence": 0.95, "resamples": 2000,
   "identity_tolerance": 1e-09, "secondary_sigmas": 2,
-  "bootstrap_seed": int, "split_seed": int,
+  "bootstrap_seed": int, "cell_bootstrap_seed": int, "split_seed": int,
   "displacement_median": 3.9694722203504225,
   "episodes": {"val": [...]},
   "windows": {"total": 229, "episode": [...]},
@@ -1694,7 +1698,7 @@ EOF
     "open_loop_divergence": 0.0, "floor_divergence": 0.0,
     "identity_residual": 0.0, "negative_headroom_steps": [[k, h], ...],
   },
-  "nonfinite": 0, "kl_dyn_max": float, "kl_rate_above_free_bits": float,
+  "kl_dyn_max": float, "kl_rate_above_free_bits": float,
 }
 ```
 
@@ -1932,7 +1936,8 @@ def measure_cell(
             for name, array in rows.items():
                 point, low, high = clustered_interval(
                     array, groups, h=h,
-                    resamples=RESAMPLES, seed=bootstrap_seed,
+                    resamples=RESAMPLES,
+                    seed=cell_bootstrap_seed(bootstrap_seed, arm, seed),
                 )
                 cell[name] = {"point": point, "ci_low": low, "ci_high": high}
             intervals[k][h] = cell
@@ -1961,6 +1966,7 @@ def measure_cell(
         "identity_tolerance": IDENTITY_TOLERANCE,
         "secondary_sigmas": SECONDARY_SIGMAS,
         "bootstrap_seed": bootstrap_seed,
+        "cell_bootstrap_seed": cell_bootstrap_seed(bootstrap_seed, arm, seed),
         "context": context,
         "horizon": horizon,
         "displacement_median": DISPLACEMENT_RECORDED_ONLY,
