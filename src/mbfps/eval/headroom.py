@@ -17,12 +17,16 @@ UNREADABLE. The error was attractive rather than careless: the statistic needs
 a scale for "how much motion was there to predict," and the intuitive answer is
 the true displacement. But the numerator lives in probe space, and the only
 probe-space answer is what a PERFECT predictor would have won -- which is
-measured, not constant, and varies 20.5x across the nine cells.
+measured, not constant, and varies 20.5x across the nine cells at the decision
+cell (k=1, h=1), from 0.575649 to 11.824.
 
 THE SAME MISTAKE IS AVAILABLE ONE LEVEL UP. Normalising this module's `skill`
-by 3.9694722203504225 produces an apparent bimodal split across the nine cells
-(four near 100%, five at 6-43%) that dissolves entirely under `headroom`
-(-2.4% to 72.7%, unimodal). The pattern was the constant denominator.
+by 3.9694722203504225 produces an apparent split across the nine cells at
+(k=1, h=1): three cells at 106-118% (118.3, 112.1, 106.4), five at 6.5-43.2%
+(43.2, 21.5, 19.8, 10.1, 6.5), and one at -1.8% (`random_vit_seed0`) that
+belongs to neither group. Normalised by `headroom` at the same cell, the same
+nine read -2.4% to 72.7%, unimodal, and the split is gone. The pattern was the
+constant denominator.
 
 THE THREE DIFFERENCES, all probe-space, all per (k, h):
 
@@ -37,9 +41,15 @@ steps is 1.421e-14.
 THAT IDENTITY IS WHY THE READING CARRIES NO RATIO. The two-sided test against
 the copying end and the perfect end is `skill > 0` and `deficit > 0`: two
 differences, no denominator. A denominator would matter, because `headroom`
-crosses zero inside the reported grid on a real cell -- `pixel_ae_seed1` reads
-0.575649 at h=1 and -0.641206 at h=2, so the normalised share there prints
-+339.5% then -335.7%.
+crosses zero inside the reported grid on a real cell. `pixel_ae_seed1` at k=45,
+with the share taken as `skill / headroom`:
+
+    h=1: headroom +0.575649   share  +69.8%
+    h=2: headroom -0.641206   share +339.5%
+    h=3: headroom +0.798695   share -335.7%
+
+The two absurd shares are at h=2, where the denominator is negative, and h=3,
+where it is still under 0.8; h=1 reads plausibly.
 
 BOTH AXES ARE NAMED. `k` is the re-grounding period, `h` the horizon step.
 Write `headroom(k, h)`, never `headroom(45)`.
@@ -65,7 +75,7 @@ rather than an assumption."""
 
 IDENTITY_TOLERANCE: float = 1e-9
 """`triple_residual` above this is a plumbing fault, not rounding. The observed
-residual on the shipped curves is 1.421e-14, seven orders below."""
+residual on the shipped curves is 1.421e-14, about five orders below."""
 
 CONFIDENCE: float = 0.95
 RESAMPLES: int = 2000
@@ -115,9 +125,29 @@ def skill(hold: np.ndarray, rung: np.ndarray) -> np.ndarray:
 
     Positive means the rung beats holding the floor's own position from the
     rung's last re-grounding step. Both sides pass through the same encoder,
-    RSSM and embedding head and are read by the same probe, so the readout
-    error they share cancels in this difference -- which is the entire reason
-    this statistic is readable where `motion_margin` was not.
+    RSSM and embedding head and are read by the same probe.
+
+    WHAT CANCELS DEPENDS ON `g = ground_step(k, h)`, and it is established only
+    where `g == 0`, which is every `h <= k`. There the rung and the hold
+    baseline descend from the SAME posterior latent, so the readout error they
+    share cancels in the difference and what remains is of the order of the
+    model's predicted displacement. That is why this statistic is readable
+    where `motion_margin` was not: it subtracted a ground-truth displacement,
+    so there was no common latent for anything to cancel against.
+
+    Where `g > 0` that is not exact. The rung's own re-grounding `observe` draws
+    fresh categorical samples and the floor's runs elsewhere in the same stream,
+    so the two latents are redraws of one another and the difference carries a
+    sampling-redraw term. On the test rig at `k=2` their `z` differed in 28 of
+    32 groups at step 2 and in all 32 at step 4. Whether the readout error also
+    cancels there is NOT claimed; the `g > 0` cells are reported, and a reader
+    should expect them to be noisier for this reason as well as for the longer
+    horizon (`RegroundingSweep.hold_position` has the measurement).
+
+    The milestone's decision cell is `(k=1, h=1)`, where `g == 0`, so the
+    verdict rests on the established case. That is also why the unscoped claim
+    was tempting: the cell the verdict reads lies inside the region where the
+    claim holds, so the verdict never meets a case that contradicts it.
     """
     hold, rung = checked_pair(hold, rung)
     return hold - rung
@@ -143,9 +173,15 @@ def triple_residual(
 
     `max`, NOT `sum` or `mean`: one bad step is a plumbing fault and summing
     would let 45 tiny roundings hide it while averaging would divide it away.
-    The gap between `max` and `sum` on real data is in the 7th significant
-    figure, so a test asserting this with `pytest.approx(rel=1e-6)` would
-    accept the `np.sum` mutant.
+
+    Real data barely separates the reductions, so it cannot be what tests this.
+    On M3n's own k=45 column, 8 of 9 cells give exactly 0.0 under both `max`
+    and `sum`, and the ninth (`pixel_ae_seed0`) separates them by 4x -- 1.421e-14
+    against 5.684e-14 -- which is rounding on either reading. A tolerance wide
+    enough to pass that column passes the `np.sum` mutant too. So the tests
+    assert with exact equality, and build a fixture that separates `max` from
+    `sum` (several bad steps, of different sizes and signs) rather than relying
+    on real data to do it.
     """
     whole = headroom(hold, floor)
     parts = skill(hold, rung) + deficit(rung, floor)
