@@ -96,6 +96,12 @@ def _q(x) -> np.ndarray:
 # The hand-built sweep.
 # ---------------------------------------------------------------------------
 
+ZERO_CONTROL_NAMES = (
+    "persistence_divergence", "k_invariance_at_h1", "open_loop_divergence", "floor_divergence",
+)
+"""The four controls whose known answer is exactly 0.0, spelled out here: a test
+that iterated `ZERO_CONTROL_NAMES` would shrink with it when one was dropped."""
+
 HAND_KS = (1, 3, 45)
 HAND_GROUPS = np.array([0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 5, 5])
 HAND_NAMES = [f"ep_{i:06d}.npz" for i in (5, 4, 3, 2, 1, 0)]
@@ -228,6 +234,17 @@ def test_read_exits_are_the_two_non_placements_each_to_its_own_number():
     four placements exit 0: each is an answer."""
     assert script.READ_EXITS == {"UNREADABLE": 47, H.NO_MAJORITY: 48}
     assert set(script.READ_EXITS).isdisjoint({"BETWEEN", "AT_PERFECT", "AT_COPYING", "AMBIGUOUS"})
+
+
+def test_the_zero_controls_are_the_four_the_spec_names():
+    """`persistence_divergence`, `k_invariance_at_h1`, `open_loop_divergence` and
+    `floor_divergence` are each required to be exactly 0.0; `identity_residual` is
+    held to a tolerance instead. A control dropped from the tuple is a control
+    never read, so the tuple is compared with the four names written out here.
+
+    THE MUTATION THIS EXISTS FOR, run against it: deleting one name from
+    `ZERO_CONTROLS`."""
+    assert tuple(script.ZERO_CONTROLS) == ZERO_CONTROL_NAMES
 
 
 def test_the_record_path_separates_seeds_and_arms(tmp_path):
@@ -453,7 +470,7 @@ def test_each_control_is_measured_from_the_object_it_names_not_asserted(hand, mo
 def test_the_clean_sweep_reads_every_control_at_exactly_its_known_answer(hand, hand_record):
     """The four zeros and the identity, from a sweep built to satisfy them."""
     controls = hand_record["controls"]
-    for name in script.ZERO_CONTROLS:
+    for name in ZERO_CONTROL_NAMES:
         assert controls[name] == 0.0, name
     assert controls["identity_residual"] == 0.0
     assert script.broken_controls(controls) == []
@@ -532,6 +549,36 @@ def test_the_identity_residual_is_the_largest_over_the_ks_not_the_first_the_last
     record = _hand_measure(monkeypatch, copy.deepcopy(hand))
     assert len(calls) == len(HAND_KS)
     assert record["controls"]["identity_residual"] == 0.5
+
+
+def test_a_nan_identity_residual_at_any_k_is_not_swallowed_by_the_reduction(hand, monkeypatch):
+    """The reduction over the ks is `np.max`, which PROPAGATES a NaN. Python's
+    `max` does not: `max([0.25, nan, 0.125])` is 0.25, because every comparison
+    with NaN is False, so a NaN in the middle of the list is skipped and the
+    residual reads as passing. The brief's `max(residuals)` was that.
+
+    The fault is a NaN on the middle k's `triple_residual` call (the one place
+    rows reach it finite is the fault itself: `checked_pair` refuses a NaN row,
+    so this is the only way to put one in), and the record must read NaN -- which
+    `broken_controls` then names.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `float(np.max(residuals))` ->
+    `float(max(residuals))`."""
+    calls = []
+    real = H.skill
+    bumps = (0.25, float("nan"), 0.125)
+
+    def faulted(hold, rung):
+        bump = np.zeros(hold.shape)
+        bump[2, 5] = bumps[len(calls)]
+        calls.append(None)
+        return real(hold, rung) + bump
+
+    monkeypatch.setattr(H, "skill", faulted)
+    record = _hand_measure(monkeypatch, copy.deepcopy(hand))
+    assert len(calls) == len(HAND_KS)
+    assert np.isnan(record["controls"]["identity_residual"])
+    assert script.broken_controls(record["controls"]) == ["identity_residual=nan"]
 
 
 def test_the_record_carries_the_verified_reference_and_the_sweeps_own_rungs_and_holds(
@@ -1032,7 +1079,7 @@ def test_the_real_rig_reads_every_control_at_its_known_answer(real_record):
     `identity_residual` is a MEASURED float, not a constant: on the rig it is
     rounding noise, below `IDENTITY_TOLERANCE`, and not hard-coded to 0.0."""
     controls = real_record["controls"]
-    for name in script.ZERO_CONTROLS:
+    for name in ZERO_CONTROL_NAMES:
         assert controls[name] == 0.0, name
     assert 0.0 <= controls["identity_residual"] < H.IDENTITY_TOLERANCE
     assert script.broken_controls(controls) == []
@@ -1057,7 +1104,7 @@ def test_the_sweep_is_run_at_the_cells_seed(rig, monkeypatch):
     assert np.abs(at_cell.curve(HORIZON) - at_zero.curve(HORIZON)).max() > 1.0
     record = script.measure_cell(**_real_kwargs(rig, model=model))
     assert SEED != 0
-    for name in script.ZERO_CONTROLS:
+    for name in ZERO_CONTROL_NAMES:
         assert record["controls"][name] == 0.0, name
     for k in REGROUNDING_KS:
         np.testing.assert_array_equal(
@@ -1144,12 +1191,30 @@ def test_the_sweep_runs_on_the_device_it_was_handed(rig, monkeypatch):
 
 def test_the_ladder_swept_is_the_ks_handed_in(rig, monkeypatch):
     """`--ks 1,45` is the smoke's ladder: the record carries those two rungs and
-    no others, and the sweep's k-invariance control still reads 0.0 over them.
+    no others, the sweep is ASKED for those two, and its k-invariance control still
+    reads 0.0 over them.
 
-    THE MUTATION THIS EXISTS FOR: `ks=ks` -> `ks=REGROUNDING_KS` in the call to
-    `regrounding_sweep` (five rungs where two were asked for)."""
+    What the sweep is asked for is seen through a wrapper that records the `ks` it
+    was called with and returns the real sweep -- the argument's PASS-THROUGH, and
+    the most that can be pinned: a sweep run over five rungs where two were asked
+    for returns the same two the record reads, so nothing in the record can tell
+    them apart (that mutation is an equivalent one, caught only by the wrapper).
+
+    THE MUTATIONS THIS EXISTS FOR, each run against it: `ks=ks` ->
+    `ks=REGROUNDING_KS` in the call to `regrounding_sweep` (the wrapper);
+    `"ks": [int(k) for k in ks]` -> `list(REGROUNDING_KS)` in the record, and
+    `for k in ks:` -> `for k in REGROUNDING_KS:` in the interval loop."""
     monkeypatch.setattr(script, "RESAMPLES", SMALL)
+    real = script.regrounding_sweep
+    asked = []
+
+    def watching(*args, **kwargs):
+        asked.append(tuple(kwargs["ks"]))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(script, "regrounding_sweep", watching)
     record = script.measure_cell(**_real_kwargs(rig, ks=(1, 45)))
+    assert asked == [(1, 45)]
     assert record["ks"] == [1, 45]
     assert set(record["curves"]["rungs"]) == set(record["curves"]["holds"]) == {"1", "45"}
     assert set(record["intervals"]) == set(record["share"]) == {"1", "45"}
@@ -1470,11 +1535,34 @@ def test_the_cell_line_prints_the_numbers_the_verdict_is_read_from(
         assert str(path) in line
 
 
-def test_the_cell_line_says_the_controls_hold_when_they_do(hand_record, tmp_path):
-    line = script._cell_line(hand_record, tmp_path / "x.json")
+@pytest.mark.parametrize("decision", [(1, 1), (3, 10), (45, 45)])
+def test_the_cell_line_is_read_at_the_records_own_decision_cell_and_says_the_controls_hold(
+    hand_record, tmp_path, decision,
+):
+    """The line prints the three differences at the decision cell THE RECORD NAMES
+    -- (1, 1), a middle cell and the last -- so a line that read a fixed (k, h)
+    prints another cell's numbers. Each cell's intervals differ (it is the hand
+    sweep's own), and the controls are the clean ones.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `record["decision_k"]` ->
+    the literal `"1"` in `_cell_line`."""
+    k, h = decision
+    record = copy.deepcopy(hand_record)
+    record.update(decision_k=k, decision_h=h)
+    line = script._cell_line(record, tmp_path / "x.json")
     assert "controls hold" in line and "BROKEN" not in line, line
-    assert "at k=1, h=1" in line and "0.00e+00" in line
+    assert f"at k={k}, h={h} " in line and "0.00e+00" in line
     assert "13 windows from 6 episodes" in line
+    at = record["intervals"][str(k)][str(h)]
+    for name in ("headroom", "skill", "deficit"):
+        assert f"{name} {_triple_text(at[name])}" in line, (name, line)
+    if decision != (1, 1):
+        other = hand_record["intervals"]["1"]["1"]["headroom"]
+        assert f"headroom {_triple_text(other)}" not in line
+
+
+def _triple_text(interval) -> str:
+    return f"{interval['point']:+8.3f} [{interval['ci_low']:+8.3f},{interval['ci_high']:+8.3f}]"
 
 
 @pytest.mark.parametrize(
@@ -2185,7 +2273,7 @@ def test_a_control_that_missed_its_known_answer_is_refused_by_name_whatever_its_
 
 
 @pytest.mark.parametrize(
-    "name", [*script.ZERO_CONTROLS, "identity_residual"],
+    "name", [*ZERO_CONTROL_NAMES, "identity_residual"],
 )
 def test_a_nan_control_is_refused_as_that_control_without_help_from_the_nonfinite_map(
     hand_record, tmp_path, monkeypatch, name,
@@ -2530,7 +2618,10 @@ def test_phase_all_refuses_too_few_seeds_before_measuring_anything(monkeypatch, 
     there -- by name, and `ran == []` is what says it came BEFORE the measure.
 
     THE MUTATIONS THIS EXISTS FOR, each run against it: dropping the check from
-    `main`; counting the seeds as listed instead of as distinct (the third case)."""
+    `main`; and counting the seeds as listed instead of as distinct -- which takes
+    BOTH dedups out, the parser's (`_Csv`) and `_plan`'s, because either alone
+    leaves the third case refused (`test_the_phase_measures_a_repeated_arm_once`
+    is what sees `_plan`'s on its own)."""
     ran = []
     monkeypatch.setattr(script, "measure_phase", lambda args: ran.append("measure") or 0)
     monkeypatch.setattr(script, "read_phase", lambda args: ran.append("read") or 0)
