@@ -2280,10 +2280,20 @@ Record both the counts and the SHA. The records store `record_git_sha`; a run wh
 - [ ] **Step 2: Measure**
 
 ```bash
+mkdir -p runs/m3n_motion
 .venv/bin/python scripts/motion_headroom.py --phase measure --out runs/m3n_motion \
   --arms frozen_ssl,pixel_ae,random_vit --seeds 0,1,2 --ks 1,3,5,15,45 \
-  --bootstrap-seed 0 2>&1 | tee runs/m3n_motion/measure.log
+  --bootstrap-seed 0 > runs/m3n_motion/measure.log 2>&1
+echo "measure exit: $?"
+tail -20 runs/m3n_motion/measure.log
 ```
+
+**The `mkdir` and the redirect are both load-bearing.** `tee` opens its output
+file before the Python process creates `--out`, so a piped form fails on a
+directory that does not exist yet — and a pipe makes `$?` the PAGER's status,
+not the script's, which is how a `1 failed, 474 passed` run earlier in this
+milestone reported success. Redirect, then read the exit code, then read the
+tail.
 
 Expected: nine records at `runs/m3n_motion/headroom_<arm>_seed<n>.json`, exit 0. M3m's comparable nine-cell re-measure took a measured 19m20s. Check the file count before reading:
 
@@ -2303,7 +2313,7 @@ for p in sorted(glob.glob("runs/m3n_motion/headroom_*.json")):
 EOF
 ```
 
-Expected: `persistence_divergence`, `k_invariance_at_h1`, `open_loop_divergence` and `floor_divergence` all exactly `0.0`; `identity_residual` below `1e-9`. **A nonzero value in any of the first four means the measurement is wrong and no statistic in the record may be reported.** Record the actual values.
+Expected: `persistence_divergence`, `k_invariance_at_h1`, `open_loop_divergence` and `floor_divergence` all exactly `0.0`; `identity_residual` below `1e-9`. Compare each with `!= 0.0`, never `> 0` — the first two propagate NaN by design and `nan > 0` is `False`, so a `> 0` check reports a broken measurement as passing. **A nonzero value in any of the first four means the measurement is wrong and no statistic in the record may be reported.** Record the actual values.
 
 `open_loop_divergence` and `floor_divergence` at `0.0` are also the
 `keep_trajectories=True` control: the shipped M3c curves were measured with the
@@ -2313,9 +2323,14 @@ the reference.
 - [ ] **Step 4: Read**
 
 ```bash
-.venv/bin/python scripts/motion_headroom.py --phase read --out runs/m3n_motion 2>&1 | tee runs/m3n_motion/read.log
-echo "exit: $?"
+.venv/bin/python scripts/motion_headroom.py --phase read --out runs/m3n_motion > runs/m3n_motion/read.log 2>&1
+echo "read exit: $?"
+cat runs/m3n_motion/read.log
 ```
+
+Exit **0** is one of the four model placements; **47** is `UNREADABLE` in a
+majority of cells; **48** is `NO_MAJORITY`. Record the code AND the `rule:`
+line — 48 has two causes and only the rule distinguishes them.
 
 Record the exit code and the full table.
 
