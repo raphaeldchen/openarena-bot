@@ -20,6 +20,7 @@
 - After mutating a source file to check a test bites, clear `__pycache__` under `src/`, `tests/` and `scripts/` before re-running.
 - **When you pipe pytest through `tail` or `head`, the pipeline's exit code is the pager's, not pytest's.** Always read the `N passed` / `N failed` summary line yourself. This milestone's predecessor lost a review cycle to a run that reported exit 0 over `1 failed, 474 passed`.
 - `src/mbfps/eval/rollout.py`, `src/mbfps/eval/diagnostics.py`, `src/mbfps/eval/headroom.py`, `src/mbfps/eval/burden.py`, `scripts/trust_horizon.py`, `scripts/motion_headroom.py` are **unchanged by Tasks 1-6**. Only the conditional Task 7 may read them, and it modifies none. Verify with `git diff --stat 4956f59 HEAD -- <paths>` at the end of every task.
+- **`PROBE_LIMITED` is read against a MEASURED FLOOR, never against zero.** Task 2 measured that the kernel ladder beats the shipped linear probe by +0.012 at D=1024 and +0.020 at D=2048 **on a purely linear task**, because `RIDGES` is a decade grid and the RBF rungs fill its gaps. The ladder's linear rung reproduces `fit_probe` to 1e-6, so this is not an implementation difference. Each cell fits the whole ladder on a synthetic linear task at its own `n` and `D` and records that `D − C` as `null_floor`; `PROBE_LIMITED` requires the real `D − C` resolvably above it. Spec §6.1. **Tasks 3, 4 and 5 all carry this**: Task 3 measures `null_floor`, Task 4 reads against it, Task 5 records it.
 - Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05`, `DISPLACEMENT_TARGET = 3.9694722203504225`, `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. `RIDGES` is inherited from `probe.py`, not redefined.
 - The strict-majority bar is **computed**, never stored: `burden.strict_majority(len(cells))`. It returns 5 at nine cells and 6 at eleven.
 - Every difference is read from an episode-clustered bootstrap interval via `probe._block_bootstrap_ci`, at a per-cell seed derived as M3n derives it — `zlib.crc32` of base, arm and seed. **Never `hash()`**: it is salted per process, so records would not reproduce.
@@ -1046,6 +1047,13 @@ class CeilingCell:
 
     def verdict(self) -> str:
         """`PROBE_LIMITED` takes precedence when both differences resolve.
+
+        `probe_gain` here is already `D - C - null_floor`: the cell's own
+        measured floor is subtracted before the interval is drawn, so
+        `_resolvable` still asks whether the whole interval is above zero. A
+        decade ridge grid alone buys +0.012 to +0.020 on a purely linear task,
+        which would otherwise fire this verdict for a reason that has nothing
+        to do with nonlinear structure.
 
         If the linear family was the limit, that is the finding regardless of
         the pixel comparison, because that comparison was made with the weaker
