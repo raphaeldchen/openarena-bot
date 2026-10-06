@@ -49,6 +49,18 @@ def _embedding_task(seed=0, n=400, d=1024, rank=40, noise=120.0):
     return x, (z @ w) * 20.0 + rng.normal(size=(n, 4)) * noise
 
 
+def _gapped_task(seed=0, n=300, d=150):
+    """A linear task whose best ridge falls BETWEEN the shipped grid's rungs.
+
+    `_embedding_task` at the shape where the grid's 100x step costs the most. The
+    optimum is 177.8; `probe.RIDGES` offers 1e1 and 1e3 and selects 1e3 in every
+    draw, for a scored r2 0.09-0.11 below what the fine grid reaches.
+    `_embedding_task` at its own default shape cannot show this -- at n=400
+    D=1024 the ridge response is flat enough that the shipped grid loses nothing.
+    """
+    return _embedding_task(seed, n=n, d=d)
+
+
 def _curved_task(seed=0, n=240, d=3, noise=0.0, spread=1.0):
     """A task a linear probe CANNOT solve: the target is a radial function.
 
@@ -532,29 +544,53 @@ def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
 
 
 @pytest.mark.parametrize("seed", range(6))
-def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split(seed):
+@pytest.mark.parametrize("task, off_grid", [(_embedding_task, False), (_gapped_task, True)],
+                         ids=["embedding", "gapped"])
+def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split(
+    task, off_grid, seed
+):
     """The exact form of nesting: the ladder's search space contains `fit_linear_probe`'s.
 
     Both readouts select on the same split over the same `CEILING_RIDGES`, so the
     kernel readout's recorded selection r2 is at least the linear reference's, with
     no allowance beyond rounding (1e-9). Unlike the score-split comparison this
     holds for EVERY draw, including those where an RBF rung wins.
+
+    TWO FIXTURES, because only one of them can see the grid. On `_embedding_task`
+    the optimum lands on a shipped rung in nearly every draw, so a ladder whose
+    jitters are the shipped `RIDGES` passes there: it contains the reference's
+    selection anyway. On `_gapped_task` the optimum is 177.8, between shipped
+    rungs, and that ladder's linear rung stops at 1e3. The RBF rungs then edge
+    it up toward the reference but not past it: measured, the ladder selected
+    0.0006-0.0035 below the reference on 4 of 6 draws. The `off_grid` case is
+    asserted to be off the shipped grid before anything is concluded from it.
     """
-    train, select, _ = (_embedding_task(3 * seed + i) for i in range(3))
+    train, select, _ = (task(3 * seed + i) for i in range(3))
     linear = fit_linear_probe(*train, *select)
+    if off_grid:
+        assert linear["ridge"] not in RIDGES, (
+            f"fixture must put the optimum off the shipped grid; got {linear['ridge']:g}"
+        )
     kernel = fit_kernel_probe(*train, *select)
     assert kernel["r2"] >= linear["r2"] - 1e-9, (
         f"selected {kernel['kernel']} at {kernel['r2']:.6f}, linear is {linear['r2']:.6f}"
     )
 
 
-def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(monkeypatch):
+@pytest.mark.parametrize("task, off_grid", [(_embedding_task, False), (_gapped_task, True)],
+                         ids=["embedding", "gapped"])
+def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(
+    monkeypatch, task, off_grid
+):
     """Collapse the RBF ladder to a rung that cannot win; what is left must be `fit_linear_probe`.
 
     The grid is `CEILING_RIDGES` on both sides, which is the grid the claim is
-    about: against `fit_probe` over the shipped grid the ridge match below would
-    hold here only by coincidence, because the optimum on this fixture lands on
-    a shipped rung (1000), and would fail on `_gapped_task`, where it is 177.8.
+    about. On `_embedding_task` the optimum lands on a shipped rung (1000), so
+    the ridge match below would hold there against `fit_probe` over the shipped
+    grid too, and against a ladder whose jitters are `RIDGES`, by coincidence.
+    On `_gapped_task` it is 177.8: a ladder whose linear rung stops at 1e3 is
+    selected at 1e3 there, 0.10 below the reference, and fails the ridge match.
+    The `off_grid` case is asserted to be off the shipped grid first.
     With only the narrowest bandwidth beside it the linear kernel is selected,
     at the ridge `fit_linear_probe` selects, and the predictions are that
     probe's. The two solve in different spaces (the dual, through an
@@ -562,8 +598,12 @@ def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(
     is the claim that a linear kernel with jitter lambda IS ridge regression at
     lambda, which the nesting argument rests on.
     """
-    train, select, score = (_embedding_task(i) for i in range(3))
+    train, select, score = (task(i) for i in range(3))
     probe = fit_linear_probe(*train, *select)
+    assert (probe["ridge"] not in RIDGES) == off_grid, (
+        f"fixture must put the optimum {'off' if off_grid else 'on'} the shipped grid; "
+        f"got {probe['ridge']:g}"
+    )
     with monkeypatch.context() as patch:
         patch.setattr(ceiling, "BANDWIDTHS", (BANDWIDTHS[0],))
         readout = fit_kernel_probe(*train, *select)
@@ -574,18 +614,6 @@ def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(
     np.testing.assert_allclose(
         apply_readout(readout, score[0]), apply_readout(probe, score[0]), rtol=1e-6, atol=1e-6
     )
-
-
-def _gapped_task(seed=0, n=300, d=150):
-    """A linear task whose best ridge falls BETWEEN the shipped grid's rungs.
-
-    `_embedding_task` at the shape where the grid's 100x step costs the most. The
-    optimum is 177.8; `probe.RIDGES` offers 1e1 and 1e3 and selects 1e3 in every
-    draw, for a scored r2 0.09-0.11 below what the fine grid reaches.
-    `_embedding_task` at its own default shape cannot show this -- at n=400
-    D=1024 the ridge response is flat enough that the shipped grid loses nothing.
-    """
-    return _embedding_task(seed, n=n, d=d)
 
 
 def _null_floor_over(monkeypatch, ridges, n, d, *, seed):

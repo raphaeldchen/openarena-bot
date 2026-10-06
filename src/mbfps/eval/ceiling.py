@@ -187,10 +187,15 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     THE LINEAR RUNG AND THE LINEAR REFERENCE SEARCH THE SAME GRID. Nesting is a
     claim about search spaces: with the ladder on `RIDGES` and `fit_linear_probe`
     on `CEILING_RIDGES` the ladder's linear rung would have 5 jitters against the
-    reference's 33, and `D - C` would go NEGATIVE for grid reasons alone -- about
-    -0.10 at n=300, D=150. Both are `CEILING_RIDGES`. The jitter ladder's length
-    is nearly free here: each kernel is eigendecomposed once and every jitter is
-    then O(n^2), where the decomposition is O(n^3).
+    reference's 33, and the ladder would no longer contain the reference. Its
+    linear rung would read 0.32-0.35 where the reference reads 0.42-0.45 (n=300,
+    D=150), and the RBF rungs would be left to make up the difference at the
+    coarse jitters -- which is the defect `CEILING_RIDGES` exists to remove, with
+    the roles swapped. They do not make it all up: `D - C` reads -0.0004 to
+    -0.0021 on three draws, and on 4 of 6 the ladder's SELECTION r2 falls below
+    the reference's by up to 0.0035. Both are `CEILING_RIDGES`. The jitter
+    ladder's length is nearly free here: each kernel is eigendecomposed once and
+    every jitter is then O(n^2), where the decomposition is O(n^3).
 
     EACH KERNEL IS EIGENDECOMPOSED ONCE, `K = V diag(vals) V'`, and every
     jitter is then `V ((V'(y - centre)) / (vals + jitter))`, O(n^2) per rung
