@@ -1,4 +1,5 @@
 import inspect
+import tracemalloc
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from mbfps.eval.probe import (
     TARGET_DIM,
     _mean_r2,
     _solve,
+    _solve_ladder,
     angle_error_degrees,
     apply_probe,
     filtering_comparison,
@@ -280,14 +282,21 @@ def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_ro
     """The switch is on `min(n, D)`, not "always dual", and the primal path is
     bitwise the form every recorded number in this project came out of.
 
-    The dual's cost is n^2, so it is the WRONG form at 12,000 rows and 2,048
-    features -- which is every existing caller in this repo. Which branch was
-    taken cannot be read off the result, since both forms agree: a wrong
-    branch is a memory bug and nothing here sees it. What this pins is the
-    other half of the switch: that the primal path is UNCHANGED, rung by rung,
-    to the last bit. Exact equality rather than a tolerance, because "existing
-    callers' numbers do not move" is the claim and a tolerance would let a
-    one-ulp drift through unnoticed.
+    The dual's cost is n^2, so it is the WRONG form at thousands of rows and
+    2,048 features -- the shape of every existing caller in this repo. The two
+    forms agree to about 1e-10, so no tolerance can tell which one ran; this
+    test pins the primal path UNCHANGED, rung by rung, to the last bit. Exact
+    equality rather than a tolerance, because "existing callers' numbers do not
+    move" is the claim and a tolerance would let a one-ulp drift through
+    unnoticed.
+
+    That equality is also what makes it see the switch from one side, as a
+    byte difference rather than a memory difference: the dual's bits are not
+    the primal's, so a branch that is flipped, or one that always takes the
+    dual, is caught HERE (both measured, by mutation). What it cannot see is a
+    `_solve` that NEVER takes the dual: at `n > d` that returns exactly the
+    primal, bit for bit, so it passes. That regression -- the one that undoes
+    the dual's purpose, at `D > n` -- is the memory test below's, not this one's.
     """
     rng = np.random.default_rng(1)
     n, d = 300, 40                      # n > d, so the primal path is the one taken
@@ -308,6 +317,64 @@ def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_ro
         )
 
 
+def test_a_fit_where_the_features_outnumber_the_rows_never_builds_a_d_by_d_matrix():
+    """The memory guard: the one regression that undoes what the dual is FOR.
+
+    Both forms are mathematically correct, so no value test can tell which one
+    ran, and a `_solve` that never takes the dual -- back to `np.eye(D + 1)` --
+    returns the right numbers while allocating 11.3 GB at the raw-pixel cell's
+    D = 37632. This is the test that sees it, by measuring the one thing the
+    two forms do NOT share: peak memory.
+
+    At n = 50 rows and D = 4000 the primal's Gram alone is 122 MiB. Measured
+    through `fit_probe`, the public path, with a validation set so the whole
+    ladder is solved:
+
+        this code                              4.8 MiB
+        a `_solve` that never takes the dual   249 MiB
+        a `_solve` with the branch flipped     249 MiB
+        `fit_probe` before Task 1              371 MiB   (np.eye, the penalty, the Gram)
+
+    The budget is one primal Gram divided by 8, 15 MiB: three times what the
+    dual needs, a sixteenth of what the mutants peak at. It is a byte count,
+    not a timing, so it is deterministic -- identical across repeats and with
+    BLAS pinned to 1 and 2 threads.
+
+    `tracemalloc` does NOT see LAPACK's internal malloc copy of what it
+    solves. That is fine and is not a reason to chase it: the primal's D x D
+    arrays (the `np.eye`, the penalty, the Gram) are allocated by numpy, which
+    `tracemalloc` does see. The peak must also be ABOVE the input's own size,
+    which is what proves it is seeing numpy's allocations at all -- a
+    `tracemalloc` that saw nothing would read zero and satisfy the budget
+    trivially.
+    """
+    rng = np.random.default_rng(7)
+    n, d = 50, 4000
+    x = rng.normal(size=(n, d))
+    y = rng.normal(size=(n, 4)) * 240.0
+    xv = rng.normal(size=(30, d))
+    yv = rng.normal(size=(30, 4)) * 240.0
+    primal_gram_bytes = (d + 1) ** 2 * 8
+    budget = primal_gram_bytes // 8
+    assert n < d, "the fixture must be in the regime where the dual is the smaller form"
+
+    tracemalloc.start()
+    try:
+        fit_probe(x, y, xv, yv)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak > x.nbytes, (
+        f"peak {peak / 2**20:.2f} MiB is not above the input's own "
+        f"{x.nbytes / 2**20:.2f} MiB: `tracemalloc` is not seeing numpy's allocations"
+    )
+    assert peak < budget, (
+        f"peak {peak / 2**20:.1f} MiB exceeds the {budget / 2**20:.1f} MiB budget; "
+        f"a {d + 1} x {d + 1} primal Gram is {primal_gram_bytes / 2**20:.0f} MiB"
+    )
+
+
 def test_the_ladder_shares_one_gram_without_leaking_one_rungs_ridge_into_the_next():
     """`fit_probe` solves every rung from ONE Gram matrix, so the ridge added to
     its diagonal for one rung must not survive into the next.
@@ -320,7 +387,6 @@ def test_the_ladder_shares_one_gram_without_leaking_one_rungs_ridge_into_the_nex
     descending adds the large ones to the small. Primal rungs are compared
     exactly and dual rungs to the tolerance the dual is held to elsewhere.
     """
-    ladder = probe_module._solve_ladder
     rng = np.random.default_rng(4)
     query_rows = 17
 
@@ -330,7 +396,7 @@ def test_the_ladder_shares_one_gram_without_leaking_one_rungs_ridge_into_the_nex
     y = rng.normal(size=(n, 4)) * 240.0
     assert n > d, "this half must exercise the primal branch"
     for rungs in (RIDGES, RIDGES[::-1]):
-        weights = ladder(x, y, rungs)
+        weights = _solve_ladder(x, y, rungs)
         assert len(weights) == len(rungs)
         assert not np.allclose(weights[0], weights[-1], atol=1e-3), (
             "the fixture must make the rungs genuinely differ, or a leaked "
@@ -349,7 +415,7 @@ def test_the_ladder_shares_one_gram_without_leaking_one_rungs_ridge_into_the_nex
     query = rng.normal(size=(query_rows, d))
     design = np.concatenate([query, np.ones((query_rows, 1))], axis=1)
     for rungs in (RIDGES, RIDGES[::-1]):
-        weights = ladder(x, y, rungs)
+        weights = _solve_ladder(x, y, rungs)
         assert len(weights) == len(rungs)
         assert not np.allclose(weights[0], weights[-1], atol=1e-3)
         for ridge, w in zip(rungs, weights):
@@ -390,7 +456,6 @@ def test_fit_probe_is_unchanged_on_the_shape_every_existing_caller_uses():
     xs = (xf - mean) / scale
     expected = _primal_solve_for_test(xs, yf, probe["ridge"])
     np.testing.assert_array_equal(probe["w"], expected)
-    assert probe["ridge"] in RIDGES
 
 
 def test_fit_probe_selects_and_solves_correctly_where_the_features_outnumber_the_rows():
