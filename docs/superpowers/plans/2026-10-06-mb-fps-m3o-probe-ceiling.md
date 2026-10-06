@@ -664,8 +664,18 @@ floor that proves it per shape. Spec §3.3.1, §6.1.
 
 **Files:**
 - Modify: `src/mbfps/eval/probe.py` — `fit_probe` gains `ridges=RIDGES`
-- Modify: `src/mbfps/eval/ceiling.py` — append `CEILING_RIDGES`, `fit_linear_probe`, `null_floor`
-- Test: `tests/eval/test_probe.py` (append), `tests/eval/test_ceiling.py` (append)
+- Modify: `src/mbfps/eval/ceiling.py` — append `CEILING_RIDGES`, `fit_linear_probe`, `null_floor`; **change `fit_kernel_probe`'s jitter loop at `:186`**
+- Test: `tests/eval/test_probe.py` (append), `tests/eval/test_ceiling.py` (append **and three existing tests updated, below**)
+
+**BOTH SIDES, OR THE BUG RETURNS MIRRORED.** `fit_kernel_probe` currently searches
+jitters over `RIDGES` (`ceiling.py:186`). Giving `C` the finer grid while the
+ladder keeps the coarse one would leave the ladder's LINEAR RUNG restricted to 5
+jitters against `C`'s 33, so `C` could beat `D` — on the fixture below by about
+-0.10, since `C` reaches 0.44 at ridge 178 where the coarse grid reaches 0.33.
+That is Task 2's defect inverted: `D - C` negative for instrument reasons, and
+`PROBE_LIMITED` unreachable. The nesting argument requires the two search spaces
+to share the grid, so **`fit_kernel_probe` moves to `CEILING_RIDGES` in the same
+commit.**
 
 **Interfaces:**
 - Consumes: Task 1's `probe._solve_ladder`; Task 2's `fit_kernel_probe`, `apply_readout`
@@ -937,6 +947,60 @@ def null_floor(n: int, d: int, *, seed: int = 0) -> float:
             - _mean_r2(apply_readout(linear, score[0]), score[1]))
 ```
 
+Then change `fit_kernel_probe`'s jitter loop, `ceiling.py:186`:
+
+```python
+        for jitter in CEILING_RIDGES:
+```
+
+and in its docstring replace the two phrases that name the grid — "each over the
+shipped `RIDGES`" and "the jitters are `fit_probe`'s own `RIDGES`" — with
+`CEILING_RIDGES`, adding:
+
+```
+    THE LINEAR RUNG AND THE LINEAR REFERENCE SEARCH THE SAME GRID. Nesting is a
+    claim about search spaces: with the ladder on `RIDGES` and `fit_linear_probe`
+    on `CEILING_RIDGES` the ladder's linear rung would have 5 jitters against the
+    reference's 33, and `D - C` would go NEGATIVE for grid reasons alone -- about
+    -0.10 at n=300, D=150. Both are `CEILING_RIDGES`. The jitter ladder's length
+    is nearly free here: each kernel is eigendecomposed once and every jitter is
+    then O(n^2), where the decomposition is O(n^3).
+```
+
+**Six existing places in `tests/eval/test_ceiling.py` move with the grid.** The
+first three fail if you do not change them; the last three PASS either way and
+must still change, for the reason given.
+
+Fails unless changed:
+
+- `:122` — `for jitter in RIDGES:` in the brute-force ladder helper → `CEILING_RIDGES`
+- `:258` — `assert len(entries) == (1 + len(BANDWIDTHS)) * len(RIDGES)` → `len(CEILING_RIDGES)`
+- `:534` — the docstring phrase "over the same `RIDGES`" → `CEILING_RIDGES`
+
+Do not weaken `:258`. It pins the ladder's exact rung count, and after this
+change it reads `7 * 33 = 231`.
+
+Passes either way, and still wrong — **the three nesting tests compare the ladder
+against `fit_probe`, and after this change the ladder's search space contains
+`fit_linear_probe`'s, not `fit_probe`'s.** Point all three at
+`fit_linear_probe`:
+
+- `:497` `test_the_kernel_readout_is_never_worse_than_the_linear_probe`
+- `:531` `test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split`
+- `:547` `test_the_linear_rung_is_the_shipped_probe_and_not_an_approximation_of_it`
+
+`D >= C_shipped` does remain true, because `CEILING_RIDGES` CONTAINS `RIDGES` —
+which is exactly why these keep passing and why that is not evidence. The claim
+worth testing is the exact one: the ladder's linear rung reproduces the readout
+that searches the SAME grid.
+
+`:547` is the sharpest case. Measured on its fixture, `fit_probe` and
+`fit_linear_probe` both select ridge 1000, so `readout["jitter"] == probe["ridge"]`
+holds by coincidence — the optimum happens to land on a shipped rung at
+n=400, D=1024. On `_gapped_task` it would not: 1e3 against 177.8. Rename it to
+`..._is_the_linear_reference_and_not_an_approximation_of_it` and state the
+grid in its docstring.
+
 `Sequence` is already imported in `probe.py` (`_solve_ladder` annotates with it).
 `ceiling.py` already imports `fit_probe`, `apply_probe`, `_mean_r2` and `RIDGES`
 from `probe`; `RIDGES` stays imported — the containment test reads it.
@@ -968,6 +1032,7 @@ Commit first, then:
 | `CEILING_RIDGES`: `range(33)` -> `range(17)` with step `4.0` (a 10^0.5 grid) | `test_the_ceiling_grid_contains_the_shipped_grid_and_is_finer` on the length assertion. **Containment still holds for this mutant** — that is why the count is asserted separately. |
 | `CEILING_RIDGES`: span `-1.0 ... 7.0` -> `-1.0 ... 6.0` | the containment assertion (1e7 leaves the grid) |
 | `fit_linear_probe`: drop `ridges=CEILING_RIDGES` | `test_the_shipped_grid_straddles...` (fine grid picks 1e3) and `test_the_null_floor_is_near_zero...` |
+| `fit_kernel_probe`: jitter loop back to `RIDGES` | `test_the_null_floor_is_near_zero...` — the floor goes to about -0.10, which the `abs(...) < 0.005` assertion catches. Also `test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split`, whichever of Task 2's nesting tests compares against `fit_probe`: **check which of those now compare the ladder against `fit_probe` (shipped grid) rather than `fit_linear_probe`, and report it.** A nesting test left on `fit_probe` is testing the wrong containment after this change — the ladder no longer contains the shipped grid's selection, it contains the finer one's. |
 | `null_floor`: `_null_split(3 * seed + i, ...)` -> `_null_split(seed, ...)` | all three splits become identical, so `D - C` is measured in-sample. **Verify this bites**; if the floor stays under 0.005 in-sample the test cannot see it, so add an assertion that the three splits differ and report that you did. |
 | `null_floor`: return `C - D` instead of `D - C` | `test_the_null_floor_is_near_zero...` only if the coarse-grid discrimination assertion runs first — it reads +0.1 and would read -0.1. Confirm the sign assertion is `> 0.05`, not `abs(...) > 0.05`. |
 
