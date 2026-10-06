@@ -335,7 +335,7 @@ def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_ro
     """The switch is on `min(n, D)`, not "always dual", and the primal path is
     bitwise the form every recorded number in this project came out of.
 
-    The dual's cost is n^2, so it is the WRONG form at thousands of rows and
+    The dual's cost is n^2, so it is the WRONG form at 7,740 rows against D = 2,048 in the shipped study, measured and
     2,048 features -- the shape of every existing caller in this repo. The two
     forms agree to about 1e-10, so no tolerance can tell which one ran; this
     test pins the primal path UNCHANGED, rung by rung, to the last bit. Exact
