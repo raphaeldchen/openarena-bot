@@ -200,12 +200,15 @@ each asks a question about its own cell's representation.
 episodes, at `CONFIDENCE = 0.95` and `RESAMPLES = 2000`, drawn at a per-cell
 seed derived as M3n derives it (`crc32` of base, arm and seed — never `hash()`,
 which is salted per process). `pooling.clustered_interval` reads one column of
-a `(windows, horizon)` array and so does not apply directly to an r2
-difference, which has no horizon axis; the sequence column uses
-`gain_from_blocks`'s own bootstrap, and the estimator-versus-estimator
-comparisons need the one new resampler M3o adds. It resamples episodes and
-recomputes BOTH estimators' scores on each draw, so the two are paired within a
-resample rather than compared across independent ones.
+a `(windows, horizon)` array and so does not apply to an r2 difference, which
+has no horizon axis. **M3o needs no new resampler**: `probe._block_bootstrap_ci`
+already takes TWO prediction arrays and the targets, resamples `groups` with
+the probes held fixed, and returns a percentile interval on the r2 difference.
+Its parameter names say `joint_predicted` and `embedding_predicted`, but the
+computation is generic in the two arrays, so the estimator-versus-estimator
+comparison passes the RBF's and the linear's predictions on the same scored
+rows. The sequence column uses `gain_from_blocks`, which wraps the same
+helper.
 
 ### 5.1 The falsifiable target
 
@@ -264,10 +267,11 @@ Named for the quantity, following `burden.py`, `capacity.py`, `retention.py`,
 The three model verdicts of §5 all exit 0: each is an answer.
 
 Reused: `fit_probe` and `RIDGES`, `probe_targets`, `probe_r2`, `episode_split`,
-`gain_from_blocks` for the sequence column, `pooling.clustered_interval` for
-intervals. New: the dual path, the RBF kernel, the k-NN readout, and an
-estimator-versus-estimator comparison — `gain_from_blocks` compares two feature
-sets under one estimator, where M3o needs one feature set under two estimators.
+`gain_from_blocks` for the sequence column, `_block_bootstrap_ci` for every
+interval, and `_fit_and_score` — which already factors out the three-split
+discipline for ONE feature set and is the seam the new estimators plug into.
+New: the dual path, the RBF kernel, the k-NN readout, and a dispatching
+`apply_readout`.
 
 ## 8. What each outcome licenses
 
