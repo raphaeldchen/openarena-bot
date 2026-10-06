@@ -339,7 +339,7 @@ incomplete at that shape.
 | dual equals primal at every rung of `RIDGES` | the prerequisite changed no arithmetic |
 | `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear. ~0 once both sides share `CEILING_RIDGES`; it was +0.012 to +0.020 on the shipped grid, so this is what keeps that fix honest per cell |
 | `C_shipped` reproduces the shipped `embedding_selection_r2` (0.320-0.345) | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1) |
-| `C_shipped` is bitwise the fine ladder's 5 shipped rungs | `CEILING_RIDGES` ADDED rungs and changed no arithmetic |
+| `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
 | RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
 | the zero-information baseline recomputes to 283.05 median | the scale every map-unit figure is read against |
