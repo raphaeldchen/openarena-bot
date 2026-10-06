@@ -21,11 +21,12 @@ Gram, so the memory fix and the nonlinear probe are one piece of machinery.
 
 AND WHY "THE KERNEL WINS" IS NOT A FINDING. The kernel readout searches
 {the linear kernel} u {an RBF at each bandwidth}, each over
-`CEILING_RIDGES`, so the linear reference `fit_linear_probe` is a RUNG of its search and the held-out
-selection cannot do worse than it on the split it selects on. The finding is
-the MAGNITUDE of the difference and whether it is resolvable -- the trap M3n
-walked into from the other side, where `skill` had a positive point estimate
-in 8 of 9 cells and meant nothing until the interval was drawn.
+`CEILING_RIDGES`, so the linear reference `fit_linear_probe` is a RUNG of its
+search and the held-out selection cannot do worse than it on the split it
+selects on. The finding is the MAGNITUDE of the difference and whether it is
+resolvable -- the trap M3n walked into from the other side, where `skill` had
+a positive point estimate in 8 of 9 cells and meant nothing until the interval
+was drawn.
 
 Nesting was first argued asymptotically (an RBF approaches the linear kernel as
 its bandwidth grows) and a fixed diagonal jitter made that false in practice:
@@ -38,7 +39,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from mbfps.eval.probe import RIDGES, _mean_r2, apply_probe, fit_probe
+from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
 
 BANDWIDTHS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 """RBF length scales, as multiples of the median pairwise distance.
@@ -59,17 +60,34 @@ CEILING_RIDGES: tuple[float, ...] = tuple(
 `probe.RIDGES`'s span, [1e-1, 1e7].
 
 `RIDGES` steps by 100x, and that is too coarse to resolve an interior optimum.
-Measured on a purely linear task, the kernel ladder beat the linear reference by
-+0.0109 at D=1024 and +0.0201 at D=2048 (n=2000) -- and the gain an ORACLE ridge
-would have bought the linear reference at the same shapes is +0.0110 and +0.0208.
-The same number. The RBF rungs were not finding nonlinear structure, they were
-interpolating the ridge grid, and `PROBE_LIMITED` would have fired on it.
+Measured on a purely linear task (`null_floor`'s), the kernel ladder beat the
+linear reference on the shipped grid by
 
-On this grid the floor reads -0.0016 to +0.0000, and the linear reference rises
-to exactly the oracle's value. The SPAN is unchanged -- the optimum was interior
-at every shape measured, 0 of 6 draws at an endpoint -- so only the step was
-wrong. Where the ridge response has no sharp interior optimum, the raw-pixel row
-at D >> n, there was no floor on either grid.
+    D=1024   +0.0109   (range +0.0087 .. +0.0128)
+    D=2048   +0.0201   (range +0.0171 .. +0.0228)
+
+-- and the gain an ORACLE ridge would have bought the linear reference over the
+shipped grid at the same shapes is
+
+    D=1024   +0.0110   (range +0.0089 .. +0.0125)
+    D=2048   +0.0208   (range +0.0184 .. +0.0233)
+
+The same number. Every figure here is a MEAN OVER 6 DRAWS (seeds 0-5, three
+splits each as `3 * seed + i`), at n=2000, scored on the third split, with the
+range of the 6 beside it; no single draw reads the mean. The RBF rungs were not
+finding nonlinear structure, they were interpolating the ridge grid, and
+`PROBE_LIMITED` would have fired on it.
+
+On this grid, over the same 6 draws, the floor is -0.0001 at D=1024 (range
+-0.0005 .. +0.0000) and -0.0000 at D=2048 (-0.0000 .. +0.0000), and the linear
+reference rises to the oracle's value to within 0.0001: C is 0.4855 on the
+shipped grid and 0.4964 here at D=1024 (oracle 0.4964), 0.4957 and 0.5164 at
+D=2048 (oracle 0.5165). The SPAN is unchanged -- the optimum was interior at
+every shape measured, 0 of 6 draws at an endpoint -- so only the step was
+wrong. Where the ridge response has no sharp interior optimum, the raw-pixel
+row at D >> n, there was no floor on either grid: at D=37632 (2 draws, not 6)
+the floor is +0.0000 and -0.0000 on both, and C is 0.4643 and 0.4746 on the
+shipped grid against 0.4643 and 0.4754 here.
 
 IT CONTAINS `RIDGES` BITWISE, as every 8th rung, and `probe._solve_ladder`
 writes each rung's diagonal from a pristine copy rather than from the previous
@@ -166,10 +184,11 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     `lambda` (`probe._solve_ladder` computes exactly this), and the jitters are
     `CEILING_RIDGES`, the grid `fit_linear_probe` searches. So the search space
     contains `fit_linear_probe`'s and, selecting on the same split, the selected
-    score on that split cannot be lower: that is exact. On the caller's third split it can be lower by
-    selection noise, when an RBF rung edges linear on the selection split by
-    ~1e-4 and loses ~1e-3 on the score split (worst -0.0009 over 12 draws of
-    the embedding-shaped test fixture, against -0.038 to -0.064 before).
+    score on that split cannot be lower: that is exact. On the caller's third
+    split it can be lower by selection noise, when an RBF rung edges linear on
+    the selection split by ~1e-4 and loses ~1e-3 on the score split (worst
+    -0.0009 over 12 draws of the embedding-shaped test fixture, against -0.038
+    to -0.064 before).
 
     WHY NOT JUST AN RBF LADDER. The first version fixed the jitter at 1e-3 and
     leaned on the widest RBF being nearly linear. It is linear only to first
@@ -210,6 +229,11 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     this estimator in the M3o readouts, whichever rung won. `bandwidth` is
     `inf` for a linear rung and `gamma` is None.
     """
+    if len(CEILING_RIDGES) == 0:
+        raise ValueError(
+            "fit_kernel_probe: `CEILING_RIDGES` is empty, so there is no "
+            "jitter to select among"
+        )
     x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
     mean, scale = x.mean(0), x.std(0) + 1e-8
     xs = (x - mean) / scale
@@ -330,8 +354,9 @@ def null_floor(n: int, d: int, *, seed: int = 0) -> float:
     about the representation.
 
     MEASURED PER CELL rather than taken from a figure, because the floor proved
-    sharply shape-dependent: on the shipped grid it was +0.0201 at D=2048 and
-    +0.0000 at D=37632. Three shapes do not license nine cells.
+    sharply shape-dependent: on the shipped grid it was +0.0201 at D=2048 (mean
+    over 6 draws, n=2000) and +0.0000 at D=37632 (2 draws). Three shapes do not
+    license nine cells.
     """
     train, select, score = (_null_split(3 * seed + i, n, d) for i in range(3))
     linear = fit_linear_probe(*train, *select)

@@ -557,20 +557,22 @@ def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selectio
     holds for EVERY draw, including those where an RBF rung wins.
 
     TWO FIXTURES, because only one of them can see the grid. On `_embedding_task`
-    the optimum lands on a shipped rung in nearly every draw, so a ladder whose
+    the optimum lands on a shipped rung (1000 in all 6 draws), so a ladder whose
     jitters are the shipped `RIDGES` passes there: it contains the reference's
     selection anyway. On `_gapped_task` the optimum is 177.8, between shipped
     rungs, and that ladder's linear rung stops at 1e3. The RBF rungs then edge
     it up toward the reference but not past it: measured, the ladder selected
-    0.0006-0.0035 below the reference on 4 of 6 draws. The `off_grid` case is
-    asserted to be off the shipped grid before anything is concluded from it.
+    0.0006-0.0035 below the reference on 4 of 6 draws. The `gapped` case is
+    asserted to be off the shipped grid, and the `embedding` case on it, before
+    anything is concluded from either: the two parametrisations cannot collapse
+    into one.
     """
     train, select, _ = (task(3 * seed + i) for i in range(3))
     linear = fit_linear_probe(*train, *select)
-    if off_grid:
-        assert linear["ridge"] not in RIDGES, (
-            f"fixture must put the optimum off the shipped grid; got {linear['ridge']:g}"
-        )
+    assert (linear["ridge"] not in RIDGES) == off_grid, (
+        f"fixture must put the optimum {'off' if off_grid else 'on'} the "
+        f"shipped grid; got {linear['ridge']:g}"
+    )
     kernel = fit_kernel_probe(*train, *select)
     assert kernel["r2"] >= linear["r2"] - 1e-9, (
         f"selected {kernel['kernel']} at {kernel['r2']:.6f}, linear is {linear['r2']:.6f}"
@@ -582,7 +584,8 @@ def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selectio
 def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(
     monkeypatch, task, off_grid
 ):
-    """Collapse the RBF ladder to a rung that cannot win; what is left must be `fit_linear_probe`.
+    """Collapse the RBF ladder to a rung that cannot win; what is left must
+    be `fit_linear_probe`.
 
     The grid is `CEILING_RIDGES` on both sides, which is the grid the claim is
     about. On `_embedding_task` the optimum lands on a shipped rung (1000), so
@@ -677,3 +680,98 @@ def test_the_null_floor_is_near_zero_on_the_grid_the_ceiling_searches(monkeypatc
     assert coarse > 0.05, f"fixture must show a coarse-grid floor; got {coarse:+.4f}"
     floor = null_floor(300, 150, seed=seed)
     assert abs(floor) < 0.005, f"floor is {floor:+.4f} on CEILING_RIDGES"
+
+
+def test_the_null_floor_is_scored_on_the_third_split_drawn(monkeypatch):
+    """Fit on the first split, select on the second, SCORE on the third.
+
+    On the selection split `D >= C` is exact, because the ladder contains the
+    reference and both selected on that split, so a floor read there is
+    structurally non-negative and silently optimistic. Read on the fit split
+    it is in-sample. `null_floor`'s result is only a floor if it is read on the
+    split neither readout saw, and on a null task the selection-split and
+    score-split readings differ by ~2e-3, which a threshold on the result
+    cannot separate from the right one.
+
+    So the splits are made distinguishable by construction. The third draw is
+    moved out of the readouts' support (its features scaled by 4), where a
+    kernel readout reverts to the mean and the linear one extrapolates, so
+    `D - C` reads in the units there instead of at 1e-3. That is no longer a
+    null task and the number is not claimed to be a floor: the claim is only
+    which split it is read on. The spy returns what `_null_split` draws, so the
+    test's expectation is built from the splits `null_floor` actually used.
+
+    The fixture is shown to discriminate before the result is compared: the
+    selected rung must be an RBF one (a linear rung makes `D - C` exactly 0 on
+    every split and nothing could be told apart), the selection-split reading
+    must be non-negative as nesting requires, and the score-split reading
+    must be separated from the fit-split and selection-split ones by far more
+    than the tolerance. Reached: scoring on the selection split, scoring on
+    the fit split, and the third split taking the selection role.
+    """
+    n, d, seed = 300, 150, 1
+    real = ceiling._null_split
+    drawn = []
+
+    def spy(split_seed, rows, dims):
+        x, y = real(split_seed, rows, dims)
+        if len(drawn) == 2:
+            x = x * 4.0
+        drawn.append((x, y))
+        return x, y
+
+    monkeypatch.setattr(ceiling, "_null_split", spy)
+    floor = null_floor(n, d, seed=seed)
+    assert len(drawn) == 3, f"expected three splits drawn, got {len(drawn)}"
+    train, select, score = drawn
+
+    linear = fit_linear_probe(*train, *select)
+    kernel = fit_kernel_probe(*train, *select)
+    assert kernel["kernel"] == "rbf", (
+        f"fixture must select an RBF rung; got {kernel['kernel']}"
+    )
+
+    def gap_on(split):
+        return _score_on(kernel, split) - _score_on(linear, split)
+
+    on_train, on_select, on_score = gap_on(train), gap_on(select), gap_on(score)
+    assert on_select >= -1e-9, (
+        f"nesting: D - C on the selection split is {on_select:+.6f}"
+    )
+    assert on_score - on_select > 1.0, (
+        f"score-split reading {on_score:+.4f} is not apart from the "
+        f"selection-split one {on_select:+.4f}"
+    )
+    assert on_score - on_train > 1.0, (
+        f"score-split reading {on_score:+.4f} is not apart from the "
+        f"fit-split one {on_train:+.4f}"
+    )
+
+    assert floor == pytest.approx(on_score, abs=1e-9), (
+        f"null_floor returned {floor:+.6f}; D - C is {on_score:+.6f} on the "
+        f"third split, {on_select:+.6f} on the selection split and "
+        f"{on_train:+.6f} on the fit split"
+    )
+
+
+def test_an_empty_ridge_grid_is_refused_by_both_probes(monkeypatch):
+    """`D` and `C` both read `CEILING_RIDGES`, so both must name it if empty.
+
+    Unchecked, each ends in `TypeError: 'NoneType' object is not subscriptable`
+    on its `best`, which says nothing about the grid. A one-rung grid on the
+    same splits is the control: the data fit, and it is the emptiness that
+    raises. `fit_linear_probe` reaches the check in `fit_probe` and
+    `fit_kernel_probe` has its own.
+    """
+    train, select, _ = (_linear_task(i) for i in range(3))
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "CEILING_RIDGES", (1e-1,))
+        assert fit_linear_probe(*train, *select)["ridge"] == 1e-1
+        assert fit_kernel_probe(*train, *select)["jitter"] == 1e-1
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "CEILING_RIDGES", ())
+        with pytest.raises(ValueError, match="ridges.*empty"):
+            fit_linear_probe(*train, *select)
+        with pytest.raises(ValueError, match="CEILING_RIDGES.*empty"):
+            fit_kernel_probe(*train, *select)

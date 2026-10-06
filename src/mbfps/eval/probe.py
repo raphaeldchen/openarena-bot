@@ -158,10 +158,16 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None,
     so no existing caller moves. It exists because `RIDGES` steps by 100x and
     the optimum is interior: measured, the shipped grid selects 1e3 where the
     best ridge is 177.8 and gives up 0.09-0.11 of scored R^2 for it (n=300,
-    D=150), and +0.011 to +0.021 at n=2000, D=1024-2048. `ceiling.CEILING_RIDGES`
-    is the finer grid, and it CONTAINS `RIDGES` bitwise, so passing it adds
-    rungs and moves no existing number. `RIDGES` stays the default because
-    thirteen milestones of recorded numbers came through it.
+    D=150), and +0.011 to +0.021 at n=2000, D=1024-2048 (means over 6 draws;
+    the ranges are in `ceiling.CEILING_RIDGES`'s docstring). That grid is the
+    finer one, and it CONTAINS `RIDGES` bitwise, so passing it adds rungs and
+    moves no existing number. `RIDGES` stays the default because thirteen
+    milestones of recorded numbers came through it.
+
+    SELECTION NEEDS AT LEAST ONE RUNG: an empty `ridges` with held-out data
+    raises `ValueError` rather than failing later on a `None`. A call that does
+    not select (an explicit `ridge=`, or no held-out data) never reads `ridges`,
+    so an empty grid is not an error there.
     """
     x = np.asarray(latents, dtype=np.float64)
     y = np.asarray(targets, dtype=np.float64)
@@ -172,6 +178,10 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None,
     if val_latents is None:
         return {"w": _solve(xs, y, 1e3), "mean": mean, "scale": scale, "ridge": 1e3}
 
+    if len(ridges) == 0:
+        raise ValueError(
+            "fit_probe: `ridges` is empty, so there is no ridge to select among"
+        )
     xv = (np.asarray(val_latents, dtype=np.float64) - mean) / scale
     best = None
     # One Gram for the whole ladder: it depends on `xs`, not on the ridge, and

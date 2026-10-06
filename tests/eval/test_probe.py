@@ -3103,3 +3103,34 @@ def test_fit_probe_defaults_to_the_shipped_grid():
     assert np.array_equal(default["w"], explicit["w"])
     narrow = fit_probe(x, y, xv, yv, ridges=(RIDGES[0],))
     assert narrow["ridge"] == RIDGES[0], "the parameter must actually be used"
+
+
+def test_selecting_over_an_empty_ridge_grid_raises_a_value_error_naming_it():
+    """An empty grid leaves selection nothing to choose from, and says so.
+
+    Unchecked, `best` stays `None` and the return line subscripts it, so the
+    caller sees `TypeError: 'NoneType' object is not subscriptable` and not the
+    grid. That was unreachable while the grid was a module constant and is
+    reachable now that it is a parameter, and tests that monkeypatch a grid can
+    empty it.
+
+    The same data selected over a one-rung grid is the control: it is the grid
+    and not the data that raises. A call that does not select, an explicit
+    `ridge=` or no held-out data, never reads `ridges`, so an empty grid is
+    still not an error there; that is pinned too, because the check must sit on
+    the selection path and not above it.
+    """
+    rng = np.random.default_rng(2)
+    x, y = rng.normal(size=(120, 30)), rng.normal(size=(120, 4)) * 240.0
+    xv, yv = rng.normal(size=(60, 30)), rng.normal(size=(60, 4)) * 240.0
+
+    control = fit_probe(x, y, xv, yv, ridges=(1e3,))
+    assert control["ridge"] == 1e3 and "r2" in control, (
+        "the data must select fine over one rung"
+    )
+
+    with pytest.raises(ValueError, match="ridges.*empty"):
+        fit_probe(x, y, xv, yv, ridges=())
+
+    assert fit_probe(x, y, ridges=())["ridge"] == 1e3
+    assert fit_probe(x, y, xv, yv, ridge=10.0, ridges=())["ridge"] == 10.0
