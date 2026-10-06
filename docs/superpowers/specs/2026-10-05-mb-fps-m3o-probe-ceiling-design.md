@@ -105,9 +105,25 @@ one piece of machinery.
 **k-NN** has a `k` ladder and no fitting. It asks whether near-in-feature-space
 implies near-in-position, which is the aliasing question directly.
 
-**An RBF kernel approaches the linear kernel as its bandwidth grows**, so the
-linear probe is nearly a special case and `D >= C` is close to guaranteed by
-construction. **"D > C" is therefore not a finding.** The finding is the
+**The kernel ladder CONTAINS the linear probe as a rung**, so `D >= C` holds by
+construction up to selection noise.
+
+An earlier draft argued this asymptotically — an RBF approaches the linear
+kernel as its bandwidth grows — and Task 2 measured that the argument fails in
+practice. With a fixed diagonal jitter the widest RBF rung is effectively
+under-regularised relative to what the linear probe selects, and the RBF came
+out **worse** than linear once linear r2 exceeded about 0.37, by 0.002 to 0.004
+on one fixture and 0.05 to 0.07 on another. A negative `D - C` for instrument
+reasons would make `PROBE_LIMITED` unreachable even where the probe family IS
+the limit.
+
+So the ladder is `{linear kernel} u {RBF at each bandwidth}`, each over the
+shipped `RIDGES`, selected together on held-out data. The search space then
+strictly contains `fit_probe`'s and the nesting is exact rather than
+asymptotic: measured, `D - C` is +-0.0000 where the fixed-jitter version read
+-0.0021 to -0.0040, and the ladder selects the linear rung when nothing
+nonlinear helps. Each kernel is eigendecomposed once, so the jitter ladder
+costs O(n^2) per rung instead of another O(n^3) solve. **"D > C" is therefore not a finding.** The finding is the
 magnitude, and whether it is resolvable. This is the trap M3n walked into from
 the other side: `skill`'s point estimate was positive in 8 of 9 cells and meant
 nothing until the interval was drawn.
