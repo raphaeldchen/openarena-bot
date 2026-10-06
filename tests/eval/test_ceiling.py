@@ -9,7 +9,7 @@ from mbfps.eval.ceiling import (
     BANDWIDTHS, NEIGHBOURS, _median_scale, apply_readout, fit_kernel_probe,
     fit_knn_probe,
 )
-from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
+from mbfps.eval.probe import RIDGES, _mean_r2, apply_probe, fit_probe
 
 
 def _linear_task(seed=0, n=240, d=12):
@@ -24,6 +24,29 @@ def _linear_task(seed=0, n=240, d=12):
     rng = np.random.default_rng(seed)
     x = rng.normal(size=(n, d))
     return x, x @ w + rng.normal(size=(n, 4)) * 0.5
+
+
+def _embedding_task(seed=0, n=400, d=1024, rank=40, noise=120.0):
+    """A noisy, low-rank, embedding-shaped task: a linear target the probe only
+    partly recovers.
+
+    The features are a 40-dimensional signal pushed through a fixed random
+    map into D = 1024 dimensions, plus isotropic nuisance; the labels are a
+    linear function of the signal plus label noise. At `noise` 120 the shipped
+    probe reads r2 ~0.42-0.46 on held-out splits, which is where the measured
+    embedding sits (~0.33) and, more to the point, past the ~0.37 above which a
+    fixed-jitter RBF read BELOW it. `_linear_task` cannot show that: its signal
+    std is ~104 against noise 0.5, so no jitter is visible there.
+
+    As in `_linear_task`, the maps come from a generator that does not depend on
+    `seed`, so every split samples one task.
+    """
+    g = np.random.default_rng(777)
+    a = g.normal(size=(rank, d)); w = g.normal(size=(rank, 4))
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, rank))
+    x = z @ a + rng.normal(size=(n, d)) * 3.0
+    return x, (z @ w) * 20.0 + rng.normal(size=(n, 4)) * noise
 
 
 def _curved_task(seed=0, n=240, d=3, noise=0.0, spread=1.0):
@@ -65,6 +88,50 @@ def _score_at_one_rung(monkeypatch, ladder, rung, fit, fit_split, select_split, 
     return _score_on(readout, score_split)
 
 
+def _brute_force_ladder(fit, select):
+    """Every rung of the kernel ladder, as kernel ridge written from its definition.
+
+    One entry per (kernel, bandwidth, jitter): the linear kernel and an RBF at
+    each of `BANDWIDTHS`, each at every jitter in `RIDGES`, fit by
+    `np.linalg.solve` on `gram + jitter * I` with centred targets, inputs
+    standardised by the fit split. The bandwidth is a multiple of the median
+    pairwise distance of the standardised fit rows. Nothing here is shared with
+    the estimator but the constants it is meant to use, so it cannot agree with
+    it by sharing a mistake.
+
+    Each entry carries its `select` r2 and a `predict(x)`. Small fixtures only:
+    the pairwise differences are n x n x D.
+    """
+    fit_x, fit_y = fit
+    mean, scale = fit_x.mean(axis=0), fit_x.std(axis=0) + 1e-8
+    anchors = (fit_x - mean) / scale
+    centre = fit_y.mean(axis=0)
+    pairwise = np.sqrt(((anchors[:, None, :] - anchors[None, :, :]) ** 2).sum(axis=-1))
+    unit = np.median(pairwise[np.triu_indices(len(anchors), k=1)])
+
+    def rbf(sigma):
+        return lambda a, b: np.exp(
+            -((a[:, None, :] - b[None, :, :]) ** 2).sum(axis=-1) / (2.0 * sigma ** 2)
+        )
+
+    rungs = [("linear", np.inf, lambda a, b: a @ b.T)]
+    rungs += [("rbf", m, rbf(m * unit)) for m in BANDWIDTHS]
+    entries = []
+    for kernel, bandwidth, gram in rungs:
+        k = gram(anchors, anchors)
+        for jitter in RIDGES:
+            alpha = np.linalg.solve(k + jitter * np.eye(len(anchors)), fit_y - centre)
+
+            def predict(x, gram=gram, alpha=alpha):
+                return gram((x - mean) / scale, anchors) @ alpha + centre
+
+            entries.append({
+                "kernel": kernel, "bandwidth": bandwidth, "jitter": jitter,
+                "select": _mean_r2(predict(select[0]), select[1]), "predict": predict,
+            })
+    return entries
+
+
 def test_the_rbf_recovers_a_curved_target_the_linear_probe_cannot(monkeypatch):
     """The fixture is shown to defeat the linear probe FIRST.
 
@@ -95,31 +162,35 @@ def test_the_rbf_recovers_a_curved_target_the_linear_probe_cannot(monkeypatch):
     assert rbf > 0.8, f"selection should find a rung the widest one cannot; got {rbf:.3f}"
 
 
-def test_the_rbf_matches_the_linear_probe_on_a_linear_task(monkeypatch):
-    """Nesting: an RBF approaches the linear kernel as its bandwidth grows.
+def test_the_rbf_matches_the_linear_probe_on_a_linear_task():
+    """Nesting on a task the linear probe solves: the kernel readout must not be worse.
 
-    So the RBF must not be WORSE on a task the linear probe solves. This is the
-    control that stops "D >= C" being evidence of anything -- it is guaranteed
-    by construction, and this test is what makes that guarantee checkable.
+    This fixture is high signal-to-noise, so it cannot show the failure that
+    needed the linear kernel in the ladder -- see
+    `test_the_kernel_readout_is_never_worse_than_the_linear_probe` for that.
+    What it does show is that the readout is not merely agreeing with the linear
+    probe because both reach the ceiling: an RBF confined to the narrowest rung
+    is shown to score far below the linear probe on the same split, so a pass
+    here is the ladder finding the linear rung.
 
-    The comparison can fail: an RBF stuck on the narrowest rung is shown to
-    score far below the linear probe on the same split, so a pass is not the
-    two readouts agreeing because both reach the ceiling.
+    The narrowest-rung control is the brute-force oracle's, not the estimator's
+    with its ladder collapsed: the linear kernel is a rung of every ladder, so
+    collapsing `BANDWIDTHS` can no longer produce an RBF-only readout.
     """
     train, select, score = _linear_task(0), _linear_task(1), _linear_task(2)
     linear = _score_on(fit_probe(*train, *select), score)
     assert linear > 0.9, f"fixture must be solvable linearly; linear scored {linear:.3f}"
 
-    narrowest = _score_at_one_rung(
-        monkeypatch, "BANDWIDTHS", BANDWIDTHS[0], fit_kernel_probe, train, select, score
-    )
+    narrow = [e for e in _brute_force_ladder(train, select)
+              if e["kernel"] == "rbf" and e["bandwidth"] == BANDWIDTHS[0]]
+    narrowest = _mean_r2(max(narrow, key=lambda e: e["select"])["predict"](score[0]), score[1])
     assert narrowest < linear - 0.5, (
         f"an RBF stuck on rung {BANDWIDTHS[0]} must read worse than linear here "
         f"for the nesting comparison to be able to fail; it scored {narrowest:.3f}"
     )
 
     rbf = _score_on(fit_kernel_probe(*train, *select), score)
-    assert rbf > linear - 0.05, f"the RBF nests the linear probe; {rbf:.3f} vs {linear:.3f}"
+    assert rbf > linear - 0.05, f"the kernel readout nests the linear probe; {rbf:.3f} vs {linear:.3f}"
 
 
 def test_the_knn_recovers_a_curved_target_and_reports_its_k():
@@ -158,31 +229,49 @@ def test_the_knn_prediction_is_the_mean_of_the_k_nearest_targets(k):
     np.testing.assert_allclose(apply_readout(readout, query_x), expected, rtol=1e-12)
 
 
-def test_the_rbf_is_kernel_ridge_with_its_bandwidth_in_units_of_the_median_distance():
-    """Predictions against kernel ridge written out from its definition.
+@pytest.mark.parametrize("name, expected_kernel, fit, select, query", [
+    ("curved", "rbf", _curved_task(0, n=60), _curved_task(1, n=60), _curved_task(2, n=40)),
+    ("linear", "linear", _linear_task(0), _linear_task(1), _linear_task(2)),
+])
+def test_the_kernel_readout_is_the_best_kernel_ridge_over_the_whole_ladder(
+    name, expected_kernel, fit, select, query
+):
+    """The selected rung and its predictions, against kernel ridge written out.
 
     Pins what the value tests cannot see: that `bandwidth` is a MULTIPLE of the
     median pairwise distance of the standardised fit rows, that `gamma` is
-    1 / (2 sigma^2), that the targets are centred, and the 1e-3 diagonal
-    jitter. The median is taken over the upper triangle here and over both
-    triangles in the code; they are the same number.
+    1 / (2 sigma^2), that the targets are centred, that the jitter is added to
+    the diagonal and is one of `RIDGES`, that the linear rung is the plain Gram
+    of the standardised rows, and that the eigendecomposed solve is the same
+    answer as `np.linalg.solve`.
+
+    The readout must be the argmax of the oracle over ALL 35 rungs on the
+    selection split, so a ladder that skips a rung, selects the worst, or
+    selects on the fit split fails here. Both kernels are exercised through
+    `apply_readout`: the expected kernel is asserted, so neither case can pass
+    by having selected the other.
     """
-    fit_x, fit_y = _curved_task(0, n=60)
-    query_x, _ = _curved_task(2, n=40)
-    readout = fit_kernel_probe(fit_x, fit_y, *_curved_task(1, n=60))
+    readout = fit_kernel_probe(*fit, *select)
+    assert readout["kernel"] == expected_kernel, f"{name}: selected {readout['kernel']}"
 
-    mean, scale = fit_x.mean(axis=0), fit_x.std(axis=0) + 1e-8
-    anchors = (fit_x - mean) / scale
-    pairwise = np.sqrt(((anchors[:, None, :] - anchors[None, :, :]) ** 2).sum(axis=-1))
-    sigma = readout["bandwidth"] * np.median(pairwise[np.triu_indices(len(anchors), k=1)])
+    entries = _brute_force_ladder(fit, select)
+    assert len(entries) == (1 + len(BANDWIDTHS)) * len(RIDGES)
+    best = max(entries, key=lambda e: e["select"])
+    assert (readout["kernel"], readout["bandwidth"], readout["jitter"]) == (
+        best["kernel"], best["bandwidth"], best["jitter"]
+    )
+    assert readout["r2"] == pytest.approx(best["select"], abs=1e-8)
+    np.testing.assert_allclose(
+        apply_readout(readout, query[0]), best["predict"](query[0]), rtol=1e-6, atol=1e-6
+    )
 
-    def kernel(a, b):
-        return np.exp(-((a[:, None, :] - b[None, :, :]) ** 2).sum(axis=-1) / (2.0 * sigma ** 2))
 
-    centre = fit_y.mean(axis=0)
-    alpha = np.linalg.solve(kernel(anchors, anchors) + 1e-3 * np.eye(len(anchors)), fit_y - centre)
-    expected = kernel((query_x - mean) / scale, anchors) @ alpha + centre
-    np.testing.assert_allclose(apply_readout(readout, query_x), expected, rtol=1e-6, atol=1e-6)
+def test_apply_readout_refuses_a_kernel_it_does_not_know():
+    readout = dict(
+        fit_kernel_probe(*_curved_task(0, n=40), *_curved_task(1, n=40)), kernel="wavelet"
+    )
+    with pytest.raises(KeyError, match="unknown kernel"):
+        apply_readout(readout, _curved_task(2, n=5)[0])
 
 
 def test_the_kernel_probe_selects_its_bandwidth_on_the_split_it_is_handed(monkeypatch):
@@ -402,3 +491,78 @@ def test_a_scale_that_is_only_rounding_noise_is_not_accepted_as_one(monkeypatch)
     monkeypatch.setattr(ceiling, "_sqdist", lambda a, b: np.full((len(a), len(b)), 1e-6))
     with pytest.raises(ValueError, match="identical"):
         _median_scale(x)
+
+
+@pytest.mark.parametrize("seed", (0, 1))
+def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
+    """Nesting, asserted directly, on a task where the linear probe is NOT at ceiling.
+
+    The fixed-jitter RBF this replaced read below the linear probe wherever
+    linear r2 passed ~0.37: -0.0635 and -0.0512 on these two fixtures (linear
+    0.4552 / 0.4637, RBF 0.3918 / 0.4125). M3o's PROBE_LIMITED verdict fires on
+    D - C resolvably above zero, so an instrument that reads D - C < 0 on a
+    linear-ish task makes that verdict unreachable. With the linear kernel in
+    the ladder both read +0.0000: nothing nonlinear helps, so selection lands on
+    the linear rung and the readout IS the linear probe.
+
+    The linear score is asserted to be in the regime where the old code failed
+    first, so a pass is not the two readouts agreeing on an easy task.
+
+    THE TOLERANCE IS 1e-6, AND IT HOLDS ONLY WHERE THE LINEAR RUNG IS SELECTED.
+    On the score split `D - C >= 0` is not guaranteed: an RBF rung that edges
+    linear on the SELECTION split by ~1e-4 can lose ~1e-3 on the score split.
+    Over 12 draws of this fixture the linear rung was selected in 9 and D - C
+    was exactly 0 in those; the worst of the rest was -0.0009, against -0.046 to
+    -0.064 before. That residual is selection noise, which a test cannot
+    separate from a fault and which M3o's interval is for. What IS exact is the
+    selection split, and the next two tests pin that. These two seeds are
+    where the linear rung wins, so this is the "ladder finds linear" case, not
+    a claim about every draw.
+    """
+    train, select, score = (_embedding_task(3 * seed + i) for i in range(3))
+    linear = _score_on(fit_probe(*train, *select), score)
+    assert linear > 0.37, f"fixture must be where the fixed jitter failed; linear scored {linear:.3f}"
+
+    kernel = _score_on(fit_kernel_probe(*train, *select), score)
+    assert kernel >= linear - 1e-6, f"D - C = {kernel - linear:+.4f} ({kernel:.4f} vs linear {linear:.4f})"
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split(seed):
+    """The exact form of nesting: the ladder's search space contains `fit_probe`'s.
+
+    Both readouts select on the same split over the same `RIDGES`, so the
+    kernel readout's recorded selection r2 is at least the linear probe's, with
+    no allowance beyond rounding (1e-9). Unlike the score-split comparison this
+    holds for EVERY draw, including those where an RBF rung wins.
+    """
+    train, select, _ = (_embedding_task(3 * seed + i) for i in range(3))
+    linear = fit_probe(*train, *select)
+    kernel = fit_kernel_probe(*train, *select)
+    assert kernel["r2"] >= linear["r2"] - 1e-9, (
+        f"selected {kernel['kernel']} at {kernel['r2']:.6f}, linear is {linear['r2']:.6f}"
+    )
+
+
+def test_the_linear_rung_is_the_shipped_probe_and_not_an_approximation_of_it(monkeypatch):
+    """Collapse the RBF ladder to a rung that cannot win; what is left must be `fit_probe`.
+
+    With only the narrowest bandwidth beside it the linear kernel is selected,
+    at the ridge `fit_probe` selects, and the predictions are the shipped
+    probe's. The two solve in different spaces (the dual, through an
+    eigendecomposition, against `probe._solve_ladder`), so agreement to 1e-6
+    is the claim that a linear kernel with jitter lambda IS ridge regression at
+    lambda, which the nesting argument rests on.
+    """
+    train, select, score = (_embedding_task(i) for i in range(3))
+    probe = fit_probe(*train, *select)
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "BANDWIDTHS", (BANDWIDTHS[0],))
+        readout = fit_kernel_probe(*train, *select)
+
+    assert readout["kernel"] == "linear"
+    assert readout["bandwidth"] == float("inf") and readout["gamma"] is None
+    assert readout["jitter"] == probe["ridge"]
+    np.testing.assert_allclose(
+        apply_readout(readout, score[0]), apply_readout(probe, score[0]), rtol=1e-6, atol=1e-6
+    )

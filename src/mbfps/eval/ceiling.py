@@ -19,19 +19,26 @@ variance entering the one measurement whose job is to bound variance. It is
 also literally `probe._solve`'s dual branch with a kernel in place of the
 Gram, so the memory fix and the nonlinear probe are one piece of machinery.
 
-AND WHY "THE RBF WINS" IS NOT A FINDING. An RBF approaches the linear kernel
-as its bandwidth grows, so the linear probe is nearly a special case and the
-held-out selection will pick something like it if nothing better exists. The
-finding is the MAGNITUDE of the difference and whether it is resolvable --
-the trap M3n walked into from the other side, where `skill` had a positive
-point estimate in 8 of 9 cells and meant nothing until the interval was drawn.
+AND WHY "THE KERNEL WINS" IS NOT A FINDING. The kernel readout searches
+{the linear kernel} u {an RBF at each bandwidth}, each over the shipped
+`RIDGES`, so the linear probe is a RUNG of its search and the held-out
+selection cannot do worse than it on the split it selects on. The finding is
+the MAGNITUDE of the difference and whether it is resolvable -- the trap M3n
+walked into from the other side, where `skill` had a positive point estimate
+in 8 of 9 cells and meant nothing until the interval was drawn.
+
+Nesting was first argued asymptotically (an RBF approaches the linear kernel as
+its bandwidth grows) and a fixed diagonal jitter made that false in practice:
+the widest rung is capped at an effective linear ridge far below the ~1e3 the
+linear probe selects, and the RBF read 0.05-0.06 BELOW linear at linear r2
+above ~0.37. See `fit_kernel_probe`.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from mbfps.eval.probe import _mean_r2, apply_probe, fit_probe
+from mbfps.eval.probe import RIDGES, _mean_r2, apply_probe, fit_probe
 
 BANDWIDTHS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 """RBF length scales, as multiples of the median pairwise distance.
@@ -88,23 +95,83 @@ def _rbf(a: np.ndarray, b: np.ndarray, gamma: float) -> np.ndarray:
     return np.exp(-gamma * _sqdist(a, b))
 
 
+def _kernel_matrix(kernel: str, a: np.ndarray, b: np.ndarray, gamma: float | None) -> np.ndarray:
+    """The `kernel` rung's matrix between the rows of `a` and of `b`.
+
+    One definition shared by the fit and by `apply_readout`, so a readout is
+    applied with exactly the kernel it was selected with.
+    """
+    if kernel == "linear":
+        return a @ b.T
+    if kernel == "rbf":
+        return _rbf(a, b, gamma)
+    raise KeyError(f"unknown kernel {kernel!r}; expected linear or rbf")
+
+
+def _kernel_rungs(xs: np.ndarray, xv: np.ndarray, unit: float):
+    """Each kernel in the ladder as `(kernel, gamma, bandwidth, fit gram, query gram)`.
+
+    A generator, so one rung's n x n matrices are alive at a time: the whole
+    ladder held at once is seven of them, ~300 MB at n = 2000.
+
+    The linear rung comes first and its bandwidth is infinite, which is what a
+    linear kernel is as a limit of the RBF family, and keeps `float(bandwidth)`
+    meaningful for a caller that records it. Ties go to the earlier rung, so a
+    nonlinear kernel has to BEAT linear on the selection split rather than match
+    it.
+    """
+    yield "linear", None, float("inf"), xs @ xs.T, xv @ xs.T
+    for multiple in BANDWIDTHS:
+        gamma = 1.0 / (2.0 * (multiple * unit) ** 2)
+        yield "rbf", gamma, multiple, _rbf(xs, xs, gamma), _rbf(xv, xs, gamma)
+
+
 def fit_kernel_probe(x, y, val_x, val_y) -> dict:
-    """Kernel ridge with an RBF kernel, bandwidth selected on held-out data.
+    """Kernel ridge over {linear kernel} u {RBF at each bandwidth}, each over
+    the shipped `probe.RIDGES`, selected TOGETHER on held-out data.
 
-    The same three-split discipline as `fit_probe`: fit here, select the
-    bandwidth on `val_*`, and the caller scores on a third split. A bandwidth
-    selected on the fit split selects itself in, which is exactly what makes a
-    nonlinear probe untrustworthy as evidence.
+    The same three-split discipline as `fit_probe`: fit here, select the kernel,
+    bandwidth and diagonal jitter on `val_*`, and the caller scores on a third
+    split. A capacity selected on the fit split selects itself in, which is
+    exactly what makes a nonlinear probe untrustworthy as evidence.
 
-    THE DIAGONAL JITTER IS FIXED AT 1e-3 AND NOT SELECTED, which bounds how
-    well this nests the linear probe. The widest rung's kernel is linear to
-    first order, with an effective linear ridge of ~1e-3 x (bandwidth x median
-    distance)^2: ~130 at D = 1024 against the shipped probe's optimum of 1e3.
-    On a noisy low-rank synthetic task (D = 1024, linear r2 0.46-0.78) that left this
-    readout 0.05-0.06 BELOW the linear probe, and selecting the jitter on the
-    held-out split alongside the bandwidth closed the gap to within 0.003. At
-    a high signal-to-noise ratio the fixed jitter does not show, which is the
-    regime `test_the_rbf_matches_the_linear_probe_on_a_linear_task` samples.
+    THE LINEAR KERNEL IS A RUNG, which is what makes this nest `fit_probe`
+    rather than approach it. Kernel ridge with the linear kernel `xs xs'` of the
+    standardised fit rows, a jitter `lambda` on the diagonal and centred
+    targets IS the dual form of `fit_probe`'s ridge regression at the same
+    `lambda` (`probe._solve_ladder` computes exactly this), and the jitters are
+    `fit_probe`'s own `RIDGES`. So the search space contains `fit_probe`'s and,
+    selecting on the same split, the selected score on that split cannot be
+    lower: that is exact. On the caller's third split it can be lower by
+    selection noise, when an RBF rung edges linear on the selection split by
+    ~1e-4 and loses ~1e-3 on the score split (worst -0.0009 over 12 draws of
+    the embedding-shaped test fixture, against -0.038 to -0.064 before).
+
+    WHY NOT JUST AN RBF LADDER. The first version fixed the jitter at 1e-3 and
+    leaned on the widest RBF being nearly linear. It is linear only to first
+    order, with an effective linear ridge of ~1e-3 x (bandwidth x median
+    distance)^2: ~130 at D = 1024 against the ~1e3 the linear probe selects. On
+    a noisy low-rank task (D = 1024, n = 400, linear r2 0.45) that left the
+    readout 0.046-0.064 BELOW the linear probe. Selecting the jitter over
+    `RIDGES` with NO linear rung closes most of that (-0.001 to -0.003 on the
+    same three fixtures) but not all of it, and not by construction: an RBF
+    kernel's eigenvalues are bounded by n, so the jitters of 1e3 and up that the
+    linear probe selects only flatten an RBF rung to the mean, and the rungs
+    that can act are the small ones. The linear rung is what makes the nesting
+    exact rather than close.
+
+    EACH KERNEL IS EIGENDECOMPOSED ONCE, `K = V diag(vals) V'`, and every
+    jitter is then `V ((V'(y - centre)) / (vals + jitter))`, O(n^2) per rung
+    where a solve is O(n^3). The decomposition is itself the expensive step --
+    at n = 2000 it is ~0.4 s, more than five LU solves of the same kernel
+    (~0.15 s) -- so what this buys is a jitter ladder whose length is free, not
+    a cheaper five-rung one. The jitters are all >= 0.1, so rounding's slightly
+    negative eigenvalues (~1e-12 x the largest) never reach the denominator.
+
+    The readout records which kernel was selected, as `kernel`, because the
+    linear and RBF rungs apply differently. `kind` stays "rbf", the name of
+    this estimator in the M3o readouts, whichever rung won. `bandwidth` is
+    `inf` for a linear rung and `gamma` is None.
     """
     x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
     mean, scale = x.mean(0), x.std(0) + 1e-8
@@ -113,18 +180,18 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     unit = _median_scale(xs)
     centre = y.mean(0)
     best = None
-    for multiple in BANDWIDTHS:
-        gamma = 1.0 / (2.0 * (multiple * unit) ** 2)
-        gram = _rbf(xs, xs, gamma)
-        gram.flat[:: gram.shape[0] + 1] += 1e-3
-        alpha = np.linalg.solve(gram, y - centre)
-        score = _mean_r2(_rbf(xv, xs, gamma) @ alpha + centre, val_y)
-        if best is None or score > best[0]:
-            best = (score, multiple, gamma, alpha)
+    for kernel, gamma, bandwidth, gram, query in _kernel_rungs(xs, xv, unit):
+        vals, vecs = np.linalg.eigh(gram)
+        coords = vecs.T @ (y - centre)
+        for jitter in RIDGES:
+            alpha = vecs @ (coords / (vals + jitter)[:, None])
+            score = _mean_r2(query @ alpha + centre, val_y)
+            if best is None or score > best[0]:
+                best = (score, kernel, gamma, bandwidth, jitter, alpha)
     return {
-        "kind": "rbf", "mean": mean, "scale": scale, "anchors": xs,
-        "alpha": best[3], "centre": centre, "gamma": best[2],
-        "bandwidth": best[1], "r2": best[0],
+        "kind": "rbf", "kernel": best[1], "mean": mean, "scale": scale,
+        "anchors": xs, "alpha": best[5], "centre": centre, "gamma": best[2],
+        "bandwidth": best[3], "jitter": best[4], "r2": best[0],
     }
 
 
@@ -163,6 +230,9 @@ def _knn_predict(anchors, targets, query, k) -> np.ndarray:
 def apply_readout(readout: dict, x: np.ndarray) -> np.ndarray:
     """Apply any of the three readouts, dispatching on `kind`.
 
+    An "rbf" readout is further dispatched on its `kernel`, "linear" or "rbf",
+    because the kernel ladder's selected rung may be either.
+
     A readout with no `kind` is the shipped linear probe and goes to
     `probe.apply_probe` UNCHANGED. Reimplementing that path would silently
     change thirteen milestones' worth of recorded numbers, so it is delegated
@@ -177,6 +247,6 @@ def apply_readout(readout: dict, x: np.ndarray) -> np.ndarray:
         raise KeyError(f"unknown readout kind {kind!r}; expected linear, rbf or knn")
     xs = (np.asarray(x, dtype=np.float64) - readout["mean"]) / readout["scale"]
     if kind == "rbf":
-        return _rbf(xs, readout["anchors"], readout["gamma"]) @ readout["alpha"] \
-            + readout["centre"]
+        query = _kernel_matrix(readout["kernel"], xs, readout["anchors"], readout["gamma"])
+        return query @ readout["alpha"] + readout["centre"]
     return _knn_predict(readout["anchors"], readout["targets"], xs, readout["k"])
