@@ -20,8 +20,12 @@
 - After mutating a source file to check a test bites, clear `__pycache__` under `src/`, `tests/` and `scripts/` before re-running.
 - **When you pipe pytest through `tail` or `head`, the pipeline's exit code is the pager's, not pytest's.** Always read the `N passed` / `N failed` summary line yourself. This milestone's predecessor lost a review cycle to a run that reported exit 0 over `1 failed, 474 passed`.
 - `src/mbfps/eval/rollout.py`, `src/mbfps/eval/diagnostics.py`, `src/mbfps/eval/headroom.py`, `src/mbfps/eval/burden.py`, `scripts/trust_horizon.py`, `scripts/motion_headroom.py` are **unchanged by Tasks 1-6**. Only the conditional Task 7 may read them, and it modifies none. Verify with `git diff --stat 4956f59 HEAD -- <paths>` at the end of every task.
-- **`PROBE_LIMITED` is read against a MEASURED FLOOR, never against zero.** Task 2 measured that the kernel ladder beats the shipped linear probe by +0.012 at D=1024 and +0.020 at D=2048 **on a purely linear task**, because `RIDGES` is a decade grid and the RBF rungs fill its gaps. The ladder's linear rung reproduces `fit_probe` to 1e-6, so this is not an implementation difference. Each cell fits the whole ladder on a synthetic linear task at its own `n` and `D` and records that `D − C` as `null_floor`; `PROBE_LIMITED` requires the real `D − C` resolvably above it. Spec §6.1. **Tasks 3, 4 and 5 all carry this**: Task 3 measures `null_floor`, Task 4 reads against it, Task 5 records it.
-- Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05`, `DISPLACEMENT_TARGET = 3.9694722203504225`, `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. `RIDGES` is inherited from `probe.py`, not redefined.
+- **BOTH SIDES OF `D - C` SEARCH `ceiling.CEILING_RIDGES`, NOT `probe.RIDGES`.** Task 2 measured the ladder beating the linear reference by +0.012 to +0.020 **on a purely linear task**; Task 2b found the cause and removed it. `probe.RIDGES` steps by 100x and the optimum is interior, so the RBF rungs were reaching regularisation the linear reference could not — the floor and the gain an oracle ridge buys `C` are the SAME number. `CEILING_RIDGES` is 33 rungs at 10^0.25 over the same span; the floor then reads -0.0016 to +0.0000. Spec §3.3.1.
+- **`probe.RIDGES` IS FROZEN** at `(1e-1, 1e1, 1e3, 1e5, 1e7)`. Thirteen milestones of recorded numbers came through it and `fit_probe` keeps it as the default for its new `ridges=` parameter. A task that changes its value is wrong.
+- **`C` is the best LINEAR readout and is NOT the shipped probe.** `C` searches `CEILING_RIDGES` and is expected ABOVE the shipped `embedding_selection_r2` band (0.320-0.345) by up to ~0.02. The reconciliation and **exit 49 read `C_shipped`** — the same fit over `probe.RIDGES`, recorded as `shipped_grid_r2`. Gating on `C` would exit 49 on a correct run. Spec §3.3.1, §6.
+- **`PROBE_LIMITED` is read against a MEASURED FLOOR, never against zero.** The floor is sharply shape-dependent — ~0 at D=37632 even on the coarse grid, largest at D=2048 — so Task 2b's three shapes do not license nine cells. Each cell measures `ceiling.null_floor(n, d)` at its own shape; `PROBE_LIMITED` requires the real `D - C` resolvably above it. A `null_floor` materially above zero is a finding about the instrument, not a number to subtract. Spec §6.1. **Task 2b implements it, Task 4 reads it, Task 5 records it.**
+- Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05`, `DISPLACEMENT_TARGET = 3.9694722203504225`, `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. `RIDGES` is inherited from `probe.py`, not redefined. `CEILING_RIDGES` is `tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))` — 33 rungs, and it contains `RIDGES` bitwise as every 8th rung.
+- **THE RAW-PIXEL ROW DOES NOT FIT IN MEMORY AT `FRAME_BUDGET`, and Task 5 must size it explicitly.** `FRAME_BUDGET = 12000` was reasoned from the dual Gram (12000^2 x 8 = 1.07 GiB), but the raw-pixel FEATURE matrix at D = 37632 is 12000 x 37632 x 8 = **3.36 GiB per split**, and three splits plus `fit_kernel_probe`'s standardised copy is ~13 GiB live. `_solve_ladder`'s dual branch coerces to float64 whatever it is handed, so storing float32 does not help the solve. This is the 18 GB allocation that stopped this milestone's first attempt, and `FRAME_BUDGET` as written does not prevent it — it only bounds the Gram. Task 5 gives the raw-pixel row its own smaller budget, records it, and states in its report what the reduced `n` costs row B as a ceiling. Do not discover this at run time in Task 6.
 - The strict-majority bar is **computed**, never stored: `burden.strict_majority(len(cells))`. It returns 5 at nine cells and 6 at eleven.
 - Every difference is read from an episode-clustered bootstrap interval via `probe._block_bootstrap_ci`, at a per-cell seed derived as M3n derives it — `zlib.crc32` of base, arm and seed. **Never `hash()`**: it is salted per process, so records would not reproduce.
 
@@ -649,6 +653,358 @@ EOF
 
 ---
 
+## Task 2b: the ridge grid both sides search, and the floor that proves it
+
+Task 2 made `D >= C` exact on the SELECTION split by putting the linear kernel in
+the ladder. It did not make `D - C` mean "nonlinear capacity": both sides were
+still searching `probe.RIDGES`, which steps by 100x, and the RBF rungs could
+reach regularisation strengths the linear reference could not. This task gives
+both sides one grid fine enough to resolve the optimum, and adds the per-cell
+floor that proves it per shape. Spec §3.3.1, §6.1.
+
+**Files:**
+- Modify: `src/mbfps/eval/probe.py` — `fit_probe` gains `ridges=RIDGES`
+- Modify: `src/mbfps/eval/ceiling.py` — append `CEILING_RIDGES`, `fit_linear_probe`, `null_floor`
+- Test: `tests/eval/test_probe.py` (append), `tests/eval/test_ceiling.py` (append)
+
+**Interfaces:**
+- Consumes: Task 1's `probe._solve_ladder`; Task 2's `fit_kernel_probe`, `apply_readout`
+- Produces:
+  ```python
+  # probe.py — the ONLY change is a new keyword with the shipped default
+  def fit_probe(latents, targets, val_latents=None, val_targets=None,
+                ridge=None, ridges: Sequence[float] = RIDGES) -> dict
+
+  # ceiling.py
+  CEILING_RIDGES: tuple[float, ...]                 # 33 rungs, 10^0.25 over [1e-1, 1e7]
+  def fit_linear_probe(x, y, val_x, val_y) -> dict  # C: fit_probe over CEILING_RIDGES
+  def null_floor(n: int, d: int, *, seed: int = 0) -> float
+  ```
+  Task 3 wires `fit_linear_probe` as the `"linear"` readout and plain `fit_probe`
+  as `"linear_shipped"`. Do not change `fit_probe`'s default — `"linear_shipped"`
+  IS the shipped probe.
+
+**The measurements this task is built on**, all re-derivable from the fixture
+below and none to be taken on trust:
+
+| shape (n, D) | best ridge | `C` shipped grid | `C` fine grid | floor shipped | floor fine |
+| --- | --- | --- | --- | --- | --- |
+| 2000, 1024 | 3.16e3 | 0.4855 | 0.4964 | **+0.0109** | -0.0001 |
+| 2000, 2048 | 5.62e3 | 0.4957 | 0.5164 | **+0.0201** | -0.0000 |
+| 2000, 37632 | flat | 0.4643 | 0.4643 | +0.0000 | +0.0000 |
+| 300, 150 (the fixture) | 177.8 | 0.3099-0.3459 | 0.4022-0.4510 | **+0.0894 to +0.1106** | -0.0016 to +0.0000 |
+
+The floor and the oracle-ridge gain coincide at every shape where the gap
+exists, which is why refining the step removes it rather than merely shrinking
+it. The fixture shape is the one to test on: the effect is 0.09-0.11 and a draw
+takes 0.4 s, where the n=2000 shapes take ~4 s each.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/eval/test_probe.py`:
+
+```python
+def test_the_ridges_parameter_changes_no_arithmetic_at_the_shipped_rungs():
+    """`ridges=` is a pure EXTENSION: it adds rungs and moves no existing number.
+
+    Thirteen milestones of recorded numbers came through `RIDGES`, so this is
+    checked bitwise rather than to a tolerance, and in BOTH branches of
+    `_solve_ladder`. The features are UNCENTRED so the dual's own centring is
+    exercised: on centred input the two branches agree for a reason that would
+    hide a centring fault.
+    """
+    fine = tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))
+    assert tuple(fine[i] for i in range(0, 33, 8)) == RIDGES, (
+        "fixture must line the shipped rungs up with every 8th fine rung"
+    )
+    for n, d in ((400, 60), (60, 400)):          # d < n, then n <= d
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=(n, d)) + 5.0
+        y = rng.normal(size=(n, 4)) * 240.0
+        wide, shipped = _solve_ladder(x, y, fine), _solve_ladder(x, y, RIDGES)
+        for j, i in enumerate(range(0, 33, 8)):
+            assert np.array_equal(wide[i], shipped[j]), (
+                f"n={n} d={d} rung {RIDGES[j]:g} moved by "
+                f"{np.abs(wide[i] - shipped[j]).max():.3g}"
+            )
+
+
+def test_fit_probe_defaults_to_the_shipped_grid():
+    """The default path is byte-identical to the one without the parameter.
+
+    Guards the frozen constant itself, and that `fit_probe` passes `ridges`
+    through rather than reaching past it to the module global.
+    """
+    assert RIDGES == (1e-1, 1e1, 1e3, 1e5, 1e7), "the shipped grid is frozen"
+    rng = np.random.default_rng(1)
+    x, y = rng.normal(size=(120, 30)), rng.normal(size=(120, 4)) * 240.0
+    xv, yv = rng.normal(size=(60, 30)), rng.normal(size=(60, 4)) * 240.0
+    default, explicit = fit_probe(x, y, xv, yv), fit_probe(x, y, xv, yv, ridges=RIDGES)
+    assert default["ridge"] == explicit["ridge"]
+    assert np.array_equal(default["w"], explicit["w"])
+    narrow = fit_probe(x, y, xv, yv, ridges=(RIDGES[0],))
+    assert narrow["ridge"] == RIDGES[0], "the parameter must actually be used"
+```
+
+Append to `tests/eval/test_ceiling.py`:
+
+```python
+def _gapped_task(seed=0, n=300, d=150, rank=40, noise=120.0):
+    """A linear task whose best ridge falls BETWEEN the shipped grid's rungs.
+
+    Same construction as `_embedding_task`, at the shape where the grid's 100x
+    step costs the most. The optimum is 177.8; `probe.RIDGES` offers 1e1 and 1e3
+    and selects 1e3 in every draw, for a scored r2 0.09-0.11 below what the fine
+    grid reaches. `_embedding_task` cannot show this -- at n=400 D=1024 the ridge
+    response is flat enough that the shipped grid loses nothing.
+    """
+    g = np.random.default_rng(777)
+    a = g.normal(size=(rank, d)); w = g.normal(size=(rank, 4))
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, rank))
+    x = z @ a + rng.normal(size=(n, d)) * 3.0
+    return x, (z @ w) * 20.0 + rng.normal(size=(n, 4)) * noise
+
+
+def test_the_ceiling_grid_contains_the_shipped_grid_and_is_finer():
+    """Containment by VALUE, and the rung count, pinned separately.
+
+    Containment alone does not pin the step: a 17-rung 10^0.5 grid contains
+    `RIDGES` too, and it left a +0.0004 floor at D=2048 where 33 rungs left
+    -0.0000. So the count is asserted as well.
+    """
+    assert len(CEILING_RIDGES) == 33
+    assert set(RIDGES) <= set(CEILING_RIDGES)
+    assert CEILING_RIDGES[0] == RIDGES[0] and CEILING_RIDGES[-1] == RIDGES[-1]
+    assert all(a < b for a, b in zip(CEILING_RIDGES, CEILING_RIDGES[1:]))
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_the_shipped_grid_straddles_the_best_ridge_and_the_fine_grid_resolves_it(seed):
+    """The whole reason `C` does not use `probe.RIDGES`.
+
+    The fixture is shown to discriminate first: the shipped grid must select an
+    ENDPOINT of the interval the optimum lies in, so there is something to
+    resolve. Then the fine grid must land strictly inside that interval and read
+    materially higher on a third split.
+    """
+    train, select, score = (_gapped_task(3 * seed + i) for i in range(3))
+    shipped = fit_probe(*train, *select)
+    assert shipped["ridge"] == 1e3, f"fixture must straddle; shipped picked {shipped['ridge']:g}"
+
+    fine = fit_linear_probe(*train, *select)
+    assert 1e1 < fine["ridge"] < 1e3, f"fine grid picked {fine['ridge']:g}, not interior"
+    gap = _score_on(fine, score) - _score_on(shipped, score)
+    assert gap > 0.05, f"fine grid bought only {gap:+.4f}"
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_the_null_floor_is_near_zero_on_the_grid_the_ceiling_searches(seed):
+    """`D - C` where there is nothing nonlinear to find.
+
+    The fixture is shown to discriminate by measuring the SAME quantity over the
+    shipped grid, which must come back far above zero -- otherwise a test that
+    only checks `null_floor` is near zero would pass on a coarse grid too.
+    """
+    coarse = _null_floor_over(RIDGES, 300, 150, seed=seed)
+    assert coarse > 0.05, f"fixture must show a coarse-grid floor; got {coarse:+.4f}"
+    assert abs(null_floor(300, 150, seed=seed)) < 0.005, (
+        f"floor is {null_floor(300, 150, seed=seed):+.4f} on CEILING_RIDGES"
+    )
+```
+
+`_null_floor_over(ridges, n, d, *, seed)` is a TEST helper, not production code:
+it is `null_floor`'s body with the grid as a parameter. Write it in the test
+file by calling `null_floor` under `monkeypatch.setattr(ceiling, "CEILING_RIDGES",
+ridges)` if that is cleaner than duplicating the body — **prefer the
+monkeypatch**, so the helper cannot drift from the function it is validating.
+Adjust the test signature to take `monkeypatch` accordingly.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+.venv/bin/python -m pytest tests/eval/test_probe.py tests/eval/test_ceiling.py -k "ridges_parameter or defaults_to_the_shipped or ceiling_grid_contains or straddles or null_floor" -v
+```
+
+Expected: FAIL — `ImportError: cannot import name 'CEILING_RIDGES'`, and
+`fit_probe() got an unexpected keyword argument 'ridges'`.
+
+- [ ] **Step 3: Write the implementation**
+
+In `src/mbfps/eval/probe.py`, change `fit_probe`'s signature and its ladder loop
+ONLY:
+
+```python
+def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None,
+              ridges: Sequence[float] = RIDGES) -> dict:
+```
+
+and
+
+```python
+    for ridge, w in zip(ridges, _solve_ladder(xs, y, ridges)):
+```
+
+Add to `fit_probe`'s docstring, after the existing paragraphs:
+
+```
+    `ridges` is the grid SELECTION searches, defaulting to the shipped `RIDGES`
+    so no existing caller moves. It exists because `RIDGES` steps by 100x and
+    the optimum is interior: measured, the shipped grid selects 1e3 where the
+    best ridge is 177.8 and gives up 0.09-0.11 of scored R^2 for it (n=300,
+    D=150), and +0.011 to +0.021 at n=2000, D=1024-2048. `ceiling.CEILING_RIDGES`
+    is the finer grid, and it CONTAINS `RIDGES` bitwise, so passing it adds
+    rungs and moves no existing number. `RIDGES` stays the default because
+    thirteen milestones of recorded numbers came through it.
+```
+
+Append to `src/mbfps/eval/ceiling.py`:
+
+```python
+CEILING_RIDGES: tuple[float, ...] = tuple(
+    10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33)
+)
+"""The ridge grid BOTH sides of `D - C` search: 33 rungs at a 10^0.25 step over
+`probe.RIDGES`'s span, [1e-1, 1e7].
+
+`RIDGES` steps by 100x, and that is too coarse to resolve an interior optimum.
+Measured on a purely linear task, the kernel ladder beat the linear reference by
++0.0109 at D=1024 and +0.0201 at D=2048 (n=2000) -- and the gain an ORACLE ridge
+would have bought the linear reference at the same shapes is +0.0110 and +0.0208.
+The same number. The RBF rungs were not finding nonlinear structure, they were
+interpolating the ridge grid, and `PROBE_LIMITED` would have fired on it.
+
+On this grid the floor reads -0.0016 to +0.0000, and the linear reference rises
+to exactly the oracle's value. The SPAN is unchanged -- the optimum was interior
+at every shape measured, 0 of 6 draws at an endpoint -- so only the step was
+wrong. Where the ridge response has no sharp interior optimum, the raw-pixel row
+at D >> n, there was no floor on either grid.
+
+IT CONTAINS `RIDGES` BITWISE, as every 8th rung, and `probe._solve_ladder`
+writes each rung's diagonal from a pristine copy rather than from the previous
+rung's. So this grid ADDS rungs and moves no number any earlier milestone
+recorded. `probe.RIDGES` itself is untouched."""
+
+
+def fit_linear_probe(x, y, val_x, val_y) -> dict:
+    """The linear reference `C`: the shipped probe over `CEILING_RIDGES`.
+
+    NOT the shipped probe's own number -- that is `fit_probe` at its default,
+    which M3o records separately as `shipped_grid_r2` and reconciles against the
+    study. `C` is the best LINEAR readout, so that `D - C` isolates
+    nonlinearity rather than ridge-grid resolution.
+    """
+    return fit_probe(x, y, val_x, val_y, ridges=CEILING_RIDGES)
+
+
+_NULL_RANK: int = 40
+_NULL_NOISE: float = 120.0
+
+
+def _null_split(seed: int, n: int, d: int):
+    """One split of a SYNTHETIC purely-linear task: a low-rank signal pushed
+    through a fixed random map into `d` dimensions, plus isotropic nuisance.
+
+    The map and the target weights come from a generator that does NOT depend on
+    `seed`, so the three splits sample ONE task. Drawn from `seed`, each split
+    would get its own map and the readouts would be fit on one task and scored
+    on another.
+    """
+    g = np.random.default_rng(777)
+    a = g.normal(size=(_NULL_RANK, d)); w = g.normal(size=(_NULL_RANK, 4))
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, _NULL_RANK))
+    x = z @ a + rng.normal(size=(n, d)) * 3.0
+    return x, (z @ w) * 20.0 + rng.normal(size=(n, 4)) * _NULL_NOISE
+
+
+def null_floor(n: int, d: int, *, seed: int = 0) -> float:
+    """`D - C` at this shape when the target is EXACTLY linear in the features.
+
+    The honest answer is 0: nothing nonlinear is there to find. Anything
+    materially above it is the ladder beating the linear reference for
+    instrument reasons, which would read as `PROBE_LIMITED` and mean nothing
+    about the representation.
+
+    MEASURED PER CELL rather than taken from a figure, because the floor proved
+    sharply shape-dependent: on the shipped grid it was +0.0201 at D=2048 and
+    +0.0000 at D=37632. Three shapes do not license nine cells.
+    """
+    train, select, score = (_null_split(3 * seed + i, n, d) for i in range(3))
+    linear = fit_linear_probe(*train, *select)
+    kernel = fit_kernel_probe(*train, *select)
+    return (_mean_r2(apply_readout(kernel, score[0]), score[1])
+            - _mean_r2(apply_readout(linear, score[0]), score[1]))
+```
+
+`Sequence` is already imported in `probe.py` (`_solve_ladder` annotates with it).
+`ceiling.py` already imports `fit_probe`, `apply_probe`, `_mean_r2` and `RIDGES`
+from `probe`; `RIDGES` stays imported — the containment test reads it.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```bash
+.venv/bin/python -m pytest tests/eval/test_probe.py tests/eval/test_ceiling.py -q
+```
+
+Read the `N passed` line yourself. Expected: all pass, 149 + 10 = 159.
+
+Then confirm nothing else moved:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+A changed number anywhere else means `ridges=` is not a pure extension. Report
+the full count.
+
+- [ ] **Step 5: Verify the tests bite**
+
+Commit first, then:
+
+| mutation | test that must fail |
+| --- | --- |
+| `fit_probe`: ladder loop reads the module `RIDGES` instead of `ridges` | `test_fit_probe_defaults_to_the_shipped_grid` (the `narrow` assertion) and `test_the_shipped_grid_straddles_the_best_ridge_and_the_fine_grid_resolves_it` |
+| `CEILING_RIDGES`: `range(33)` -> `range(17)` with step `4.0` (a 10^0.5 grid) | `test_the_ceiling_grid_contains_the_shipped_grid_and_is_finer` on the length assertion. **Containment still holds for this mutant** — that is why the count is asserted separately. |
+| `CEILING_RIDGES`: span `-1.0 ... 7.0` -> `-1.0 ... 6.0` | the containment assertion (1e7 leaves the grid) |
+| `fit_linear_probe`: drop `ridges=CEILING_RIDGES` | `test_the_shipped_grid_straddles...` (fine grid picks 1e3) and `test_the_null_floor_is_near_zero...` |
+| `null_floor`: `_null_split(3 * seed + i, ...)` -> `_null_split(seed, ...)` | all three splits become identical, so `D - C` is measured in-sample. **Verify this bites**; if the floor stays under 0.005 in-sample the test cannot see it, so add an assertion that the three splits differ and report that you did. |
+| `null_floor`: return `C - D` instead of `D - C` | `test_the_null_floor_is_near_zero...` only if the coarse-grid discrimination assertion runs first — it reads +0.1 and would read -0.1. Confirm the sign assertion is `> 0.05`, not `abs(...) > 0.05`. |
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/mbfps/eval/probe.py src/mbfps/eval/ceiling.py tests/eval/test_probe.py tests/eval/test_ceiling.py
+git commit -F - <<'EOF'
+feat: one ridge grid for both sides of D - C, fine enough to resolve the optimum
+
+Task 2's linear rung made D >= C exact on the selection split. It did not make
+D - C mean nonlinear capacity: probe.RIDGES steps by 100x and the optimum is
+interior, so the RBF rungs reached regularisation the linear reference could
+not. The floor on a purely linear task (+0.0109 at D=1024, +0.0201 at D=2048,
+n=2000) EQUALS the gain an oracle ridge buys the linear reference (+0.0110,
++0.0208) -- the ladder was interpolating the grid, not finding structure.
+
+CEILING_RIDGES is 33 rungs at 10^0.25 over the same span. The floor then reads
+-0.0016 to +0.0000 and C rises to the oracle's value exactly. The span was
+already right: the optimum was interior in 0 of 6 draws at an endpoint.
+
+probe.RIDGES is untouched and stays fit_probe's default, so no earlier
+milestone's number moves. CEILING_RIDGES contains it bitwise as every 8th rung,
+and _solve_ladder writes each rung from a pristine diagonal, so passing the
+finer grid adds rungs and changes no arithmetic -- asserted bitwise in both
+branches on uncentred features.
+
+null_floor measures D - C per cell at the cell's own shape. The floor proved
+sharply shape-dependent (+0.0201 at D=2048, +0.0000 at D=37632), so three
+shapes do not license nine cells.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+EOF
+```
+
+---
+
 ## Task 3: the grid, and the instrument's quality on the applied distribution
 
 **Files:**
@@ -656,7 +1012,7 @@ EOF
 - Test: `tests/eval/test_ceiling.py` (append)
 
 **Interfaces:**
-- Consumes: Task 2's estimators; `probe.probe_targets`, `probe._block_bootstrap_ci`, `probe._validate_groups`
+- Consumes: Task 2's estimators and Task 2b's `fit_linear_probe`; `probe.probe_targets`, `probe._block_bootstrap_ci`, `probe._validate_groups`
 - Produces:
   ```python
   FRAME_BUDGET: int = 12000
@@ -771,8 +1127,25 @@ class Readout:
     can be bootstrapped with both held fixed."""
 
 
-_FITTERS = {"linear": fit_probe, "rbf": fit_kernel_probe, "knn": fit_knn_probe}
-_CAPACITY_KEY = {"linear": "ridge", "rbf": "bandwidth", "knn": "k"}
+_FITTERS = {
+    "linear": fit_linear_probe,      # C: the best linear readout, CEILING_RIDGES
+    "linear_shipped": fit_probe,     # C_shipped: the study's own probe, RIDGES
+    "rbf": fit_kernel_probe,
+    "knn": fit_knn_probe,
+}
+"""Two linear entries, and the difference is the whole point of Task 2b.
+
+`"linear"` searches `CEILING_RIDGES` and is what `D - C` is read against, so the
+difference isolates nonlinearity rather than ridge-grid resolution.
+`"linear_shipped"` is `fit_probe` at its default and is the ONLY one that
+reconciles against the study's `embedding_selection_r2` -- it is what exit 49
+reads. Gating on `"linear"` would exit 49 on a correct run, because the finer
+grid is expected to read up to ~0.02 ABOVE the shipped band."""
+
+_CAPACITY_KEY = {
+    "linear": "ridge", "linear_shipped": "ridge",
+    "rbf": "bandwidth", "knn": "k",
+}
 
 
 def score_readout(name: str, fit, select, score) -> Readout:
@@ -826,7 +1199,7 @@ def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) 
     return {"point": a.r2 - b.r2, "ci_low": low, "ci_high": high}
 ```
 
-Add to the module's imports: `from dataclasses import dataclass` and extend the `probe` import with `_block_bootstrap_ci`. Add `CONFIDENCE: float = 0.95` and `RESAMPLES: int = 2000` beside the other constants.
+Add to the module's imports: `from dataclasses import dataclass` and extend the `probe` import with `_block_bootstrap_ci`. `fit_linear_probe` is Task 2b's and is already in this module. Add `CONFIDENCE: float = 0.95` and `RESAMPLES: int = 2000` beside the other constants.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -834,7 +1207,8 @@ Add to the module's imports: `from dataclasses import dataclass` and extend the 
 .venv/bin/python -m pytest tests/eval/test_ceiling.py -q
 ```
 
-Expected: PASS, 10 tests.
+Read the `N passed` line yourself. Expected: the three new tests pass on top of
+Task 2b's total; report the count rather than matching a number from this plan.
 
 - [ ] **Step 5: Verify the tests bite**
 
@@ -1260,12 +1634,15 @@ EOF
   "episodes": {"fit": [...], "select": [...], "score": [...]},
   "groups": [...],
   "applied": {"r2": float, "median_error": float},
+  "ceiling_ridges": [...],        # the 33 rungs, stored; no literal survives the tests
   "readouts": {
     "pixels_linear":     {"r2": f, "median_error": f, "capacity": f},
     "pixels_rbf":        {...}, "embedding_linear": {...},
     "embedding_rbf":     {...}, "embedding_knn":   {...},
     "sequence_linear":   {...}, "sequence_rbf":    {...},
   },
+  "shipped_grid_r2": float,      # C_shipped: the "linear_shipped" readout's r2
+  "null_floor": float,           # ceiling.null_floor(n, d) at THIS cell's shape
   "gains": {
     "probe":    {"point": f, "ci_low": f, "ci_high": f},
     "pixel":    {...}, "sequence": {...},
@@ -1277,6 +1654,20 @@ EOF
     "zero_information_recomputed": float,
   },
 }
+```
+
+**`shipped_grid_r2`, not `embedding_linear`, is what `harness_r2_matches_study`
+reads and what exit 49 fires on.** `embedding_linear` searches `CEILING_RIDGES`
+and is expected up to ~0.02 ABOVE the study's 0.320-0.345 band, so reconciling on
+it would exit 49 on a correct run. Spec §3.3.1.
+
+**`null_floor` is measured at the cell's own `(n, d)`** — the `n` after the
+stride subsample and the `d` of the embedding feature set, the same shape
+`embedding_rbf` and `embedding_linear` are fit at. It costs one extra ladder fit
+per cell. Record it even when it comes back at zero: a floor materially above
+zero is a finding about the instrument, and Task 4 reads `probe_gain` against it.
+
+```python
 ```
 
 - [ ] **Step 1: Write the failing test**
