@@ -19,6 +19,7 @@ Two properties of `my_way_home`, measured rather than assumed:
 Positions are Doom map units, not metres.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -56,7 +57,7 @@ RIDGES: tuple[float, ...] = (1e-1, 1e1, 1e3, 1e5, 1e7)
 """Candidate strengths. The measured optimum here is 1e3-1e5, not 1."""
 
 
-def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
+def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges: Sequence[float]) -> list[np.ndarray]:
     """Ridge weights with an UNREGULARISED intercept, one set per entry of
     `ridges`, solved in the smaller space and from ONE Gram matrix.
 
@@ -71,10 +72,10 @@ def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
 
     The dual's cost is n^2, so neither form is universally right and the
     branch is on `min(n, D)`. Verified against the primal across the whole
-    ladder on 40 rows of 300 features: 1.5e-10 at ridge 1e-1 falling to 1.4e-14
-    at 1e7 for centred features, and 2.7e-07 at 1e-1 for features with a mean of
-    5. Agreement is worst at the smallest ridge, where the Gram is worst
-    conditioned.
+    ladder on 40 rows of 300 features: 1.5e-10 at ridge 1e-1 falling to
+    1.4e-14 at 1e7 for centred features, and 2.7e-07 at 1e-1 for features with
+    a mean of 5. Agreement is worst at the smallest ridge, where the Gram is
+    worst conditioned.
 
     THE GRAM DEPENDS ON `x` ALONE, NOT ON THE RIDGE, so it is built once and
     only its diagonal is rewritten between rungs. Each rung is written from a
@@ -87,11 +88,18 @@ def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
     THE INTERCEPT IS NEVER REGULARISED, in either form, and the dual CENTRES
     `x` ITSELF rather than assuming a centred caller. `fit_probe` does pass
     standardised features, so assuming it would work in production -- and be
-    wrong by hundreds of map units (485.2 at ridge 1e-1, on features with a mean
-    of 5) for anyone calling `_solve` directly with raw features, silently,
-    since both forms return a plausible array. Ridge with a
-    free intercept is exactly: centre both, solve without an intercept, then
-    recover it as `y.mean(0) - x.mean(0) @ w`.
+    wrong by hundreds of map units (485.2 at ridge 1e-1, on features with a
+    mean of 5) for anyone calling `_solve` directly with raw features,
+    silently, since both forms return a plausible array. Ridge with a free
+    intercept is exactly: centre both, solve without an intercept, then recover
+    it as `y.mean(0) - x.mean(0) @ w`.
+
+    THE DUAL WORKS IN FLOAT64 WHATEVER IT IS HANDED, and accepts a 1-D `y`,
+    returning `(D + 1,)` as the primal does. `fit_probe` coerces to float64
+    before it gets here, so neither is reachable from it; a direct caller with
+    float32 features would otherwise get a float32 Gram, and weights that are
+    the right shape and dtype and wrong by 1.8e-4 at ridge 1e-1 and 1.6e-5 at
+    1e3, on 40 rows of 300 features with a mean of 5.
     """
     n, d = x.shape
     solved = []
@@ -105,6 +113,11 @@ def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
             diagonal[:d] = pristine + ridge          # the intercept entry is untouched
             solved.append(np.linalg.solve(gram, moment))
         return solved
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    vector = y.ndim == 1
+    if vector:
+        y = y[:, None]
     x_centre, y_centre = x.mean(0), y.mean(0)
     # `yc` is numerical hygiene, not part of the answer: the columns of `xc`
     # sum to zero, so `xc.T @ solve(gram, y)` is the same weights without it.
@@ -116,7 +129,8 @@ def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
         diagonal[:] = pristine + ridge
         weights = xc.T @ np.linalg.solve(gram, yc)
         intercept = (y_centre - x_centre @ weights)[None, :]
-        solved.append(np.concatenate([weights, intercept], axis=0))
+        w = np.concatenate([weights, intercept], axis=0)
+        solved.append(w[:, 0] if vector else w)
     return solved
 
 

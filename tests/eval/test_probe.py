@@ -278,6 +278,59 @@ def test_the_dual_solve_centres_its_own_features_rather_than_assuming_a_caller_d
         assert gap < 1e-5, f"ridge={ridge:g}: {gap:.3e}"
 
 
+# `fit_probe` coerces its inputs to float64, so neither of the next two cases is
+# reachable from it. Both are reachable by anyone calling `_solve` directly, as
+# these tests do, and the pre-Task-1 `_solve` handled both.
+
+
+@pytest.mark.parametrize("n, d", [(40, 300), (40, 40), (300, 40)], ids=["dual", "boundary", "primal"])
+def test_a_one_dimensional_target_gives_a_one_dimensional_weight_vector(n, d):
+    """The pre-Task-1 `_solve` returned shape `(d + 1,)` for a 1-D `y`, and the
+    dual branch raised `IndexError: invalid index to scalar variable` instead,
+    because the mean of a vector is a scalar and `[None, :]` cannot index it.
+
+    Covers both sides of the switch and the `n == d` boundary, which takes the
+    dual (`d < n` is strict); the primal was never broken and is here so the
+    shape contract is pinned on both branches.
+    """
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(n, d)) + 5.0
+    y = rng.normal(size=n) * 240.0 + 500.0
+
+    w = _solve(x, y, 1e3)
+    assert w.shape == (d + 1,)
+    design = np.concatenate([rng.normal(size=(17, d)), np.ones((17, 1))], axis=1)
+    gap = np.max(np.abs(design @ w - design @ _primal_solve_for_test(x, y, 1e3)))
+    assert gap < 1e-5, f"{gap:.3e}"
+
+
+def test_a_float32_feature_matrix_is_solved_at_float64_precision():
+    """SILENT PRECISION LOSS. A float32 `x` made the dual branch build its Gram
+    in float32, so the weights came back plausible, the right shape and the
+    right dtype, and wrong: by 1.8e-4 at ridge 1e-1 and 1.6e-5 at 1e3 on this
+    fixture. Nothing but a value comparison against the primal can see it.
+
+    The oracle is given the very same float32 values widened to float64, which
+    is exactly what the primal does to them (the intercept column is float64,
+    so `np.concatenate` promotes), so the comparison isolates the Gram's
+    precision rather than the rounding of the inputs.
+    """
+    rng = np.random.default_rng(6)
+    n, d = 40, 300
+    x = (rng.normal(size=(n, d)) + 5.0).astype(np.float32)
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert x.dtype == np.float32, "the fixture must be single precision"
+    assert n < d, "the fixture must exercise the dual branch"
+
+    widened = x.astype(np.float64)
+    design = np.concatenate([rng.normal(size=(17, d)), np.ones((17, 1))], axis=1)
+    for ridge in RIDGES:
+        gap = np.max(np.abs(
+            design @ _solve(x, y, ridge) - design @ _primal_solve_for_test(widened, y, ridge)
+        ))
+        assert gap < 1e-5, f"ridge={ridge:g}: {gap:.3e}"
+
+
 def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_rows():
     """The switch is on `min(n, D)`, not "always dual", and the primal path is
     bitwise the form every recorded number in this project came out of.
