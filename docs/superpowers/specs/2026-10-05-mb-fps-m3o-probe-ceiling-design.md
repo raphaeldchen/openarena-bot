@@ -251,9 +251,31 @@ two verdicts.
 
 ## 6. Controls
 
+### 6.1 The null control: what `D - C` reads when there is nothing to find
+
+Task 2 measured that the kernel ladder beats the shipped linear probe **on a
+purely linear task** by +0.012 at D=1024 and +0.020 at D=2048, n=2000. The
+linear RUNG of the ladder reproduces `fit_probe` to 1e-6, so the gap is not an
+implementation difference: the RBF rungs are filling in gaps in `RIDGES`, which
+is a decade grid, and acting as intermediate regularisation.
+
+That is a **false `PROBE_LIMITED`**. It has nothing to do with nonlinear
+structure in the representation, which is what the verdict is supposed to mean.
+
+So `D - C` is read against a measured floor rather than against zero. Each cell
+additionally fits the whole ladder on a SYNTHETIC purely-linear task at that
+cell's own `n` and `D`, and records the `D - C` it produces. `PROBE_LIMITED`
+requires the real `D - C` to be resolvably above **that** floor, not above
+zero.
+
+The floor is measured per cell rather than taken from the figures above,
+because it depends on `n` and `D`, and those differ between the raw-pixel row
+and the representation rows.
+
 | control | claim it pins |
 | --- | --- |
 | dual equals primal at every rung of `RIDGES` | the prerequisite changed no arithmetic |
+| `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear; a decade ridge grid alone buys +0.012 to +0.020 |
 | cell `C` reproduces the shipped `embedding_selection_r2` (0.320-0.345) | M3o's harness measures what the study measured, not something adjacent |
 | RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
