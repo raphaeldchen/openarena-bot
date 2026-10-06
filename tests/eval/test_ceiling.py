@@ -6,8 +6,8 @@ import pytest
 import mbfps.eval.ceiling as ceiling
 import mbfps.eval.probe as probe_module
 from mbfps.eval.ceiling import (
-    BANDWIDTHS, NEIGHBOURS, _median_scale, apply_readout, fit_kernel_probe,
-    fit_knn_probe,
+    BANDWIDTHS, CEILING_RIDGES, NEIGHBOURS, _median_scale, apply_readout,
+    fit_kernel_probe, fit_knn_probe, fit_linear_probe, null_floor,
 )
 from mbfps.eval.probe import RIDGES, _mean_r2, apply_probe, fit_probe
 
@@ -92,7 +92,7 @@ def _brute_force_ladder(fit, select):
     """Every rung of the kernel ladder, as kernel ridge written from its definition.
 
     One entry per (kernel, bandwidth, jitter): the linear kernel and an RBF at
-    each of `BANDWIDTHS`, each at every jitter in `RIDGES`, fit by
+    each of `BANDWIDTHS`, each at every jitter in `CEILING_RIDGES`, fit by
     `np.linalg.solve` on `gram + jitter * I` with centred targets, inputs
     standardised by the fit split. The bandwidth is a multiple of the median
     pairwise distance of the standardised fit rows. Nothing here is shared with
@@ -119,7 +119,7 @@ def _brute_force_ladder(fit, select):
     entries = []
     for kernel, bandwidth, gram in rungs:
         k = gram(anchors, anchors)
-        for jitter in RIDGES:
+        for jitter in CEILING_RIDGES:
             alpha = np.linalg.solve(k + jitter * np.eye(len(anchors)), fit_y - centre)
 
             def predict(x, gram=gram, alpha=alpha):
@@ -146,7 +146,7 @@ def test_the_rbf_recovers_a_curved_target_the_linear_probe_cannot(monkeypatch):
     that rung reaches and what selection reaches.
     """
     train, select, score = _curved_task(0), _curved_task(1), _curved_task(2)
-    linear = _score_on(fit_probe(*train, *select), score)
+    linear = _score_on(fit_linear_probe(*train, *select), score)
     assert linear < 0.5, f"fixture must defeat the linear probe; it scored {linear:.3f}"
 
     widest = _score_at_one_rung(
@@ -178,7 +178,7 @@ def test_the_rbf_matches_the_linear_probe_on_a_linear_task():
     collapsing `BANDWIDTHS` can no longer produce an RBF-only readout.
     """
     train, select, score = _linear_task(0), _linear_task(1), _linear_task(2)
-    linear = _score_on(fit_probe(*train, *select), score)
+    linear = _score_on(fit_linear_probe(*train, *select), score)
     assert linear > 0.9, f"fixture must be solvable linearly; linear scored {linear:.3f}"
 
     narrow = [e for e in _brute_force_ladder(train, select)
@@ -241,11 +241,11 @@ def test_the_kernel_readout_is_the_best_kernel_ridge_over_the_whole_ladder(
     Pins what the value tests cannot see: that `bandwidth` is a MULTIPLE of the
     median pairwise distance of the standardised fit rows, that `gamma` is
     1 / (2 sigma^2), that the targets are centred, that the jitter is added to
-    the diagonal and is one of `RIDGES`, that the linear rung is the plain Gram
+    the diagonal and is one of `CEILING_RIDGES`, that the linear rung is the plain Gram
     of the standardised rows, and that the eigendecomposed solve is the same
     answer as `np.linalg.solve`.
 
-    The readout must be the argmax of the oracle over ALL 35 rungs on the
+    The readout must be the argmax of the oracle over ALL 231 rungs on the
     selection split, so a ladder that skips a rung, selects the worst, or
     selects on the fit split fails here. Both kernels are exercised through
     `apply_readout`: the expected kernel is asserted, so neither case can pass
@@ -255,7 +255,7 @@ def test_the_kernel_readout_is_the_best_kernel_ridge_over_the_whole_ladder(
     assert readout["kernel"] == expected_kernel, f"{name}: selected {readout['kernel']}"
 
     entries = _brute_force_ladder(fit, select)
-    assert len(entries) == (1 + len(BANDWIDTHS)) * len(RIDGES)
+    assert len(entries) == (1 + len(BANDWIDTHS)) * len(CEILING_RIDGES)
     best = max(entries, key=lambda e: e["select"])
     assert (readout["kernel"], readout["bandwidth"], readout["jitter"]) == (
         best["kernel"], best["bandwidth"], best["jitter"]
@@ -497,6 +497,10 @@ def test_a_scale_that_is_only_rounding_noise_is_not_accepted_as_one(monkeypatch)
 def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
     """Nesting, asserted directly, on a task where the linear probe is NOT at ceiling.
 
+    The comparison is against `fit_linear_probe`, the linear readout over the
+    SAME `CEILING_RIDGES` the ladder searches, not against `fit_probe` over the
+    shipped grid: the ladder's search space contains the former's.
+
     The fixed-jitter RBF this replaced read below the linear probe wherever
     linear r2 passed ~0.37: -0.0635 and -0.0512 on these two fixtures (linear
     0.4552 / 0.4637, RBF 0.3918 / 0.4125). M3o's PROBE_LIMITED verdict fires on
@@ -511,7 +515,7 @@ def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
     THE TOLERANCE IS 1e-6, AND IT HOLDS ONLY WHERE THE LINEAR RUNG IS SELECTED.
     On the score split `D - C >= 0` is not guaranteed: an RBF rung that edges
     linear on the SELECTION split by ~1e-4 can lose ~1e-3 on the score split.
-    Over 12 draws of this fixture the linear rung was selected in 9 and D - C
+    Over 12 draws of this fixture the linear rung was selected in 8 and D - C
     was exactly 0 in those; the worst of the rest was -0.0009, against -0.046 to
     -0.064 before. That residual is selection noise, which a test cannot
     separate from a fault and which M3o's interval is for. What IS exact is the
@@ -520,7 +524,7 @@ def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
     a claim about every draw.
     """
     train, select, score = (_embedding_task(3 * seed + i) for i in range(3))
-    linear = _score_on(fit_probe(*train, *select), score)
+    linear = _score_on(fit_linear_probe(*train, *select), score)
     assert linear > 0.37, f"fixture must be where the fixed jitter failed; linear scored {linear:.3f}"
 
     kernel = _score_on(fit_kernel_probe(*train, *select), score)
@@ -529,33 +533,37 @@ def test_the_kernel_readout_is_never_worse_than_the_linear_probe(seed):
 
 @pytest.mark.parametrize("seed", range(6))
 def test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split(seed):
-    """The exact form of nesting: the ladder's search space contains `fit_probe`'s.
+    """The exact form of nesting: the ladder's search space contains `fit_linear_probe`'s.
 
-    Both readouts select on the same split over the same `RIDGES`, so the
-    kernel readout's recorded selection r2 is at least the linear probe's, with
+    Both readouts select on the same split over the same `CEILING_RIDGES`, so the
+    kernel readout's recorded selection r2 is at least the linear reference's, with
     no allowance beyond rounding (1e-9). Unlike the score-split comparison this
     holds for EVERY draw, including those where an RBF rung wins.
     """
     train, select, _ = (_embedding_task(3 * seed + i) for i in range(3))
-    linear = fit_probe(*train, *select)
+    linear = fit_linear_probe(*train, *select)
     kernel = fit_kernel_probe(*train, *select)
     assert kernel["r2"] >= linear["r2"] - 1e-9, (
         f"selected {kernel['kernel']} at {kernel['r2']:.6f}, linear is {linear['r2']:.6f}"
     )
 
 
-def test_the_linear_rung_is_the_shipped_probe_and_not_an_approximation_of_it(monkeypatch):
-    """Collapse the RBF ladder to a rung that cannot win; what is left must be `fit_probe`.
+def test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it(monkeypatch):
+    """Collapse the RBF ladder to a rung that cannot win; what is left must be `fit_linear_probe`.
 
+    The grid is `CEILING_RIDGES` on both sides, which is the grid the claim is
+    about: against `fit_probe` over the shipped grid the ridge match below would
+    hold here only by coincidence, because the optimum on this fixture lands on
+    a shipped rung (1000), and would fail on `_gapped_task`, where it is 177.8.
     With only the narrowest bandwidth beside it the linear kernel is selected,
-    at the ridge `fit_probe` selects, and the predictions are the shipped
+    at the ridge `fit_linear_probe` selects, and the predictions are that
     probe's. The two solve in different spaces (the dual, through an
     eigendecomposition, against `probe._solve_ladder`), so agreement to 1e-6
     is the claim that a linear kernel with jitter lambda IS ridge regression at
     lambda, which the nesting argument rests on.
     """
     train, select, score = (_embedding_task(i) for i in range(3))
-    probe = fit_probe(*train, *select)
+    probe = fit_linear_probe(*train, *select)
     with monkeypatch.context() as patch:
         patch.setattr(ceiling, "BANDWIDTHS", (BANDWIDTHS[0],))
         readout = fit_kernel_probe(*train, *select)
@@ -566,3 +574,78 @@ def test_the_linear_rung_is_the_shipped_probe_and_not_an_approximation_of_it(mon
     np.testing.assert_allclose(
         apply_readout(readout, score[0]), apply_readout(probe, score[0]), rtol=1e-6, atol=1e-6
     )
+
+
+def _gapped_task(seed=0, n=300, d=150):
+    """A linear task whose best ridge falls BETWEEN the shipped grid's rungs.
+
+    `_embedding_task` at the shape where the grid's 100x step costs the most. The
+    optimum is 177.8; `probe.RIDGES` offers 1e1 and 1e3 and selects 1e3 in every
+    draw, for a scored r2 0.09-0.11 below what the fine grid reaches.
+    `_embedding_task` at its own default shape cannot show this -- at n=400
+    D=1024 the ridge response is flat enough that the shipped grid loses nothing.
+    """
+    return _embedding_task(seed, n=n, d=d)
+
+
+def _null_floor_over(monkeypatch, ridges, n, d, *, seed):
+    """`null_floor` with the grid both sides search replaced by `ridges`.
+
+    The grid is swapped for the call only, so a second call outside this helper
+    reads the real `CEILING_RIDGES`. `null_floor` reaches the grid through
+    `fit_linear_probe` AND through `fit_kernel_probe`'s jitter loop, and both
+    read the module global at call time, so one swap moves both sides together.
+    Calling `null_floor` itself, rather than repeating its body, means this
+    cannot drift from the function it is validating.
+    """
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "CEILING_RIDGES", ridges)
+        return null_floor(n, d, seed=seed)
+
+
+def test_the_ceiling_grid_contains_the_shipped_grid_and_is_finer():
+    """Containment by VALUE, the rung count and the step, pinned separately.
+
+    Containment alone does not pin the step: a 17-rung 10^0.5 grid contains
+    `RIDGES` too, and it left a +0.0009 floor at n=2000, D=2048 (seed 0) where
+    33 rungs left -0.0000. So the count is asserted as well.
+    """
+    assert len(CEILING_RIDGES) == 33
+    assert set(RIDGES) <= set(CEILING_RIDGES)
+    assert CEILING_RIDGES[::8] == RIDGES, "the shipped rungs are every 8th fine rung"
+    assert CEILING_RIDGES[0] == RIDGES[0] and CEILING_RIDGES[-1] == RIDGES[-1]
+    assert all(a < b for a, b in zip(CEILING_RIDGES, CEILING_RIDGES[1:]))
+    np.testing.assert_allclose(np.diff(np.log10(CEILING_RIDGES)), 0.25, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_the_shipped_grid_straddles_the_best_ridge_and_the_fine_grid_resolves_it(seed):
+    """The whole reason `C` does not use `probe.RIDGES`.
+
+    The fixture is shown to discriminate first: the shipped grid must select an
+    ENDPOINT of the interval the optimum lies in, so there is something to
+    resolve. Then the fine grid must land strictly inside that interval and read
+    materially higher on a third split.
+    """
+    train, select, score = (_gapped_task(3 * seed + i) for i in range(3))
+    shipped = fit_probe(*train, *select)
+    assert shipped["ridge"] == 1e3, f"fixture must straddle; shipped picked {shipped['ridge']:g}"
+
+    fine = fit_linear_probe(*train, *select)
+    assert 1e1 < fine["ridge"] < 1e3, f"fine grid picked {fine['ridge']:g}, not interior"
+    gap = _score_on(fine, score) - _score_on(shipped, score)
+    assert gap > 0.05, f"fine grid bought only {gap:+.4f}"
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_the_null_floor_is_near_zero_on_the_grid_the_ceiling_searches(monkeypatch, seed):
+    """`D - C` where there is nothing nonlinear to find.
+
+    The fixture is shown to discriminate by measuring the SAME quantity over the
+    shipped grid, which must come back far above zero -- otherwise a test that
+    only checks `null_floor` is near zero would pass on a coarse grid too.
+    """
+    coarse = _null_floor_over(monkeypatch, RIDGES, 300, 150, seed=seed)
+    assert coarse > 0.05, f"fixture must show a coarse-grid floor; got {coarse:+.4f}"
+    floor = null_floor(300, 150, seed=seed)
+    assert abs(floor) < 0.005, f"floor is {floor:+.4f} on CEILING_RIDGES"

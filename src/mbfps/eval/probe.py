@@ -139,7 +139,8 @@ def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
     return _solve_ladder(x, y, (ridge,))[0]
 
 
-def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) -> dict:
+def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None,
+              ridges: Sequence[float] = RIDGES) -> dict:
     """Standardise the inputs, then SELECT the ridge on held-out data.
 
     Returns a dict carrying the weights and the standardisation, because both
@@ -152,6 +153,15 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) 
     are order 1 -- and measured, that one default cost held-out R^2 0.16 against
     a ceiling of 0.42. Without validation data the fallback is 1e3, the middle
     of the measured optimum, not 1.
+
+    `ridges` is the grid SELECTION searches, defaulting to the shipped `RIDGES`
+    so no existing caller moves. It exists because `RIDGES` steps by 100x and
+    the optimum is interior: measured, the shipped grid selects 1e3 where the
+    best ridge is 177.8 and gives up 0.09-0.11 of scored R^2 for it (n=300,
+    D=150), and +0.011 to +0.021 at n=2000, D=1024-2048. `ceiling.CEILING_RIDGES`
+    is the finer grid, and it CONTAINS `RIDGES` bitwise, so passing it adds
+    rungs and moves no existing number. `RIDGES` stays the default because
+    thirteen milestones of recorded numbers came through it.
     """
     x = np.asarray(latents, dtype=np.float64)
     y = np.asarray(targets, dtype=np.float64)
@@ -166,7 +176,7 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) 
     best = None
     # One Gram for the whole ladder: it depends on `xs`, not on the ridge, and
     # recomputing it per rung was five matmuls where one will do.
-    for ridge, w in zip(RIDGES, _solve_ladder(xs, y, RIDGES)):
+    for ridge, w in zip(ridges, _solve_ladder(xs, y, ridges)):
         pred = np.concatenate([xv, np.ones((xv.shape[0], 1))], axis=1) @ w
         score = _mean_r2(pred, val_targets)
         if best is None or score > best[0]:

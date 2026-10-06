@@ -3061,3 +3061,45 @@ def test_the_distributions_are_row_aligned_with_the_latent_they_came_from(tmp_pa
         "a one-row shift is undetectable here, so this test cannot see a "
         "misalignment either"
     )
+
+
+def test_the_ridges_parameter_changes_no_arithmetic_at_the_shipped_rungs():
+    """`ridges=` is a pure EXTENSION: it adds rungs and moves no existing number.
+
+    Thirteen milestones of recorded numbers came through `RIDGES`, so this is
+    checked bitwise rather than to a tolerance, and in BOTH branches of
+    `_solve_ladder`. The features are UNCENTRED so the dual's own centring is
+    exercised: on centred input the two branches agree for a reason that would
+    hide a centring fault.
+    """
+    fine = tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))
+    assert tuple(fine[i] for i in range(0, 33, 8)) == RIDGES, (
+        "fixture must line the shipped rungs up with every 8th fine rung"
+    )
+    for n, d in ((400, 60), (60, 400)):          # d < n, then n <= d
+        rng = np.random.default_rng(0)
+        x = rng.normal(size=(n, d)) + 5.0
+        y = rng.normal(size=(n, 4)) * 240.0
+        wide, shipped = _solve_ladder(x, y, fine), _solve_ladder(x, y, RIDGES)
+        for j, i in enumerate(range(0, 33, 8)):
+            assert np.array_equal(wide[i], shipped[j]), (
+                f"n={n} d={d} rung {RIDGES[j]:g} moved by "
+                f"{np.abs(wide[i] - shipped[j]).max():.3g}"
+            )
+
+
+def test_fit_probe_defaults_to_the_shipped_grid():
+    """The default path is byte-identical to the one without the parameter.
+
+    Guards the frozen constant itself, and that `fit_probe` passes `ridges`
+    through rather than reaching past it to the module global.
+    """
+    assert RIDGES == (1e-1, 1e1, 1e3, 1e5, 1e7), "the shipped grid is frozen"
+    rng = np.random.default_rng(1)
+    x, y = rng.normal(size=(120, 30)), rng.normal(size=(120, 4)) * 240.0
+    xv, yv = rng.normal(size=(60, 30)), rng.normal(size=(60, 4)) * 240.0
+    default, explicit = fit_probe(x, y, xv, yv), fit_probe(x, y, xv, yv, ridges=RIDGES)
+    assert default["ridge"] == explicit["ridge"]
+    assert np.array_equal(default["w"], explicit["w"])
+    narrow = fit_probe(x, y, xv, yv, ridges=(RIDGES[0],))
+    assert narrow["ridge"] == RIDGES[0], "the parameter must actually be used"

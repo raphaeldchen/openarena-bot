@@ -20,8 +20,8 @@ also literally `probe._solve`'s dual branch with a kernel in place of the
 Gram, so the memory fix and the nonlinear probe are one piece of machinery.
 
 AND WHY "THE KERNEL WINS" IS NOT A FINDING. The kernel readout searches
-{the linear kernel} u {an RBF at each bandwidth}, each over the shipped
-`RIDGES`, so the linear probe is a RUNG of its search and the held-out
+{the linear kernel} u {an RBF at each bandwidth}, each over
+`CEILING_RIDGES`, so the linear reference `fit_linear_probe` is a RUNG of its search and the held-out
 selection cannot do worse than it on the split it selects on. The finding is
 the MAGNITUDE of the difference and whether it is resolvable -- the trap M3n
 walked into from the other side, where `skill` had a positive point estimate
@@ -51,6 +51,30 @@ NEIGHBOURS: tuple[int, ...] = (1, 4, 16, 64)
 """k for the k-NN readout. 1 is the aliasing question at its sharpest: if the
 single nearest frame in feature space is at a distant true position, the
 feature space aliases."""
+
+CEILING_RIDGES: tuple[float, ...] = tuple(
+    10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33)
+)
+"""The ridge grid BOTH sides of `D - C` search: 33 rungs at a 10^0.25 step over
+`probe.RIDGES`'s span, [1e-1, 1e7].
+
+`RIDGES` steps by 100x, and that is too coarse to resolve an interior optimum.
+Measured on a purely linear task, the kernel ladder beat the linear reference by
++0.0109 at D=1024 and +0.0201 at D=2048 (n=2000) -- and the gain an ORACLE ridge
+would have bought the linear reference at the same shapes is +0.0110 and +0.0208.
+The same number. The RBF rungs were not finding nonlinear structure, they were
+interpolating the ridge grid, and `PROBE_LIMITED` would have fired on it.
+
+On this grid the floor reads -0.0016 to +0.0000, and the linear reference rises
+to exactly the oracle's value. The SPAN is unchanged -- the optimum was interior
+at every shape measured, 0 of 6 draws at an endpoint -- so only the step was
+wrong. Where the ridge response has no sharp interior optimum, the raw-pixel row
+at D >> n, there was no floor on either grid.
+
+IT CONTAINS `RIDGES` BITWISE, as every 8th rung, and `probe._solve_ladder`
+writes each rung's diagonal from a pristine copy rather than from the previous
+rung's. So this grid ADDS rungs and moves no number any earlier milestone
+recorded. `probe.RIDGES` itself is untouched."""
 
 
 def _sqdist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -128,7 +152,7 @@ def _kernel_rungs(xs: np.ndarray, xv: np.ndarray, unit: float):
 
 def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     """Kernel ridge over {linear kernel} u {RBF at each bandwidth}, each over
-    the shipped `probe.RIDGES`, selected TOGETHER on held-out data.
+    `CEILING_RIDGES`, selected TOGETHER on held-out data.
 
     The same three-split discipline as `fit_probe`: fit here, select the kernel,
     bandwidth and diagonal jitter on `val_*`, and the caller scores on a third
@@ -140,9 +164,9 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     standardised fit rows, a jitter `lambda` on the diagonal and centred
     targets IS the dual form of `fit_probe`'s ridge regression at the same
     `lambda` (`probe._solve_ladder` computes exactly this), and the jitters are
-    `fit_probe`'s own `RIDGES`. So the search space contains `fit_probe`'s and,
-    selecting on the same split, the selected score on that split cannot be
-    lower: that is exact. On the caller's third split it can be lower by
+    `CEILING_RIDGES`, the grid `fit_linear_probe` searches. So the search space
+    contains `fit_linear_probe`'s and, selecting on the same split, the selected
+    score on that split cannot be lower: that is exact. On the caller's third split it can be lower by
     selection noise, when an RBF rung edges linear on the selection split by
     ~1e-4 and loses ~1e-3 on the score split (worst -0.0009 over 12 draws of
     the embedding-shaped test fixture, against -0.038 to -0.064 before).
@@ -159,6 +183,14 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     linear probe selects only flatten an RBF rung to the mean, and the rungs
     that can act are the small ones. The linear rung is what makes the nesting
     exact rather than close.
+
+    THE LINEAR RUNG AND THE LINEAR REFERENCE SEARCH THE SAME GRID. Nesting is a
+    claim about search spaces: with the ladder on `RIDGES` and `fit_linear_probe`
+    on `CEILING_RIDGES` the ladder's linear rung would have 5 jitters against the
+    reference's 33, and `D - C` would go NEGATIVE for grid reasons alone -- about
+    -0.10 at n=300, D=150. Both are `CEILING_RIDGES`. The jitter ladder's length
+    is nearly free here: each kernel is eigendecomposed once and every jitter is
+    then O(n^2), where the decomposition is O(n^3).
 
     EACH KERNEL IS EIGENDECOMPOSED ONCE, `K = V diag(vals) V'`, and every
     jitter is then `V ((V'(y - centre)) / (vals + jitter))`, O(n^2) per rung
@@ -183,7 +215,7 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     for kernel, gamma, bandwidth, gram, query in _kernel_rungs(xs, xv, unit):
         vals, vecs = np.linalg.eigh(gram)
         coords = vecs.T @ (y - centre)
-        for jitter in RIDGES:
+        for jitter in CEILING_RIDGES:
             alpha = vecs @ (coords / (vals + jitter)[:, None])
             score = _mean_r2(query @ alpha + centre, val_y)
             if best is None or score > best[0]:
@@ -250,3 +282,54 @@ def apply_readout(readout: dict, x: np.ndarray) -> np.ndarray:
         query = _kernel_matrix(readout["kernel"], xs, readout["anchors"], readout["gamma"])
         return query @ readout["alpha"] + readout["centre"]
     return _knn_predict(readout["anchors"], readout["targets"], xs, readout["k"])
+
+
+def fit_linear_probe(x, y, val_x, val_y) -> dict:
+    """The linear reference `C`: the shipped probe over `CEILING_RIDGES`.
+
+    NOT the shipped probe's own number -- that is `fit_probe` at its default,
+    which M3o records separately as `shipped_grid_r2` and reconciles against the
+    study. `C` is the best LINEAR readout, so that `D - C` isolates
+    nonlinearity rather than ridge-grid resolution.
+    """
+    return fit_probe(x, y, val_x, val_y, ridges=CEILING_RIDGES)
+
+
+_NULL_RANK: int = 40
+_NULL_NOISE: float = 120.0
+
+
+def _null_split(seed: int, n: int, d: int):
+    """One split of a SYNTHETIC purely-linear task: a low-rank signal pushed
+    through a fixed random map into `d` dimensions, plus isotropic nuisance.
+
+    The map and the target weights come from a generator that does NOT depend on
+    `seed`, so the three splits sample ONE task. Drawn from `seed`, each split
+    would get its own map and the readouts would be fit on one task and scored
+    on another.
+    """
+    g = np.random.default_rng(777)
+    a = g.normal(size=(_NULL_RANK, d)); w = g.normal(size=(_NULL_RANK, 4))
+    rng = np.random.default_rng(seed)
+    z = rng.normal(size=(n, _NULL_RANK))
+    x = z @ a + rng.normal(size=(n, d)) * 3.0
+    return x, (z @ w) * 20.0 + rng.normal(size=(n, 4)) * _NULL_NOISE
+
+
+def null_floor(n: int, d: int, *, seed: int = 0) -> float:
+    """`D - C` at this shape when the target is EXACTLY linear in the features.
+
+    The honest answer is 0: nothing nonlinear is there to find. Anything
+    materially above it is the ladder beating the linear reference for
+    instrument reasons, which would read as `PROBE_LIMITED` and mean nothing
+    about the representation.
+
+    MEASURED PER CELL rather than taken from a figure, because the floor proved
+    sharply shape-dependent: on the shipped grid it was +0.0201 at D=2048 and
+    +0.0000 at D=37632. Three shapes do not license nine cells.
+    """
+    train, select, score = (_null_split(3 * seed + i, n, d) for i in range(3))
+    linear = fit_linear_probe(*train, *select)
+    kernel = fit_kernel_probe(*train, *select)
+    return (_mean_r2(apply_readout(kernel, score[0]), score[1])
+            - _mean_r2(apply_readout(linear, score[0]), score[1]))
