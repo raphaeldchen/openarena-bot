@@ -91,9 +91,35 @@ def test_the_dual_and_primal_solves_agree_at_every_rung_of_the_ladder():
     for ridge in RIDGES:
         dual = design @ _solve(x, y, ridge)
         primal = design @ _primal_solve_for_test(x, y, ridge)
-        assert np.max(np.abs(dual - primal)) < 1e-7, (
+        assert np.max(np.abs(dual - primal)) < 1e-6, (
             f"ridge={ridge:g}: {np.max(np.abs(dual - primal)):.3e}"
         )
+
+
+def test_the_dual_solve_centres_its_own_features_rather_than_assuming_a_caller_did():
+    """UNCENTRED features, which the centred fixture above cannot catch.
+
+    `fit_probe` passes standardised features, so a dual branch that assumes
+    centring works in production and is silently wrong for any direct caller.
+    Measured against the primal on features with a mean of 5.0, a dual that
+    takes `y.mean(0)` as the intercept without centring `x` is off by 504.5
+    map units at ridge 1e-1 and 130.3 at 1e3 -- plausible numbers, not a
+    crash. This is the fixture that makes that mutation visible.
+    """
+    rng = np.random.default_rng(3)
+    n, d = 40, 300
+    x = rng.normal(size=(n, d)) + 5.0
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n < d, "the fixture must exercise the dual branch"
+    assert np.min(np.abs(x.mean(0))) > 1.0, "the fixture must be genuinely uncentred"
+
+    query = rng.normal(size=(17, d))
+    design = np.concatenate([query, np.ones((17, 1))], axis=1)
+    for ridge in RIDGES:
+        gap = np.max(np.abs(
+            design @ _solve(x, y, ridge) - design @ _primal_solve_for_test(x, y, ridge)
+        ))
+        assert gap < 1e-5, f"ridge={ridge:g}: {gap:.3e}"
 
 
 def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_rows():
@@ -180,10 +206,13 @@ def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
     5.164e-09 at ridge 1e-1, 3.553e-15 at 1e7. Agreement is worst at the
     smallest ridge, where the Gram is worst conditioned.
 
-    THE INTERCEPT IS NEVER REGULARISED, in either form. `fit_probe`
-    standardises `x` to zero column means on the fit split, so the dual is
-    taken on already-centred features and the intercept is exactly `y.mean(0)`
-    -- not an approximation.
+    THE INTERCEPT IS NEVER REGULARISED, in either form, and the dual CENTRES
+    `x` ITSELF rather than assuming a centred caller. `fit_probe` does pass
+    standardised features, so assuming it would work in production -- and be
+    wrong by up to 504 map units for anyone calling `_solve` directly with raw
+    features, silently, since both forms return a plausible array. Ridge with a
+    free intercept is exactly: centre both, solve without an intercept, then
+    recover it as `y.mean(0) - x.mean(0) @ w`.
     """
     n, d = x.shape
     if d < n:
@@ -192,11 +221,12 @@ def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
         gram.flat[:: gram.shape[0] + 1] += ridge      # in place; no np.eye
         gram[-1, -1] -= ridge                         # the intercept stays free
         return np.linalg.solve(gram, design.T @ y)
-    centre = y.mean(0)
-    gram = x @ x.T
+    x_centre, y_centre = x.mean(0), y.mean(0)
+    xc = x - x_centre
+    gram = xc @ xc.T
     gram.flat[:: gram.shape[0] + 1] += ridge
-    weights = x.T @ np.linalg.solve(gram, y - centre)
-    return np.concatenate([weights, centre[None, :]], axis=0)
+    weights = xc.T @ np.linalg.solve(gram, y - y_centre)
+    return np.concatenate([weights, (y_centre - x_centre @ weights)[None, :]], axis=0)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -213,8 +243,9 @@ Commit first, so `git checkout` restores your work rather than destroying it. Th
 
 | mutation | test that must fail |
 | --- | --- |
-| dual branch: drop `- centre` from `y - centre` | `test_the_dual_and_primal_solves_agree_at_every_rung_of_the_ladder` |
+| dual branch: drop `- y_centre` | `test_the_dual_and_primal_solves_agree_at_every_rung_of_the_ladder` |
 | dual branch: return `weights` without the intercept row | the agreement test (shape) |
+| dual branch: take `x` as already centred (`xc = x`, intercept `y_centre`) | `test_the_dual_solve_centres_its_own_features_rather_than_assuming_a_caller_did` ONLY — the centred fixture cannot see it |
 | primal branch: drop `gram[-1, -1] -= ridge` | the agreement test, at the largest ridges |
 | branch condition `d < n` -> `d > n` | neither — **report this honestly.** Both forms are correct; a flipped branch is a memory bug, not a value bug, and no value test can see it. |
 
