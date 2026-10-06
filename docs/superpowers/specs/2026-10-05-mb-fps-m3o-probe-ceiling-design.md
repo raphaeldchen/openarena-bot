@@ -79,7 +79,7 @@ directly comparable to M3n's 131-259 rather than living in a different unit.
 | feature set | linear ridge | kernel ridge (RBF) | k-NN |
 | --- | --- | --- | --- |
 | raw pixels at `t` | A | B | — |
-| encoder embedding at `t` | C (the criterion-4 probe, 0.320-0.345) | D | yes |
+| encoder embedding at `t` | C (best linear; `C_shipped` reconciles, §3.3.1) | D | yes |
 | window of frames `t-k..t` | E | F | — |
 
 - **A vs C** — does the encoder lose anything a linear probe could have used?
@@ -117,16 +117,74 @@ on one fixture and 0.05 to 0.07 on another. A negative `D - C` for instrument
 reasons would make `PROBE_LIMITED` unreachable even where the probe family IS
 the limit.
 
-So the ladder is `{linear kernel} u {RBF at each bandwidth}`, each over the
-shipped `RIDGES`, selected together on held-out data. The search space then
-strictly contains `fit_probe`'s and the nesting is exact rather than
-asymptotic: measured, `D - C` is +-0.0000 where the fixed-jitter version read
--0.0021 to -0.0040, and the ladder selects the linear rung when nothing
+So the ladder is `{linear kernel} u {RBF at each bandwidth}`, each over
+`CEILING_RIDGES` (§3.3.1), selected together on held-out data. The search space
+then strictly contains the linear reference's and the nesting is exact rather
+than asymptotic: measured, `D - C` is +-0.0000 where the fixed-jitter version
+read -0.0021 to -0.0040, and the ladder selects the linear rung when nothing
 nonlinear helps. Each kernel is eigendecomposed once, so the jitter ladder
 costs O(n^2) per rung instead of another O(n^3) solve. **"D > C" is therefore not a finding.** The finding is the
 magnitude, and whether it is resolvable. This is the trap M3n walked into from
 the other side: `skill`'s point estimate was positive in 8 of 9 cells and meant
 nothing until the interval was drawn.
+
+#### 3.3.1 Both sides search the same ridge grid, and it is finer than the shipped one
+
+Nesting the linear kernel made `D >= C` exact ON THE SELECTION SPLIT. It did not
+make `D - C` mean "nonlinear capacity", because both sides were still searching
+ridges on a grid too coarse to resolve the optimum, and the RBF rungs could
+reach regularisation strengths the linear reference could not.
+
+`probe.RIDGES` is `(1e-1, 1e1, 1e3, 1e5, 1e7)` — a 100x step, not a decade. On a
+purely linear task at n=2000 the best ridge sits at 3.16e3 (D=1024) and 5.62e3
+(D=2048): between the grid's 1e3 and 1e5 rungs, a factor of 3 to 6 from either.
+Measured on the embedding-shaped linear fixture, scored on a third split:
+
+| n=2000 | floor `D - C`, 100x step | floor, 10^0.25 step | gain an oracle ridge buys `C` |
+| --- | --- | --- | --- |
+| D=1024 | **+0.0109** | -0.0001 | +0.0110 |
+| D=2048 | **+0.0201** | -0.0000 | +0.0208 |
+| D=37632 | +0.0000 | +0.0000 | — |
+
+**The floor and the oracle gain are the same number.** That is the proof of
+mechanism: the RBF ladder was not finding nonlinear structure, it was
+interpolating the ridge grid. Where the ridge response has no sharp interior
+optimum — the raw-pixel row, D >> n — there is no gap to interpolate and no
+floor even on the coarse grid. Refining the step removes it at every shape
+measured, and `C` rises to the oracle's value exactly: 0.4964 at D=1024 (from
+0.4855), 0.5164 at D=2048 (from 0.4957).
+
+So `CEILING_RIDGES` is **33 rungs at a 10^0.25 step over the shipped span
+[1e-1, 1e7]**, and BOTH `C` and the ladder's jitters use it. The span is
+unchanged: the optimum was interior at every shape measured, 0 of 6 draws at an
+endpoint. Only the step was wrong.
+
+**`probe.RIDGES` IS NOT TOUCHED.** Thirteen milestones of recorded numbers came
+through that constant and `fit_probe` keeps it as its default; the finer grid is
+M3o's, passed in. Restating every prior result is not in M3o's scope.
+
+`CEILING_RIDGES` **contains `probe.RIDGES` bitwise**, as every 8th rung — a
+property of the span and step, verified rather than assumed. Because
+`_solve_ladder` writes each rung's diagonal from a pristine copy rather than
+from the previous rung, selecting over only those five rungs of the fine ladder
+reproduces `fit_probe` to 0.0 in both the primal and the dual branch. So the
+reconciliation anchor is free:
+
+- **`C`** — best over all 33 rungs. The best LINEAR readout, and the thing
+  `D - C` is read against, so that the difference isolates nonlinearity.
+- **`C_shipped`** — best over the 5 shipped rungs, recorded as
+  `shipped_grid_r2`. The reconciliation against the study (§6), and what exit 49
+  reads.
+
+`C` is therefore **not** the shipped probe's r2 and is expected to exceed it by
+up to ~0.02 at representation scale. That is the intent, and it is why the §6
+reconciliation runs through `C_shipped`.
+
+A side finding, recorded and out of scope: the shipped grid leaves +0.011 to
++0.021 of r2 unclaimed at representation scale, and `aggregate.ridge_groups`
+and `study.py` already document gate criterion 4's gain SIGN flipping across
+that grid (-0.0706, -0.0208, +0.0325) because the effect is ~0.02. Those are the
+same order. M3o does not re-measure the gate.
 
 ### 3.4 Split discipline
 
@@ -253,35 +311,42 @@ two verdicts.
 
 ### 6.1 The null control: what `D - C` reads when there is nothing to find
 
-Task 2 measured that the kernel ladder beats the shipped linear probe **on a
-purely linear task** by +0.012 at D=1024 and +0.020 at D=2048, n=2000. The
-linear RUNG of the ladder reproduces `fit_probe` to 1e-6, so the gap is not an
-implementation difference: the RBF rungs are filling in gaps in `RIDGES`, which
-is a decade grid, and acting as intermediate regularisation.
+Task 2 measured the kernel ladder beating the linear reference **on a purely
+linear task** by +0.012 at D=1024 and +0.020 at D=2048, n=2000 — a **false
+`PROBE_LIMITED`**, having nothing to do with nonlinear structure in the
+representation, which is what the verdict is supposed to mean.
 
-That is a **false `PROBE_LIMITED`**. It has nothing to do with nonlinear
-structure in the representation, which is what the verdict is supposed to mean.
+§3.3.1 found the cause and removed it: both sides were searching ridges on a
+grid too coarse to resolve the optimum. With both on `CEILING_RIDGES` the floor
+measures -0.0001 to +0.0000 at those same shapes.
 
-So `D - C` is read against a measured floor rather than against zero. Each cell
-additionally fits the whole ladder on a SYNTHETIC purely-linear task at that
-cell's own `n` and `D`, and records the `D - C` it produces. `PROBE_LIMITED`
-requires the real `D - C` to be resolvably above **that** floor, not above
-zero.
+**The control stays anyway, and is measured per cell** — not because the floor
+is expected to be nonzero, but because it is the only thing that catches this
+class of fault at a shape §3.3.1 did not measure. The floor proved sharply
+shape-dependent: ~0 at D=37632 even on the coarse grid, largest at D=2048. A
+figure measured at three shapes does not license the other six cells.
 
-The floor is measured per cell rather than taken from the figures above,
-because it depends on `n` and `D`, and those differ between the raw-pixel row
-and the representation rows.
+Each cell fits the whole ladder on a SYNTHETIC purely-linear task at its own
+`n` and `D` and records that `D - C` as `null_floor`. `PROBE_LIMITED` requires
+the real `D - C` resolvably above **that**, not above zero.
+
+A `null_floor` that comes back materially above zero is a finding about the
+instrument, not a number to subtract and move on from: it means §3.3.1's fix is
+incomplete at that shape.
 
 | control | claim it pins |
 | --- | --- |
 | dual equals primal at every rung of `RIDGES` | the prerequisite changed no arithmetic |
-| `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear; a decade ridge grid alone buys +0.012 to +0.020 |
-| cell `C` reproduces the shipped `embedding_selection_r2` (0.320-0.345) | M3o's harness measures what the study measured, not something adjacent |
+| `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear. ~0 once both sides share `CEILING_RIDGES`; it was +0.012 to +0.020 on the shipped grid, so this is what keeps that fix honest per cell |
+| `C_shipped` reproduces the shipped `embedding_selection_r2` (0.320-0.345) | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1) |
+| `C_shipped` is bitwise the fine ladder's 5 shipped rungs | `CEILING_RIDGES` ADDED rungs and changed no arithmetic |
 | RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
 | the zero-information baseline recomputes to 283.05 median | the scale every map-unit figure is read against |
 
-The fourth is free and bitwise, of the same kind as M3n's two reductions.
+Two are free and bitwise, of the same kind as M3n's two reductions: the
+raw-pixel row's identity across the nine cells, and `C_shipped`'s agreement with
+the fine ladder's shipped rungs.
 
 ## 7. Code
 
@@ -296,9 +361,11 @@ Named for the quantity, following `burden.py`, `capacity.py`, `retention.py`,
 **Exit codes.** 43-44 are `latent_capacity`'s, 45-46 `prediction_burden`'s,
 47-48 `motion_headroom`'s, and nothing uses a higher number, so:
 
-- **49 `EXIT_HARNESS_DISAGREES`** — cell `C` failed to reproduce the shipped
+- **49 `EXIT_HARNESS_DISAGREES`** — `C_shipped` failed to reproduce the shipped
   `embedding_selection_r2` (§6). M3o is then measuring something other than
-  what the study measured, and no verdict is available.
+  what the study measured, and no verdict is available. Read on `C_shipped`,
+  never on `C`: `C` searches the finer `CEILING_RIDGES` and is expected above
+  the shipped band, so gating on it would exit 49 on a correct run.
 - **50 `EXIT_NO_MAJORITY`** — no verdict held a strict majority of the nine
   cells.
 
