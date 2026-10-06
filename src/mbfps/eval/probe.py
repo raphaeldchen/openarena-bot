@@ -56,11 +56,73 @@ RIDGES: tuple[float, ...] = (1e-1, 1e1, 1e3, 1e5, 1e7)
 """Candidate strengths. The measured optimum here is 1e3-1e5, not 1."""
 
 
+def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges) -> list[np.ndarray]:
+    """Ridge weights with an UNREGULARISED intercept, one set per entry of
+    `ridges`, solved in the smaller space and from ONE Gram matrix.
+
+    Two algebraically identical forms:
+
+        primal (D x D):  w = (X'X + lambda I_D)^-1 X'y
+        dual   (n x n):  w = X'(XX' + lambda I_n)^-1 y
+
+    The primal is natural at latent scale, where D is 1536-2048 and D^2 is
+    33 MB. It is unusable on raw frames: at D = 37632 the `np.eye` alone is
+    11.3 GB, and `fit_probe` solves once per rung of `RIDGES`.
+
+    The dual's cost is n^2, so neither form is universally right and the
+    branch is on `min(n, D)`. Verified against the primal across the whole
+    ladder on 40 rows of 300 features: 1.5e-10 at ridge 1e-1 falling to 1.4e-14
+    at 1e7 for centred features, and 2.7e-07 at 1e-1 for features with a mean of
+    5. Agreement is worst at the smallest ridge, where the Gram is worst
+    conditioned.
+
+    THE GRAM DEPENDS ON `x` ALONE, NOT ON THE RIDGE, so it is built once and
+    only its diagonal is rewritten between rungs. Each rung is written from a
+    pristine copy of that diagonal rather than added to the last rung's, so no
+    rung can inherit another's penalty. The primal path is bitwise the form it
+    replaces: the ridge is added to the first D diagonal entries only, so the
+    intercept's entry is the untouched Gram value, exactly the `+ 0.0` the old
+    `penalty` matrix gave it. Existing callers' numbers do not move.
+
+    THE INTERCEPT IS NEVER REGULARISED, in either form, and the dual CENTRES
+    `x` ITSELF rather than assuming a centred caller. `fit_probe` does pass
+    standardised features, so assuming it would work in production -- and be
+    wrong by hundreds of map units (485.2 at ridge 1e-1, on features with a mean
+    of 5) for anyone calling `_solve` directly with raw features, silently,
+    since both forms return a plausible array. Ridge with a
+    free intercept is exactly: centre both, solve without an intercept, then
+    recover it as `y.mean(0) - x.mean(0) @ w`.
+    """
+    n, d = x.shape
+    solved = []
+    if d < n:
+        design = np.concatenate([x, np.ones((n, 1))], axis=1)
+        gram = design.T @ design
+        moment = design.T @ y
+        diagonal = np.einsum("ii->i", gram)          # a writable view; no np.eye
+        pristine = diagonal[:d].copy()
+        for ridge in ridges:
+            diagonal[:d] = pristine + ridge          # the intercept entry is untouched
+            solved.append(np.linalg.solve(gram, moment))
+        return solved
+    x_centre, y_centre = x.mean(0), y.mean(0)
+    # `yc` is numerical hygiene, not part of the answer: the columns of `xc`
+    # sum to zero, so `xc.T @ solve(gram, y)` is the same weights without it.
+    xc, yc = x - x_centre, y - y_centre
+    gram = xc @ xc.T
+    diagonal = np.einsum("ii->i", gram)
+    pristine = diagonal.copy()
+    for ridge in ridges:
+        diagonal[:] = pristine + ridge
+        weights = xc.T @ np.linalg.solve(gram, yc)
+        intercept = (y_centre - x_centre @ weights)[None, :]
+        solved.append(np.concatenate([weights, intercept], axis=0))
+    return solved
+
+
 def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
-    design = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
-    penalty = ridge * np.eye(design.shape[1])
-    penalty[-1, -1] = 0.0  # never regularise the intercept
-    return np.linalg.solve(design.T @ design + penalty, design.T @ y)
+    """One ridge's weights; see `_solve_ladder` for how they are computed."""
+    return _solve_ladder(x, y, (ridge,))[0]
 
 
 def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) -> dict:
@@ -88,8 +150,9 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) 
 
     xv = (np.asarray(val_latents, dtype=np.float64) - mean) / scale
     best = None
-    for ridge in RIDGES:
-        w = _solve(xs, y, ridge)
+    # One Gram for the whole ladder: it depends on `xs`, not on the ridge, and
+    # recomputing it per rung was five matmuls where one will do.
+    for ridge, w in zip(RIDGES, _solve_ladder(xs, y, RIDGES)):
         pred = np.concatenate([xv, np.ones((xv.shape[0], 1))], axis=1) @ w
         score = _mean_r2(pred, val_targets)
         if best is None or score > best[0]:

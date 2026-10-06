@@ -11,6 +11,7 @@ from mbfps.eval.probe import (
     RIDGES,
     TARGET_DIM,
     _mean_r2,
+    _solve,
     angle_error_degrees,
     apply_probe,
     filtering_comparison,
@@ -187,6 +188,245 @@ def test_intercept_is_never_regularised_even_at_high_ridge():
     targets = np.full((20, 4), 500.0)
     probe = fit_probe(latents, targets, ridge=1e5)
     np.testing.assert_allclose(apply_probe(probe, latents), targets, atol=1.0)
+
+
+# --- The solver's two forms ------------------------------------------------
+#
+# `_solve` works in whichever of the primal (D x D) or dual (n x n) space is
+# smaller, and `fit_probe` shares one Gram matrix across the whole ladder of
+# ridges. Every statistic in this project flows through it, so the oracle below
+# is the OLD implementation written out here, never a call into the module.
+
+
+def _primal_solve_for_test(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
+    """`probe._solve` as it stood before Task 1, kept as the oracle.
+
+    An independent implementation, not a call into the module under test, so
+    the agreement assertions below cannot be satisfied by both sides moving
+    together -- the defect class this project has hit twice.
+    """
+    design = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
+    penalty = ridge * np.eye(design.shape[1])
+    penalty[-1, -1] = 0.0
+    return np.linalg.solve(design.T @ design + penalty, design.T @ y)
+
+
+def test_the_dual_and_primal_solves_agree_at_every_rung_of_the_ladder():
+    """The reformulation is exact, so it is pinned at EVERY ridge, not one.
+
+    Agreement is worst at the smallest ridge -- measured 1.479e-10 at 1e-1
+    against 1.421e-14 at 1e7 -- because that is where the Gram is worst
+    conditioned. A test at a single representative rung would pass against a
+    dual path that is wrong precisely where it is hardest.
+
+    The features here are CENTRED, as `fit_probe` hands them over; the next
+    test is the one that is not. What this fixture reaches is a dual branch
+    that loses the intercept row, or the `y` mean inside it. It cannot reach
+    dropping the `- y_centre` from the solve itself, and no test can: with `x`
+    centred the columns of `xc` sum to zero, so `xc.T @ solve(gram, y)` is the
+    same weights with or without it -- an equivalent mutant, not a gap.
+    """
+    rng = np.random.default_rng(0)
+    n, d = 40, 300                      # n < d, so the dual path is the one taken
+    x = rng.normal(size=(n, d))
+    x = (x - x.mean(0)) / (x.std(0) + 1e-8)
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n < d, "the fixture must exercise the dual branch"
+    assert np.ptp(y) > 100.0, "targets must span a real range, as Doom coordinates do"
+    assert np.abs(x.mean(0)).max() < 1e-12, "this fixture is the CENTRED one"
+    assert np.abs(y.mean(0)).min() > 1.0, (
+        "the target means must be far from zero, or an intercept that drops "
+        "the `y` mean has nothing to move"
+    )
+
+    query = rng.normal(size=(17, d))
+    design = np.concatenate([query, np.ones((17, 1))], axis=1)
+    for ridge in RIDGES:
+        dual = design @ _solve(x, y, ridge)
+        primal = design @ _primal_solve_for_test(x, y, ridge)
+        assert np.max(np.abs(dual - primal)) < 1e-6, (
+            f"ridge={ridge:g}: {np.max(np.abs(dual - primal)):.3e}"
+        )
+
+
+def test_the_dual_solve_centres_its_own_features_rather_than_assuming_a_caller_did():
+    """UNCENTRED features, which the centred fixture above cannot catch.
+
+    `fit_probe` passes standardised features, so a dual branch that assumes
+    centring works in production and is silently wrong for any direct caller.
+    Measured against the primal on features with a mean of 5.0, a dual that
+    takes `y.mean(0)` as the intercept without centring `x` is off by 485.2
+    map units at ridge 1e-1 and 56.8 at 1e3 -- plausible numbers, not a
+    crash. This is the fixture that makes that mutation visible; the centred
+    one above measures the same mutation at 1.479e-10.
+    """
+    rng = np.random.default_rng(3)
+    n, d = 40, 300
+    x = rng.normal(size=(n, d)) + 5.0
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n < d, "the fixture must exercise the dual branch"
+    assert np.min(np.abs(x.mean(0))) > 1.0, "the fixture must be genuinely uncentred"
+
+    query = rng.normal(size=(17, d))
+    design = np.concatenate([query, np.ones((17, 1))], axis=1)
+    for ridge in RIDGES:
+        gap = np.max(np.abs(
+            design @ _solve(x, y, ridge) - design @ _primal_solve_for_test(x, y, ridge)
+        ))
+        assert gap < 1e-5, f"ridge={ridge:g}: {gap:.3e}"
+
+
+def test_the_solve_takes_the_primal_path_when_the_features_are_fewer_than_the_rows():
+    """The switch is on `min(n, D)`, not "always dual", and the primal path is
+    bitwise the form every recorded number in this project came out of.
+
+    The dual's cost is n^2, so it is the WRONG form at 12,000 rows and 2,048
+    features -- which is every existing caller in this repo. Which branch was
+    taken cannot be read off the result, since both forms agree: a wrong
+    branch is a memory bug and nothing here sees it. What this pins is the
+    other half of the switch: that the primal path is UNCHANGED, rung by rung,
+    to the last bit. Exact equality rather than a tolerance, because "existing
+    callers' numbers do not move" is the claim and a tolerance would let a
+    one-ulp drift through unnoticed.
+    """
+    rng = np.random.default_rng(1)
+    n, d = 300, 40                      # n > d, so the primal path is the one taken
+    x = (lambda a: (a - a.mean(0)) / (a.std(0) + 1e-8))(rng.normal(size=(n, d)))
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n > d, "the fixture must exercise the primal branch"
+    assert np.abs(y.mean(0)).min() > 1.0, (
+        "the target means must be far from zero, or an intercept that is "
+        "shrunk toward zero is indistinguishable from one that is not"
+    )
+
+    w = _solve(x, y, 1e3)
+    assert w.shape == (d + 1, 4), "an intercept row is appended in both forms"
+    for ridge in RIDGES:
+        np.testing.assert_array_equal(
+            _solve(x, y, ridge), _primal_solve_for_test(x, y, ridge),
+            err_msg=f"ridge={ridge:g}",
+        )
+
+
+def test_the_ladder_shares_one_gram_without_leaking_one_rungs_ridge_into_the_next():
+    """`fit_probe` solves every rung from ONE Gram matrix, so the ridge added to
+    its diagonal for one rung must not survive into the next.
+
+    Each rung is compared with the independent oracle, not with `_solve` at the
+    same ridge: `_solve` is a single-rung call into the same code, so agreement
+    with it would hold even if the shared Gram were corrupted. The rungs are
+    handed over in ladder order and then reversed, so a ridge that accumulates
+    is wrong in both -- ascending adds the small rungs to the large ones,
+    descending adds the large ones to the small. Primal rungs are compared
+    exactly and dual rungs to the tolerance the dual is held to elsewhere.
+    """
+    ladder = probe_module._solve_ladder
+    rng = np.random.default_rng(4)
+    query_rows = 17
+
+    # Primal: n > d, exact.
+    n, d = 300, 40
+    x = rng.normal(size=(n, d)) + 5.0
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n > d, "this half must exercise the primal branch"
+    for rungs in (RIDGES, RIDGES[::-1]):
+        weights = ladder(x, y, rungs)
+        assert len(weights) == len(rungs)
+        assert not np.allclose(weights[0], weights[-1], atol=1e-3), (
+            "the fixture must make the rungs genuinely differ, or a leaked "
+            "ridge has nothing to move"
+        )
+        for ridge, w in zip(rungs, weights):
+            np.testing.assert_array_equal(
+                w, _primal_solve_for_test(x, y, ridge), err_msg=f"primal ridge={ridge:g}"
+            )
+
+    # Dual: n < d, uncentred, to the dual's tolerance on held-out query rows.
+    n, d = 40, 300
+    x = rng.normal(size=(n, d)) + 5.0
+    y = rng.normal(size=(n, 4)) * 240.0
+    assert n < d, "this half must exercise the dual branch"
+    query = rng.normal(size=(query_rows, d))
+    design = np.concatenate([query, np.ones((query_rows, 1))], axis=1)
+    for rungs in (RIDGES, RIDGES[::-1]):
+        weights = ladder(x, y, rungs)
+        assert len(weights) == len(rungs)
+        assert not np.allclose(weights[0], weights[-1], atol=1e-3)
+        for ridge, w in zip(rungs, weights):
+            gap = np.max(np.abs(design @ w - design @ _primal_solve_for_test(x, y, ridge)))
+            assert gap < 1e-5, f"dual ridge={ridge:g}: {gap:.3e}"
+
+
+def test_fit_probe_is_unchanged_on_the_shape_every_existing_caller_uses():
+    """A golden check against the shipped behaviour at latent scale.
+
+    The expected values come from the PRIMAL form computed inline here, not
+    from `fit_probe`, so a change inside it cannot move both sides. Compared
+    exactly: this is the shape every recorded number was fit on, and "the same
+    weights" is the claim.
+
+    The fixture plants a signal, and the selection has to land on 1e1 or 1e5.
+    Pure noise has no preferred ridge -- the top rungs tie to 1e-4 -- and the
+    MIDDLE rung, 1e3, is the one the ladder's own reversal leaves fixed, so a
+    selection there cannot see weights paired with the mirror-image rung.
+    """
+    rng = np.random.default_rng(4)
+    signal = np.zeros((48, 4))
+    signal[:12] = rng.normal(size=(12, 4))
+
+    def draw(rows):
+        features = rng.normal(size=(rows, 48))
+        return features, features @ signal * 60.0 + rng.normal(size=(rows, 4)) * 240.0
+
+    xf, yf = draw(120)
+    xv, yv = draw(60)
+    probe = fit_probe(xf, yf, xv, yv)
+    assert probe["ridge"] in (RIDGES[1], RIDGES[3]), (
+        "selection must land on a rung the ladder's reversal does not fix, "
+        f"so weights solved at the wrong rung are visible; got {probe['ridge']:g}"
+    )
+
+    mean, scale = xf.mean(0), xf.std(0) + 1e-8
+    xs = (xf - mean) / scale
+    expected = _primal_solve_for_test(xs, yf, probe["ridge"])
+    np.testing.assert_array_equal(probe["w"], expected)
+    assert probe["ridge"] in RIDGES
+
+
+def test_fit_probe_selects_and_solves_correctly_where_the_features_outnumber_the_rows():
+    """The regime the raw-pixel cell is in: `fit_probe` takes the dual path.
+
+    The oracle is the primal solve on the standardised features, computed here,
+    at the ridge `fit_probe` reports having selected. A ridge paired with the
+    wrong rung's weights, or weights solved from a corrupted shared Gram, is
+    wrong at the reported ridge. Selection must land on 1e1 or 1e5: the middle
+    rung is the one the ladder's reversal leaves fixed, so a selection there
+    cannot see weights paired with the mirror-image rung.
+    """
+    rng = np.random.default_rng(20)
+    n, d = 60, 200
+    w_true = np.zeros((d, 4))
+    w_true[:20] = rng.normal(size=(20, 4))
+
+    def draw(rows):
+        features = rng.normal(size=(rows, d)) * 3.0 + 2.0
+        return features, features @ w_true * 20.0 + rng.normal(size=(rows, 4)) * 150.0 + 500.0
+
+    xf, yf = draw(n)
+    xv, yv = draw(40)
+    assert n < d, "the fixture must exercise the dual branch"
+    probe = fit_probe(xf, yf, xv, yv)
+    assert probe["ridge"] in (RIDGES[1], RIDGES[3]), (
+        f"selection must land on a rung the ladder's reversal does not fix; "
+        f"got {probe['ridge']:g}"
+    )
+
+    mean, scale = xf.mean(0), xf.std(0) + 1e-8
+    xs = (xf - mean) / scale
+    expected = _primal_solve_for_test(xs, yf, probe["ridge"])
+    query = (xv - mean) / scale
+    design = np.concatenate([query, np.ones((query.shape[0], 1))], axis=1)
+    assert np.max(np.abs(design @ probe["w"] - design @ expected)) < 1e-5
 
 
 def test_probe_r2_averages_per_column_not_pooled_variance():
