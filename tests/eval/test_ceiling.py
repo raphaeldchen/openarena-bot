@@ -1362,6 +1362,25 @@ def test_the_difference_interval_tolerates_rounding_and_refuses_a_real_disagreem
         difference_interval(dataclasses.replace(a, r2=a.r2 + 1e-3), b, truth, episode, seed=0)
 
 
+def test_a_readouts_mean_error_comes_directly_before_its_median_error():
+    """The order is part of the record type, not decoration.
+
+    `mean_error` was added beside `median_error`, before it, so that a caller
+    still constructing a `Readout` positionally against the old field order gets
+    a missing-argument error rather than a median silently landing in the mean's
+    place. Every construction in this file is by keyword; this is the pin on
+    the order that those no longer exercise.
+    Reached by the names: the two fields swapped, and the mean moved away from
+    the median. The last assertion shows the stale five-field call is refused;
+    arity alone refuses it, so it does not discriminate the order.
+    """
+    names = [field.name for field in dataclasses.fields(Readout)]
+    assert names[:2] == ["name", "r2"]
+    assert names.index("mean_error") + 1 == names.index("median_error")
+    with pytest.raises(TypeError, match="missing"):
+        Readout("a", 0.5, 1.0, 2.0, np.zeros((3, 4)))  # the old five-field order
+
+
 def test_a_readout_is_compared_and_hashed_by_identity_despite_its_array_field():
     """`eq=False`: the `ndarray` field made the generated `__eq__` and `__hash__`
     raise, so neither was usable on a `Readout`.
