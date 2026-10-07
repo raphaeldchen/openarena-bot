@@ -350,6 +350,12 @@ noisy, and the floor is a nuisance parameter the verdict is read against, so it
 is worth estimating more precisely than the quantity it bounds. Three draws at
 the cell's own shape, averaged.
 
+**AVERAGE FIRST, THEN CLAMP — the two do not commute.** Draws of -0.002, -0.001
+and +0.003 average to +0.0000 and clamp to 0.0; clamped first they average to
++0.001, a bar the instrument never showed. `null_floor` returns the unclamped
+mean and the clamp lives downstream, in the one place the bar is formed, so the
+order cannot be got wrong by a caller.
+
 One thing the floor cannot fix: the measured `D - C` has its own draw noise. On
 purely linear data at n=300, D=150, `D - C` exceeded +0.003 in 4 of 40 draws, and
 one draw read +0.0085 with an interval of [+0.0043, +0.0133] against a correctly
