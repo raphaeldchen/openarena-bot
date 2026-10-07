@@ -45,13 +45,15 @@ import torch.nn as nn
 from mbfps.data.episode import load_episode, save_episode
 from mbfps.eval import headroom as H
 from mbfps.eval import pooling
+from mbfps.eval import probe as probe_module
 from mbfps.eval.diagnostics import REGROUNDING_KS, RegroundingSweep, ground_step, regrounding_sweep
-from mbfps.eval.probe import apply_probe, fit_probe, probe_targets
+from mbfps.eval.probe import apply_probe, fit_probe, fit_probes, probe_targets
 from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.eval.windows import window_starts
 from tests.eval.test_rollout import (
-    KEYS, STEP, DriftingModel, OracleModel, _OracleRSSM, oracle_probe, synthetic_episode,
+    KEYS, STEP, DriftingModel, OracleModel, _OracleRSSM, oracle_probe, real_model_and_probe,
+    synthetic_episode,
 )
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "motion_headroom.py"
@@ -2845,3 +2847,310 @@ def test_main_reads_the_arms_seeds_and_directory_the_command_line_names(
     assert "BETWEEN in 6 of 6 cells" in capsys.readouterr().out
     _write_records(tmp_path / "unreadable", _records_from(hand_record, _spec(["UNREADABLE"] * 9)))
     assert script.main(["--phase", "read", "--out", str(tmp_path / "unreadable")]) == 47
+
+
+# ---------------------------------------------------------------------------
+# M3o Task 7: `--readout`, the opt-in that lets M3n's sweep be read through the
+# kernel readout.
+#
+# THE DEFAULT IS THE CONTRACT. M3n's nine records were written through the
+# linear probe `prepare_cell` refit, and "every existing invocation is
+# unchanged" is a claim about this section's first two tests, pinned before any
+# rescue cell was run. The rest pin what the opt-in does: it fits the kernel
+# readout on the rows and splits `fit_probes` fits the linear probe on, and it
+# reads the reference the controls compare against THROUGH that readout.
+# ---------------------------------------------------------------------------
+
+
+def test_readout_defaults_to_linear_and_offers_exactly_linear_and_rbf():
+    parser = script._parser()
+    assert script.READOUTS == ("linear", "rbf")
+    assert parser.parse_args([]).readout == "linear"
+    assert parser.parse_args(["--readout", "linear"]).readout == "linear"
+    assert parser.parse_args(["--readout", "rbf"]).readout == "rbf"
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args(["--readout", "knn"])
+    assert caught.value.code == 2
+
+
+def test_main_hands_the_phase_a_linear_readout_when_the_flag_is_absent(monkeypatch):
+    """The default is pinned THROUGH `main`, not only on the parser: a parser
+    default that `main` did not forward would leave the phase on whatever it
+    read when the attribute was missing."""
+    seen = []
+    monkeypatch.setattr(script, "measure_phase", lambda args: seen.append(args.readout) or 0)
+    assert script.main(["--phase", "measure"]) == 0
+    assert script.main(["--phase", "measure", "--readout", "rbf"]) == 0
+    assert seen == ["linear", "rbf"]
+
+
+def _forbidden(name):
+    def refuse(*a, **k):
+        raise AssertionError(f"the linear phase reached {name}")
+    return refuse
+
+
+@pytest.mark.parametrize("spelling", ["old namespace", "readout=linear"])
+def test_the_linear_phase_is_the_phase_it_always_was(tmp_path, monkeypatch, spelling):
+    """Neither the kernel fit nor a second reference pass is reached; the cell is
+    measured through THE probe `prepare_cell` refit and against THE reference it
+    verified, by identity; and the record gains no key.
+
+    `old namespace` is the shape every caller built before the flag existed
+    (`_phase_env`'s, which this change leaves untouched): a `measure_phase` that
+    read `args.readout` unguarded would raise on it.
+
+    THE MUTATIONS THIS EXISTS FOR: fitting the kernel readout whatever the flag
+    says, and passing a fresh `reference_trajectories` pass in place of the
+    verified reference."""
+    args, _ = _phase_env(tmp_path, monkeypatch)
+    if spelling == "readout=linear":
+        args.readout = "linear"
+    else:
+        assert not hasattr(args, "readout")
+    for name in ("fit_embedding_readout", "fit_kernel_probe", "reference_trajectories"):
+        monkeypatch.setattr(script, name, _forbidden(name))
+    seen = []
+    real = script.measure_cell
+    monkeypatch.setattr(script, "measure_cell", lambda *a, **k: seen.append((a, k)) or real(*a, **k))
+    args.arms, args.seeds = ["pixel_ae"], [1]
+    assert script.measure_phase(args) == script.EXIT_OK
+    ((positional, keyword),) = seen
+    assert positional[2] is args.probe
+    assert keyword["reference"] is args.references[("pixel_ae", 1)][0]
+    record = load_record(args.out / "headroom_pixel_ae_seed1.json")
+    assert "readout" not in record and "readout_fit" not in record
+
+
+def test_an_unknown_readout_is_refused_by_name_before_any_cell_is_paid_for(tmp_path, monkeypatch):
+    args, prepared_for = _phase_env(tmp_path, monkeypatch)
+    args.readout = "knn"
+    with pytest.raises(SystemExit) as caught:
+        script.measure_phase(args)
+    assert "knn" in str(caught.value) and "linear" in str(caught.value)
+    assert prepared_for == []
+
+
+def _context_horizon():
+    return dict(context=3, horizon=5)
+
+
+def _real_model_paths(directory: Path, count: int = 7):
+    """Seven episodes, so `fit_probes` has three to fit and four to select on, with
+    lengths that give them different window counts. The REAL model, because its
+    `observe` samples: a deterministic fake leaves `seed` unbound, and a mirror
+    that fit the selection split at `seed` instead of `seed + 1` would read as
+    correct."""
+    model, _ = real_model_and_probe()
+    paths = [
+        _episode_file(directory, synthetic_episode(length=18 + 3 * i), i) for i in range(count)
+    ]
+    return model, paths
+
+
+def _spy_on_fit_probe(monkeypatch):
+    """Every `(fit_x, fit_y, select_x, select_y)` `fit_probes` hands `fit_probe`,
+    in call order: the latent probe's, then the embedding probe's."""
+    calls = []
+    real = probe_module.fit_probe
+
+    def recorder(x, y, val_x=None, val_y=None, **kw):
+        calls.append(tuple(None if a is None else np.array(a) for a in (x, y, val_x, val_y)))
+        return real(x, y, val_x, val_y, **kw)
+
+    monkeypatch.setattr(probe_module, "fit_probe", recorder)
+    return calls
+
+
+def test_the_readout_is_fit_on_the_rows_and_splits_fit_probes_fits_the_linear_probe_on(
+    tmp_path, monkeypatch,
+):
+    """THE COMPARISON AGAINST M3n IS VOID if the readout is fit anywhere else.
+    The expectation is what `fit_probes` ACTUALLY hands its estimator, recorded
+    from a real call, never rebuilt from what the mirror does.
+
+    The fixture is shown to discriminate first: the fit and selection splits
+    differ from each other, and a second seed gives a different pair (the
+    posterior samples), so a mirror that swaps the splits, or fits the
+    selection split at `seed` rather than `seed + 1`, fails an array equality.
+    A matching `w` from the linear estimator is asserted as well: the same
+    rows through the same estimator must give the same probe, bitwise.
+    """
+    model, paths = _real_model_paths(tmp_path)
+    calls = _spy_on_fit_probe(monkeypatch)
+    _, shipped = fit_probes(model, paths, None, CPU, seed=4, **_context_horizon())
+    shipped_calls = list(calls)
+    calls.clear()
+    fit_probes(model, paths, None, CPU, seed=5, **_context_horizon())
+    other_seed = list(calls)
+    fit_x, fit_y, select_x, select_y = shipped_calls[1]               # the embedding probe
+    assert fit_x.shape[1] == select_x.shape[1] == 2048
+    assert fit_x.shape[0] != select_x.shape[0]
+    assert not np.array_equal(fit_x[: select_x.shape[0]], select_x)
+    assert not np.array_equal(shipped_calls[1][0], other_seed[1][0])  # seed reaches the data
+    assert not np.array_equal(shipped_calls[1][2], other_seed[1][2])
+
+    got = []
+    real = probe_module.fit_probe
+
+    def estimator(*a):
+        got.append(tuple(np.array(x) for x in a))
+        return real(*a)
+
+    mirrored = script.fit_embedding_readout(
+        model, paths, None, CPU, seed=4, estimator=estimator, **_context_horizon(),
+    )
+    assert len(got) == 1
+    for mine, theirs in zip(got[0], shipped_calls[1]):
+        np.testing.assert_array_equal(mine, theirs)
+    np.testing.assert_array_equal(mirrored["w"], shipped["w"])
+    assert mirrored["ridge"] == shipped["ridge"]
+
+
+def test_the_default_estimator_is_the_kernel_ladder(tmp_path, monkeypatch):
+    """Only the estimator changes: left to its default the mirror calls
+    `ceiling.fit_kernel_probe` and returns its readout."""
+    model, paths = _real_model_paths(tmp_path)
+    readout = script.fit_embedding_readout(model, paths, None, CPU, seed=4, **_context_horizon())
+    assert readout["kind"] == "rbf"
+    assert set(readout) >= {"kernel", "anchors", "alpha", "centre", "jitter", "r2"}
+    calls = _spy_on_fit_probe(monkeypatch)
+    fit_probes(model, paths, None, CPU, seed=4, **_context_horizon())
+    # The anchors are the standardised fit rows: they came from the same fit split.
+    fit_x = calls[1][0]
+    np.testing.assert_allclose(
+        readout["anchors"] * readout["scale"] + readout["mean"], fit_x, rtol=1e-9, atol=1e-9,
+    )
+
+
+def test_the_readout_is_refused_by_name_when_there_is_no_episode_to_select_on(tmp_path):
+    """`fit_probes` falls back to an unselected fit with too few episodes; the
+    kernel ladder cannot, since it selects its kernel, bandwidth and jitter on
+    held-out rows. A silent fallback would be a different estimator under the
+    same name."""
+    model, paths = _real_model_paths(tmp_path, count=script.SELECT_EPISODES)
+    with pytest.raises(SystemExit) as caught:
+        script.fit_embedding_readout(model, paths, None, CPU, seed=4, **_context_horizon())
+    assert "select" in str(caught.value)
+
+
+def test_the_selection_count_is_fit_probes_own_default():
+    assert script.SELECT_EPISODES == 4
+
+
+def test_the_rbf_phase_fits_the_readout_and_reads_the_reference_through_it(
+    tmp_path, monkeypatch, capsys,
+):
+    """The controls compare the sweep's k = horizon rung and its floor with a
+    reference. The reference `prepare_cell` verified was read through the LINEAR
+    probe (and `evaluate_rollout` cannot read any other), so against a sweep read
+    through the kernel readout it would break two controls by hundreds of map
+    units. The phase therefore builds the reference with `reference_trajectories`
+    through the same readout, and those controls read exactly 0.0.
+
+    The fixture is shown to discriminate: the same sweep scored against the
+    verified (linear, recognisable) reference breaks controls.
+
+    THE MUTATION THIS EXISTS FOR: handing `measure_cell` the readout together
+    with `prepared.reference`."""
+    args, _ = _phase_env(tmp_path, monkeypatch)
+    args.readout = "rbf"
+    args.arms, args.seeds = ["pixel_ae"], [1]
+    seen = []
+    real = script.measure_cell
+    monkeypatch.setattr(script, "measure_cell", lambda *a, **k: seen.append((a, k)) or real(*a, **k))
+    assert script.measure_phase(args) == script.EXIT_OK
+    ((positional, keyword),) = seen
+    readout = positional[2]
+    verified = args.references[("pixel_ae", 1)][0]
+    assert readout["kind"] == "rbf" and readout is not args.probe
+    assert keyword["reference"] is not verified
+
+    record = load_record(args.out / "headroom_pixel_ae_seed1.json")
+    assert script.broken_controls(record["controls"]) == []
+    assert record["controls"]["open_loop_divergence"] == 0.0
+    assert record["controls"]["floor_divergence"] == 0.0
+    mismatched = real(*positional, **{**keyword, "reference": verified})
+    assert script.broken_controls(mismatched["controls"]), "the fixture must be able to break them"
+
+    assert record["readout"] == "rbf"
+    fit = record["readout_fit"]
+    assert fit["rbf"]["kernel"] == readout["kernel"]
+    assert fit["rbf"]["jitter"] == readout["jitter"]
+    assert fit["rbf"]["r2"] == readout["r2"]
+    assert fit["rbf"]["n_fit"] == readout["anchors"].shape[0] > 0
+    assert fit["linear"]["ridge"] == args.probe["ridge"]
+    assert record["nonfinite"] == {}
+    out = capsys.readouterr().out
+    assert "rbf readout" in out and readout["kernel"] in out
+
+
+def test_the_rbf_records_say_which_readout_they_were_read_through_at_the_read_phase(
+    hand_record, tmp_path,
+):
+    """A pool that mixes readouts is two measurements read as one. A record with
+    no `readout` is a linear one -- every record before M3o -- and an explicit
+    "linear" is the same thing."""
+    records = _records_from(hand_record, _spec(["BETWEEN"] * 9))
+    assert all("readout" not in r for r in records.values())
+    script.require_one_readout(records)
+    records[SECOND_CELL]["readout"] = "linear"
+    script.require_one_readout(records)
+    records[SECOND_CELL]["readout"] = "rbf"
+    with pytest.raises(SystemExit) as caught:
+        script.require_one_readout(records)
+    message = str(caught.value)
+    assert "disagree on readout" in message, message
+    named = _named_cells(message, records)
+    assert SECOND_CELL in named and len(named) == 2, (named, message)
+    for record in records.values():
+        record["readout"] = "rbf"
+    script.require_one_readout(records)
+
+
+def test_the_read_phase_refuses_a_pool_of_mixed_readouts_and_writes_nothing(
+    hand_record, tmp_path,
+):
+    records = _records_from(hand_record, _spec(["BETWEEN"] * 9))
+    records[LAST_CELL]["readout"] = "rbf"
+    _write_records(tmp_path, records)
+    with pytest.raises(SystemExit) as caught:
+        script.read_phase(_read_args(tmp_path))
+    assert "disagree on readout" in str(caught.value)
+    assert not (tmp_path / "headroom.txt").exists()
+
+
+def test_a_run_refuses_to_overwrite_a_record_measured_through_the_other_readout(
+    tmp_path, monkeypatch,
+):
+    """`--out` is the one thing standing between the rescue and M3n's nine
+    records, which live in a directory shared by every worktree. A run whose
+    readout differs from the record already at a cell's path is refused by name,
+    BEFORE any cell is loaded or paid for, and the record is left as it was. The
+    same readout may be re-run over its own records, as it always could.
+
+    THE MUTATIONS THIS EXISTS FOR: no check, and a check that reads only the
+    first planned cell."""
+    args, prepared_for = _phase_env(tmp_path, monkeypatch)
+    args.arms, args.seeds = ["pixel_ae"], [1, 2]
+    args.out.mkdir()
+    linear = script.headroom_record_path(args.out, "pixel_ae", 2)
+    write_record(linear, {"arm": "pixel_ae", "seed": 2, "marker": "m3n"})
+    before = linear.read_bytes()
+    args.readout = "rbf"
+    with pytest.raises(SystemExit) as caught:
+        script.measure_phase(args)
+    message = str(caught.value)
+    assert linear.name in message and "linear" in message and "rbf" in message, message
+    assert prepared_for == []
+    assert linear.read_bytes() == before
+    assert sorted(p.name for p in args.out.iterdir()) == [linear.name]
+    # The other direction: an rbf record is not overwritten by a linear run.
+    write_record(linear, {"arm": "pixel_ae", "seed": 2, "readout": "rbf"})
+    del args.readout
+    with pytest.raises(SystemExit):
+        script.measure_phase(args)
+    assert prepared_for == []
+    # And the same readout over its own records is allowed.
+    args.readout = "rbf"
+    assert script.measure_phase(args) == script.EXIT_OK

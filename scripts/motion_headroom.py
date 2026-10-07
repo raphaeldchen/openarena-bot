@@ -116,10 +116,39 @@ Those controls are ALSO the `keep_trajectories=True` control: the verified
 reference was measured with the flag OFF, so a bitwise match on
 `open_loop_divergence` and `floor_divergence` proves the flag moved neither the
 arms nor the reference, with no second traversal.
+
+`--readout {linear,rbf}` (M3o Task 7) IS OPT-IN AND DEFAULTS TO `linear`, which is
+every earlier invocation unchanged. `rbf` re-reads the SAME cells through
+`ceiling.fit_kernel_probe` in place of the linear probe, to answer whether the
+readout error that made M3n unreadable was the probe family's. THREE THINGS CHANGE
+and nothing else:
+
+  * the probe handed to the sweep is `fit_embedding_readout`'s: the same rows,
+    from the same TRAINING episodes, at the same context, horizon and seed, split
+    the same way as `probe.fit_probes` splits them, fit by the kernel ladder;
+  * the reference the controls compare against is `reference_trajectories`' band
+    through that readout, because the one `prepare_cell` verified was read through
+    the linear probe and `evaluate_rollout` can read no other. `prepare_cell`
+    STILL runs, with the linear probe, and still refuses a cell whose checkpoint
+    does not reproduce the study record: that check is about the checkpoint, not
+    the readout;
+  * the record gains `readout` and `readout_fit`, and the read phase refuses a
+    pool that mixes readouts. A linear record carries neither key, so M3n's nine
+    are byte-for-byte what they were.
+
+WHAT THE RBF REFERENCE IS AND IS NOT. `open_loop_divergence` and
+`floor_divergence` compare the sweep with a reference. For `linear` that reference
+is `evaluate_rollout`'s, an independent code path. For `rbf` it is a second pass of
+the diagnostics' own `_diagnose`, so those two controls certify that the sweep's
+arms and its keep-trajectories flag moved neither the canonical pass nor the floor
+(a real check, and bitwise), and they no longer certify the sweep against
+`evaluate_rollout`. That half is carried by the linear path, which M3o Task 7
+re-ran over M3n's own nine cells and compared with `runs/m3n_motion/`.
 """
 
 import argparse
 import importlib.util
+import inspect
 import math
 import sys
 import types
@@ -132,7 +161,10 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
-from mbfps.eval.diagnostics import REGROUNDING_KS, RegroundingSweep, regrounding_sweep
+from mbfps.eval.ceiling import fit_kernel_probe
+from mbfps.eval.diagnostics import (
+    REGROUNDING_KS, RegroundingSweep, reference_trajectories, regrounding_sweep,
+)
 from mbfps.eval.headroom import (
     ARMS_REQUIRED, CONFIDENCE, DECISION_H, DECISION_K, DISPLACEMENT_RECORDED_ONLY,
     IDENTITY_TOLERANCE, NO_MAJORITY, REPORTED_H, RESAMPLES, SECONDARY_SIGMAS, SEEDS_MINIMUM,
@@ -140,6 +172,7 @@ from mbfps.eval.headroom import (
     reading_headroom, skill, triple_residual,
 )
 from mbfps.eval.pooling import clustered_interval
+from mbfps.eval.probe import PROBE_EPISODE_LIMIT, fit_probes, gather_probe_data, probe_episodes
 from mbfps.eval.rollout import RolloutResult
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.utils.config import ARMS
@@ -271,6 +304,102 @@ def broken_controls(controls: dict) -> list[str]:
     if not residual <= IDENTITY_TOLERANCE:
         broken.append(f"identity_residual={residual!r}")
     return broken
+
+
+# ---------------------------------------------------------------------------
+# the readout: linear (M3n's), or the kernel ladder's (M3o Task 7).
+# ---------------------------------------------------------------------------
+
+READOUTS: tuple[str, ...] = ("linear", "rbf")
+"""The readouts `--readout` offers. `linear` is the first and the default."""
+
+SELECT_EPISODES: int = inspect.signature(fit_probes).parameters["select_episodes"].default
+"""How many of the probe's episodes are held back to SELECT on, read off
+`fit_probes` itself so that the two cannot drift apart."""
+
+
+def fit_embedding_readout(
+    model, train, backbone, device, *, context: int, horizon: int, seed: int,
+    estimator=fit_kernel_probe,
+) -> dict:
+    """`fit_probes`' embedding probe with ONLY THE ESTIMATOR changed.
+
+    The same episodes (`probe_episodes(train)`, the leading `PROBE_EPISODE_LIMIT`
+    training episodes), the same rows (`gather_probe_data`'s `embedding`, the
+    model's own PREDICTED embeddings that the rollout applies the probe to), at
+    the rollout's own `context` and `horizon`, the last `SELECT_EPISODES` episodes
+    held out to select on, and the same two seeds: `seed` for the fit rows and
+    `seed + 1` for the selection rows. Fit anywhere else, the comparison with M3n
+    measures a different thing and is void.
+
+    This repeats `fit_probes`' data assembly because `fit_probes` takes no
+    estimator and `probe.py` is not this task's to change. A test records what
+    `fit_probes` actually hands `fit_probe` and holds this to those arrays, so
+    drift is a failing test and not a silent change of question.
+
+    `estimator` is `fit_kernel_probe` by default and takes `(fit_x, fit_y,
+    select_x, select_y)` as `probe.fit_probe` does. It exists so that test can run
+    this function with the linear estimator and demand `fit_probes`' own weights.
+
+    REFUSES by name when fewer than `SELECT_EPISODES + 1` episodes are available.
+    `fit_probes` falls back to an unselected fit there; the kernel ladder selects
+    its kernel, bandwidth and jitter on held-out rows and has no such fallback,
+    and a silent one would be a different estimator under the same name.
+    """
+    used, _ = probe_episodes(train, PROBE_EPISODE_LIMIT)
+    spare = len(used) - SELECT_EPISODES
+    if spare < 1:
+        raise SystemExit(
+            f"the rbf readout needs at least {SELECT_EPISODES + 1} training episodes "
+            f"({SELECT_EPISODES} to select on, one to fit); {len(used)} were given"
+        )
+
+    def gather(paths, gather_seed):
+        return gather_probe_data(
+            model, paths, backbone, device, context, horizon,
+            limit=len(paths), seed=gather_seed,
+        )
+
+    fit_rows = gather(used[:spare], seed)
+    select_rows = gather(used[spare:], seed + 1)
+    return estimator(
+        fit_rows["embedding"], fit_rows["targets"],
+        select_rows["embedding"], select_rows["targets"],
+    )
+
+
+def rbf_cell_inputs(prepared, cell, train, val, device) -> tuple[dict, RolloutResult, dict]:
+    """`(readout, reference, fit)` for one cell under `--readout rbf`.
+
+    The readout is `fit_embedding_readout`'s, at the cell's own seed. The
+    reference is `reference_trajectories`' band THROUGH THAT READOUT -- the
+    controls compare the sweep with it, and the one `prepare_cell` verified was
+    read through the linear probe (module docstring). `fit` is what the record
+    carries about the two fits, finite throughout: `write_record` nulls a
+    non-finite value into the `nonfinite` map and the read phase refuses a record
+    that has one, so the linear rung's infinite bandwidth is written as null.
+    """
+    readout = fit_embedding_readout(
+        prepared.model, train, prepared.common["feature_backbone"], device,
+        context=prepared.context, horizon=prepared.horizon, seed=cell.seed,
+    )
+    reference = reference_trajectories(prepared.model, val, readout, **prepared.common).band
+    linear = prepared.embedding_probe
+    bandwidth = float(readout["bandwidth"])
+    fit = {
+        "rbf": {
+            "kernel": readout["kernel"],
+            "bandwidth": bandwidth if math.isfinite(bandwidth) else None,
+            "jitter": float(readout["jitter"]),
+            "r2": float(readout["r2"]),
+            "n_fit": int(readout["anchors"].shape[0]),
+        },
+        "linear": {
+            "ridge": float(linear["ridge"]),
+            "r2": float(linear["r2"]) if "r2" in linear else None,
+        },
+    }
+    return readout, reference, fit
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +662,11 @@ def measure_phase(args) -> int:
     line, and the read phase refuses it.
     """
     arms, seeds = _plan(args)
+    # `getattr`: a namespace built before the flag existed is a linear one.
+    readout = getattr(args, "readout", "linear")
+    if readout not in READOUTS:
+        raise SystemExit(f"--readout {readout!r} is not one of {list(READOUTS)!r}")
+    require_no_other_readout_on_disk(args.out, arms, seeds, readout)
     device = get_device(prefer=args.device)
     try:
         loaded = [load_cell(args.source, arm, seed) for arm in arms for seed in seeds]
@@ -550,14 +684,29 @@ def measure_phase(args) -> int:
         )
         if prepared is None:
             return status
+        probe, reference, fit = prepared.embedding_probe, prepared.reference, None
+        if readout == "rbf":
+            probe, reference, fit = rbf_cell_inputs(prepared, cell, train, val, device)
+            print(
+                f"{cell.arm} seed {cell.seed}: rbf readout fitted on "
+                f"{fit['rbf']['n_fit']} rows ({fit['rbf']['kernel']} kernel, bandwidth "
+                f"{fit['rbf']['bandwidth']}, jitter {fit['rbf']['jitter']:.3g}); "
+                f"selection r2 {fit['rbf']['r2']:+.4f} against the linear probe's "
+                f"{fit['linear']['r2']}"
+            )
         record = measure_cell(
-            prepared.model, val, prepared.embedding_probe,
-            reference=prepared.reference, arm=cell.arm, seed=cell.seed,
+            prepared.model, val, probe,
+            reference=reference, arm=cell.arm, seed=cell.seed,
             context=prepared.context, horizon=prepared.horizon,
             ks=args.ks, device=device,
             feature_backbone=prepared.common["feature_backbone"],
             study_record=cell.record, bootstrap_seed=args.bootstrap_seed,
         )
+        if fit is not None:
+            # Only a non-linear run carries the keys: a linear record is
+            # byte-for-byte what M3n wrote, and an absent `readout` means linear.
+            record["readout"] = readout
+            record["readout_fit"] = fit
         path = headroom_record_path(args.out, cell.arm, cell.seed)
         write_record(path, record)
         print(_cell_line(record, path))
@@ -704,6 +853,57 @@ def require_one_protocol(records: dict) -> None:
     `scripts/prediction_burden.py`'s namesake, and `git_sha` is among the fields
     for the reason `_PROTOCOL_FIELDS` gives."""
     _require_agreement(records, [name for name, _ in _PROTOCOL_FIELDS])
+
+
+def _readout_of(record: dict) -> str:
+    """The readout a record was measured through: its `readout`, or "linear" for a
+    record with none, which is every record before M3o and every linear one."""
+    return str(record.get("readout", "linear"))
+
+
+def require_one_readout(records: dict) -> None:
+    """Refuse a pool whose records were measured through different readouts, naming
+    the two cells and the two readouts.
+
+    Not a `_PROTOCOL_FIELDS` entry, because that table refuses a record that LACKS
+    a field and a linear record lacks this one by design. A pool of linear and rbf
+    cells is two measurements read as one verdict."""
+    items = sorted(records.items())
+    if not items:
+        raise SystemExit("no headroom record to read")
+    (first_cell, first), rest = items[0], items[1:]
+    reference = _readout_of(first)
+    for cell, record in rest:
+        mine = _readout_of(record)
+        if mine != reference:
+            raise SystemExit(
+                f"{cell[0]} seed {cell[1]} and {first_cell[0]} seed {first_cell[1]} "
+                f"disagree on readout: {mine!r} vs {reference!r}; they are not one "
+                "measurement and cannot be read as one"
+            )
+
+
+def require_no_other_readout_on_disk(out, arms, seeds, readout: str) -> None:
+    """Refuse, by name and before any cell is loaded, a run that would overwrite a
+    record measured through a DIFFERENT readout.
+
+    `--out` is the one thing between a rescue and the records it is compared with:
+    `runs/m3n_motion/`'s nine are linear, live in a directory shared by every
+    worktree, and cannot be regenerated by a run that reads them differently. Every
+    planned cell is checked, not the first. The same readout over its own records
+    is not refused: re-running a cell has always overwritten it."""
+    for arm in arms:
+        for seed in seeds:
+            path = headroom_record_path(out, arm, seed)
+            if not path.exists():
+                continue
+            found = _readout_of(load_record(path))
+            if found != readout:
+                raise SystemExit(
+                    f"{path} is a {found} record and this run's readout is {readout}; "
+                    "writing it would destroy a measurement the other readout cannot "
+                    "reproduce. Pass a NEW --out"
+                )
 
 
 def require_sound_records(records: dict) -> None:
@@ -942,6 +1142,7 @@ def read_phase(args) -> int:
         print(f"NO CELL: {error}")
         return EXIT_NO_CHECKPOINTS
     require_one_protocol(records)
+    require_one_readout(records)
     require_sound_records(records)
     inputs = headroom_inputs(records)
     reading = reading_headroom(inputs)
@@ -1020,6 +1221,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="the run's base seed; each cell draws its intervals at "
                              "cell_bootstrap_seed(base, arm, seed), and both are "
                              "recorded in the cell")
+    parser.add_argument("--readout", choices=READOUTS, default=READOUTS[0],
+                        help="the readout the embedding probe is: `linear` is M3n's and the "
+                             "default; `rbf` is the kernel ladder, fit on the same rows and "
+                             "splits (M3o Task 7). Write it to a NEW --out")
     parser.add_argument("--phase", choices=PHASES, default=PHASES[-1])
     return parser
 

@@ -182,9 +182,9 @@ import torch
 from numpy.random import default_rng
 
 from mbfps.data.episode import load_episode
+from mbfps.eval.ceiling import apply_readout
 from mbfps.eval.probe import (
     angle_error_degrees,
-    apply_probe,
     position_error,
     probe_targets,
 )
@@ -748,14 +748,21 @@ def _diagnose(
             )
 
             # ONE head call per latent, shared by the probe and the
-            # embedding-space reading: `apply_probe` casts to float64 itself,
+            # embedding-space reading: `apply_readout` casts to float64 itself,
             # so handing it the same float32 copy changes no probe number,
             # and the two readings cannot come from different rows.
+            #
+            # `apply_readout`, not `probe.apply_probe`, at all four reads below
+            # (M3o Task 7): it dispatches on the readout's `kind`, and a readout
+            # with none -- the shipped linear probe -- goes to `apply_probe`
+            # UNCHANGED, so every earlier caller is bit-identical. It exists so
+            # that M3n's sweep can be re-run through a nonlinear readout; the
+            # probe dict this function takes is whatever `apply_readout` reads.
             embed = lambda latent: model.heads(latent)["embedding"][0].cpu().numpy()  # noqa: E731
             real_embedding = embed(imagined["latent"])
-            model_pred = apply_probe(embedding_probe_weights, real_embedding)
-            floor_pred = apply_probe(embedding_probe_weights, floor_embeddings)
-            pers_pred = apply_probe(
+            model_pred = apply_readout(embedding_probe_weights, real_embedding)
+            floor_pred = apply_readout(embedding_probe_weights, floor_embeddings)
+            pers_pred = apply_readout(
                 embedding_probe_weights,
                 np.repeat(last_context_embedding[None, :], horizon, axis=0),
             )
@@ -783,7 +790,7 @@ def _diagnose(
                 held_truth = np.repeat(true_embedding[:1], horizon, axis=0)
                 kept["positions"].append(model_pred[:, :2])
                 # Row 0 of the persistence prediction, not a fresh
-                # `apply_probe` on one row: the curve's persistence error is
+                # `apply_readout` on one row: the curve's persistence error is
                 # scored on these rows, and a separate matmul over a
                 # different shape is not guaranteed the same last bit.
                 kept["positions_at_context"].append(pers_pred[0, :2])
@@ -838,7 +845,7 @@ def _diagnose(
             for name, latent in arm_latents.items():
                 arm_embedding = embed(latent)
                 arm_embeddings[name] = arm_embedding
-                predicted = apply_probe(embedding_probe_weights, arm_embedding)
+                predicted = apply_readout(embedding_probe_weights, arm_embedding)
                 arm_windows[name]["position"].append(position_error(predicted, truth))
                 arm_windows[name]["angle"].append(angle_error_degrees(predicted, truth))
                 arm_windows[name]["embedding"].append(
