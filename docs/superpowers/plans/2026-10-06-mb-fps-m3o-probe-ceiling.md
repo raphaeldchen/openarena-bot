@@ -2073,13 +2073,21 @@ Read the `N passed` line, not the exit code. Record both and the SHA. A run whos
 mkdir -p runs/m3o_ceiling
 .venv/bin/python scripts/probe_ceiling.py --phase measure --out runs/m3o_ceiling \
   --arms frozen_ssl,pixel_ae,random_vit --seeds 0,1,2 \
-  --frames 12000 --bootstrap-seed 0 > runs/m3o_ceiling/measure.log 2>&1
+  --frames 4000 --bootstrap-seed 0 > runs/m3o_ceiling/measure.log 2>&1
 echo "measure exit: $?"
 tail -20 runs/m3o_ceiling/measure.log
 ls runs/m3o_ceiling/ceiling_*.json | wc -l    # must print 9
 ```
 
 The `mkdir` and the redirect are both load-bearing: `tee` opens its file before the script creates `--out`, and a pipe makes `$?` the pager's status.
+
+**`--frames 4000` is the settled budget, not a default.** At stride 1 the fit
+split is 9,044 rows and the kernel ladder's `n^3.04` makes nine cells ~7 hours
+with an unmeasured multi-GB raw-pixel ladder; `--frames 4000` gives stride 3 —
+fit 3,016 / select 1,905 / score 2,088 — for ~15 minutes. Striding keeps every
+episode and thins only within-episode density, where the redundancy is. Verify
+`frame_stride` is 3 and `rows_per_split` matches in every record, and **state in
+the results what the reduced `n` costs row B as a ceiling claim.**
 
 - [ ] **Step 3: Check every control before reading any statistic**
 
