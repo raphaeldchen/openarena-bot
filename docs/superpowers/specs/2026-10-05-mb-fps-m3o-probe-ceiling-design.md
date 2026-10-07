@@ -73,8 +73,17 @@ second, and the 2x2 would be answering an adjacent question.
 
 ### 3.2 The grid
 
-Every cell reports **both** r2 and median map-unit error, so results are
-directly comparable to M3n's 131-259 rather than living in a different unit.
+Every cell reports **both** r2 and map-unit error, so results are comparable to
+M3n's 131-259 rather than living in a different unit.
+
+**And the map-unit error is reported as BOTH a mean and a median, because M3n's
+131.88-259.06 is a MEAN.** `rollout.py:237` averages the per-window position
+error across windows at each horizon step, so a median reported beside that
+figure would be a different statistic wearing the same unit. The comparison M3o
+exists to make runs through the mean; the median is carried beside it because it
+is robust to the tail that an extrapolating readout produces, and because
+`ZERO_INFORMATION_MEDIAN` is a median. Every ratio states which statistic sits
+on each side.
 
 | feature set | linear ridge | kernel ridge (RBF) | k-NN |
 | --- | --- | --- | --- |
@@ -342,7 +351,7 @@ incomplete at that shape.
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
 | RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
-| the zero-information baseline recomputes to 283.05 median | the scale every map-unit figure is read against |
+| the zero-information baseline recomputes to 283.05 median, **and its mean is recorded beside it** | the scale every map-unit figure is read against. Two statistics because the readout errors have two; a mean error over a median baseline is not a ratio |
 
 Two are free and bitwise, of the same kind as M3n's two reductions: the
 raw-pixel row's identity across the nine cells, and `C_shipped`'s agreement with

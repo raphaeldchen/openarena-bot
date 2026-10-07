@@ -1085,9 +1085,10 @@ EOF
 
   @dataclass(frozen=True)
   class Readout:
-      name: str          # "linear" | "rbf" | "knn"
+      name: str          # "linear" | "linear_shipped" | "rbf" | "knn"
       r2: float
-      median_error: float      # map units, the unit M3n's 131.88-259.06 is in
+      mean_error: float        # map units. THE statistic M3n's 131.88-259.06 is
+      median_error: float      # map units, robust; the unit 283.05 is in
       capacity: float          # the selected ridge, bandwidth or k
       predicted: np.ndarray    # kept so a difference can be bootstrapped
 
@@ -1180,12 +1181,24 @@ class Readout:
 
     name: str
     r2: float
-    median_error: float
-    """Median Euclidean position error in MAP UNITS, over the scored rows.
+    mean_error: float
+    """MEAN Euclidean position error in map units, over the scored rows.
 
     Carried beside r2 because r2 is not the unit the decision is made in. M3n
     was unreadable because a 0.576-11.824 signal sat under a 131.88-259.06
-    readout error, and a result in r2 alone cannot be set against that."""
+    readout error, and a result in r2 alone cannot be set against that.
+
+    THE MEAN IS THE ONE THAT COMPARES TO 131.88-259.06. `rollout.py:237`
+    averages the per-window position error across windows, so that figure is a
+    mean; a median reported against it would be a different statistic in the
+    same unit."""
+    median_error: float
+    """MEDIAN of the same errors, carried beside the mean.
+
+    Robust to the tail a readout produces when it extrapolates off its support,
+    and it is the statistic `ZERO_INFORMATION_MEDIAN` is expressed in. Every
+    ratio must state which statistic is on each side: 131.88-259.06 against
+    283.05 is a mean over a median and is not one."""
     capacity: float
     predicted: np.ndarray
     """The scored-row predictions, kept so a difference between two readouts
@@ -1227,9 +1240,8 @@ def score_readout(name: str, fit, select, score) -> Readout:
     return Readout(
         name=name,
         r2=_mean_r2(predicted, score[1]),
-        median_error=float(np.median(
-            np.linalg.norm(predicted[:, :2] - score[1][:, :2], axis=1)
-        )),
+        mean_error=float(np.mean(_errors(predicted, score[1]))),
+        median_error=float(np.median(_errors(predicted, score[1]))),
         capacity=float(readout[_CAPACITY_KEY[name]]),
         predicted=predicted,
     )
@@ -1725,6 +1737,17 @@ EOF
 reads and what exit 49 fires on.** `embedding_linear` searches `CEILING_RIDGES`
 and is expected up to ~0.02 ABOVE the study's 0.320-0.345 band, so reconciling on
 it would exit 49 on a correct run. Spec §3.3.1.
+
+**`capacity` IS `inf` ON EVERY CELL WHERE NOTHING NONLINEAR HELPS, and `inf` is
+not JSON.** The RBF ladder's linear rung reports `bandwidth = inf`, which is
+exactly what wins when the representation carries no nonlinear structure — the
+`PROBE_LIMITED`-is-false case, so the common one. `json.dumps` writes it as the
+bare token `Infinity`, which no strict JSON reader accepts, and `allow_nan=False`
+raises instead. Serialise it as the string `"inf"` or as `None` with the kernel
+name carrying the meaning, and **assert in the read phase that no record
+round-trips through `json.loads(..., parse_constant=...)` with a non-finite
+capacity.** Decide once and apply it to every readout's `capacity`, not just the
+RBF's.
 
 **`null_floor` is measured at the cell's own `(n, d)`** — the `n` after the
 stride subsample and the `d` of the embedding feature set, the same shape
