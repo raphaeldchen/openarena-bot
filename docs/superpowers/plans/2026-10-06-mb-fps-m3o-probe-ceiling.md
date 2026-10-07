@@ -1731,6 +1731,9 @@ EOF
     "embedding_linear_shipped": {...},   # C_shipped, the reconciliation anchor
   },
   "shipped_grid_r2": float,      # C_shipped: the "linear_shipped" readout's r2
+  "fine_minus_shipped_on_score": float,   # C - C_shipped on the SCORE split; a
+                                 # large systematic dip means the finer grid is
+                                 # overfitting selection. Recorded, not gated.
   "null_floor": float,           # ceiling.null_floor(n, d) at THIS cell's shape
   "gains": {
     "probe":    {"point": f, "ci_low": f, "ci_high": f},
@@ -1964,7 +1967,23 @@ zero-information MEAN and `median_error` against `ZERO_INFORMATION_MEDIAN =
 283.05`, each ratio naming its statistic, and where M3n's 131.88-259.06 — a mean
 — is compared only to `mean_error`.
 
-`measure_cell` then builds the three splits by **episode** from `episode_split`, subsamples to `FRAME_BUDGET` by a fixed stride recorded as `frame_stride`, scores the seven readouts through `ceiling.score_readout`, forms the three gains through `ceiling.difference_interval` at `cell_bootstrap_seed(...)`, and records the four controls. The raw-pixel readouts use no model, so compute them once and reuse across cells — assert they are identical across the nine records in the read phase, which is the free bitwise control.
+**THE FIT SPLIT IS THE STUDY'S 20 TRAINING EPISODES.** Dividing the 24
+validation episodes three ways starves the fit and `C_shipped` reads -0.026 to
+0.166 against the 0.3195-0.3451 band, so exit 49 fires on all nine cells of a
+correct run. Criterion 4 fits on TRAINING episodes —
+`study.py` calls `filtering_report(model, train_paths, val_paths, ...)` — and fit
+there the same rows read 0.300 to 0.342, worst gap 0.035. Fit on the 20 training
+episodes strided to the frame budget; select on 12 validation episodes; score on
+the other 12. Spec §3.4. `prepare_shared` already receives the training paths.
+
+**THE RECONCILIATION FIELD IS `filtering.criterion_4.embedding_r2`, NOT
+`probe.embedding_selection_r2`.** The band 0.3195-0.3451 is the former; the
+latter spans 0.0180 to 0.3829 over the same nine cells, a factor of 21, and is a
+different quantity. Gate `harness_r2_matches_study` on
+`study_embedding_r2` (the criterion-4 field) and record
+`study_embedding_selection_r2` beside it, ungated. Spec §2.
+
+`measure_cell` then builds the remaining splits by **episode** from `episode_split`, subsamples to `FRAME_BUDGET` by a fixed stride recorded as `frame_stride`, scores the seven readouts through `ceiling.score_readout`, forms the three gains through `ceiling.difference_interval` at `cell_bootstrap_seed(...)`, and records the four controls. The raw-pixel readouts use no model, so compute them once and reuse across cells — assert they are identical across the nine records in the read phase, which is the free bitwise control.
 
 `read_phase` loads every record, refuses on a protocol disagreement, checks `controls.harness_r2_matches_study` and exits 49 if any cell fails, builds `CeilingInputs`, calls `reading_ceiling`, writes `format_reading_ceiling`'s text to stdout **and** `<out>/ceiling.txt`, and exits `READ_EXITS.get(reading.verdict, 0)`. **Print `reading.rule`, not only `reading.verdict`.**
 

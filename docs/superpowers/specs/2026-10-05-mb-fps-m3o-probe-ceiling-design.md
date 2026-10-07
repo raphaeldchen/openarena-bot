@@ -36,9 +36,17 @@ difference between representations.
 This codebase has **two** probes, and conflating them is the first way M3o can
 go wrong.
 
-- **The criterion-4 probe** is fit on REAL encoder embeddings at frame `t` and
-  reports `embedding_selection_r2`, measured at **0.320 to 0.345** across the
-  nine cells.
+- **The criterion-4 probe** is fit on REAL encoder embeddings at frame `t`,
+  **fit on the 20 TRAINING episodes and scored on validation**
+  (`study.py` calls `filtering_report(model, train_paths, val_paths, ...)`). It
+  reports **`filtering.criterion_4.embedding_r2`**, measured at **0.3195 to
+  0.3451** across the nine cells of `runs/m3_study_v2`.
+
+  **NOT `probe.embedding_selection_r2`**, which an earlier revision of this very
+  section named — the conflation this section exists to prevent, made inside it.
+  That field spans **0.0180 to 0.3829** over the same nine cells, a factor of 21,
+  and is a different quantity. Every reconciliation in M3o reads
+  `filtering.criterion_4.embedding_r2`.
 - **The rollout probe** is the one `evaluate_rollout` takes. It is fit on the
   model's OWN PREDICTED embeddings (`rollout.py:195`), because all three
   rollout references pass through the same embedding head, and fitting on real
@@ -47,8 +55,8 @@ go wrong.
 **The r2 of the second probe, on the distribution it is actually applied to,
 is recorded nowhere.** What is recorded is its error in map units: the floor at
 h=1 spans **131.88 to 259.06** across the nine cells — nearly 2x — against a
-`embedding_selection_r2` that spans 8%. Something differs between the two
-distributions, and no milestone has named it.
+`criterion_4.embedding_r2` that spans 8% (0.3195 to 0.3451). Something differs
+between the two distributions, and no milestone has named it.
 
 For scale: a readout with ZERO information, predicting the training mean,
 scores **292.82 mean / 283.05 median** map units on the validation set (12,073
@@ -201,6 +209,34 @@ Three splits — fit / select / score — as `probe.gain_from_blocks` already
 enforces. Capacity is selected on a split that is neither the fit nor the score
 split, or a high-capacity probe selects itself in. That is exactly the confound
 that makes a nonlinear probe untrustworthy as evidence.
+
+**THE FIT SPLIT IS THE STUDY'S 20 TRAINING EPISODES, NOT A THIRD OF VALIDATION.**
+An earlier revision divided the 24 validation episodes three ways. That starves
+the fit: criterion 4 fits on the 20 TRAINING episodes, so an 8-episode
+validation fit is both a smaller and a different sample, and `C_shipped` then
+reads **-0.026 to 0.166** against the 0.3195-0.3451 band it is supposed to
+reconcile with — a gap of 0.17 to 0.35 in every one of the nine cells. Exit 49
+would have fired on all nine of a correct run and M3o would have returned no
+verdict at all.
+
+Measured: fit on the study's own 20 training episodes, the same rows and targets
+read **0.300 to 0.342**, worst gap 0.035 against the band. So the split is:
+
+| split | episodes | role |
+| --- | --- | --- |
+| fit | the 20 TRAINING episodes, strided to the frame budget | where the weights come from |
+| select | 12 validation episodes | where ridge, bandwidth and k are chosen |
+| score | the other 12 validation episodes | where every reported number is read |
+
+Selection and scoring stay entirely within validation and share no episode, so
+the three-split discipline is unchanged — it is only the fit set that moves, to
+the one criterion 4 actually uses. Validation splits in halves rather than
+thirds, so the intervals are drawn on 12 episodes instead of 8.
+
+The effective sample size here is the EPISODE count, not the frame count: this
+project measured a 1.26x-2.17x clustering penalty for treating adjacent Doom
+frames as independent, and 8 episodes of near-duplicates is a far smaller sample
+than its ~4,000 rows suggest.
 
 **Episodes, never frames.** Adjacent Doom frames are near-duplicates, and this
 project has a measured 1.26x-2.17x penalty for pretending otherwise
@@ -373,7 +409,8 @@ incomplete at that shape.
 | --- | --- |
 | dual equals primal at every rung of `RIDGES` | the prerequisite changed no arithmetic |
 | `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear. ~0 once both sides share `CEILING_RIDGES`; it was +0.012 to +0.020 on the shipped grid, so this is what keeps that fix honest per cell |
-| `C_shipped` reproduces the shipped `embedding_selection_r2` (0.320-0.345) | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1) |
+| `C_shipped` reproduces the shipped `filtering.criterion_4.embedding_r2` (0.3195-0.3451), within 0.10 | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1). The tolerance is set against a measured worst gap of 0.035 once the fit split is the study's training episodes (§3.4) |
+| `C >= C_shipped` on the SELECTION split, exactly | containment: `CEILING_RIDGES` contains `RIDGES`. On the SCORE split it may dip by selection noise, but a large systematic dip means the finer grid is overfitting selection, so the score-split difference is recorded per cell |
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
 | RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
