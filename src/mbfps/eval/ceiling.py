@@ -619,12 +619,14 @@ def _check_interval(where: str, interval: dict) -> None:
 
     `nan > 0.0` is False, so a NaN lower bound would read as `does not resolve`
     and count toward OBSERVATION_LIMITED: a missing measurement answering as the
-    most consequential of the three verdicts. The point is not required to sit
+    verdict that says no readout can do better. The point is not required to sit
     inside the interval, since a percentile interval need not contain it.
     """
     for key in _INTERVAL_KEYS:
         if not math.isfinite(interval[key]):
-            raise ValueError(f"{where}[{key!r}] is {interval[key]}; an interval needs finite figures")
+            raise ValueError(
+                f"{where}[{key!r}] is {interval[key]}; an interval needs finite figures"
+            )
     if interval["ci_low"] > interval["ci_high"]:
         raise ValueError(
             f"{where} has ci_low {interval['ci_low']} above ci_high {interval['ci_high']}"
@@ -668,8 +670,14 @@ def probe_gain_over_floor(
 
     THE FLOOR IS ONE SYNTHETIC DRAW PER CELL and is subtracted as a constant, so
     its own sampling noise is not in the interval. Over six draws it ranged
-    -0.0005 to +0.0000 at D=1024, against intervals orders of magnitude wider; it
-    is a point estimate all the same, and the record keeps it beside the gain.
+    -0.0005 to +0.0000 at D=1024 (`CEILING_RIDGES`); how that compares with the
+    real intervals' widths is not yet measured. It is a point estimate, and the
+    record keeps it beside the gain.
+
+    `score_targets` must be the exact targets both readouts were scored on, and
+    `groups` the episode label of each of those rows: `difference_interval`
+    refuses a readout whose stored `r2` is not what its predictions score against
+    them.
     """
     if d.name != "rbf":
         raise ValueError(f"D must be the 'rbf' readout; got {d.name!r}")
@@ -713,9 +721,12 @@ class CeilingCell:
 
         `probe_gain` here is already `D - C - floor`: the cell's own measured
         floor is subtracted before the interval is read, so `_resolvable` still
-        asks whether the whole interval is above zero. A decade ridge grid alone
-        buys +0.012 to +0.020 on a purely linear task, which would otherwise fire
-        this verdict for a reason that has nothing to do with nonlinear structure.
+        asks whether the whole interval is above zero. The floor is what keeps
+        this verdict from firing for a reason that has nothing to do with
+        nonlinear structure: with both sides on the shipped 100x ridge grid the
+        ladder beat the linear reference by +0.011 (D=1024) and +0.020 (D=2048)
+        on a purely linear task, and on `CEILING_RIDGES` it reads -0.0001 and
+        -0.0000. It is measured per cell because shapes not measured may differ.
 
         If the linear family was the limit, that is the finding regardless of
         the pixel comparison, because that comparison was made with the weaker

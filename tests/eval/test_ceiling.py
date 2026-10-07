@@ -1563,8 +1563,8 @@ def test_a_lower_bound_of_exactly_zero_does_not_resolve_and_one_above_it_does():
 ], ids=["nan-point", "nan-low", "nan-high", "inf-high", "inverted"])
 def test_a_cell_whose_interval_is_not_one_cannot_be_built(field, bad):
     """`nan > 0.0` is False, so a NaN lower bound read as `no difference` and
-    counted toward OBSERVATION_LIMITED: the most severe of the three verdicts,
-    reached by a missing measurement. The cell refuses it, by field name.
+    counted toward OBSERVATION_LIMITED, the verdict that says no readout can do
+    better, reached by a missing measurement. The cell refuses it, by field name.
 
     Reached: the validation removed.
     """
@@ -1791,16 +1791,27 @@ def test_the_formatter_aligns_and_names_the_sequence_rider_separately():
     built nine identical cells and checked lengths, so a column under the wrong
     heading, a row for the wrong cell and a rider counted from the wrong gain
     all passed it. Reached: probe and pixel columns exchanged, the rider counted
-    from `probe_gain`, the rider's bar loosened to `>= 0.0`, and `sorted(...)`
-    removed (the cells arrive reversed).
+    from `probe_gain` or from `pixel_gain`, the rider's bar loosened to `>= 0.0`,
+    `sorted(...)` removed (the cells arrive reversed), a figure printed at three
+    decimals, and a column narrowed until it fills its width.
     """
     inputs = _distinct_nine(reverse=True)
+    resolved = [
+        sum(getattr(c, gain)["ci_low"] > 0.0 for c in inputs.cells.values())
+        for gain in ("probe_gain", "pixel_gain", "sequence_gain")
+    ]
+    assert resolved == [6, 2, 4], "fixture: the three gains resolve in different numbers of cells"
+    assert inputs.cells[("frozen_ssl", 1)].sequence_gain["ci_low"] == 0.0
     text = format_reading_ceiling(reading_ceiling(inputs), inputs)
     header, body = _table(text)
 
     assert len(header) == sum(READING_WIDTHS)
     assert _fields(header) == READING_COLUMNS
     assert len(body) == 9 and all(len(ln) == len(header) for ln in body)
+    # a column that fills its width runs into the next one: every field but the
+    # last ends in at least one space of its own
+    edges = [sum(READING_WIDTHS[:i]) - 1 for i in range(1, len(READING_WIDTHS))]
+    assert all(ln[edge] == " " for ln in [header, *body] for edge in edges)
     assert [ln.split()[0] for ln in body] == [
         f"{arm}_seed{seed}" for arm, seed in _layout(3, 3, 3)
     ]
