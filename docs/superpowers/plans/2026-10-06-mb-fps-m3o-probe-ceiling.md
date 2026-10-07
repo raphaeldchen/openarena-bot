@@ -16,6 +16,7 @@
 - Commit trailer is the literal `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` in its own paragraph, on every commit, regardless of which model writes it.
 - **Never** `git stash` — the stash stack is shared across worktrees and other sessions use it. Use a temporary WIP commit instead.
 - **Never** `rm` anything under `runs/`. It is a symlink to a directory outside every worktree, shared by all of them. `runs/m3n_motion/` (9 records) and `runs/m3m_burden*/` (18) must survive this milestone untouched.
+- **`data/` IS ALSO A SYMLINK OUT OF THE WORKTREE**, to the main checkout's `data/` — 122 episodes of `my_way_home` (98 training, 24 validation), shared by every worktree and every session. Read it; never write, move or delete anything under it. The same rule as `runs/`, and the plan previously named only `runs/`.
 - **Never** `git clean -fdx` — it destroys the session ledger at `.superpowers/sdd/`.
 - After mutating a source file to check a test bites, clear `__pycache__` under `src/`, `tests/` and `scripts/` before re-running.
 - **When you pipe pytest through `tail` or `head`, the pipeline's exit code is the pager's, not pytest's.** Always read the `N passed` / `N failed` summary line yourself. This milestone's predecessor lost a review cycle to a run that reported exit 0 over `1 failed, 474 passed`.
