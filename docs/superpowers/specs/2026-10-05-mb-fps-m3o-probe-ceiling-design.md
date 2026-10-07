@@ -69,15 +69,27 @@ get compared.
 
 ### 3.1 The instrument's quality on the applied distribution (first)
 
-Per cell: the r2 and the median map-unit error of the shipped rollout probe
-where `evaluate_rollout` actually uses it — on predicted embeddings — against
-the 283.05 zero-information baseline.
+Per cell, the shipped rollout probe's r2 and map-unit error on **both
+distributions it is read on**, because they are not the same and M3n's figure
+belongs to only one of them:
 
-**This is measured FIRST and the rest is read in its light.** The 2x2 below is
-measured on real encoder embeddings at frame `t`; the number that swamped M3n
-is the error on predicted embeddings over an imagined rollout. If those differ
-substantially, a better probe on the first distribution says little about the
-second, and the 2x2 would be answering an adjacent question.
+| distribution | what it is | what it compares to |
+| --- | --- | --- |
+| **real-latent** | `model.heads(real["latent"])["embedding"]` — the embedding head on the posterior from the TRUE frame (`rollout.py:161`) | **M3n's 131.88-259.06**, which is `floor_position` at h=1, i.e. this (`rollout.py:218`) |
+| **predicted** | the model's own imagined embeddings, which is where `evaluate_rollout` applies the probe (`rollout.py:195`) | nothing earlier; its r2 is recorded nowhere |
+
+**This is measured FIRST and the rest is read in its light.** An earlier
+revision recorded only the predicted distribution and set it against
+131.88-259.06. That is a category error: 131.88-259.06 is the FLOOR — the
+probe's error given perfect dynamics — so it belongs to the real-latent
+distribution, and the predicted one has no prior figure at all.
+
+The distinction decides what the 2x2 licenses. The 2x2 is measured on real
+encoder embeddings at frame `t`. If the real-latent and predicted errors differ
+substantially, a better readout on the first says little about the second, and
+the 2x2 is answering an adjacent question — which is exactly what §3.1 is
+measured first to find out. Report map-unit error as a **mean** against
+131.88-259.06, which is a mean, and the median beside it.
 
 ### 3.2 The grid
 
@@ -412,7 +424,7 @@ incomplete at that shape.
 | `C_shipped` reproduces the shipped `filtering.criterion_4.embedding_r2` (0.3195-0.3451), within 0.10 | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1). The tolerance is set against a measured worst gap of 0.035 once the fit split is the study's training episodes (§3.4) |
 | `C >= C_shipped` on the SELECTION split, exactly | containment: `CEILING_RIDGES` contains `RIDGES`. On the SCORE split it may dip by selection noise, but a large systematic dip means the finer grid is overfitting selection, so the score-split difference is recorded per cell |
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
-| RBF and k-NN at their most-regularised ladder end approach the linear result | the kernel nests the linear probe, as claimed |
+| RBF at its widest bandwidth against linear, recorded and NOT gated | the ASYMPTOTIC nesting claim, which §3.3 measured to be FALSE in practice — an RBF is linear only to first order and its widest rung is capped far below the ridge the linear probe selects. Expected negative on good cells. Nesting is structural instead: the linear kernel is a RUNG, and that is pinned by test, not by this control |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
 | the zero-information baseline recomputes to 283.05 median, **and its mean is recorded beside it** | the scale every map-unit figure is read against. Two statistics because the readout errors have two; a mean error over a median baseline is not a ratio |
 
