@@ -5,16 +5,40 @@ under readout errors of 131.88-259.06. `mbfps.eval.ceiling` is the pure half: th
 estimators, the ridge grid, the scoring layer, the reading and its table. This
 script is the impure half: the rows, the checkpoints, the records.
 
-THE ROWS ARE FRAMES, AND ARE MODEL-FREE. The 24 validation episodes are divided
-three ways BY EPISODE (`episode_split` twice, at `SPLIT_SEED`: 8 / 8 / 8 on the
-shipped split) into fit / select / score. A row is a frame `t` of one episode with
-`SEQUENCE_FRAMES - 1` frames of real history behind it, so the first
-`SEQUENCE_FRAMES - 1` frames of every episode are not rows. One stride, recorded as
-`frame_stride`, is chosen so that no split exceeds the budget (`ceiling.FRAME_BUDGET`
-or `--frames`); the rows each split actually holds are recorded beside it as
-`rows_per_split`, because the budget does NOT bind at the shipped split (n is about
-4,000 per split, against a cap of 12,000) and a change that lets it bind turns a
-17-minute run into a 7.7-hour one without any other symptom.
+THE ROWS ARE FRAMES, AND ARE MODEL-FREE. Three splits, BY EPISODE, and the fit split is
+NOT drawn from validation (spec section 3.4):
+
+  fit     the study's 20 TRAINING episodes (`probe.probe_episodes(train)[0]`): the set
+          gate criterion 4 fits its probe on (`study.py` calls
+          `filtering_report(model, train_paths, val_paths, ...)`)
+  select  12 of the 24 validation episodes: where ridge, bandwidth and k are chosen
+  score   the other 12: where every reported number is read
+
+`episode_split` at `SPLIT_SEED` halves the validation set (12 / 12 on the shipped
+split), so selection and scoring share no episode and the three-split discipline is
+unchanged; only the fit set moved, to the one criterion 4 uses. An earlier revision
+divided the 24 validation episodes three ways (8 / 8 / 8). Eight episodes of near-
+duplicate frames cannot pin 2,048 features: `C_shipped` read -0.026 to +0.166 against the
+study's 0.3195-0.3451 in all nine cells, so exit 49 would have fired on a correct run.
+
+A row is a frame `t` of one episode with `SEQUENCE_FRAMES - 1` frames of real history
+behind it, so the first `SEQUENCE_FRAMES - 1` frames of every episode are not rows. One
+stride, recorded as `frame_stride`, is the smallest that brings every split within the
+budget (`ceiling.FRAME_BUDGET` or `--frames`); the rows each split actually holds are
+recorded beside it as `rows_per_split`. ON THE SHIPPED SPLIT THE BUDGET DOES NOT BIND:
+fit holds 9,044 rows, select 5,713 and score 6,264, against a cap of 12,000, so the stride
+is 1.
+
+THE COST MOVED WITH THE FIT SPLIT. It is about 2.3 times the 8-episode one, and a kernel
+ladder is dominated by one eigendecomposition per rung, cubic in the fit rows. MEASURED, on
+random data of the real shape (9,044 fit rows, 6,000 select rows, 2,048 columns): one
+`fit_kernel_probe` took 513 s, with a second job running for part of it. A cell fits
+several (the embedding, the sequence, the widest rung, and three draws of the null floor at
+the fit split's own `n`), so a cell is of the order of three-quarters of an hour and the
+nine of the order of seven hours at stride 1; that is an extrapolation, not a measurement.
+`--frames 4000` (stride 3, a third of the rows in each split, so about a 27th of the
+eigendecomposition cost) is how a cell is brought back down, and the stride is what the
+record states.
 
 THREE FEATURE SETS, ONE ROW SET. `pixels` is the raw frame, 112 x 112 x 3 = 37,632
 values, from `episode.obs`. `embedding` is the model's ENCODER output for that frame
@@ -39,27 +63,48 @@ a free control that no model leaked into a model-free row.
 PER CELL, THE RECORD CARRIES (every constant it was taken at is stored, so none is a
 literal that survives the tests):
 
-  applied      the shipped rollout probe's r2 and map-unit errors on the
-               distribution `evaluate_rollout` applies it to: its own output at
-               each imagined step (`diagnostics.reference_trajectories`'
-               `positions`) against the truth (`true_positions`). Spec section 3.1.
-               `mean_error` is carried beside the brief's `median_error` because
-               M3n's 131.88-259.06 is a MEAN.
+  applied      the shipped rollout probe's r2 and map-unit errors on BOTH distributions it is
+               read on (spec section 3.1), because they are not the same and M3n's figure
+               belongs to only one of them:
+                 real_latent  the embedding head on the posterior from the TRUE frame
+                              (`diagnostics.reference_trajectories`' `positions_real`,
+                              `rollout.py:161`). THE FLOOR: the probe's error given perfect
+                              dynamics. M3n's 131.88-259.06 is `floor_position[0]`, this
+                              distribution at h=1 (`rollout.py:218`), and a MEAN, so it is
+                              comparable to `mean_error_h1` ONLY.
+                 predicted    the model's own imagined embeddings (`positions`), where
+                              `evaluate_rollout` applies the probe (`rollout.py:195`). It
+                              has NO prior figure: nothing earlier recorded its r2 or its
+                              error, and M3n's 131.88-259.06 is not one.
+               Each carries r2, mean_error, median_error (pooled over every window and
+               horizon step) and `mean_error_h1` (the mean over windows at the first
+               imagined step, the statistic M3n's figure is), and names what it compares
+               to in `compares_to`. An earlier revision recorded only `predicted` and set
+               it against 131.88-259.06, a category error.
   readouts     eight `Readout`s, each as r2, mean_error, median_error, capacity and
                jitter. The eighth, `embedding_linear_shipped`, is `fit_probe` over
                `probe.RIDGES`: the reconciliation anchor.
   shipped_grid_r2   that eighth readout's r2. Exit 49 and `harness_r2_matches_study`
                read THIS and never `embedding_linear`, whose finer grid is expected
                up to ~0.02 above the shipped one.
+  fine_minus_shipped_on_score   `C - C_shipped` on the SCORE split, recorded and never
+               gated. On the SELECTION split `C >= C_shipped` is exact (`CEILING_RIDGES`
+               contains `RIDGES`); on the score split it may dip by selection noise, but
+               a large SYSTEMATIC dip means the finer grid is overfitting selection
+               rather than resolving a ridge, which is a finding about the instrument.
+               Printed beside the other ungated controls by the read phase.
   null_floor   `ceiling.null_floor(n, d)` at THIS cell's shape: n the fit split's
                rows, d the embedding width. UNCLAMPED (the clamp is
                `probe_gain_over_floor`'s, taken once, after the mean).
   gains        `D - C - max(null_floor, 0)` through `probe_gain_over_floor`,
                `B - D` and `F - B` through `difference_interval`, each as
                (point, ci_low, ci_high), drawn at `cell_bootstrap_seed(...)`.
-  controls     four numbers with known answers, MEASURED and never asserted: the
-               harness against the study, the widest RBF rung against linear, and
-               the zero-information baseline recomputed on the shipped definition.
+  controls     numbers with known answers, MEASURED and never asserted: the harness
+               against the study (`harness_r2_matches_study`, gated by the read phase, and
+               the study's two numbers beside it), the widest RBF rung against linear
+               (`nesting_rbf_at_widest_vs_linear`, recorded and NOT gated: see
+               `widest_rbf_r2`), and the zero-information baseline recomputed on the
+               shipped definition.
 
 `capacity` IS `inf` ON EVERY CELL WHERE NOTHING NONLINEAR HELPS, and `inf` is not
 JSON. The kernel ladder's linear rung has `bandwidth = inf`; `json.dumps` writes the
@@ -69,14 +114,15 @@ null it and file it under `nonfinite`. It is written as the STRING `"inf"`, befo
 read phase refuses a record with a bare `Infinity` or `NaN` anywhere in its text, and
 a capacity that is neither a finite number nor exactly `"inf"`.
 
-THE STUDY NUMBER THE HARNESS IS RECONCILED AGAINST IS NOT `probe.embedding_selection_r2`.
-The spec's 0.320-0.345 is `filtering.criterion_4.embedding_r2`, the probe on REAL
-ENCODER embeddings (0.3195-0.3451 across the nine M3c records). The field the spec
-and the brief name, `probe.embedding_selection_r2`, belongs to the ROLLOUT probe, fit
-on the model's PREDICTED embeddings, and spans 0.018-0.383 across the same nine cells
-(pixel_ae seed 1 reads 0.018). Gating `C_shipped` against that would exit 49 on a
-correct run. Both are recorded (`study_embedding_r2`, gated; `study_embedding_selection_r2`,
-not), and `HARNESS_R2_TOLERANCE` says how far apart they may sit.
+THE STUDY NUMBER THE HARNESS IS RECONCILED AGAINST is `filtering.criterion_4.embedding_r2`
+(0.3195-0.3451 across the nine M3c records): the probe on REAL ENCODER embeddings, fit on
+the 20 training episodes and scored on validation. It is NOT `probe.embedding_selection_r2`,
+which belongs to the ROLLOUT probe, is fit on the model's PREDICTED embeddings, and spans
+0.0180-0.3829 over the same nine cells (a factor of 21; pixel_ae seed 1 reads 0.018): a
+different quantity. Gating `C_shipped` on it would exit 49 on a correct run. Both are
+recorded (`controls.study_embedding_r2`, GATED; `controls.study_embedding_selection_r2`,
+beside it and never gated), and `HARNESS_R2_TOLERANCE` says how far apart `C_shipped` and
+the first may sit.
 
 NOTHING IN THE MEASURE PHASE DECIDES ANYTHING. A control that missed its known answer
 is recorded and named in the cell's printed line, and the run carries on: the records
@@ -106,8 +152,11 @@ left.
 MAP UNITS ARE COMPARED HERE, and nowhere in `ceiling.py`. The reading is in r2; the
 section this script appends to it sets each readout's `mean_error` against the
 zero-information MEAN and its `median_error` against `ZERO_INFORMATION_MEDIAN`, each
-ratio naming its statistic, and sets M3n's 131.88-259.06 -- a mean -- only against
-`mean_error`.
+ratio naming its statistic, and sets M3n's 131.88-259.06 -- a mean -- only against a
+`mean_error`: of the two `applied` distributions, against the real-latent one's
+`mean_error_h1`, which is the same statistic on the same distribution. A third section
+prints the controls that are recorded but not gated (`C - C_shipped` on the score split,
+the widest RBF rung against linear), so that a number recorded for a reason is also seen.
 
 EXIT NUMBERS. 49 and 50 are returned by the read phase and in no other tool's range
 (47/48 M3n, 45/46 M3m, 43/44 M3l, 41/42 M3k, 39/40 M3j, 38 M3i, run_study 1/3-6/23,
@@ -141,7 +190,7 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval import ceiling
 from mbfps.eval.aggregate import SEEDS
 from mbfps.eval.diagnostics import reference_trajectories
-from mbfps.eval.probe import _mean_r2, position_error, probe_targets
+from mbfps.eval.probe import _mean_r2, position_error, probe_episodes, probe_targets
 from mbfps.eval.rollout import source_for
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.utils.config import ARMS
@@ -191,24 +240,39 @@ nine cells."""
 
 SEQUENCE_FRAMES: int = 5
 """Frames in the sequence window, `t - SEQUENCE_FRAMES + 1 .. t`: the rollout's own
-context length. STATED, not derived; stored in every record as `sequence_frames`."""
+context length (`evaluate_rollout`'s `context=5`), the history the shipped probe is ever
+handed. STATED, not derived; the spec writes `t-k..t` and names no `k`. Stored in every
+record as `sequence_frames`.
+
+THE WINDOW IS OF ENCODER EMBEDDINGS, not of raw frames (188,160 values a row), because the
+sequence readouts are per MODEL (spec section 5). So `F - B` sets a window of embeddings
+against ONE raw frame, and a representation that discards position can hide a history gain
+inside it: read it as 'does history through THIS encoder beat the raw frame', not as 'does
+history help'. Reasoning kept here, with the choice, so it is not a separate document."""
 
 HARNESS_R2_TOLERANCE: float = 0.10
-"""How far `shipped_grid_r2` may sit from the study's `embedding_r2` before the harness is
-said to measure something else.
+"""How far `shipped_grid_r2` may sit from the study's `criterion_4.embedding_r2` before the
+harness is said to measure something else.
 
-NOT A DERIVED QUANTITY, and the two numbers are not the same measurement: the study's is
-fit on 20 TRAINING episodes (about 10,000 rows) and selected on the rows it is scored on;
-M3o's is fit, selected and scored on three disjoint thirds of the 24 VALIDATION episodes,
-8 episodes and about 4,000 rows each. The nine study values span 0.3195-0.3451.
+JUSTIFIED BY MEASUREMENT, not a stated guess. A ONE-OFF CHECK OUTSIDE THE STUDY, on the nine
+real checkpoints (this module's own `build_splits` and `encode_rows`, the two LINEAR readouts
+only, no record written):
 
-MEASURED, BY A ONE-OFF CHECK OUTSIDE THE STUDY (the nine cells' encoder rows through this
-module's own `build_splits` and `encode_rows`, the two linear readouts only, no record
-written): under the 8 / 8 / 8 split `C_shipped` reads -0.026 to +0.166, a gap of 0.17-0.35 to
-the study in every one of the nine cells, so this tolerance refuses all nine; fit on the
-study's own 20 training episodes instead, the same rows and targets read 0.300-0.342 against
-0.320-0.345 (worst gap 0.035). The plumbing reproduces the study; the 8-episode fit does not,
-and no tolerance that catches a broken harness also admits it."""
+  * FIT ON THE STUDY'S 20 TRAINING EPISODES (this script's split, 12 / 12 validation halves):
+    `C_shipped` reads 0.292-0.313 against the study's 0.3195-0.3451, worst gap 0.0398
+    (frozen_ssl seed 2), best 0.0248. An earlier run of the same rows scored on 8-episode
+    thirds read 0.300-0.342 and a worst gap of 0.035. So 0.10 is 2.5 times the worst gap the
+    correct pipeline shows.
+  * FIT ON 8 VALIDATION EPISODES (the revision this replaced): -0.026 to +0.166, a gap of
+    0.17 to 0.35 in every cell. A tolerance that admits that admits a broken harness, and
+    0.10 refuses all nine.
+
+THE GAP IS ONE-SIGNED, and expected to be: the study's number is optimistically biased (its
+ridge is selected on the very rows it is scored on, a maximum over `RIDGES` on the scored
+split; `probe.filtering_comparison` says so), scored on all 24 validation episodes, while
+`C_shipped` selects on `select` and scores on `score`. The study sat above `C_shipped` in
+nine of nine cells. The two are not the same measurement, which is why this is a tolerance
+and not an equality; tightening it toward 0.04 would fire on a correct run."""
 
 M3N_FLOOR_ERROR_MEAN: tuple[float, float] = (131.88, 259.06)
 """The shipped rollout probe's FLOOR error at h=1 across M3n's nine cells,
@@ -268,28 +332,18 @@ def cell_bootstrap_seed(base_seed: int, arm: str, seed: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _share(total: int, take: int) -> float:
-    """A `val_fraction` for which `episode_split` holds out exactly `take` of `total`.
+def validation_halves(val_paths, *, seed: int) -> dict[str, list]:
+    """The validation episodes as `{"select", "score"}`, by episode: one `episode_split`
+    at the study's `SPLIT_SEED` holding out half as the score split (24 -> 12 / 12;
+    `episode_split` rounds the held-out share down, so an odd count's extra episode is
+    `select`'s).
 
-    `episode_split` truncates `int(total * val_fraction)`, so `1/3` of 24 is a float
-    that lands on 8.0 only by a rounding tie. Aiming at the middle of the integer
-    cannot miss."""
-    return (take + 0.5) / total
-
-
-def three_way(val_paths, *, seed: int) -> dict[str, list]:
-    """The validation episodes as `{"fit", "select", "score"}`, by episode.
-
-    `episode_split` twice at the study's `SPLIT_SEED`: a third held out as the score
-    split, the rest halved into fit and select (24 -> 8 / 8 / 8). A pure function of
-    the episode NAMES, so it is the same for every cell and every run. Episodes, never
-    frames: adjacent Doom frames are near-duplicates."""
-    paths = list(val_paths)
-    n_score = len(paths) // 3
-    n_select = (len(paths) - n_score) // 2
-    rest, score = episode_split(paths, val_fraction=_share(len(paths), n_score), seed=seed)
-    fit, select = episode_split(rest, val_fraction=_share(len(rest), n_select), seed=seed)
-    return {"fit": fit, "select": select, "score": score}
+    The fit split is NOT here: it is the study's training episodes (`build_splits`), and
+    this halves only what is left to select and score on, which share no episode. A pure
+    function of the episode NAMES, so it is the same for every cell and every run.
+    Episodes, never frames: adjacent Doom frames are near-duplicates."""
+    select, score = episode_split(list(val_paths), val_fraction=0.5, seed=seed)
+    return {"select": select, "score": score}
 
 
 def _all_targets(path: Path) -> np.ndarray:
@@ -336,21 +390,42 @@ def _split_rows(paths, targets: dict, stride: int) -> SplitRows:
     )
 
 
-def build_splits(val_paths, *, budget: int) -> tuple[int, dict[str, SplitRows]]:
+def build_splits(train_paths, val_paths, *, budget: int) -> tuple[int, dict[str, SplitRows]]:
     """`(stride, {"fit", "select", "score"} -> SplitRows)`.
 
-    The stride is the smallest that brings the LARGEST split within `budget` rows, so
-    every split is subsampled by the one stride and `frame_stride` is one number.
-    At the shipped split the largest split holds ~4,000 rows and the stride is 1."""
+    `fit` is the study's 20 TRAINING episodes, `probe_episodes(train_paths)[0]`: the
+    set criterion 4 fits on, so that `C_shipped` reproduces it. `select` and `score` are
+    the halves of the validation episodes (`validation_halves`) and share no episode.
+
+    The stride is the smallest that brings EVERY split within `budget` rows, counted as the
+    rows actually kept: an episode of `m` rows keeps `ceil(m / stride)` of them, so the
+    count is not `m_total / stride` and a stride taken from that quotient leaves a split up
+    to one row per episode over the budget. Every split is subsampled by the one stride, so
+    `frame_stride` is one number. On the shipped split the largest is the fit split, 9,044
+    rows, and the stride is 1. A budget below the number of episodes in a split cannot be
+    met by any stride (each episode keeps at least one row) and is refused."""
     if budget < 1:
         raise SystemExit(f"a frame budget of {budget} holds no frame")
-    by_split = three_way(val_paths, seed=SPLIT_SEED)
+    fit, _ = probe_episodes(train_paths)
+    by_split = {"fit": fit, **validation_halves(val_paths, seed=SPLIT_SEED)}
     targets = {path: _all_targets(path) for paths in by_split.values() for path in paths}
     first = SEQUENCE_FRAMES - 1
-    largest = max(
-        sum(max(0, len(targets[p]) - first) for p in paths) for paths in by_split.values()
-    )
-    stride = max(1, -(-largest // budget))
+    lengths = {
+        name: [max(0, len(targets[p]) - first) for p in paths] for name, paths in by_split.items()
+    }
+    longest = max(m for ms in lengths.values() for m in ms)
+
+    def kept(stride: int) -> int:
+        return max(sum(-(-m // stride) for m in ms if m) for ms in lengths.values())
+
+    stride = 1
+    while kept(stride) > budget:
+        if stride >= longest:
+            raise SystemExit(
+                f"a frame budget of {budget} cannot hold one row of each episode of the "
+                f"largest split ({kept(stride)} episodes with rows)"
+            )
+        stride += 1
     return stride, {name: _split_rows(paths, targets, stride) for name, paths in by_split.items()}
 
 
@@ -398,8 +473,26 @@ class Shared:
     splits: dict
     pixel_readouts: dict
     zero_information: dict
-    """`{"mean", "median"}` on the SPEC's definition: the TRAINING mean position,
-    against every validation frame. Not this run's fit split against its score split."""
+    """`{"mean", "median"}` on the SPEC's definition: the TRAINING mean position (every frame
+    of ALL the training episodes), against every validation frame. Not this run's fit split
+    against its score split.
+
+    RE-CHECKED UNDER THE NEW SPLIT, and it does NOT land on the spec's 292.82 mean / 283.05
+    median. Measured on the real data (12,073 validation frames, 24 episodes), as
+    mean / median:
+      all 98 training episodes (this definition)         291.36 / 275.02
+      the 20 fit episodes only                           295.48 / 284.78
+      the leading 24 training episodes (`train[:24]`)    292.82 / 283.05  <- the spec's figures
+    The first two are what a defensible definition of "the training mean" gives; only the
+    third reproduces the spec to two decimals, and nothing in the study or the harness takes
+    24 training episodes (criterion 4's probe and the rollout probe both take 20,
+    `probe.PROBE_EPISODE_LIMIT`). The cause is not arithmetic but the constant: a map-wide
+    constant predictor's error moves several units with where its constant sits, and the
+    training mean position is (598.8, -144.9) over 98 episodes and (618.3, -155.5) over the
+    20. So the spec's 283.05 is a figure of ITS definition, `ZERO_INFORMATION_MEDIAN` pins it
+    as such, and this control is recorded beside it rather than asserted equal. Against the
+    score split's own rows (not every validation frame) the same two constants read
+    296.42 / 278.73 (98 episodes) and 300.83 / 290.19 (20)."""
 
 
 def _require_finite_readouts(label: str, readouts: dict) -> None:
@@ -416,7 +509,7 @@ def _require_finite_readouts(label: str, readouts: dict) -> None:
 
 def prepare_shared(train_paths, val_paths, *, budget: int) -> Shared:
     """The rows, the two raw-pixel readouts, and the zero-information baseline."""
-    stride, splits = build_splits(val_paths, budget=budget)
+    stride, splits = build_splits(train_paths, val_paths, budget=budget)
     triples = {
         name: (load_pixels(split), split.targets) for name, split in splits.items()
     }
@@ -438,34 +531,93 @@ def prepare_shared(train_paths, val_paths, *, budget: int) -> Shared:
     )
 
 
-def applied_quality(trajectories) -> dict:
-    """The rollout probe's r2 and map-unit errors on its OWN imagined output.
+APPLIED_COMPARISONS: dict[str, str] = {
+    "real_latent": (
+        "M3n's floor error, 131.88-259.06 at h=1, a MEAN (rollout.py:218): comparable to "
+        "mean_error_h1 ONLY, never to a median or to r2"
+    ),
+    "predicted": (
+        "nothing earlier: no prior figure exists for the rollout probe on its own imagined "
+        "embeddings (M3n's 131.88-259.06 is the real-latent floor, not this)"
+    ),
+}
+"""What each `applied` distribution compares to, stored in its record entry as
+`compares_to` and printed by the read phase. The comparison is a property of the
+DISTRIBUTION, so it travels with the numbers rather than living only in a docstring."""
 
-    Spec section 3.1, and the reason it is measured first: the 2x2 is fit on REAL
-    encoder embeddings at frame t, while the error that made M3n unreadable comes from
-    this distribution. The rows are `reference_trajectories`' `positions` (the probe's
-    output at each imagined step, `(n_windows, horizon, 2)`) against `true_positions`.
-    `mean_error` is carried beside the median because M3n's 131.88-259.06 is a mean."""
-    predicted = trajectories.positions.reshape(-1, 2)
-    truth = trajectories.true_positions.reshape(-1, 2)
-    errors = position_error(predicted, truth)
+
+def _applied_entry(name: str, predicted: np.ndarray, truth: np.ndarray, first_step) -> dict:
+    """The r2 and map-unit errors of one distribution: pooled over every window and horizon
+    step, and the mean over windows at the first imagined step alone."""
+    errors = position_error(predicted.reshape(-1, 2), truth.reshape(-1, 2))
     return {
-        "r2": float(_mean_r2(predicted, truth)),
+        "r2": float(_mean_r2(predicted.reshape(-1, 2), truth.reshape(-1, 2))),
         "mean_error": float(np.mean(errors)),
+        "mean_error_h1": float(np.mean(first_step)),
         "median_error": float(np.median(errors)),
+        "compares_to": APPLIED_COMPARISONS[name],
+    }
+
+
+def applied_quality(trajectories) -> dict:
+    """The shipped rollout probe's r2 and map-unit errors on BOTH distributions it is read
+    on, `{"real_latent": ..., "predicted": ...}`.
+
+    Spec section 3.1, and the reason it is measured first: the 2x2 is fit on REAL encoder
+    embeddings at frame t, while the error that made M3n unreadable comes from the rollout
+    probe's distributions. There are two, and M3n's figure belongs to only one:
+
+      `real_latent`  `positions_real`, the embedding head on the posterior over the TRUE
+                     future frames (`rollout.py:161`). This is the FLOOR, the probe's error
+                     given perfect dynamics, and M3n's 131.88-259.06 is `floor_position[0]`
+                     (`rollout.py:218`): this distribution at h=1, a MEAN.
+      `predicted`    `positions`, the probe on the model's own imagined embeddings, where
+                     `evaluate_rollout` applies it. Nothing earlier recorded it.
+
+    An earlier revision kept only the second and set it against 131.88-259.06, which is a
+    category error. `mean_error_h1` is the mean over windows at the FIRST imagined step, the
+    statistic M3n's figure is (the pooled `mean_error` is the same distribution over every
+    horizon step, a different set of rows); `compares_to` says which comparison each
+    entry supports. Both are scored against the same `true_positions`."""
+    truth = trajectories.true_positions
+    return {
+        name: _applied_entry(
+            name, positions, truth,
+            position_error(positions[:, 0], truth[:, 0]),
+        )
+        for name, positions in (
+            ("real_latent", trajectories.positions_real),
+            ("predicted", trajectories.positions),
+        )
     }
 
 
 def widest_rbf_r2(fit, select, score) -> float:
     """The score r2 of the RBF at the WIDEST bandwidth alone, jitter selected on `select`.
 
-    `ceiling.score_readout` scores the whole ladder (linear rung included), so the
-    widest rung is not separately reachable through it; this repeats the ladder's own
-    steps for that one rung, over the same `CEILING_RIDGES`. It is the control whose
-    claim is the OLD asymptotic one (an RBF approaches linear as its bandwidth grows),
-    which `ceiling.fit_kernel_probe` records as false in practice at high linear r2:
-    the ladder nests linear by a rung of its own, so this number is expected to read
-    BELOW the linear r2 there, and is recorded as a measurement, never gated."""
+    THIS IS THE ASYMPTOTIC NESTING CLAIM, AND THE CLAIM IS FALSE IN PRACTICE, so what it
+    returns is EXPECTED NEGATIVE ON GOOD CELLS and is recorded as a measurement, never
+    gated. The claim is that an RBF approaches the linear kernel as its bandwidth grows.
+    It does only to first order: the effective linear ridge of the widest rung is
+    ~1e-3 x (bandwidth x median distance)^2, far below the ridge the linear probe
+    selects on a good cell, and an RBF kernel's eigenvalues are bounded by n so the large
+    jitters the linear probe wants only flatten it to the mean. Spec section 3.3 measured
+    it: an RBF without the linear rung came out worse than linear once linear r2 passed
+    ~0.37, by 0.002-0.004 on one fixture and 0.05-0.07 on another, and
+    `ceiling.fit_kernel_probe` records the same. A reader who sees a negative number here
+    has seen the instrument behave as documented, not a fault, and "not materially
+    negative" is therefore not a test this control can be held to.
+
+    NESTING IS STRUCTURAL INSTEAD: the ladder's linear kernel is a rung, so its search
+    space contains `fit_linear_probe`'s exactly. That is pinned by test, not read off this
+    number: `tests/eval/test_ceiling.py::
+    test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split`
+    (the selection r2 is at least linear's, to 1e-9, on every draw) and
+    `test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it`.
+
+    `ceiling.score_readout` scores the whole ladder (linear rung included), so the widest
+    rung is not separately reachable through it; this repeats the ladder's own steps for
+    that one rung, over the same `CEILING_RIDGES`."""
     x = np.asarray(fit[0], dtype=np.float64)
     y = np.asarray(fit[1], dtype=np.float64)
     mean, scale = x.mean(0), x.std(0) + 1e-8
@@ -534,7 +686,7 @@ def measure_cell(
     model, val_paths, probe, *, arm: str, seed: int, context: int, horizon: int, device,
     feature_backbone, study_record: dict, bootstrap_seed: int, shared: Shared,
 ) -> dict:
-    """One cell: the applied pass, eight readouts, three gains, four controls.
+    """One cell: the applied pass, eight readouts, three gains, the controls.
 
     THE PROBE GAIN GOES THROUGH `ceiling.probe_gain_over_floor` AND NOTHING ELSE. It is
     the only thing that forms `D - C - max(null_floor, 0)`; a `difference_interval` here
@@ -558,11 +710,22 @@ def measure_cell(
     record that carries one.
     """
     study = _study_numbers(arm, seed, study_record)
-    union = sorted(p.name for split in shared.splits.values() for p in split.paths)
-    if union != sorted(Path(p).name for p in val_paths):
+    held_out = sorted(
+        p.name for name in ("select", "score") for p in shared.splits[name].paths
+    )
+    if held_out != sorted(Path(p).name for p in val_paths):
         raise SystemExit(
             f"{arm} seed {seed}: the rollout's validation episodes are not the episodes "
-            "the shared rows were drawn from"
+            "the shared select and score rows were drawn from"
+        )
+    leaked = sorted(
+        {p.name for p in shared.splits["fit"].paths} & {Path(p).name for p in val_paths}
+    )
+    if leaked:
+        raise SystemExit(
+            f"{arm} seed {seed}: the fit split holds validation episode(s) {leaked}; it is "
+            "the study's TRAINING episodes, so a validation episode there is scored on "
+            "what it was fit on"
         )
     applied = applied_quality(reference_trajectories(
         model, val_paths, probe, context=context, horizon=horizon, seed=seed,
@@ -602,6 +765,7 @@ def measure_cell(
     }
 
     shipped = readouts["embedding_linear_shipped"].r2
+    fine_minus_shipped = float(readouts["embedding_linear"].r2 - shipped)
     triples = [(features[s]["embedding"], targets[s]) for s in ("fit", "select", "score")]
     return {
         "arm": arm,
@@ -631,6 +795,7 @@ def measure_cell(
         "ceiling_ridges": [float(r) for r in ceiling.CEILING_RIDGES],
         "readouts": {name: _readout_record(r) for name, r in readouts.items()},
         "shipped_grid_r2": float(shipped),
+        "fine_minus_shipped_on_score": fine_minus_shipped,
         "null_floor": float(floor),
         "null_floor_shape": {"n": n_fit, "d": width},
         "gains": {
@@ -670,7 +835,8 @@ def _cell_line(record: dict, path: Path) -> str:
         f"{record['arm']} seed {record['seed']}: D-C-floor {_triple(gains['probe'])}; "
         f"B-D {_triple(gains['pixel'])}; F-B {_triple(gains['sequence'])}; "
         f"null floor {record['null_floor']:+.4f}; C_shipped {record['shipped_grid_r2']:.3f} "
-        f"vs study {controls['study_embedding_r2']:.3f} ({agrees}); rows "
+        f"vs study {controls['study_embedding_r2']:.3f} ({agrees}); C - C_shipped on score "
+        f"{record['fine_minus_shipped_on_score']:+.4f}; rows "
         f"{rows['fit']}/{rows['select']}/{rows['score']} at stride {record['frame_stride']}; "
         f"wrote {path}"
     )
@@ -863,6 +1029,9 @@ def _valid_capacity(value) -> bool:
 
 _READOUT_FIELDS = ("r2", "mean_error", "median_error", "capacity", "jitter")
 
+_APPLIED_FIELDS = ("r2", "mean_error", "mean_error_h1", "median_error")
+"""The four numbers each `applied` distribution carries (its `compares_to` is text)."""
+
 
 def require_sound_records(records: dict) -> None:
     """Refuse a record whose measurement is not to be trusted, by name, before any
@@ -870,8 +1039,12 @@ def require_sound_records(records: dict) -> None:
 
     * The sanitiser's `nonfinite` map is not empty: this script writes `{}` (it turns
       the one legitimate infinity, a linear rung's bandwidth, into `"inf"`).
-    * `applied` or `null_floor` (the two figures the map-unit section prints and the
-      floor the gain was net of) is missing or not a finite number.
+    * `applied` lacks either of its two distributions (`real_latent`, `predicted`) or any
+      of the four figures each carries, or one is not a finite number; or `null_floor`
+      (the floor the gain was net of) is missing or not finite; or any of the three
+      UNGATED figures the read phase prints (`fine_minus_shipped_on_score`,
+      `controls.nesting_rbf_at_widest_vs_linear`, `controls.study_embedding_selection_r2`)
+      is.
     * A readout lacks one of its five fields, carries a non-finite r2 or error, a
       capacity that is neither a finite number nor `"inf"`, or a jitter that is neither
       null nor finite.
@@ -887,12 +1060,25 @@ def require_sound_records(records: dict) -> None:
                 f"{', '.join(sorted(found))}, which this script never writes; "
                 "this is not a record it wrote"
             )
-        applied = _pick(cell, "applied", lambda r: dict(r["applied"]), record)
-        for key in ("r2", "mean_error", "median_error"):
-            if not _is_finite_number(applied.get(key)):
+        for name in APPLIED_COMPARISONS:
+            applied = _pick(cell, f"applied.{name}", lambda r: dict(r["applied"][name]), record)
+            for key in _APPLIED_FIELDS:
+                if not _is_finite_number(applied.get(key)):
+                    raise SystemExit(
+                        f"{cell[0]} seed {cell[1]}: applied.{name}.{key} is "
+                        f"{applied.get(key)!r}, not a finite number"
+                    )
+        for field, pick in (
+            ("fine_minus_shipped_on_score", lambda r: r["fine_minus_shipped_on_score"]),
+            ("controls.nesting_rbf_at_widest_vs_linear",
+             lambda r: r["controls"]["nesting_rbf_at_widest_vs_linear"]),
+            ("controls.study_embedding_selection_r2",
+             lambda r: r["controls"]["study_embedding_selection_r2"]),
+        ):
+            value = _pick(cell, field, pick, record)
+            if not _is_finite_number(value):
                 raise SystemExit(
-                    f"{cell[0]} seed {cell[1]}: applied.{key} is {applied.get(key)!r}, "
-                    "not a finite number"
+                    f"{cell[0]} seed {cell[1]}: {field} is {value!r}, not a finite number"
                 )
         floor = _pick(cell, "null_floor", lambda r: r["null_floor"], record)
         shape = _pick(cell, "null_floor_shape",
@@ -1088,11 +1274,34 @@ _UNIT_HEADER = (
 )
 
 
+def _applied_lines(applied: dict, zero_mean: float, zero_median: float) -> list[str]:
+    """Both `applied` distributions of one cell, each under its own name with the
+    comparison it supports printed beside it (the record's own `compares_to`)."""
+    labels = {
+        "real_latent": "real-latent (the embedding head on the posterior from the TRUE frame)",
+        "predicted": "predicted (the model's own imagined embeddings)",
+    }
+    lines = []
+    for name in APPLIED_COMPARISONS:
+        entry = applied[name]
+        lines += [
+            f"    applied, {labels[name]}",
+            f"      r2 {entry['r2']:+.4f}; mean_error {entry['mean_error']:.2f} "
+            f"({_pct(entry['mean_error'] / zero_mean)} of the zero-information mean), "
+            f"mean_error_h1 {entry['mean_error_h1']:.2f}; median_error "
+            f"{entry['median_error']:.2f} "
+            f"({_pct(entry['median_error'] / zero_median)} of the zero-information median)",
+            f"      compares to: {entry['compares_to']}",
+        ]
+    return lines
+
+
 def format_map_units(records: dict) -> str:
     """The map-unit section appended to the reading: every readout's `mean_error` against
     the zero-information MEAN and its `median_error` against the MEDIAN, each ratio under a
     column that names its statistic, with M3n's 131.88-259.06 -- a mean -- stated as
-    comparable to the mean column only.
+    comparable to the mean only, and each `applied` distribution under its own name with the
+    comparison IT supports.
 
     The baselines come from the records: the mean is `controls.zero_information_recomputed`
     and the median is the stored `zero_information_median` (the protocol check has shown
@@ -1107,14 +1316,17 @@ def format_map_units(records: dict) -> str:
     lines = [
         "",
         "map units",
-        f"  Rows per split: fit {rows['fit']}, select {rows['select']}, score {rows['score']}; "
-        f"frame stride {first['frame_stride']} under a budget of {first['frames']}.",
+        f"  Rows per split: fit {rows['fit']} (training episodes), select {rows['select']}, "
+        f"score {rows['score']} (validation halves); frame stride {first['frame_stride']} "
+        f"under a budget of {first['frames']}.",
         f"  Zero-information baselines, one set of frames: MEAN {zero_mean:.2f} (recomputed), "
         f"MEDIAN {zero_median:.2f} (pinned). Each error is read against its OWN statistic:",
         "  mean_error against the mean, median_error against the median; a mean over a "
         "median is not a ratio.",
         f"  M3n's floor error, {low:.2f}-{high:.2f} at h=1, is a MEAN over windows: it is "
-        "comparable to the mean_error column ONLY.",
+        "comparable to a mean_error and never to a median_error. Of the two `applied` "
+        "distributions below it belongs to real-latent ONLY (its mean_error_h1); the "
+        "predicted distribution has no prior figure.",
         "",
         "  raw-pixel readouts (no model; identical in every cell)",
         _UNIT_HEADER,
@@ -1124,16 +1336,9 @@ def format_map_units(records: dict) -> str:
         for name in PIXEL_READOUTS
     ]
     for (arm, seed), record in items:
-        applied = record["applied"]
-        lines += [
-            "",
-            f"  {arm}_seed{seed}",
-            f"    applied (the rollout probe on its imagined positions): r2 {applied['r2']:+.4f}, "
-            f"mean_error {applied['mean_error']:.2f} ({_pct(applied['mean_error'] / zero_mean)}"
-            f" of the zero-information mean), median_error {applied['median_error']:.2f} "
-            f"({_pct(applied['median_error'] / zero_median)} of the zero-information median)",
-            _UNIT_HEADER,
-        ]
+        lines += ["", f"  {arm}_seed{seed}"]
+        lines += _applied_lines(record["applied"], zero_mean, zero_median)
+        lines.append(_UNIT_HEADER)
         lines += [
             _unit_line(name, record["readouts"][name], zero_mean, zero_median)
             for name in READOUTS if name not in PIXEL_READOUTS
@@ -1141,6 +1346,39 @@ def format_map_units(records: dict) -> str:
         lines.append(
             f"    null floor {record['null_floor']:+.4f} at n={record['null_floor_shape']['n']}, "
             f"d={record['null_floor_shape']['d']}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_controls(records: dict) -> str:
+    """The controls the reading does not gate on, one line per cell, so that a number
+    recorded for a reason is also SEEN: `C_shipped` against the study's embedding probe
+    (the GATED one, 49 if it misses), `C - C_shipped` on the score split, and the widest
+    RBF rung against linear.
+
+    `C - C_shipped` is exactly non-negative on the SELECTION split (`CEILING_RIDGES`
+    contains `RIDGES`), so on the score split a small dip is selection noise; one that is
+    large and the same sign in every cell means the finer grid is overfitting selection,
+    and that is a finding about the instrument. The widest-RBF figure is the ASYMPTOTIC
+    nesting claim, expected NEGATIVE on a good cell (`widest_rbf_r2`); nesting itself is
+    structural and pinned by test."""
+    lines = [
+        "",
+        "controls (recorded; only the first is gated, by exit 49)",
+        "  C_shipped against the study's criterion-4 embedding_r2 (the study's rollout-probe "
+        "embedding_selection_r2 is recorded beside it and is a different quantity);",
+        "  C - C_shipped on the score split; widest RBF rung minus linear (expected negative "
+        "on a good cell: the asymptotic claim, not a fault).",
+    ]
+    for (arm, seed), record in sorted(records.items()):
+        controls = record["controls"]
+        lines.append(
+            f"  {arm}_seed{seed}: C_shipped {record['shipped_grid_r2']:.3f} vs study "
+            f"{controls['study_embedding_r2']:.3f} (study rollout-probe "
+            f"{controls['study_embedding_selection_r2']:.3f}); C - C_shipped "
+            f"{record['fine_minus_shipped_on_score']:+.4f}; widest RBF - linear "
+            f"{controls['nesting_rbf_at_widest_vs_linear']:+.4f}"
         )
     lines.append("")
     return "\n".join(lines)
@@ -1178,8 +1416,8 @@ def read_phase(args) -> int:
 
     THE READING IS PRINTED AND WRITTEN AS ONE STRING, for every verdict, 50 included: it
     is a finding, and the table is what a reader needs to see it. The text carries the
-    verdict AND THE RULE, then the map-unit section. It is printed with `end=""` and
-    written as it is, never `rstrip()`ped.
+    verdict AND THE RULE, then the map-unit section, then the controls. It is printed with
+    `end=""` and written as it is, never `rstrip()`ped.
 
     A REFUSAL WRITES NOTHING, AND LEAVES NOTHING. The `ceiling.txt` an EARLIER read of
     the same `--out` left is removed FIRST, so every way out that does not reach the write
@@ -1204,7 +1442,10 @@ def read_phase(args) -> int:
         return EXIT_HARNESS_DISAGREES
     inputs = ceiling_inputs(records)
     reading = ceiling.reading_ceiling(inputs)
-    text = ceiling.format_reading_ceiling(reading, inputs) + format_map_units(records)
+    text = (
+        ceiling.format_reading_ceiling(reading, inputs) + format_map_units(records)
+        + format_controls(records)
+    )
     reading_path.write_text(text)
     print(text, end="")
     return READ_EXITS.get(reading.verdict, EXIT_OK)

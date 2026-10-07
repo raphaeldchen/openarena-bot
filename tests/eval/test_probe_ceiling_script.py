@@ -12,7 +12,9 @@ THREE KINDS OF FIXTURE, each used where the others cannot reach.
     linear in position (so `D - C` is near zero and the ridge optimum sits off the
     shipped grid, which makes `C` differ from `C_shipped`); the RING world codes
     position on 1.6 turns of a circle, which a linear probe cannot undo and the RBF
-    can, so `D - C` is large and positive.
+    can, so `D - C` is large and positive. A world holds 22 TRAINING episodes (the fit
+    split is the first 20 of them, as `probe.probe_episodes` takes them, so two are held
+    back and a test can see that) and 24 validation episodes (12 / 12 as shipped).
   * THE REAL MEASURE PATH over those worlds: real `prepare_shared`, real fits, real
     `difference_interval`, real `write_record`. Only the rollout (`reference_trajectories`)
     is replaced where a test needs to know its output.
@@ -107,6 +109,12 @@ SIGMA_P, SIGMA_E, SPEED = 60.0, 160.0, 0.05
 LINEAR_VIEWS = 36
 """Embedding views PER MODEL in the linear world. Many noisy views make the embedding
 wide enough that the best ridge is interior, between the shipped rungs."""
+LINEAR_SIGMA_E = 220.0
+"""The linear world's embedding noise. At the default `SIGMA_E` the ladder's RBF rung edged
+the linear rung on selection (capacity 2.0, no `inf`) once the fit split held 20 training
+episodes rather than 8 validation ones: the pixel coding is clipped to 0-255, which more rows
+let an RBF rung pick up. Noisier embeddings put the linear rung back on top, and the
+`inf` test needs a world where it wins."""
 MODELS_IN_WORLD = 1
 
 
@@ -166,11 +174,12 @@ class WorldModel(OracleModel):
 
 
 def _make_world(directory, *, kind, views, models=1, sigma_p=SIGMA_P, sigma_e=SIGMA_E,
-                n_val=24, n_train=6):
-    """Twenty-four validation episodes (8 / 8 / 8 once split three ways, as shipped) and six
-    training ones, lengths 44-50, named so `ReplayBuffer` can read them. Eight score-split
-    episodes are enough that two bootstrap seeds draw visibly different intervals; with four,
-    the 2.5th percentile of a few dozen resamples was the same extreme draw under both."""
+                n_val=24, n_train=22):
+    """Twenty-four validation episodes (12 select / 12 score, as shipped) and twenty-two
+    training ones (the first 20 are the fit split, as shipped), lengths 44-50, named so
+    `ReplayBuffer` can read them. Twelve score-split episodes are enough that two
+    bootstrap seeds draw visibly different intervals; with four, the 2.5th percentile of a
+    few dozen resamples was the same extreme draw under both."""
     directory.mkdir(parents=True, exist_ok=True)
     total = views * models
     val, train = [], []
@@ -206,7 +215,7 @@ def _cell(world, shared, *, first=0, arm="pixel_ae", seed=SEED, study=None, **ov
 def linear_world(tmp_path_factory):
     world = _make_world(
         tmp_path_factory.mktemp("linear_world"), kind="linear", views=LINEAR_VIEWS,
-        models=MODELS_IN_WORLD,
+        models=MODELS_IN_WORLD, sigma_e=LINEAR_SIGMA_E,
     )
     world.shared = script.prepare_shared(world.train, world.val, budget=12000)
     return world
@@ -345,35 +354,43 @@ def _names(count):
     return [Path(f"/data/ep_{i:06d}_len00100.npz") for i in range(count)]
 
 
-def test_the_shipped_split_of_24_validation_episodes_is_8_8_8():
-    split = script.three_way(_names(24), seed=SPLIT_SEED)
-    assert {name: len(paths) for name, paths in split.items()} == {
-        "fit": 8, "select": 8, "score": 8,
-    }
+def test_the_shipped_validation_set_of_24_episodes_is_halved_12_and_12():
+    split = script.validation_halves(_names(24), seed=SPLIT_SEED)
+    assert set(split) == {"select", "score"}
+    assert {name: len(paths) for name, paths in split.items()} == {"select": 12, "score": 12}
     union = [p for paths in split.values() for p in paths]
     assert sorted(union) == _names(24) and len(set(union)) == 24
 
 
-def test_the_split_is_a_function_of_the_names_and_not_of_their_order():
+def test_the_halves_are_a_function_of_the_names_and_not_of_their_order():
     paths = _names(24)
     shuffled = list(reversed(paths))
-    assert script.three_way(paths, seed=SPLIT_SEED) == script.three_way(
+    assert script.validation_halves(paths, seed=SPLIT_SEED) == script.validation_halves(
         shuffled, seed=SPLIT_SEED,
     )
-    assert script.three_way(paths, seed=SPLIT_SEED) != script.three_way(paths, seed=SPLIT_SEED + 1)
+    assert script.validation_halves(paths, seed=SPLIT_SEED) != script.validation_halves(
+        paths, seed=SPLIT_SEED + 1,
+    )
 
 
-@pytest.mark.parametrize(
-    "count, expected", [(9, (3, 3, 3)), (12, (4, 4, 4)), (25, (9, 8, 8)), (49, (17, 16, 16))]
-)
-def test_the_split_is_thirds_by_episode_with_the_remainder_in_fit(count, expected):
-    """49 is the smallest count where `int(49 * (16 / 49))` is 15, not 16: a `val_fraction`
-    written as `take / total` loses an episode there, which `_share` aiming at the middle of
-    the integer does not.
+def test_the_held_out_half_is_the_score_split_and_the_rest_is_select():
+    """`episode_split` returns `(train, val)`: the side it HOLDS OUT is the second. The
+    score split is that side, so the roles are not exchanged, and the two are told apart
+    by an odd count, where the halves differ in size.
 
-    THE MUTATION THIS EXISTS FOR: `_share` returning `take / total`."""
-    split = script.three_way(_names(count), seed=SPLIT_SEED)
-    assert (len(split["fit"]), len(split["select"]), len(split["score"])) == expected
+    THE MUTATION THIS EXISTS FOR: `{"select": score, "score": select}`."""
+    from mbfps.data.split import episode_split
+
+    rest, held = episode_split(_names(25), val_fraction=0.5, seed=SPLIT_SEED)
+    assert (len(rest), len(held)) == (13, 12)
+    split = script.validation_halves(_names(25), seed=SPLIT_SEED)
+    assert split["select"] == rest and split["score"] == held
+
+
+@pytest.mark.parametrize("count, expected", [(2, (1, 1)), (9, (5, 4)), (24, (12, 12)), (49, (25, 24))])
+def test_the_halves_hold_the_odd_episode_in_select(count, expected):
+    split = script.validation_halves(_names(count), seed=SPLIT_SEED)
+    assert (len(split["select"]), len(split["score"])) == expected
 
 
 def test_a_row_is_a_frame_with_real_history_and_its_target_is_that_frames(linear_world):
@@ -395,35 +412,78 @@ def test_a_row_is_a_frame_with_real_history_and_its_target_is_that_frames(linear
         assert sorted(set(split.groups.tolist())) == list(range(len(split.paths)))
 
 
-def test_the_three_splits_hold_disjoint_episodes_and_the_validation_set_between_them(
-    linear_world,
-):
-    shared = linear_world.shared
-    held = [p for split in shared.splits.values() for p in split.paths]
-    assert sorted(held) == sorted(linear_world.val)
-    assert len(set(held)) == len(linear_world.val)
+def test_the_fit_split_is_the_studys_first_twenty_training_episodes(linear_world):
+    """THE FIT SPLIT IS THE TRAINING EPISODES the probe is fit on, `probe_episodes(train)[0]`:
+    the leading 20 of the 22 the world holds, in the caller's order, none of them a
+    validation episode. The two held back are what show it is the first 20 and not
+    `train` whole, and the order what shows it is the LEADING block.
+
+    THE MUTATIONS THIS EXISTS FOR: `fit` drawn from `val_paths` (the 8-episode revision this
+    replaced), `fit` the whole of `train_paths`, and `fit` the last 20."""
+    shared, world = linear_world.shared, linear_world
+    assert len(world.train) == 22 and len(world.val) == 24
+    assert shared.splits["fit"].paths == tuple(world.train[:20])
+    assert not set(shared.splits["fit"].paths) & set(world.val)
+    assert not set(world.train[20:]) & {p for s in shared.splits.values() for p in s.paths}
+    assert [len(s.paths) for s in shared.splits.values()] == [20, 12, 12]
 
 
-def test_the_stride_brings_the_largest_split_within_the_budget(linear_world):
-    """`ceil(largest / budget)`, from the split sizes the test counts itself. A budget
-    that binds divides EVERY split by the one stride, and `rows_per_split` says what was
-    left."""
+def test_select_and_score_are_the_validation_halves_and_share_no_episode(linear_world):
+    """Selection and scoring stay entirely within validation and share no episode, so the
+    three-split discipline is unchanged: only the fit set moved. The two halves are the
+    ones `validation_halves` draws at the study's split seed, and their union is the whole
+    validation set the rollout is run on."""
+    shared, world = linear_world.shared, linear_world
+    select, score = shared.splits["select"].paths, shared.splits["score"].paths
+    assert not set(select) & set(score)
+    assert sorted(select + score) == sorted(world.val)
+    halves = script.validation_halves(world.val, seed=SPLIT_SEED)
+    assert list(select) == halves["select"] and list(score) == halves["score"]
+
+
+def test_the_stride_is_the_smallest_that_brings_every_split_within_the_budget(linear_world):
+    """The rows KEPT, counted by the test from the episode lengths: an episode of `m` rows
+    keeps `ceil(m / stride)`, so a split's total is not `m_total / stride`. The stride is the
+    smallest one under which no split is over the budget (so one stride fewer WOULD be over),
+    and a budget that binds divides EVERY split by the one stride, with `rows_per_split` saying
+    what was left. The FIT split is the largest here (20 training episodes against 12).
+
+    At budget 100 `ceil(largest / budget)` is stride 9, under which the fit split keeps 105
+    rows: 5 over. THE MUTATION THIS EXISTS FOR: the stride taken as `ceil(largest / budget)`."""
     first = script.SEQUENCE_FRAMES - 1
-    largest = max(
-        sum(load_episode(p).length + 1 - first for p in split.paths)
-        for split in linear_world.shared.splits.values()
-    )
+    lengths = {
+        name: [load_episode(p).length + 1 - first for p in split.paths]
+        for name, split in linear_world.shared.splits.items()
+    }
+
+    def kept(stride):
+        return {n: sum(-(-m // stride) for m in ms) for n, ms in lengths.items()}
+
+    largest = max(kept(1).values())
+    assert kept(1)["fit"] == largest > max(kept(1)["select"], kept(1)["score"])
+    assert -(-largest // 100) == 9 and kept(9)["fit"] == 105  # the quotient's stride overshoots
+    train, val = linear_world.train, linear_world.val
     for budget in (largest, largest - 1, 100, 64):
-        stride, splits = script.build_splits(linear_world.val, budget=budget)
-        assert stride == -(-largest // budget), budget
-        assert max(split.n for split in splits.values()) <= budget or stride == largest
-        for split in splits.values():
+        stride, splits = script.build_splits(train, val, budget=budget)
+        assert max(kept(stride).values()) <= budget, budget
+        assert stride == 1 or max(kept(stride - 1).values()) > budget, budget
+        for name, split in splits.items():
+            assert split.n == kept(stride)[name] <= budget, (budget, name)
             assert all(int(f[0]) == first for f in split.frames)
             assert all(set(np.diff(f)) <= {stride} for f in split.frames)
-    assert script.build_splits(linear_world.val, budget=largest)[0] == 1
-    assert script.build_splits(linear_world.val, budget=largest - 1)[0] == 2
+    assert script.build_splits(train, val, budget=largest)[0] == 1
+    assert script.build_splits(train, val, budget=largest - 1)[0] == 2
+    assert script.build_splits(train, val, budget=100)[0] == 10
     with pytest.raises(SystemExit, match="budget"):
-        script.build_splits(linear_world.val, budget=0)
+        script.build_splits(train, val, budget=0)
+
+
+def test_a_budget_smaller_than_the_episodes_of_a_split_is_refused_not_looped_on(linear_world):
+    """Every episode keeps at least one row at any stride, so 20 fit episodes cannot be brought
+    under a budget of 19: refused by name, where a search for a stride would never end."""
+    with pytest.raises(SystemExit, match="cannot hold one row of each episode"):
+        script.build_splits(linear_world.train, linear_world.val, budget=19)
+    script.build_splits(linear_world.train, linear_world.val, budget=20)
 
 
 def test_the_pixel_rows_are_the_raw_frames_at_the_rows(linear_world):
@@ -560,7 +620,7 @@ def test_the_floor_is_measured_at_the_fit_splits_rows_and_the_embedding_width(
     record = _cell(world, world.shared)
     shared = world.shared
     assert seen == [(shared.splits["fit"].n, LINEAR_VIEWS * 2)]
-    assert len({s.n for s in shared.splits.values()}) == 3
+    assert len({s.n for s in shared.splits.values()}) == 3  # fit, select and score all differ
     assert record["null_floor_shape"] == {"n": shared.splits["fit"].n, "d": LINEAR_VIEWS * 2}
     assert seen[0][1] != LINEAR_VIEWS * 2 * script.SEQUENCE_FRAMES  # not the sequence width
 
@@ -656,6 +716,45 @@ def test_the_harness_flag_is_read_against_the_criterion_4_probe_not_the_rollout_
     assert record["controls"]["study_embedding_r2"] == shipped
 
 
+def test_the_tolerance_sits_between_what_a_correct_pipeline_measures_and_what_a_starved_fit_does():
+    """The justification of `HARNESS_R2_TOLERANCE = 0.10`, as numbers, so the docstring cannot
+    drift from them. MEASURED on the nine real checkpoints (a one-off outside the study, the
+    two linear readouts only): with the fit split the study's 20 training episodes the worst
+    gap between `C_shipped` and the study's `criterion_4.embedding_r2` was 0.0398; fit on 8
+    validation episodes every gap was 0.17 to 0.35. A tolerance at or below the first fires
+    on a correct run (exit 49 on nine of nine); at or above the second it admits a broken
+    harness."""
+    assert script.HARNESS_R2_TOLERANCE == 0.10
+    assert 0.0398 < script.HARNESS_R2_TOLERANCE < 0.17
+
+
+def test_fine_minus_shipped_is_c_less_c_shipped_on_the_score_split_by_value(world, record):
+    """`C - C_shipped`, both read on the SCORE split: the finer ridge grid's r2 less the
+    shipped grid's, recomputed here with `fit_probe` over each grid on the world's own rows.
+    The curved world is shown to put C above C_shipped (by more than rounding), so the two
+    signs of the difference are different numbers, and the difference is not the record's
+    `shipped_grid_r2` or `embedding_linear` alone.
+
+    THE MUTATIONS THIS EXISTS FOR: `shipped - C`, and a literal `0.0` where the difference
+    stood."""
+    shared = world.shared
+    fit, select, score = (_embedding_rows(world, shared, n) for n in ("fit", "select", "score"))
+    fine = fit_probe(fit[0], fit[1], select[0], select[1], ridges=ceiling.CEILING_RIDGES)
+    shipped = fit_probe(fit[0], fit[1], select[0], select[1])
+    expected = (
+        _mean_r2(apply_probe(fine, score[0]), score[1])
+        - _mean_r2(apply_probe(shipped, score[0]), score[1])
+    )
+    assert expected > 0.005
+    assert record["fine_minus_shipped_on_score"] == pytest.approx(expected, abs=1e-6)
+    assert record["fine_minus_shipped_on_score"] == (
+        _r(record, "embedding_linear")["r2"] - record["shipped_grid_r2"]
+    )
+    assert record["fine_minus_shipped_on_score"] not in (
+        record["shipped_grid_r2"], _r(record, "embedding_linear")["r2"],
+    )
+
+
 def test_a_nan_study_number_reads_as_a_disagreement_not_a_match(world):
     record = _cell(world, world.shared, study=_study(embedding_r2=float("nan")))
     assert record["controls"]["harness_r2_matches_study"] is False
@@ -665,9 +764,14 @@ def test_the_zero_information_control_is_the_training_mean_against_every_validat
     world, record,
 ):
     """The SPEC's definition (283.05 is `the median error of predicting the training mean
-    on the 12,073 validation frames`), recomputed here from the privileged arrays. It is
-    not this run's fit split's mean against its score split, which is a different number
-    (asserted), and the mean is recorded beside the median."""
+    on the 12,073 validation frames`), recomputed here from the privileged arrays: the mean
+    over ALL the training episodes (22 here, not only the 20 the fit split holds), against
+    EVERY validation frame. The mean is recorded beside the median.
+
+    It is shown to differ from the two nearby quantities it could be mistaken for: the mean
+    of the 20 FIT episodes only, and the fit split's rows against the score split's rows.
+    Their medians sit apart by more than a map unit, so a control that took either would not
+    pass."""
     train = np.concatenate([
         probe_targets(load_episode(p).privileged, KEYS)[:, :2] for p in world.train
     ])
@@ -677,6 +781,13 @@ def test_the_zero_information_control_is_the_training_mean_against_every_validat
     assert control["mean"] == pytest.approx(float(errors.mean()), abs=1e-9)
     assert control["median"] == pytest.approx(float(np.median(errors)), abs=1e-9)
     assert control["mean"] != control["median"]
+    fit_only = np.concatenate([
+        probe_targets(load_episode(p).privileged, KEYS)[:, :2] for p in world.train[:20]
+    ])
+    assert abs(
+        float(np.median(np.linalg.norm(val[:, :2] - fit_only.mean(axis=0), axis=1)))
+        - control["median"]
+    ) > 0.5
     shared = world.shared
     own = ceiling.zero_information_error(
         shared.splits["fit"].targets, shared.splits["score"].targets,
@@ -690,21 +801,23 @@ def test_the_widest_rung_control_is_the_widest_rbf_against_linear_by_value(
     """`nesting_rbf_at_widest_vs_linear` is the score r2 of the RBF at the WIDEST bandwidth
     alone, jitter selected on the select split, less the linear readout's. Recomputed here
     with `numpy.linalg.solve` per jitter -- not the eigendecomposition the script and the
-    ladder use -- on the world's own embedding rows, and the median pairwise distance by
-    brute force (every split here holds fewer than the 512 rows `_median_scale` caps at)."""
+    ladder use -- on the world's own embedding rows. The length unit is
+    `ceiling._median_scale`'s (the fit split holds more than the 512 rows it caps its pairwise
+    sample at, and its sampling rule is pinned in `test_ceiling.py`, not re-derived here); what
+    this test owns is the widest rung, the jitter chosen on the SELECT split and the score
+    read on the SCORE split."""
     shared = world.shared
     (xf, yf), (xs, ys), (xc, yc) = (
         _embedding_rows(world, shared, n) for n in ("fit", "select", "score")
     )
-    assert max(len(xf), len(xs), len(xc)) <= 512
+    assert len(xf) > 512  # the cap is reached, so the unit is the sampled one
     mean, scale = xf.mean(0), xf.std(0) + 1e-8
     zf, zs, zc = (xf - mean) / scale, (xs - mean) / scale, (xc - mean) / scale
 
     def sq(a, b):
         return ((a[:, None, :] - b[None, :, :]) ** 2).sum(-1)
 
-    pairs = np.sqrt(sq(zf, zf)[np.triu_indices(len(zf), k=1)])
-    gamma = 1.0 / (2.0 * (max(ceiling.BANDWIDTHS) * float(np.median(pairs))) ** 2)
+    gamma = 1.0 / (2.0 * (max(ceiling.BANDWIDTHS) * ceiling._median_scale(zf)) ** 2)
     gram, on_select, on_score = (np.exp(-gamma * sq(a, zf)) for a in (zf, zs, zc))
     centre = yf.mean(0)
     best = None
@@ -778,8 +891,8 @@ def test_the_record_has_the_schema_and_not_the_key_write_record_owns(record):
         "frames", "frame_stride", "rows_per_split", "sequence_frames", "confidence",
         "resamples", "null_draws", "bootstrap_seed", "cell_bootstrap_seed", "split_seed",
         "zero_information_median", "harness_r2_tolerance", "episodes", "groups", "applied",
-        "ceiling_ridges", "readouts", "shipped_grid_r2", "null_floor", "null_floor_shape",
-        "gains", "controls",
+        "ceiling_ridges", "readouts", "shipped_grid_r2", "fine_minus_shipped_on_score",
+        "null_floor", "null_floor_shape", "gains", "controls",
     }
     assert "nonfinite" not in record
     assert list(record["readouts"]) == [
@@ -793,7 +906,9 @@ def test_the_record_has_the_schema_and_not_the_key_write_record_owns(record):
         "harness_r2_matches_study", "study_embedding_r2", "study_embedding_selection_r2",
         "nesting_rbf_at_widest_vs_linear", "zero_information_recomputed",
     }
-    assert set(record["applied"]) == {"r2", "mean_error", "median_error"}
+    assert set(record["applied"]) == {"real_latent", "predicted"}
+    for entry in record["applied"].values():
+        assert set(entry) == {"r2", "mean_error", "mean_error_h1", "median_error", "compares_to"}
 
 
 def test_the_record_survives_a_round_trip_through_write_record(record, tmp_path):
@@ -877,31 +992,107 @@ def test_the_budget_the_rows_were_drawn_under_is_what_the_record_states(ring_wor
 
 
 def _hand_trajectories():
-    """`(windows, steps, 2)` predictions with a skewed error distribution, so the mean and
-    the median are different numbers and neither is the r2."""
+    """`(windows, steps, 2)` arrays for BOTH distributions, on one truth. Each error
+    distribution is skewed (so a mean and a median are different numbers), the predicted
+    errors are larger than the real-latent ones and GROW with the horizon (so the first
+    step's mean is not the pooled mean), and the two distributions are drawn
+    independently: no two of the eight statistics coincide, which the first test checks."""
     rng = np.random.default_rng(5)
     truth = rng.normal(size=(7, 9, 2)) * 100.0 + 500.0
-    errors = rng.exponential(scale=40.0, size=(7, 9, 1)) * rng.choice([-1.0, 1.0], size=(7, 9, 2))
-    return types.SimpleNamespace(positions=truth + errors, true_positions=truth)
+
+    def errors(scale, growth):
+        raw = rng.exponential(scale=scale, size=(7, 9, 1)) * rng.choice([-1.0, 1.0], size=(7, 9, 2))
+        return raw * (1.0 + growth * np.arange(9))[None, :, None]
+
+    return types.SimpleNamespace(
+        positions=truth + errors(40.0, 0.4), positions_real=truth + errors(15.0, 0.0),
+        true_positions=truth,
+    )
 
 
-def test_applied_is_the_probes_r2_and_both_map_unit_errors_on_its_own_imagined_output():
-    """Recomputed here from the arrays with the definitions written out: r2 per column over
-    all (window, step) rows, the Euclidean error, and both of its statistics."""
-    trajectories = _hand_trajectories()
-    p = trajectories.positions.reshape(-1, 2)
-    t = trajectories.true_positions.reshape(-1, 2)
+def _definitions(predicted, truth):
+    """The five numbers one distribution carries, written out from the definitions: r2 per
+    column over all (window, step) rows, the Euclidean error pooled over every row, its two
+    statistics, and the mean over windows at step 0 alone."""
+    p, t = predicted.reshape(-1, 2), truth.reshape(-1, 2)
     r2 = np.mean([
         1.0 - ((t[:, c] - p[:, c]) ** 2).sum() / ((t[:, c] - t[:, c].mean()) ** 2).sum()
         for c in range(2)
     ])
-    errors = np.sqrt(((p - t) ** 2).sum(axis=1))
+    pooled = np.sqrt(((p - t) ** 2).sum(axis=1))
+    first = np.sqrt(((predicted[:, 0] - truth[:, 0]) ** 2).sum(axis=1))
+    return {
+        "r2": r2, "mean_error": pooled.mean(), "mean_error_h1": first.mean(),
+        "median_error": np.median(pooled),
+    }
+
+
+def test_applied_is_both_distributions_each_with_r2_and_the_map_unit_statistics():
+    """Each distribution recomputed here from the arrays, and the fixture shown to
+    discriminate first: the two distributions differ in EVERY statistic, and within each
+    the pooled mean, the first-step mean and the median are three different numbers, so an
+    entry built from the other distribution's arrays, or from the pooled rows where the
+    first step belongs, is a different number."""
+    trajectories = _hand_trajectories()
+    expected = {
+        "real_latent": _definitions(trajectories.positions_real, trajectories.true_positions),
+        "predicted": _definitions(trajectories.positions, trajectories.true_positions),
+    }
+    for key in expected["real_latent"]:
+        assert abs(expected["real_latent"][key] - expected["predicted"][key]) > 0.01, key
+    for stats in expected.values():
+        assert len({stats["mean_error"], stats["mean_error_h1"], stats["median_error"]}) == 3
+        assert abs(stats["mean_error_h1"] - stats["mean_error"]) > 1.0
     applied = script.applied_quality(trajectories)
-    assert applied["r2"] == pytest.approx(r2, abs=1e-12)
-    assert applied["mean_error"] == pytest.approx(errors.mean(), abs=1e-9)
-    assert applied["median_error"] == pytest.approx(np.median(errors), abs=1e-9)
-    assert abs(applied["mean_error"] - applied["median_error"]) > 1.0
-    assert set(applied) == {"r2", "mean_error", "median_error"}
+    assert set(applied) == {"real_latent", "predicted"}
+    for name, stats in expected.items():
+        assert applied[name]["r2"] == pytest.approx(stats["r2"], abs=1e-12), name
+        for key in ("mean_error", "mean_error_h1", "median_error"):
+            assert applied[name][key] == pytest.approx(stats[key], abs=1e-9), (name, key)
+        assert set(applied[name]) == {"r2", "mean_error", "mean_error_h1", "median_error", "compares_to"}
+
+
+def test_each_distribution_is_read_from_its_own_positions_and_the_two_are_not_exchanged():
+    """`real_latent` is `positions_real` (the embedding head on the posterior over the true
+    frames) and `predicted` is `positions` (the model's own imagined embeddings): handing
+    the two arrays over in the other order exchanges the two entries, number for number.
+
+    THE MUTATION THIS EXISTS FOR: `real_latent` built from `positions` and `predicted` from
+    `positions_real`."""
+    trajectories = _hand_trajectories()
+    swapped = types.SimpleNamespace(
+        positions=trajectories.positions_real, positions_real=trajectories.positions,
+        true_positions=trajectories.true_positions,
+    )
+    straight, exchanged = script.applied_quality(trajectories), script.applied_quality(swapped)
+    for key in ("r2", "mean_error", "mean_error_h1", "median_error"):
+        assert straight["real_latent"][key] == exchanged["predicted"][key]
+        assert straight["predicted"][key] == exchanged["real_latent"][key]
+        assert straight["real_latent"][key] != straight["predicted"][key]
+
+
+def test_each_distribution_names_the_comparison_it_supports():
+    """M3n's 131.88-259.06 is the FLOOR, so it belongs to the real-latent distribution and
+    only as a MEAN, at the first step; the predicted distribution has no prior figure. The
+    sentence travels with the numbers: it is in the record entry, not only a docstring."""
+    applied = script.applied_quality(_hand_trajectories())
+    real, predicted = applied["real_latent"]["compares_to"], applied["predicted"]["compares_to"]
+    assert "131.88-259.06" in real and "MEAN" in real and "mean_error_h1 ONLY" in real
+    assert "nothing earlier" in predicted and "no prior figure" in predicted
+    assert "mean_error_h1 ONLY" not in predicted
+    assert real != predicted
+
+
+def test_the_comparison_a_record_states_is_the_modules_own_text(world, monkeypatch):
+    """The sentence in the record is the module's constant READ when the cell is measured, so
+    it moves with it: patched to values the shipped text is not, one entry at a time.
+
+    THE MUTATION THIS EXISTS FOR: the sentences written into `_applied_entry` as literals."""
+    patched = {"real_latent": "an A text", "predicted": "a B text"}
+    assert script.APPLIED_COMPARISONS != patched
+    monkeypatch.setattr(script, "APPLIED_COMPARISONS", patched)
+    record = _cell(world, world.shared)
+    assert {n: e["compares_to"] for n, e in record["applied"].items()} == patched
 
 
 def test_the_record_carries_the_applied_figures_of_the_rollout_it_was_handed(world, monkeypatch):
@@ -938,10 +1129,22 @@ def _wobbling_episode(length: int, index: int):
 def test_applied_over_the_real_rollout_is_the_closed_form_of_a_drifting_model(tmp_path):
     """The real `reference_trajectories`, on `DriftingModel` (a perfect filter whose dynamics
     advance the frame tag by TWO per action) over wobbling episodes, against a closed form
-    derived without it: the window starting at `s` ends its context at tag `s + context`,
-    imagines tag `s + context + 2h` at step h, and the probe is a linear map from tag to
-    position; the truth is the privileged position at frame `s + context + h`."""
+    derived without it. The window starting at `s` ends its context at tag `s + context`.
+
+      * PREDICTED: step h imagines tag `s + context + 2h`; the probe is a linear map from tag
+        to position.
+      * REAL-LATENT: the filter sees the real future frame, whose tag is `s + context + h`,
+        so the probe's error there is its own residual and nothing the dynamics did.
+
+    The truth is the privileged position at frame `s + context + h` for both. The two
+    distributions are shown to be far apart (the drift is 2x), so the entries cannot be
+    exchanged unnoticed.
+
+    AND `mean_error_h1` IS M3n's STATISTIC: `evaluate_rollout`'s own curves, which M3n's
+    131.88-259.06 was read from (`floor_position[0]`), reproduce it. That is rollout.py's
+    computation, not this script's."""
     from mbfps.eval.diagnostics import reference_trajectories
+    from mbfps.eval.rollout import evaluate_rollout
 
     episodes = [_wobbling_episode(n, i) for i, n in enumerate((20, 31, 26))]
     paths = []
@@ -953,24 +1156,39 @@ def test_applied_over_the_real_rollout_is_the_closed_form_of_a_drifting_model(tm
     probe = fit_probe(
         tags, np.concatenate([probe_targets(e.privileged, KEYS) for e in episodes]), ridge=1e-8,
     )
-    predicted, truth = [], []
+    predicted, real, truth = [], [], []
     for episode in episodes:
         for start in window_starts(episode.length, CONTEXT, HORIZON):
             steps = np.arange(1, HORIZON + 1, dtype=np.float64)
-            tag = (start + CONTEXT + 2 * steps)[:, None]
-            predicted.append(apply_probe(probe, tag)[:, :2])
+            predicted.append(apply_probe(probe, (start + CONTEXT + 2 * steps)[:, None])[:, :2])
+            real.append(apply_probe(probe, (start + CONTEXT + steps)[:, None])[:, :2])
             truth.append(probe_targets(episode.privileged, KEYS)[start + CONTEXT + 1:
                                                                  start + CONTEXT + 1 + HORIZON, :2])
-    predicted, truth = np.concatenate(predicted), np.concatenate(truth)
-    errors = position_error(predicted, truth)
-    assert errors.mean() != np.median(errors)
+    predicted, real, truth = (np.stack(a) for a in (predicted, real, truth))
+    expected = {
+        "predicted": _definitions(predicted, truth), "real_latent": _definitions(real, truth),
+    }
+    assert expected["predicted"]["mean_error"] > 5 * expected["real_latent"]["mean_error"] > 0.0
     applied = script.applied_quality(reference_trajectories(
         DriftingModel(), paths, probe, context=CONTEXT, horizon=HORIZON, seed=SEED,
         device=CPU, feature_backbone=None,
     ))
-    assert applied["mean_error"] == pytest.approx(float(errors.mean()), abs=1e-6)
-    assert applied["median_error"] == pytest.approx(float(np.median(errors)), abs=1e-6)
-    assert applied["r2"] == pytest.approx(_mean_r2(predicted, truth), abs=1e-9)
+    for name, stats in expected.items():
+        assert applied[name]["mean_error"] == pytest.approx(stats["mean_error"], abs=1e-6), name
+        assert applied[name]["mean_error_h1"] == pytest.approx(stats["mean_error_h1"], abs=1e-6)
+        assert applied[name]["median_error"] == pytest.approx(stats["median_error"], abs=1e-6), name
+        assert applied[name]["r2"] == pytest.approx(stats["r2"], abs=1e-9), name
+    curves = evaluate_rollout(
+        DriftingModel(), paths, probe, context=CONTEXT, horizon=HORIZON, seed=SEED,
+        device=CPU, feature_backbone=None,
+    )
+    assert applied["real_latent"]["mean_error_h1"] == pytest.approx(
+        float(curves.floor_position[0]), abs=1e-6,
+    )
+    assert applied["predicted"]["mean_error_h1"] == pytest.approx(
+        float(curves.rssm_position[0]), abs=1e-6,
+    )
+    assert applied["real_latent"]["mean_error_h1"] != applied["predicted"]["mean_error_h1"]
 
 
 # ---------------------------------------------------------------------------
@@ -997,8 +1215,21 @@ def test_a_non_finite_readout_is_refused_by_name_before_any_interval(world, monk
 
 
 def test_a_rollout_over_other_episodes_than_the_rows_were_drawn_from_is_refused(world):
-    with pytest.raises(SystemExit, match="not the episodes the shared rows were drawn from"):
+    with pytest.raises(SystemExit, match="not the episodes the shared select and score rows"):
         _cell(world, world.shared, val_paths=world.val[:-1])
+
+
+def test_a_fit_split_that_holds_a_validation_episode_is_refused(world, tmp_path):
+    """The fit split is the study's TRAINING episodes, scored on none of them. Rows built
+    with a validation episode among the 'training' ones would be fit on what they are
+    scored on, and the refusal names it. (The shared rows here are built from a training
+    list that holds one validation episode.)
+
+    THE MUTATION THIS EXISTS FOR: the overlap check dropped."""
+    leaky = script.prepare_shared([world.val[0]] + world.train[:19], world.val, budget=12000)
+    assert world.val[0] in leaky.splits["fit"].paths
+    with pytest.raises(SystemExit, match=r"fit split holds validation episode\(s\) \['ep_000000"):
+        _cell(world, leaky)
 
 
 @pytest.mark.parametrize("remove", [
@@ -1025,7 +1256,7 @@ assert all(seed not in (0, SPLIT_SEED, BOOTSTRAP_SEED) for _, seed in PHASE_CELL
 
 
 def _phase_env(tmp_path, monkeypatch, *, missing=(), refuse=None, study=None):
-    """A real `ReplayBuffer`, the real three-way split, the real `prepare_shared` and
+    """A real `ReplayBuffer`, the real study split and halves, the real `prepare_shared` and
     `measure_cell`; only `load_cell` and `prepare_cell` are faked, because they need nine
     checkpoints. The fakes BEHAVE: `prepare_cell` refuses a cell unless `args.out` is the
     directory holding its checkpoint (the study directory, which the record directory is
@@ -1151,18 +1382,34 @@ def test_the_raw_pixel_readouts_are_computed_once_and_identical_in_every_record(
     assert len(set(embeddings)) == len(PHASE_CELLS)
 
 
-def test_the_phase_scores_the_studys_own_validation_split_three_ways(phase_run):
+def test_the_phase_fits_on_the_studys_training_episodes_and_halves_its_validation_set(phase_run):
+    """THE STUDY'S OWN SPLIT, rebuilt here through the buffer and `episode_split`: the fit
+    split is the first 20 of its training episodes, and select and score are the two halves of
+    its validation episodes (5 and 4 of 9 here, the odd episode in `select`).
+
+    THE MUTATIONS THIS EXISTS FOR: the 8-episode fit drawn from validation, and a fit split
+    that is not the leading block of the study's own training list."""
     args = phase_run
-    _, val = _val_split(args)
+    train, val = _val_split(args)
+    assert len(train) == 36 and len(val) == 9
     record = load_record(args.out / "ceiling_pixel_ae_seed1.json")
-    union = sorted(n for names in record["episodes"].values() for n in names)
-    assert union == sorted(p.name for p in val)
-    assert {k: len(v) for k, v in record["episodes"].items()} == {"fit": 3, "select": 3, "score": 3}
+    assert record["episodes"]["fit"] == [p.name for p in train[:20]]
+    held = sorted(record["episodes"]["select"] + record["episodes"]["score"])
+    assert held == sorted(p.name for p in val)
+    assert not set(record["episodes"]["fit"]) & set(held)
+    assert not set(record["episodes"]["select"]) & set(record["episodes"]["score"])
+    assert {k: len(v) for k, v in record["episodes"].items()} == {
+        "fit": 20, "select": 5, "score": 4,
+    }
     assert record["split_seed"] == SPLIT_SEED
     assert record["frame_stride"] == 1 and record["frames"] == 12000
-    assert sum(record["rows_per_split"].values()) == sum(
-        load_episode(p).length + 1 - (script.SEQUENCE_FRAMES - 1) for p in val
+    first = script.SEQUENCE_FRAMES - 1
+    rows = lambda names: sum(  # noqa: E731
+        load_episode(next(p for p in train + val if p.name == n)).length + 1 - first for n in names
     )
+    assert record["rows_per_split"] == {
+        name: rows(names) for name, names in record["episodes"].items()
+    }
 
 
 def test_the_zero_information_baseline_is_the_training_mean_over_the_studys_val_frames(phase_run):
@@ -2194,15 +2441,25 @@ def test_the_baselines_are_the_records_and_not_a_literal(tmp_path, record):
     assert "MEAN 100.00 (recomputed), MEDIAN 200.00 (pinned)" in text
 
 
-def test_m3ns_floor_error_is_stated_as_a_mean_and_compared_to_the_mean_column_only(
+def test_m3ns_floor_error_is_stated_as_a_mean_and_belongs_to_the_real_latent_distribution_only(
     tmp_path, record,
 ):
-    """131.88-259.06 is a MEAN over windows (`evaluate_rollout` averages the per-window error),
-    so the sentence that sets it beside the table says so and names the one column it may be
-    read against. No line sets it beside a median."""
+    """131.88-259.06 is a MEAN over windows (`evaluate_rollout` averages the per-window error)
+    AND the FLOOR, the probe on the posterior over the true frames: so the sentence that sets
+    it beside the table says it is a mean, never a median, and belongs to the real-latent
+    distribution alone. Every other line that names the figure is a `compares to:` line, and
+    those say the same of their own distribution. No line sets it beside a median."""
     text = _unit_reading(tmp_path, record)
-    (line,) = [l for l in text.splitlines() if "131.88-259.06" in l]
-    assert "MEAN" in line and "mean_error column ONLY" in line and "median" not in line
+    (header,) = [l for l in text.splitlines() if l.startswith("  M3n's floor error")]
+    assert "is a MEAN over windows" in header
+    assert "comparable to a mean_error and never to a median_error" in header
+    assert "belongs to real-latent ONLY (its mean_error_h1)" in header
+    assert "predicted distribution has no prior figure" in header
+    mentions = [l for l in text.splitlines() if "131.88-259.06" in l and l != header]
+    assert len(mentions) == 18  # two `compares to:` lines in each of nine cells
+    assert all(l.startswith("      compares to: ") for l in mentions)
+    assert sum("mean_error_h1 ONLY" in l for l in mentions) == 9
+    assert sum("nothing earlier" in l for l in mentions) == 9
     assert script.M3N_FLOOR_ERROR_MEAN == (131.88, 259.06)
 
 
@@ -2218,26 +2475,131 @@ def test_m3ns_floor_error_range_is_what_its_records_hold():
     assert (round(min(floors), 2), round(max(floors), 2)) == script.M3N_FLOOR_ERROR_MEAN
 
 
+REPO = Path(__file__).resolve().parents[2]
+
+
+def test_the_study_number_the_harness_reads_spans_the_band_the_spec_means_on_the_real_records():
+    """`_study_numbers` over the nine real M3c records (skipped where `runs/` is absent):
+    `criterion_4.embedding_r2` is the band 0.3195-0.3451, and the rollout probe's
+    `embedding_selection_r2` is a DIFFERENT quantity spanning 0.0180-0.3829, a factor of 21.
+    Reading either field for the other moves the figure the harness is reconciled against
+    from one span to the other, which only real records can show.
+
+    THE MUTATION THIS EXISTS FOR: `_study_numbers` reading `embedding_r2` from the rollout
+    probe's field."""
+    files = sorted((REPO / "runs" / "m3_study_v2").glob("result_*_seed*.json"))
+    if len(files) != 9:
+        pytest.skip("runs/m3_study_v2 is not on disk")
+    numbers = [script._study_numbers("arm", 0, json.loads(p.read_text())) for p in files]
+    gated = [n["embedding_r2"] for n in numbers]
+    rollout = [n["embedding_selection_r2"] for n in numbers]
+    assert (round(min(gated), 4), round(max(gated), 4)) == (0.3195, 0.3451)
+    assert (round(min(rollout), 4), round(max(rollout), 4)) == (0.0180, 0.3829)
+
+
+def test_the_real_split_and_the_zero_information_figures_are_what_the_script_documents():
+    """The numbers `Shared.zero_information`'s and the module's docstrings state, recomputed
+    from the real episodes (skipped where `data/my_way_home` is absent): the fit, select and
+    score splits hold 9,044 / 5,713 / 6,264 rows at stride 1 under the shipped budget, and the
+    zero-information baseline reads, as mean / median,
+
+      all 98 training episodes      291.36 / 275.02   (this script's definition)
+      the 20 fit episodes only      295.48 / 284.78
+      the leading 24 training       292.82 / 283.05   (the spec's figures, to two decimals)
+
+    so the spec's 283.05 is NOT what the mean over all the training episodes gives, and the
+    control cannot be held to 'within 1.0 of 283.05'. A change to the split or to the definition moves these and
+    the docstrings with them."""
+    from mbfps.data.buffer import ReplayBuffer
+    from mbfps.data.split import VAL_FRACTION, episode_split
+
+    data = REPO / "data" / "my_way_home"
+    if not data.exists():
+        pytest.skip("data/my_way_home is not on disk")
+    train, val = episode_split(
+        ReplayBuffer(data, capacity_transitions=10**9).episode_paths(),
+        val_fraction=VAL_FRACTION, seed=SPLIT_SEED,
+    )
+    assert (len(train), len(val)) == (98, 24)
+    stride, splits = script.build_splits(train, val, budget=ceiling.FRAME_BUDGET)
+    assert stride == 1
+    assert {name: split.n for name, split in splits.items()} == {
+        "fit": 9044, "select": 5713, "score": 6264,
+    }
+    every = np.concatenate([script._all_targets(p) for p in val])
+    assert len(every) == 12073
+    for episodes, expected in (
+        (train, (291.36, 275.02)),
+        (train[:20], (295.48, 284.78)),
+        (train[:24], (292.82, 283.05)),
+    ):
+        got = ceiling.zero_information_error(
+            np.concatenate([script._all_targets(p) for p in episodes]), every,
+        )
+        assert (round(got["mean"], 2), round(got["median"], 2)) == expected, len(episodes)
+
+
 def test_the_section_prints_the_rows_the_applied_figures_and_the_floor_of_every_cell(
     tmp_path, record,
 ):
+    """Both distributions of every cell, each under its own name and with ITS OWN figures:
+    the eighteen entries are all different numbers, so an entry printed from the other
+    distribution, or from another cell, is a different line."""
     records = _records_from(record, ["PROBE_LIMITED"] * 9)
     for index, (cell, r) in enumerate(records.items()):
-        r["applied"] = {"r2": 0.1 * index, "mean_error": 100.0 + index, "median_error": 90.0 + index}
+        for k, name in enumerate(("real_latent", "predicted")):
+            base = 100.0 * (k + 1) + index
+            r["applied"][name].update(
+                r2=0.1 * index + 0.01 * k, mean_error=base, mean_error_h1=base + 0.5,
+                median_error=base - 7.0,
+            )
         r["null_floor"] = 0.001 * index
     text = _capture_read(_write_records(tmp_path / "section", records))[1]
     rows = record["rows_per_split"]
     assert (
-        f"Rows per split: fit {rows['fit']}, select {rows['select']}, score {rows['score']}; "
-        f"frame stride {record['frame_stride']} under a budget of {record['frames']}."
+        f"Rows per split: fit {rows['fit']} (training episodes), select {rows['select']}, "
+        f"score {rows['score']} (validation halves); frame stride {record['frame_stride']} "
+        f"under a budget of {record['frames']}."
     ) in text
     for index, (arm, seed) in enumerate(NINE_CELLS):
         block = text.split(f"  {arm}_seed{seed}\n")[1].split("\n\n")[0]
-        assert f"r2 {0.1 * index:+.4f}, mean_error {100.0 + index:.2f}" in block
-        assert f"median_error {90.0 + index:.2f}" in block
+        lines = block.splitlines()
+        for k, (name, label) in enumerate((("real_latent", "real-latent"), ("predicted", "predicted"))):
+            base = 100.0 * (k + 1) + index
+            (at,) = [i for i, l in enumerate(lines) if l.startswith(f"    applied, {label} (")]
+            figures, comparison = lines[at + 1], lines[at + 2]
+            assert f"r2 {0.1 * index + 0.01 * k:+.4f};" in figures
+            assert f"mean_error {base:.2f} (" in figures
+            assert f"mean_error_h1 {base + 0.5:.2f};" in figures
+            assert f"median_error {base - 7.0:.2f} (" in figures
+            assert comparison == f"      compares to: {record['applied'][name]['compares_to']}"
+        assert lines.index(next(l for l in lines if l.startswith("    applied, real-latent"))) < \
+            lines.index(next(l for l in lines if l.startswith("    applied, predicted")))
         assert f"null floor {0.001 * index:+.4f} at n={record['null_floor_shape']['n']}" in block
     assert text.count("raw-pixel readouts (no model; identical in every cell)") == 1
     assert text.count("    pixels_rbf ") == 1
+
+
+def test_each_applied_figure_is_read_against_its_own_zero_information_statistic(
+    tmp_path, record,
+):
+    """A mean error of 146.41 is half of the zero-information MEAN and a median of 141.5 half
+    of the MEDIAN, in BOTH distributions: `mean_error_h1` carries no percentage because it is
+    compared with M3n's figure, not with a baseline. Exchanged denominators print 51.7% and
+    48.3%."""
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    for r in records.values():
+        for name in ("real_latent", "predicted"):
+            r["applied"][name].update(mean_error=146.41, median_error=141.5)
+    text = _capture_read(_write_records(tmp_path / "applied_units", records))[1]
+    block = text.split("  pixel_ae_seed0\n")[1].split("\n\n")[0]
+    figures = [l for l in block.splitlines() if l.startswith("      r2 ")]
+    assert len(figures) == 2
+    for line in figures:
+        mean_part, median_part = line.split("median_error")
+        assert "mean_error 146.41 ( 50.0% of the zero-information mean)" in mean_part
+        assert "141.50 ( 50.0% of the zero-information median)" in median_part
+        assert "51.7%" not in line and "48.3%" not in line
 
 
 def test_a_pixel_row_is_printed_once_and_a_model_row_once_per_cell(tmp_path, record):
@@ -2248,22 +2610,44 @@ def test_a_pixel_row_is_printed_once_and_a_model_row_once_per_cell(tmp_path, rec
         assert text.count(f"\n    {name} ") == 9, name
 
 
-@pytest.mark.parametrize("key", ["r2", "mean_error", "median_error"])
+@pytest.mark.parametrize("name", ["real_latent", "predicted"])
+@pytest.mark.parametrize("key", ["r2", "mean_error", "mean_error_h1", "median_error"])
 @pytest.mark.parametrize("bad", ["nan", None])
-def test_an_applied_figure_that_is_not_a_finite_number_is_refused_by_name(tmp_path, record, key, bad):
+def test_an_applied_figure_that_is_not_a_finite_number_is_refused_by_name(
+    tmp_path, record, name, key, bad,
+):
     """`applied` is printed beside the table and read by nobody else, so a missing or broken one
-    would surface as a KeyError or a printed `nan` in the section: refused by name instead."""
+    would surface as a KeyError or a printed `nan` in the section: refused by name instead, for
+    each figure of each of the two distributions."""
     out = _write_nine(tmp_path, record, harness_matches=True)
     path = script.ceiling_record_path(out, "pixel_ae", 0)
     broken = load_record(path)
     broken.pop("nonfinite")
-    broken["applied"][key] = bad
+    broken["applied"][name][key] = bad
     write_record(path, broken)
-    with pytest.raises(SystemExit, match=rf"pixel_ae seed 0: applied\.{key} is"):
+    with pytest.raises(SystemExit, match=rf"pixel_ae seed 0: applied\.{name}\.{key} is"):
+        _capture_read(out)
+
+
+@pytest.mark.parametrize("name", ["real_latent", "predicted"])
+def test_a_record_missing_either_applied_distribution_is_refused_by_name(tmp_path, record, name):
+    """An `applied` of the earlier, flat schema (one distribution's figures at the top) is
+    refused too: it has neither entry."""
+    out = _write_nine(tmp_path, record, harness_matches=True)
+    path = script.ceiling_record_path(out, "pixel_ae", 0)
+    broken = load_record(path)
+    broken.pop("nonfinite")
+    del broken["applied"][name]
+    write_record(path, broken)
+    with pytest.raises(SystemExit, match=rf"pixel_ae seed 0 lacks applied\.{name}:"):
+        _capture_read(out)
+    broken["applied"] = {"r2": 0.3, "mean_error": 150.0, "median_error": 140.0}
+    write_record(path, broken)
+    with pytest.raises(SystemExit, match=r"pixel_ae seed 0 lacks applied\.real_latent:"):
         _capture_read(out)
     del broken["applied"]
     write_record(path, broken)
-    with pytest.raises(SystemExit, match="pixel_ae seed 0 lacks applied:"):
+    with pytest.raises(SystemExit, match=r"pixel_ae seed 0 lacks applied\.real_latent:"):
         _capture_read(out)
 
 
@@ -2281,3 +2665,109 @@ def test_a_record_without_its_floor_or_the_floors_shape_is_refused_by_name(tmp_p
     write_record(path, broken)
     with pytest.raises(SystemExit, match="null_floor .* is not a finite number"):
         _capture_read(out)
+
+
+# ---------------------------------------------------------------------------
+# The controls that are recorded and never gated, and that the read prints.
+# ---------------------------------------------------------------------------
+
+
+def _controls_reading(tmp_path, record, edit=None, *, name="controls"):
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    for index, (cell, r) in enumerate(records.items()):
+        r["fine_minus_shipped_on_score"] = 0.001 * index - 0.0123
+        r["controls"]["nesting_rbf_at_widest_vs_linear"] = -0.01 * index - 0.0071
+        r["controls"]["study_embedding_selection_r2"] = 0.018 + 0.03 * index
+        if edit is not None:
+            edit(index, r)
+    return _capture_read(_write_records(tmp_path / name, records))
+
+
+def test_the_controls_section_prints_each_cells_own_ungated_figures(tmp_path, record):
+    """One line per cell, each carrying its OWN `C - C_shipped`, widest-rung-minus-linear, and
+    the study's two numbers LABELLED (the criterion-4 one the harness is gated on, the rollout
+    probe's beside it): nine different values of each, so a figure printed from another cell or
+    one number printed under the other's label is a different line. Printed in cell order."""
+    status, text = _controls_reading(tmp_path, record)
+    assert status == 0
+    section = text.split("controls (recorded; only the first is gated, by exit 49)\n")[1]
+    lines = [l for l in section.splitlines() if l.startswith("  ") and "_seed" in l]
+    assert len(lines) == 9
+    for index, ((arm, seed), line) in enumerate(zip(sorted(NINE_CELLS), lines)):
+        cell_index = list(NINE_CELLS).index((arm, seed))
+        r = _records_from(record, ["PROBE_LIMITED"] * 9)[(arm, seed)]
+        assert line.startswith(f"  {arm}_seed{seed}: C_shipped {r['shipped_grid_r2']:.3f} vs study ")
+        assert f"vs study {r['controls']['study_embedding_r2']:.3f} (study rollout-probe " in line
+        assert f"(study rollout-probe {0.018 + 0.03 * cell_index:.3f})" in line
+        assert f"C - C_shipped {0.001 * cell_index - 0.0123:+.4f}" in line
+        assert f"widest RBF - linear {-0.01 * cell_index - 0.0071:+.4f}" in line
+    assert "expected negative on a good cell" in section
+
+
+def test_a_large_negative_fine_minus_shipped_is_recorded_and_printed_and_never_gates(
+    tmp_path, record,
+):
+    """Recorded, not gated: a finer grid that overfits selection (`C - C_shipped` of -0.16 on
+    every cell, as the 8-episode fit produced on `random_vit`) is a FINDING, so the read still
+    takes its reading and exits 0, and the number is on the page rather than only in the
+    records."""
+    status, text = _controls_reading(
+        tmp_path, record, lambda i, r: r.__setitem__("fine_minus_shipped_on_score", -0.16),
+    )
+    assert status == 0
+    assert text.count("C - C_shipped -0.1600") == 9
+    assert "PROBE_LIMITED" in text
+
+
+def test_the_widest_rung_minus_linear_never_gates_whatever_it_reads(tmp_path, record):
+    """The asymptotic nesting claim is EXPECTED negative on a good cell (nesting is structural,
+    pinned in `test_ceiling.py`), so no value of it refuses a read: a large negative one and a
+    large positive one both read, at exit 0, and are printed."""
+    for value in (-0.5, 0.5):
+        status, text = _controls_reading(
+            tmp_path, record, name=f"nest{value}",
+            edit=lambda i, r, v=value: r["controls"].__setitem__(
+                "nesting_rbf_at_widest_vs_linear", v,
+            ),
+        )
+        assert status == 0
+        assert text.count(f"widest RBF - linear {value:+.4f}") == 9
+
+
+@pytest.mark.parametrize("field", [
+    "fine_minus_shipped_on_score", "nesting_rbf_at_widest_vs_linear",
+    "study_embedding_selection_r2",
+])
+@pytest.mark.parametrize("bad", ["nan", None, "0.1"])
+def test_an_ungated_control_that_is_not_a_finite_number_is_refused_by_name(
+    tmp_path, record, field, bad,
+):
+    """They are printed, so they are read: a `nan` or a missing one would otherwise print as
+    such, or raise a bare KeyError from the formatter."""
+    out = _write_nine(tmp_path, record, harness_matches=True)
+    path = script.ceiling_record_path(out, "pixel_ae", 0)
+    broken = load_record(path)
+    broken.pop("nonfinite")
+    in_controls = field != "fine_minus_shipped_on_score"
+    target = broken["controls"] if in_controls else broken
+    target[field] = bad
+    write_record(path, broken)
+    label = f"controls.{field}" if in_controls else field
+    with pytest.raises(SystemExit, match=rf"pixel_ae seed 0: {label} is"):
+        _capture_read(out)
+    del target[field]
+    write_record(path, broken)
+    with pytest.raises(SystemExit, match=rf"pixel_ae seed 0 lacks {label}:"):
+        _capture_read(out)
+
+
+def test_the_tests_the_widest_rung_docstring_cites_exist():
+    """`widest_rbf_r2` says nesting is structural and pinned by test, and names the tests. A
+    docstring that cites a test that was renamed away claims a pin that is gone."""
+    text = (Path(__file__).with_name("test_ceiling.py")).read_text()
+    for name in (
+        "test_the_kernel_readout_cannot_select_below_the_linear_probe_on_its_selection_split",
+        "test_the_linear_rung_is_the_linear_reference_and_not_an_approximation_of_it",
+    ):
+        assert f"def {name}(" in text, name
+        assert name in script.widest_rbf_r2.__doc__

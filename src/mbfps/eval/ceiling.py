@@ -422,7 +422,12 @@ def null_floor(n: int, d: int, *, seed: int = 0) -> float:
 
 
 FRAME_BUDGET: int = 12000
-"""Frames drawn from the validation episodes, by a fixed stride.
+"""Rows each split is brought within, by one fixed stride (`scripts/probe_ceiling.py`).
+
+The splits are the study's 20 training episodes (fit; 9,044 rows on the shipped data) and
+the two halves of the validation episodes (select and score; ~6,000 each), so the budget
+does not bind on the shipped split and the stride is 1. Cost is cubic in the fit split's
+rows, which is why `--frames` exists.
 
 STATED RATHER THAN DISCOVERED. `_solve`'s dual branch costs n^2 float64s:
 12,000 frames is 1.15 GB (the whole 12,073-frame validation set is 1.17 GB),
