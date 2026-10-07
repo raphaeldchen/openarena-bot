@@ -1933,6 +1933,28 @@ def applied_quality(trajectories) -> dict:
 
 It costs one `reference_trajectories` pass per cell, about 2.3 minutes at M3n's measured rate, and it is the first thing `measure_cell` does.
 
+**THE PROBE GAIN GOES THROUGH `ceiling.probe_gain_over_floor`, NOT
+`difference_interval`.** Task 4 added it because nothing else forms
+`D - C - max(null_floor, 0)`: it takes `(d, c, floor, score_targets, groups, *,
+seed)`, refuses `c.name != "linear"` and `d.name != "rbf"`, and clamps a negative
+floor. If this phase forms `gains["probe"]` with `difference_interval` directly,
+every cell reads against ZERO and nothing in `CeilingCell` can tell — which is
+the exact defect Task 2b exists to have fixed. **Add a read-phase test that a
+`D - C` interval lying below `null_floor` does not yield `PROBE_LIMITED`.**
+
+**`B - D` AND `F - B` HAVE NO NAME GUARD, because B, D and F are all `"rbf"`.**
+`probe_gain_over_floor` can refuse a swapped C, but the pixel and sequence gains
+cannot be protected that way: exchanging the two arguments returns a wrong-sign
+gain and nothing refuses it. Pin each by VALUE on a fixture where the expected
+sign is known by construction — raw pixels beating the representation for the
+pixel gain, and history beating one frame for the sequence gain.
+
+**MAP UNITS ARE COMPARED HERE, NOT IN TASK 4.** Nothing in the reading touches a
+map-unit statistic. This phase is where `mean_error` is set against the
+zero-information MEAN and `median_error` against `ZERO_INFORMATION_MEDIAN =
+283.05`, each ratio naming its statistic, and where M3n's 131.88-259.06 — a mean
+— is compared only to `mean_error`.
+
 `measure_cell` then builds the three splits by **episode** from `episode_split`, subsamples to `FRAME_BUDGET` by a fixed stride recorded as `frame_stride`, scores the seven readouts through `ceiling.score_readout`, forms the three gains through `ceiling.difference_interval` at `cell_bootstrap_seed(...)`, and records the four controls. The raw-pixel readouts use no model, so compute them once and reuse across cells — assert they are identical across the nine records in the read phase, which is the free bitwise control.
 
 `read_phase` loads every record, refuses on a protocol disagreement, checks `controls.harness_r2_matches_study` and exits 49 if any cell fails, builds `CeilingInputs`, calls `reading_ceiling`, writes `format_reading_ceiling`'s text to stdout **and** `<out>/ceiling.txt`, and exits `READ_EXITS.get(reading.verdict, 0)`. **Print `reading.rule`, not only `reading.verdict`.**

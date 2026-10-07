@@ -339,6 +339,26 @@ Each cell fits the whole ladder on a SYNTHETIC purely-linear task at its own
 `n` and `D` and records that `D - C` as `null_floor`. `PROBE_LIMITED` requires
 the real `D - C` resolvably above **that**, not above zero.
 
+**A NEGATIVE FLOOR CLAMPS TO ZERO.** The floor is a bar to clear, not a
+correction to apply. Subtracting a measured `-0.0016` would ADD to the gain and
+make `PROBE_LIMITED` easier to reach than reading against zero — the opposite of
+what the control is for. The bar is `max(null_floor, 0)`; a positive floor is
+subtracted exactly.
+
+**AND IT IS AVERAGED OVER THREE DRAWS.** A single draw of the floor is itself
+noisy, and the floor is a nuisance parameter the verdict is read against, so it
+is worth estimating more precisely than the quantity it bounds. Three draws at
+the cell's own shape, averaged.
+
+One thing the floor cannot fix: the measured `D - C` has its own draw noise. On
+purely linear data at n=300, D=150, `D - C` exceeded +0.003 in 4 of 40 draws, and
+one draw read +0.0085 with an interval of [+0.0043, +0.0133] against a correctly
+zero floor — a resolvably positive gain with nothing nonlinear present. At
+n=1200, D=512 the same spread is -0.0001 to +0.0011. The real cells sit at the
+larger end, and the strict majority of five is what makes one such cell
+harmless, but **a reduced-frame smoke run can legitimately show a spurious
+`PROBE_LIMITED` cell** and that is not a bug.
+
 A `null_floor` that comes back materially above zero is a finding about the
 instrument, not a number to subtract and move on from: it means §3.3.1's fix is
 incomplete at that shape.
