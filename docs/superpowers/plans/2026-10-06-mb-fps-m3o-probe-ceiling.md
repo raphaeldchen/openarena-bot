@@ -25,7 +25,16 @@
 - **`C` is the best LINEAR readout and is NOT the shipped probe.** `C` searches `CEILING_RIDGES` and is expected ABOVE the shipped `embedding_selection_r2` band (0.320-0.345) by up to ~0.02. The reconciliation and **exit 49 read `C_shipped`** — the same fit over `probe.RIDGES`, recorded as `shipped_grid_r2`. Gating on `C` would exit 49 on a correct run. Spec §3.3.1, §6.
 - **`PROBE_LIMITED` is read against a MEASURED FLOOR, never against zero.** The floor is sharply shape-dependent — ~0 at D=37632 even on the coarse grid, largest at D=2048 — so Task 2b's three shapes do not license nine cells. Each cell measures `ceiling.null_floor(n, d)` at its own shape; `PROBE_LIMITED` requires the real `D - C` resolvably above it. A `null_floor` materially above zero is a finding about the instrument, not a number to subtract. Spec §6.1. **Task 2b implements it, Task 4 reads it, Task 5 records it.**
 - Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05`, `DISPLACEMENT_TARGET = 3.9694722203504225`, `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. `RIDGES` is inherited from `probe.py`, not redefined. `CEILING_RIDGES` is `tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))` — 33 rungs, and it contains `RIDGES` bitwise as every 8th rung.
-- **THE RAW-PIXEL ROW DOES NOT FIT IN MEMORY AT `FRAME_BUDGET`, and Task 5 must size it explicitly.** `FRAME_BUDGET = 12000` was reasoned from the dual Gram (12000^2 x 8 = 1.07 GiB), but the raw-pixel FEATURE matrix at D = 37632 is 12000 x 37632 x 8 = **3.36 GiB per split**, and three splits plus `fit_kernel_probe`'s standardised copy is ~13 GiB live. `_solve_ladder`'s dual branch coerces to float64 whatever it is handed, so storing float32 does not help the solve. This is the 18 GB allocation that stopped this milestone's first attempt, and `FRAME_BUDGET` as written does not prevent it — it only bounds the Gram. Task 5 gives the raw-pixel row its own smaller budget, records it, and states in its report what the reduced `n` costs row B as a ceiling. Do not discover this at run time in Task 6.
+- **`FRAME_BUDGET` DOES NOT BIND PER SPLIT, AND EVERYTHING EXPENSIVE SCALES AS `n^3`. Task 5 records the actual rows per split; Task 6 budgets from them.** The validation set is 12,073 frames over 24 episodes and `episode_split` divides it three ways, so each split holds **n ≈ 4,000** — `FRAME_BUDGET = 12000` never binds. That distinction is the whole budget:
+
+  | per split | one kernel ladder | `null_floor`, 3 draws | nine cells of floors | raw pixels, D=37632 |
+  | --- | --- | --- | --- | --- |
+  | n ≈ 4,000 (actual) | 36 s | 109 s | **17 min** | 1.12 GiB/split, 3.36 GiB for three |
+  | n = 12,000 (the cap) | 1,027 s | 3,082 s | **7.7 hours** | 3.36 GiB/split, 10.1 GiB for three |
+
+  Measured: 0.93 s at n=1200 and 63.2 s at n=4800, which is `n^3.04` — the seven eigendecompositions in `fit_kernel_probe`. **So the planned run is comfortable and needs no reduced budget.** Do not add one. But a change that lets `n` reach the cap turns 17 minutes into 7.7 hours, so `measure_cell` records the rows per split beside `frame_stride`, and the read phase prints them.
+
+  Two corrections to what an earlier revision of this line claimed. The 18 GB allocation that stopped this milestone's first attempt was `_solve`'s PRIMAL path building `np.eye(37632)` at 11.3 GiB; **Task 1 fixed that** by branching on `min(n, D)`, and the dual Gram at n ≈ 4,000 is 128 MiB. And `FRAME_BUDGET`'s own docstring reasons from the Gram, which is right — it was the feature matrix that needed checking, and at the real `n` that is 1.12 GiB, not the 3.36 GiB the cap implies.
 - The strict-majority bar is **computed**, never stored: `burden.strict_majority(len(cells))`. It returns 5 at nine cells and 6 at eleven.
 - Every difference is read from an episode-clustered bootstrap interval via `probe._block_bootstrap_ci`, at a per-cell seed derived as M3n derives it — `zlib.crc32` of base, arm and seed. **Never `hash()`**: it is salted per process, so records would not reproduce.
 
@@ -1704,7 +1713,7 @@ EOF
 {
   "arm": str, "seed": int, "step": int,
   "git_sha": str, "record_git_sha": str, "torch_version": str, "device": str,
-  "frames": 12000, "frame_stride": int,
+  "frames": 12000, "frame_stride": int, "rows_per_split": {"fit": int, "select": int, "score": int},
   "confidence": 0.95, "resamples": 2000,
   "bootstrap_seed": int, "cell_bootstrap_seed": int, "split_seed": int,
   "zero_information_median": 283.05,
