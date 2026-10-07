@@ -1091,14 +1091,23 @@ def test_the_difference_interval_is_the_shipped_bootstrap_at_the_recorded_level(
 def test_the_difference_interval_follows_its_seed():
     """The seed is the caller's, so it must reach the resampler.
 
-    The same seed twice is the control that the interval is a function of it; two
-    seeds are first shown to give different intervals through the oracle, so that
-    a hard-coded seed could not hide behind two draws that happen to agree.
+    Two seeds are first shown to give different intervals through the shipped
+    bootstrap itself, so that a hard-coded seed could not hide behind two draws
+    that happen to agree; then each seed's interval must be that bootstrap's at
+    that seed. Reached: the seed fixed at 0 inside `difference_interval`.
     """
     a, b, truth, episode = _episode_pair()
-    two = difference_interval(a, b, truth, episode, seed=1)
-    assert two == difference_interval(a, b, truth, episode, seed=1)
-    assert two != difference_interval(a, b, truth, episode, seed=2)
+
+    def oracle(seed):
+        return _block_bootstrap_ci(
+            a.predicted, b.predicted, truth,
+            resamples=2000, confidence=0.95, seed=seed, groups=episode,
+        )
+
+    assert oracle(1) != oracle(2), "fixture must give a different interval per seed"
+    for seed in (1, 2):
+        interval = difference_interval(a, b, truth, episode, seed=seed)
+        assert (interval["ci_low"], interval["ci_high"]) == oracle(seed)
 
 
 def test_the_difference_interval_refuses_groups_it_cannot_resample():
