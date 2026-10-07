@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import re
 import tracemalloc
@@ -9,9 +10,9 @@ import mbfps.eval.ceiling as ceiling
 import mbfps.eval.probe as probe_module
 from mbfps.eval.ceiling import (
     ARMS_REQUIRED, BANDWIDTHS, CEILING_RIDGES, CONFIDENCE, FRAME_BUDGET, NEIGHBOURS,
-    NO_MAJORITY, READING_COLUMNS, READING_WIDTHS, RESAMPLES, SEEDS_MINIMUM,
+    NO_MAJORITY, NULL_DRAWS, READING_COLUMNS, READING_WIDTHS, RESAMPLES, SEEDS_MINIMUM,
     VERDICTS, ZERO_INFORMATION_MEDIAN, CeilingCell, CeilingInputs, CeilingStatus,
-    Readout, _median_scale, _row, apply_readout, difference_interval,
+    Readout, _gap, _median_scale, _row, apply_readout, difference_interval,
     fit_kernel_probe, fit_knn_probe, fit_linear_probe, format_reading_ceiling,
     null_floor, probe_gain_over_floor, reading_ceiling, score_readout,
     zero_information_error,
@@ -689,8 +690,38 @@ def test_the_null_floor_is_near_zero_on_the_grid_the_ceiling_searches(monkeypatc
     assert abs(floor) < 0.005, f"floor is {floor:+.4f} on CEILING_RIDGES"
 
 
-def test_the_null_floor_is_scored_on_the_third_split_drawn(monkeypatch):
-    """Fit on the first split, select on the second, SCORE on the third.
+@contextlib.contextmanager
+def _spied_null_splits(monkeypatch, score_scales=None):
+    """Record every split `null_floor` draws, and hand it exactly what was recorded.
+
+    Yields a list of `(split_seed, x, y)` in call order, three splits to a draw
+    (fit, select, score), so an expectation built from the record is built from
+    the splits `null_floor` actually used. `score_scales[j]`, when given,
+    multiplies the features of draw `j`'s third split. The spy is removed on
+    exit, so two calls in one test do not wrap each other.
+    """
+    real = ceiling._null_split
+    drawn = []
+
+    def spy(split_seed, rows, dims):
+        x, y = real(split_seed, rows, dims)
+        k = len(drawn)
+        if score_scales is not None and k % 3 == 2:
+            x = x * score_scales[k // 3]
+        drawn.append((split_seed, x, y))
+        return x, y
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "_null_split", spy)
+        yield drawn
+
+
+@pytest.mark.parametrize("seed", [4, 14])
+def test_the_null_floor_is_the_mean_of_d_minus_c_scored_on_the_third_split_of_each_draw(
+    monkeypatch, seed
+):
+    """Fit on a draw's first split, select on its second, SCORE on its third; the
+    floor is the mean of the draws' scores.
 
     On the selection split `D >= C` is exact, because the ladder contains the
     reference and both selected on that split, so a floor read there is
@@ -700,65 +731,162 @@ def test_the_null_floor_is_scored_on_the_third_split_drawn(monkeypatch):
     score-split readings differ by ~2e-3, which a threshold on the result
     cannot separate from the right one.
 
-    So the splits are made distinguishable by construction. The third draw is
-    moved out of the readouts' support (its features scaled by 4), where a
-    kernel readout reverts to the mean and the linear one extrapolates, so
-    `D - C` reads in the units there instead of at 1e-3. That is no longer a
-    null task and the number is not claimed to be a floor: the claim is only
-    which split it is read on. The spy returns what `_null_split` draws, so the
-    test's expectation is built from the splits `null_floor` actually used.
+    So the splits are made distinguishable by construction. Each draw's third
+    split is moved out of the readouts' support (its features scaled, by a
+    DIFFERENT factor per draw), where a kernel readout reverts to the mean and
+    the linear one extrapolates, so `D - C` reads in the units there instead of
+    at 1e-3, and the three draws read far apart. That is no longer a null task
+    and the number is not claimed to be a floor: the claim is only which split
+    each draw is read on, and that the draws are averaged. The spy returns what
+    `_null_split` draws, so the expectation is built from the splits used.
 
-    The fixture is shown to discriminate before the result is compared: the
-    selected rung must be an RBF one (a linear rung makes `D - C` exactly 0 on
-    every split and nothing could be told apart), the selection-split reading
-    must be non-negative as nesting requires, and the score-split reading
-    must be separated from the fit-split and selection-split ones by far more
-    than the tolerance. Reached: scoring on the selection split, scoring on
-    the fit split, and the third split taking the selection role.
+    The fixture is shown to discriminate before the result is compared. In every
+    draw the selected rung must be an RBF one (a linear rung makes `D - C`
+    exactly 0 on every split and nothing could be told apart; at this shape that
+    holds for one draw in three on average, and seeds 4 and 14 are the two of the
+    first sixty where it holds for all three), the selection-split reading must
+    be non-negative as nesting
+    requires, and the score-split reading must be separated from the fit-split
+    and selection-split ones by far more than the tolerance. The three draws'
+    readings must differ from one another and the mean from every one of them
+    and from their median, so a floor taken from one draw, or the median of
+    three, or a sum, cannot match. Reached: scoring on the selection split,
+    scoring on the fit split, the third split taking the selection role, a
+    single draw returned, a sum in place of a mean.
     """
-    n, d, seed = 300, 150, 1
-    real = ceiling._null_split
-    drawn = []
+    n, d = 200, 60
+    with _spied_null_splits(monkeypatch, score_scales=(4.0, 6.0, 5.0)) as drawn:
+        floor = null_floor(n, d, seed=seed)
+    assert len(drawn) == 3 * NULL_DRAWS, f"expected {NULL_DRAWS} draws of three splits, got {len(drawn)}"
 
-    def spy(split_seed, rows, dims):
-        x, y = real(split_seed, rows, dims)
-        if len(drawn) == 2:
-            x = x * 4.0
-        drawn.append((x, y))
-        return x, y
+    on_scores = []
+    for draw in range(NULL_DRAWS):
+        train, select, score = [(x, y) for _, x, y in drawn[3 * draw:3 * draw + 3]]
+        linear = fit_linear_probe(*train, *select)
+        kernel = fit_kernel_probe(*train, *select)
+        assert kernel["kernel"] == "rbf", (
+            f"fixture must select an RBF rung in draw {draw}; got {kernel['kernel']}"
+        )
 
-    monkeypatch.setattr(ceiling, "_null_split", spy)
-    floor = null_floor(n, d, seed=seed)
-    assert len(drawn) == 3, f"expected three splits drawn, got {len(drawn)}"
-    train, select, score = drawn
+        def gap_on(split):
+            return _score_on(kernel, split) - _score_on(linear, split)
 
-    linear = fit_linear_probe(*train, *select)
-    kernel = fit_kernel_probe(*train, *select)
-    assert kernel["kernel"] == "rbf", (
-        f"fixture must select an RBF rung; got {kernel['kernel']}"
+        on_train, on_select, on_score = gap_on(train), gap_on(select), gap_on(score)
+        assert on_select >= -1e-9, (
+            f"draw {draw}: nesting, D - C on the selection split is {on_select:+.6f}"
+        )
+        assert on_score - on_select > 1.0, (
+            f"draw {draw}: score-split reading {on_score:+.4f} is not apart from the "
+            f"selection-split one {on_select:+.4f}"
+        )
+        assert on_score - on_train > 1.0, (
+            f"draw {draw}: score-split reading {on_score:+.4f} is not apart from the "
+            f"fit-split one {on_train:+.4f}"
+        )
+        on_scores.append(on_score)
+
+    mean = sum(on_scores) / NULL_DRAWS
+    assert all(abs(a - b) > 0.5 for a, b in zip(on_scores, on_scores[1:] + on_scores[:1])), (
+        f"fixture: the draws read {on_scores}, and they must differ from one another"
+    )
+    assert all(abs(mean - v) > 0.1 for v in on_scores), "fixture: the mean must match no draw"
+    assert abs(mean - sorted(on_scores)[NULL_DRAWS // 2]) > 0.1, "fixture: mean is not the median"
+
+    assert floor == pytest.approx(mean, abs=1e-9), (
+        f"null_floor returned {floor:+.6f}; the mean of D - C on each draw's third "
+        f"split is {mean:+.6f} (draws {on_scores})"
     )
 
-    def gap_on(split):
-        return _score_on(kernel, split) - _score_on(linear, split)
 
-    on_train, on_select, on_score = gap_on(train), gap_on(select), gap_on(score)
-    assert on_select >= -1e-9, (
-        f"nesting: D - C on the selection split is {on_select:+.6f}"
-    )
-    assert on_score - on_select > 1.0, (
-        f"score-split reading {on_score:+.4f} is not apart from the "
-        f"selection-split one {on_select:+.4f}"
-    )
-    assert on_score - on_train > 1.0, (
-        f"score-split reading {on_score:+.4f} is not apart from the "
-        f"fit-split one {on_train:+.4f}"
+def test_no_two_null_draws_share_a_split_and_no_two_seeds_share_one(monkeypatch):
+    """Each draw is a task of its own: its three splits are drawn from seeds no
+    other draw uses, and a different `seed` argument gets a block of its own.
+
+    Averaging draws that share splits is not averaging: the old derivation,
+    `_null_split(3 * seed + i, ...)` for each draw, would give three copies of
+    one draw and a mean no more precise than a single one. Overlap by one split
+    (`3 * seed + draw + i`) is the quieter version of the same error, and
+    this checks that too, since it makes draw `j`'s select split draw `j + 1`'s
+    fit split.
+
+    Reached: every draw on the same three splits, draws offset by one, and
+    neighbouring seeds whose blocks of splits overlap.
+    """
+    with _spied_null_splits(monkeypatch) as at_zero:
+        null_floor(60, 20, seed=0)
+    with _spied_null_splits(monkeypatch) as at_one:
+        null_floor(60, 20, seed=1)
+    zero = [s for s, _, _ in at_zero]
+    one = [s for s, _, _ in at_one]
+    assert len(zero) == len(one) == 3 * NULL_DRAWS, "fixture: three splits to a draw"
+    assert len(set(zero)) == len(zero), f"a split is reused within one call: {zero}"
+    assert len(set(one)) == len(one), f"a split is reused within one call: {one}"
+    assert not set(zero) & set(one), f"seeds 0 and 1 share splits: {sorted(set(zero) & set(one))}"
+    draws = [zero[3 * j:3 * j + 3] for j in range(NULL_DRAWS)]
+    for a in range(NULL_DRAWS):
+        for b in range(a + 1, NULL_DRAWS):
+            assert not set(draws[a]) & set(draws[b]), f"draws {a} and {b} share a split: {draws}"
+    # and the data differ, not only the labels
+    xs = [x for _, x, _ in at_zero]
+    assert all(
+        not np.array_equal(xs[a], xs[b]) for a in range(len(xs)) for b in range(a + 1, len(xs))
     )
 
-    assert floor == pytest.approx(on_score, abs=1e-9), (
-        f"null_floor returned {floor:+.6f}; D - C is {on_score:+.6f} on the "
-        f"third split, {on_select:+.6f} on the selection split and "
-        f"{on_train:+.6f} on the fit split"
+
+@pytest.mark.parametrize("gaps, mean, bar", [
+    pytest.param((-0.004, -0.002, 0.003), -0.001, 0.0, id="negative-mean"),
+    pytest.param((-0.002, -0.001, 0.003), 0.0, 0.0, id="the-spec-example"),
+    pytest.param((0.004, -0.001, -0.001), 0.002 / 3, 0.002 / 3, id="positive-mean"),
+])
+def test_the_floor_averages_its_draws_before_it_clamps_and_returns_the_mean_unclamped(
+    monkeypatch, gaps, mean, bar
+):
+    """`max(mean(draws), 0)` is not `mean(max(draw, 0))`, and the first is the bar.
+
+    The draws are SCRIPTED, so the orders can be told apart by value: `null_floor`
+    is run with each readout's score replaced by a number the test chooses, the
+    linear one at 0 and the kernel one at the draw's gap. Draws of -0.004, -0.002
+    and +0.003 average to -0.001, which clamps to a bar of 0.0; clamped first they
+    average to +0.001. The second row is the spec's own example, and the third has
+    a positive mean the per-draw clamp would inflate.
+
+    Two things are pinned, each by a value written out here and not computed by
+    the code under test: `null_floor` returns the UNCLAMPED mean (so it is
+    negative where the mean is, and clamps nothing), and the gain built from it
+    carries the bar `max(mean, 0)` and not the clamp-first one.
+
+    Reached: each draw clamped before the mean, the mean clamped inside
+    `null_floor`, one draw returned, the sum not divided.
+    """
+    clamp_first = sum(max(g, 0.0) for g in gaps) / len(gaps)
+    assert abs(clamp_first - bar) > 5e-4, "fixture: clamping first must give a different bar"
+    assert len(gaps) == NULL_DRAWS
+    assert sum(gaps) / len(gaps) == pytest.approx(mean, abs=1e-12), "fixture: the stated mean"
+
+    seen = {"kernel": 0, "linear": 0}
+
+    def scripted_r2(tag, targets):
+        draw = seen[tag]
+        seen[tag] += 1
+        return gaps[draw] if tag == "kernel" else 0.0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ceiling, "fit_kernel_probe", lambda *a: {"tag": "kernel"})
+        patch.setattr(ceiling, "fit_linear_probe", lambda *a: {"tag": "linear"})
+        patch.setattr(ceiling, "apply_readout", lambda readout, x: readout["tag"])
+        patch.setattr(ceiling, "_mean_r2", scripted_r2)
+        floor = null_floor(10, 4)
+    assert seen == {"kernel": len(gaps), "linear": len(gaps)}, "one scored pair per draw"
+    assert floor == pytest.approx(mean, abs=1e-12), (
+        f"null_floor returned {floor:+.6f}; the unclamped mean of {gaps} is {mean:+.6f}"
     )
+
+    d, c, truth, episode = _d_and_c()
+    raw = difference_interval(d, c, truth, episode, seed=0)
+    got = probe_gain_over_floor(d, c, floor, truth, episode, seed=0)
+    for key in ("point", "ci_low", "ci_high"):
+        assert got[key] == pytest.approx(raw[key] - bar, abs=1e-12), key
+        assert abs(got[key] - (raw[key] - clamp_first)) > 5e-4, f"{key}: clamp-first bar"
 
 
 def test_an_empty_ridge_grid_is_refused_by_both_probes(monkeypatch):
@@ -1076,13 +1204,16 @@ def test_the_zero_information_error_is_the_distance_to_the_fit_mean():
 
 
 def test_the_stated_constants_are_the_ones_the_plan_records():
-    """A change detector for four figures that are STATED, not derived.
+    """A change detector for five figures that are STATED, not derived.
 
     `FRAME_BUDGET` is the n^2 dual's memory ceiling, `ZERO_INFORMATION_MEDIAN`
-    the measured scale the map-unit figures are read against, and the last two
-    the interval the verdict's differences are drawn at. None is computed by the
-    code, so the only test of a value is that it has not moved.
+    the measured scale the map-unit figures are read against, `CONFIDENCE` and
+    `RESAMPLES` the interval the verdict's differences are drawn at, and
+    `NULL_DRAWS` the number of draws the floor is averaged over (and so the
+    multiple of one draw's cost that `null_floor` takes). None is computed by
+    the code, so the only test of a value is that it has not moved.
     """
+    assert NULL_DRAWS == 3
     assert FRAME_BUDGET == 12000
     assert ZERO_INFORMATION_MEDIAN == 283.05
     assert CONFIDENCE == 0.95
@@ -1574,6 +1705,62 @@ def test_a_cell_whose_interval_is_not_one_cannot_be_built(field, bad):
         CeilingCell(arm="a", seed=0, **{**fields, field: bad})
 
 
+@pytest.mark.parametrize("field", ["probe_gain", "pixel_gain", "sequence_gain"])
+@pytest.mark.parametrize("bad, needle", [
+    ({"point": 0.2, "low": 0.1, "high": 0.3}, "'ci_low'"),
+    ({"point": 0.2, "ci_low": 0.1}, "'ci_high'"),
+    ({"ci_low": 0.1, "ci_high": 0.3}, "'point'"),
+    ({}, "'point'"),
+    ((0.2, 0.1, 0.3), "tuple"),
+    (None, "NoneType"),
+], ids=["renamed", "no-high", "no-point", "empty", "tuple", "none"])
+def test_a_cell_whose_interval_lacks_a_key_is_refused_by_name_and_is_not_a_keyerror(
+    field, bad, needle
+):
+    """Every other refusal here is a `ValueError` that names the field, and a
+    gain dict whose keys were renamed (`low` and `high` for `ci_low` and
+    `ci_high`) escaped as `KeyError: 'ci_low'` from inside `__post_init__`,
+    which says neither which field nor which cell. The message now names the
+    field it belongs to and the key (or the type) that is wrong. `KeyError` is
+    not a `ValueError`, so `pytest.raises(ValueError)` fails on the old code.
+
+    Reached: the missing-key and not-a-dict checks removed.
+    """
+    fields = {"probe_gain": _iv(*_UP), "pixel_gain": _iv(*_UP), "sequence_gain": _iv(*_UP)}
+    CeilingCell(arm="a", seed=0, **fields)  # the same cell with a sound interval builds
+    with pytest.raises(ValueError) as caught:
+        CeilingCell(arm="a", seed=0, **{**fields, field: bad})
+    message = str(caught.value)
+    assert f".{field}" in message, message
+    assert needle in message, message
+
+
+def test_a_cell_built_positionally_is_refused_because_its_three_gains_look_alike():
+    """The three gains are dicts of one shape, so `CeilingCell(arm, seed, pixel,
+    probe, sequence)` would build without complaint and read
+    REPRESENTATION_LIMITED where PROBE_LIMITED holds, with every figure in the
+    table still plausible. `probe_gain_over_floor` guards which READOUTS form a
+    gain, not which FIELD receives it, so only the signature can refuse this.
+
+    The fixture is shown to discriminate first: the swap, spelled with keywords,
+    does build, and does read a different verdict. Then the positional forms are
+    refused, the swapped one and the one in the right order alike.
+
+    Reached: `kw_only=True` removed from `CeilingCell`.
+    """
+    probe, pixel, sequence = _iv(*_UP), _iv(*_FLAT), _iv(*_FLAT)
+    right = CeilingCell(arm="a", seed=0, probe_gain=probe, pixel_gain=pixel, sequence_gain=sequence)
+    swapped = CeilingCell(arm="a", seed=0, probe_gain=pixel, pixel_gain=probe, sequence_gain=sequence)
+    assert (right.verdict(), swapped.verdict()) == ("PROBE_LIMITED", "REPRESENTATION_LIMITED")
+
+    with pytest.raises(TypeError, match="positional"):
+        CeilingCell("a", 0, pixel, probe, sequence)
+    with pytest.raises(TypeError, match="positional"):
+        CeilingCell("a", 0, probe, pixel, sequence)
+    with pytest.raises(TypeError, match="positional"):
+        CeilingCell("a", seed=0, probe_gain=probe, pixel_gain=pixel, sequence_gain=sequence)
+
+
 @pytest.mark.parametrize("sizes, counts, verdict, bar", [
     ((3, 3, 3), {"PROBE_LIMITED": 5, "OBSERVATION_LIMITED": 4}, "PROBE_LIMITED", 5),
     ((3, 3, 3), {"PROBE_LIMITED": 4, "REPRESENTATION_LIMITED": 5}, "REPRESENTATION_LIMITED", 5),
@@ -1877,6 +2064,10 @@ def test_the_formatter_states_what_a_difference_does_and_does_not_show():
     assert "differences in r2" in text and "not in map units" in text
     assert "MINUS the cell's own measured null floor" in text
     assert "D-C-floor" in READING_COLUMNS[1]
+    # the floor is a mean of three draws, averaged BEFORE it is clamped, and the
+    # legend is wrapped, so compare with the whitespace folded
+    legend = " ".join(text.split())
+    assert "the mean of 3 draws, THEN clamped at zero from below" in legend
 
 
 def test_a_row_refuses_a_value_count_that_does_not_match_its_widths():
@@ -1892,6 +2083,87 @@ def test_a_row_refuses_a_value_count_that_does_not_match_its_widths():
     with pytest.raises(ValueError):
         _row(("a", "b"), (3, 3, 3))
     assert len(READING_COLUMNS) == len(READING_WIDTHS)
+
+
+def test_a_value_that_fills_its_column_is_refused_and_one_a_space_short_is_not():
+    """The boundary, at the real width of the probe column. A value that fills
+    its column runs into the next, and a row built from it is no longer
+    `sum(widths)` long, or is exactly that long and cut in the wrong place.
+
+    Reached: the refusal removed, and `>=` relaxed to `>`.
+    """
+    width = READING_WIDTHS[1]
+    fits = _row(("cell", "y" * (width - 1)), READING_WIDTHS[:2])
+    assert len(fits) == READING_WIDTHS[0] + width and fits.endswith("y" + " ")
+    with pytest.raises(ValueError, match="cannot hold"):
+        _row(("cell", "y" * width), READING_WIDTHS[:2])
+    with pytest.raises(ValueError, match="cannot hold"):
+        _row(("cell", "y" * (width + 3)), READING_WIDTHS[:2])
+
+
+def test_the_reading_widths_are_the_ones_the_plan_records():
+    """A column is made to fit by refusing what does not, not by widening it."""
+    assert READING_WIDTHS == (22, 30, 30, 30, 24)
+
+
+@pytest.mark.parametrize("where", ["probe_gain", "pixel_gain", "sequence_gain"])
+def test_a_figure_too_wide_for_its_column_is_refused_not_printed_misaligned(where):
+    """A `probe_gain` point of -1000.0 used to give a row longer than the header,
+    with no space between its first two columns, and a fixed-width reader then
+    cut every field after it in the wrong place. It is now a `ValueError` naming
+    the cell and the string that does not fit, from the formatter, and the
+    verdict is still read: only the TABLE is refused, because it cannot show the
+    figure faithfully. An r2 difference that large is not expected on the planned
+    run.
+
+    The fixture is shown to discriminate first: the figure's cell is at least a
+    column wide, the same cell with sound figures is narrower and builds, and
+    `reading_ceiling` reads the cells either way.
+
+    Reached: the width check removed from `_row`, for each of the three gains.
+    """
+    wide, sound, culprit = (-1000.0, -1100.0, -900.0), (-1.0, -1.1, -0.9), "pixel_ae_seed1"
+
+    def study(figures):
+        cells = dict(_distinct_nine().cells)
+        flat = (0.01, -0.05, 0.07)
+        gains = {"probe_gain": flat, "pixel_gain": flat, "sequence_gain": flat}
+        gains[where] = figures
+        cells[("pixel_ae", 1)] = CeilingCell(
+            arm="pixel_ae", seed=1, **{k: _iv(*v) for k, v in gains.items()}
+        )
+        return CeilingInputs(cells=cells)
+
+    wide_study, sound_study = study(wide), study(sound)
+    assert len(_gap(_iv(*wide))) >= READING_WIDTHS[1], "fixture: the figure must not fit"
+    assert len(_gap(_iv(*sound))) < READING_WIDTHS[1]
+    for inputs in (wide_study, sound_study):
+        assert reading_ceiling(inputs).verdict in (*VERDICTS, NO_MAJORITY)
+    format_reading_ceiling(reading_ceiling(sound_study), sound_study)
+
+    with pytest.raises(ValueError, match=culprit) as caught:
+        format_reading_ceiling(reading_ceiling(wide_study), wide_study)
+    assert _gap(_iv(*wide)) in str(caught.value)
+
+
+def test_an_arm_name_too_long_for_the_cell_column_is_refused_too():
+    """The same defect in the first column: `f"{arm}_seed{seed}"` against
+    `READING_WIDTHS[0]`, which a long arm name overflows into the probe column.
+
+    Reached: the width check removed from `_row`.
+    """
+    def study(arm):
+        flat = (0.01, -0.05, 0.07)
+        return CeilingInputs(cells={
+            (a, s): _cell(a, s, flat, flat) for a in (arm, "pixel_ae") for s in range(3)
+        })
+
+    sound, long_arm = study("x" * 10), study("x" * 20)
+    assert len(f"{'x' * 20}_seed0") >= READING_WIDTHS[0], "fixture: the label must not fit"
+    assert len(f"{'x' * 10}_seed0") < READING_WIDTHS[0]
+    format_reading_ceiling(reading_ceiling(sound), sound)
+    with pytest.raises(ValueError, match="cannot hold"):
+        format_reading_ceiling(reading_ceiling(long_arm), long_arm)
 
 
 # --- the probe gain, read against the cell's own measured floor -------------

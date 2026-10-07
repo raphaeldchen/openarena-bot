@@ -351,6 +351,14 @@ def fit_linear_probe(x, y, val_x, val_y) -> dict:
 _NULL_RANK: int = 40
 _NULL_NOISE: float = 120.0
 
+NULL_DRAWS: int = 3
+"""How many independent synthetic draws `null_floor` averages.
+
+A single draw of the floor is noisy, and the floor is a nuisance parameter the
+verdict is read against, so it is worth estimating more precisely than the
+quantity it bounds. STATED, not derived: nothing computes it, a change detector
+pins it, and `null_floor` costs this many times one draw."""
+
 
 def _null_split(seed: int, n: int, d: int):
     """One split of a SYNTHETIC purely-linear task: a low-rank signal pushed
@@ -370,7 +378,8 @@ def _null_split(seed: int, n: int, d: int):
 
 
 def null_floor(n: int, d: int, *, seed: int = 0) -> float:
-    """`D - C` at this shape when the target is EXACTLY linear in the features.
+    """`D - C` at this shape when the target is EXACTLY linear in the features:
+    the UNCLAMPED mean over `NULL_DRAWS` draws.
 
     The honest answer is 0: nothing nonlinear is there to find. Anything
     materially above it is the ladder beating the linear reference for
@@ -381,12 +390,35 @@ def null_floor(n: int, d: int, *, seed: int = 0) -> float:
     sharply shape-dependent: on the shipped grid it was +0.0201 at D=2048 (mean
     over 6 draws, n=2000) and +0.0000 at D=37632 (2 draws). Three shapes do not
     license nine cells.
+
+    EACH DRAW is a full fit, select and score cycle on its own three splits of
+    the one fixed task (`_null_split`: the map and the target weights do not
+    depend on the seed, so the draws are repeated samples of ONE task and no
+    readout is fit on one task and scored on another). Draw `j` takes its splits
+    from the seeds `3 * (NULL_DRAWS * seed + j) + i` for `i = 0, 1, 2` (fit,
+    select, score). The `3 * NULL_DRAWS` seeds of one call are therefore the
+    consecutive integers from `3 * NULL_DRAWS * seed`: no two draws share a
+    split, no split is reused across draws, and a different `seed` gets a block
+    of its own. Draw 0 at `seed=0` is the single draw this function used to be.
+
+    AVERAGE FIRST, THEN CLAMP, and the clamp is not here. `max(mean(draws), 0)`
+    and `mean(max(draw, 0))` are different numbers: draws of -0.002, -0.001 and
+    +0.003 average to +0.0000 and clamp to 0.0, but clamped first they average to
+    +0.001, a bar the instrument never showed. This returns the mean as it is,
+    negative or not, and `probe_gain_over_floor` takes `max(floor, 0)` once, in
+    the one place the bar is formed, so a caller cannot get the order wrong.
     """
-    train, select, score = (_null_split(3 * seed + i, n, d) for i in range(3))
-    linear = fit_linear_probe(*train, *select)
-    kernel = fit_kernel_probe(*train, *select)
-    return (_mean_r2(apply_readout(kernel, score[0]), score[1])
-            - _mean_r2(apply_readout(linear, score[0]), score[1]))
+    draws = []
+    for draw in range(NULL_DRAWS):
+        first = 3 * (NULL_DRAWS * seed + draw)
+        train, select, score = (_null_split(first + i, n, d) for i in range(3))
+        linear = fit_linear_probe(*train, *select)
+        kernel = fit_kernel_probe(*train, *select)
+        draws.append(
+            _mean_r2(apply_readout(kernel, score[0]), score[1])
+            - _mean_r2(apply_readout(linear, score[0]), score[1])
+        )
+    return float(sum(draws) / NULL_DRAWS)
 
 
 FRAME_BUDGET: int = 12000
@@ -621,7 +653,22 @@ def _check_interval(where: str, interval: dict) -> None:
     and count toward OBSERVATION_LIMITED: a missing measurement answering as the
     verdict that says no readout can do better. The point is not required to sit
     inside the interval, since a percentile interval need not contain it.
+
+    A dict without one of the keys (`low` and `high` for `ci_low` and `ci_high`,
+    say) is refused by name too: a `KeyError` from inside `__post_init__` is the
+    one refusal here that does not say which field it was about.
     """
+    if not isinstance(interval, dict):
+        raise ValueError(
+            f"{where} is a {type(interval).__name__}, not a dict with the keys "
+            f"{list(_INTERVAL_KEYS)}"
+        )
+    for key in _INTERVAL_KEYS:
+        if key not in interval:
+            raise ValueError(
+                f"{where} has no {key!r}; an interval needs the keys "
+                f"{list(_INTERVAL_KEYS)} and this one has {sorted(interval)}"
+            )
     for key in _INTERVAL_KEYS:
         if not math.isfinite(interval[key]):
             raise ValueError(
@@ -665,14 +712,24 @@ def probe_gain_over_floor(
     that reads below zero means the ladder under-read a linear task by selection
     noise, which is no credit to hand the real difference. Subtracting it as given
     would add up to |floor| to the lower bound and let an interval that includes
-    zero read as `PROBE_LIMITED`; the measured floors run -0.0016 to +0.0000, so
-    that is the usual sign and not an edge.
+    zero read as `PROBE_LIMITED`; the floors measured on the n=300, D=150 fixture
+    run -0.0016 to +0.0000, so that is the usual sign and not an edge.
 
-    THE FLOOR IS ONE SYNTHETIC DRAW PER CELL and is subtracted as a constant, so
-    its own sampling noise is not in the interval. Over six draws it ranged
-    -0.0005 to +0.0000 at D=1024 (`CEILING_RIDGES`); how that compares with the
-    real intervals' widths is not yet measured. It is a point estimate, and the
-    record keeps it beside the gain.
+    AVERAGE FIRST, THEN CLAMP; the two do not commute. `null_floor` returns the
+    UNCLAMPED mean of its draws and `max(floor, 0)` is taken here, once. Draws of
+    -0.002, -0.001 and +0.003 (illustrative, not measured) average to +0.0000 and
+    clamp to 0.0; clamped first they average to +0.001, a bar the instrument never
+    showed.
+
+    THE FLOOR IS THE MEAN OF `NULL_DRAWS` SYNTHETIC DRAWS PER CELL, not one, and
+    is subtracted as a constant, so what noise is left in that mean is not in the
+    interval. A single draw is noisy and the floor is a nuisance parameter the
+    verdict is read against, so it is estimated more precisely than the quantity
+    it bounds. On `CEILING_RIDGES` it measured -0.0001 at D=1024 and -0.0000 at
+    D=2048 (means over 6 draws, n=2000), and -0.0016 to +0.0000 on the n=300,
+    D=150 fixture (taken before the draws were averaged); how that compares with
+    the real intervals' widths is not yet measured. It is a point estimate, and
+    the record keeps it beside the gain.
 
     `score_targets` must be the exact targets both readouts were scored on, and
     `groups` the episode label of each of those rows: `difference_interval`
@@ -693,16 +750,27 @@ def probe_gain_over_floor(
     return {key: interval[key] - bar for key in _INTERVAL_KEYS}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class CeilingCell:
-    """One arm at one seed: the three differences the verdict reads."""
+    """One arm at one seed: the three differences the verdict reads.
+
+    KEYWORD-ONLY, because the three gains are identically typed dicts: a
+    positional `CeilingCell(arm, seed, pixel, probe, sequence)` would build
+    without complaint and read `REPRESENTATION_LIMITED` where `PROBE_LIMITED`
+    holds, and every figure in the table would still look plausible. Nothing
+    else can tell the fields apart (`probe_gain_over_floor` guards which readouts
+    form a gain, not which field receives it), so the names are spelled at every
+    call. A positional construction is a `TypeError`.
+    """
 
     arm: str
     seed: int
     probe_gain: dict
     """`D - C - floor`: the nonlinear readout over the best linear one on the
-    same features, net of this cell's own measured null floor. Formed by
-    `probe_gain_over_floor`, never by subtracting `D.r2 - C.r2` by hand."""
+    same features, net of this cell's own measured null floor: `max(null_floor,
+    0)`, where `null_floor` is the UNCLAMPED mean of `NULL_DRAWS` synthetic
+    draws at this cell's shape. Formed by `probe_gain_over_floor`, never by
+    subtracting `D.r2 - C.r2` by hand."""
     pixel_gain: dict
     """`B - D`: the best readout of raw pixels over the best of the
     representation. Formed against THIS cell's `D` from the one study-wide
@@ -843,7 +911,25 @@ READING_WIDTHS: tuple[int, ...] = (22, 30, 30, 30, 24)
 
 
 def _row(values, widths) -> str:
-    return "".join(str(v).ljust(w) for v, w in zip(values, widths, strict=True))
+    """One table line, each value left-justified in its column.
+
+    A value that fills its column runs into the next: the line is still
+    `sum(widths)` long, or longer by exactly the overflow, and a fixed-width
+    reader cuts the wrong fields without a word. So every value must leave at
+    least one space of its own, and one that does not is REFUSED, naming the
+    value and the row, rather than printed misaligned.
+    """
+    cells = []
+    for i, (value, width) in enumerate(zip(values, widths, strict=True)):
+        text = str(value)
+        if len(text) >= width:
+            raise ValueError(
+                f"column {i} is {width} wide and cannot hold {text!r} "
+                f"({len(text)} characters) with a space before the next; "
+                f"the row begins {str(values[0])!r}"
+            )
+        cells.append(text.ljust(width))
+    return "".join(cells)
 
 
 def _gap(iv: dict) -> str:
@@ -862,6 +948,11 @@ def format_reading_ceiling(reading: CeilingStatus, inputs: CeilingInputs) -> str
     and the rider count are read from `inputs`. Every figure here is a
     difference in r2, so no mean or median map-unit error appears, and none is
     set against a baseline.
+
+    A figure too wide for its column is a `ValueError` from `_row`, never a
+    misaligned table. A cell is 25 characters while every figure is under 10 in
+    magnitude and 28 while all are under 100; the column is `READING_WIDTHS[1]`
+    wide. No r2 difference on the planned run is expected near that.
     """
     lines = [
         "M3o probe ceiling -- what the readout can reach, independently of the model",
@@ -886,10 +977,11 @@ def format_reading_ceiling(reading: CeilingStatus, inputs: CeilingInputs) -> str
         "  All three are differences in r2 (a fraction of variance), not in map units.",
         "  D-C-floor  the nonlinear readout over the best linear one, on the same",
         "       features, MINUS the cell's own measured null floor (D - C on a purely",
-        "       linear task of this cell's shape, clamped at zero from below). The",
-        "       interval is read against zero AFTER that subtraction. An RBF nests",
-        "       the linear kernel, so D >= C is near-guaranteed and only a",
-        "       RESOLVABLE difference is evidence of anything.",
+        f"       linear task of this cell's shape, the mean of {NULL_DRAWS} draws, THEN",
+        "       clamped at zero from below). The interval is read against zero AFTER",
+        "       that subtraction. An RBF nests the linear kernel, so D >= C is",
+        "       near-guaranteed and only a RESOLVABLE difference is evidence of",
+        "       anything.",
         "  B-D  the best readout of raw pixels over the best of the representation.",
         "       B is one study-wide number, so the nine differences share a term",
         "       and are correlated; each still asks about its own representation.",
