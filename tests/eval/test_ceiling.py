@@ -8,10 +8,13 @@ import pytest
 import mbfps.eval.ceiling as ceiling
 import mbfps.eval.probe as probe_module
 from mbfps.eval.ceiling import (
-    BANDWIDTHS, CEILING_RIDGES, CONFIDENCE, FRAME_BUDGET, NEIGHBOURS, RESAMPLES,
-    ZERO_INFORMATION_MEDIAN, Readout, _median_scale, apply_readout,
-    difference_interval, fit_kernel_probe, fit_knn_probe, fit_linear_probe,
-    null_floor, score_readout, zero_information_error,
+    ARMS_REQUIRED, BANDWIDTHS, CEILING_RIDGES, CONFIDENCE, FRAME_BUDGET, NEIGHBOURS,
+    NO_MAJORITY, READING_COLUMNS, READING_WIDTHS, RESAMPLES, SEEDS_MINIMUM,
+    VERDICTS, ZERO_INFORMATION_MEDIAN, CeilingCell, CeilingInputs, CeilingStatus,
+    Readout, _median_scale, _row, apply_readout, difference_interval,
+    fit_kernel_probe, fit_knn_probe, fit_linear_probe, format_reading_ceiling,
+    null_floor, probe_gain_over_floor, reading_ceiling, score_readout,
+    zero_information_error,
 )
 from mbfps.eval.probe import RIDGES, _block_bootstrap_ci, _mean_r2, apply_probe, fit_probe
 
@@ -1409,3 +1412,613 @@ def test_a_readout_is_compared_and_hashed_by_identity_despite_its_array_field():
     assert isinstance(hash(a), int) and hash(a) == hash(a)
     assert {a: "a", b: "b"}[a] == "a"
     assert len({a, b, twin}) == 3
+
+
+# ---------------------------------------------------------------------------
+# The reading: nine measured cells in, one of three verdicts out.
+# ---------------------------------------------------------------------------
+
+_ARMS = ("frozen_ssl", "pixel_ae", "random_vit")
+# `_UP`: the whole interval is above zero. `_FLAT`: a positive point and a
+# positive upper bound over a NEGATIVE lower bound, so it does not resolve and
+# it is what separates `ci_low` from `point` and from `ci_high`.
+_UP = (0.20, 0.10, 0.30)
+_FLAT = (0.01, -0.05, 0.07)
+
+
+def _iv(point, low, high):
+    return {"point": point, "ci_low": low, "ci_high": high}
+
+
+def _cell(arm, seed, probe, pixel, seq=_FLAT):
+    return CeilingCell(
+        arm=arm, seed=seed, probe_gain=_iv(*probe), pixel_gain=_iv(*pixel),
+        sequence_gain=_iv(*seq),
+    )
+
+
+def _layout(*seeds_per_arm):
+    """The (arm, seed) keys: `seeds_per_arm[i]` seeds for the i-th arm."""
+    return [
+        (arm, seed)
+        for arm, n in zip(_ARMS, seeds_per_arm, strict=False)
+        for seed in range(n)
+    ]
+
+
+_GAINS_FOR = {
+    "PROBE_LIMITED": (_UP, _FLAT),
+    "REPRESENTATION_LIMITED": (_FLAT, _UP),
+    "OBSERVATION_LIMITED": (_FLAT, _FLAT),
+}
+
+
+def _cells_for(layout, counts, *, reverse=False):
+    """`counts[verdict]` cells per verdict, assigned in layout order.
+
+    The fixture is shown to hold what the assertions need BEFORE they run, and
+    from the raw interval bounds rather than from `verdict()`, so a wrong
+    `verdict()` cannot vouch for its own inputs.
+    """
+    plan = [verdict for verdict, n in counts.items() for _ in range(n)]
+    assert len(plan) == len(layout), "the counts must cover every cell"
+    cells = {}
+    for (arm, seed), verdict in zip(layout, plan, strict=True):
+        probe, pixel = _GAINS_FOR[verdict]
+        cells[(arm, seed)] = _cell(arm, seed, probe, pixel)
+    probe_up = [k for k, c in cells.items() if c.probe_gain["ci_low"] > 0.0]
+    pixel_only = [
+        k for k, c in cells.items()
+        if c.probe_gain["ci_low"] <= 0.0 < c.pixel_gain["ci_low"]
+    ]
+    assert len(probe_up) == counts.get("PROBE_LIMITED", 0)
+    assert len(pixel_only) == counts.get("REPRESENTATION_LIMITED", 0)
+    items = list(cells.items())
+    return CeilingInputs(cells=dict(reversed(items) if reverse else items))
+
+
+@pytest.mark.parametrize("probe_up, pixel_up, seq_up, expected", [
+    (False, False, False, "OBSERVATION_LIMITED"),
+    (True, False, False, "PROBE_LIMITED"),
+    (False, True, False, "REPRESENTATION_LIMITED"),
+    (False, False, True, "OBSERVATION_LIMITED"),
+    (True, True, False, "PROBE_LIMITED"),
+    (True, False, True, "PROBE_LIMITED"),
+    (False, True, True, "REPRESENTATION_LIMITED"),
+    (True, True, True, "PROBE_LIMITED"),
+])
+def test_the_verdict_is_a_function_of_which_differences_resolve_and_the_sequence_is_never_one(
+    probe_up, pixel_up, seq_up, expected
+):
+    """All eight combinations, each stated as a value.
+
+    Three same-typed fields feed one verdict, and a read of the wrong one
+    returns a plausible verdict: with `sequence_gain` read in place of
+    `pixel_gain`, a cell whose ONLY resolved difference is the sequence would
+    be called REPRESENTATION_LIMITED. The three rows with a single resolved
+    field are what tell the fields apart; the rest pin the precedence.
+
+    Reached: `pixel_gain` and `probe_gain` exchanged, `sequence_gain` read in
+    place of `pixel_gain`, and the pixel comparison tested before the probe's.
+    """
+    cell = _cell(
+        "a", 0, _UP if probe_up else _FLAT, _UP if pixel_up else _FLAT,
+        _UP if seq_up else _FLAT,
+    )
+    assert (
+        cell.probe_gain["ci_low"] > 0.0,
+        cell.pixel_gain["ci_low"] > 0.0,
+        cell.sequence_gain["ci_low"] > 0.0,
+    ) == (probe_up, pixel_up, seq_up), "fixture must resolve exactly the fields it names"
+    assert cell.verdict() == expected
+
+
+def test_each_verdict_is_reachable_and_the_three_are_distinct():
+    """Built as a table so no two rows share a discriminating field by accident."""
+    table = {
+        "PROBE_LIMITED": ((0.20, 0.10, 0.30), (0.01, -0.05, 0.07)),
+        "REPRESENTATION_LIMITED": ((0.01, -0.05, 0.07), (0.20, 0.10, 0.30)),
+        "OBSERVATION_LIMITED": ((0.01, -0.05, 0.07), (0.01, -0.05, 0.07)),
+    }
+    seen = {k: _cell("a", 0, *v).verdict() for k, v in table.items()}
+    assert seen == {k: k for k in table}
+    assert len(set(seen.values())) == 3
+    assert set(seen) == set(VERDICTS)
+
+
+def test_probe_limited_wins_when_both_differences_resolve():
+    """Precedence, stated as a value rather than left to branch order.
+
+    If the linear family was the limit, that is the finding regardless of what
+    the pixel comparison says, because the representation comparison was made
+    with the weaker estimator on one side.
+
+    Reached: the pixel comparison tested before the probe's.
+    """
+    assert _cell("a", 0, _UP, _UP).verdict() == "PROBE_LIMITED"
+
+
+def test_a_lower_bound_of_exactly_zero_does_not_resolve_and_one_above_it_does():
+    """`ci_low > 0.0`, strictly. An interval that touches zero does not exclude it.
+
+    No fixture above has a lower bound of exactly 0.0, so a `>=` survived the
+    brief's tests. Each comparison is checked at the boundary and just above
+    it, so neither can be loosened alone.
+
+    Reached: `ci_low >= 0.0`, in the probe comparison or in the pixel one.
+    """
+    on_zero, above = (0.05, 0.0, 0.10), (0.05, 1e-9, 0.10)
+    assert on_zero[1] == 0.0 < above[1]
+    assert _cell("a", 0, on_zero, _FLAT).verdict() == "OBSERVATION_LIMITED"
+    assert _cell("a", 0, above, _FLAT).verdict() == "PROBE_LIMITED"
+    assert _cell("a", 0, _FLAT, on_zero).verdict() == "OBSERVATION_LIMITED"
+    assert _cell("a", 0, _FLAT, above).verdict() == "REPRESENTATION_LIMITED"
+
+
+@pytest.mark.parametrize("field", ["probe_gain", "pixel_gain", "sequence_gain"])
+@pytest.mark.parametrize("bad", [
+    _iv(float("nan"), 0.1, 0.3), _iv(0.2, float("nan"), 0.3),
+    _iv(0.2, 0.1, float("nan")), _iv(0.2, 0.1, float("inf")),
+    _iv(0.2, 0.4, 0.3),
+], ids=["nan-point", "nan-low", "nan-high", "inf-high", "inverted"])
+def test_a_cell_whose_interval_is_not_one_cannot_be_built(field, bad):
+    """`nan > 0.0` is False, so a NaN lower bound read as `no difference` and
+    counted toward OBSERVATION_LIMITED: the most severe of the three verdicts,
+    reached by a missing measurement. The cell refuses it, by field name.
+
+    Reached: the validation removed.
+    """
+    fields = {"probe_gain": _iv(*_UP), "pixel_gain": _iv(*_UP), "sequence_gain": _iv(*_UP)}
+    CeilingCell(arm="a", seed=0, **fields)  # the same cell with a sound interval builds
+    with pytest.raises(ValueError, match=field):
+        CeilingCell(arm="a", seed=0, **{**fields, field: bad})
+
+
+@pytest.mark.parametrize("sizes, counts, verdict, bar", [
+    ((3, 3, 3), {"PROBE_LIMITED": 5, "OBSERVATION_LIMITED": 4}, "PROBE_LIMITED", 5),
+    ((3, 3, 3), {"PROBE_LIMITED": 4, "REPRESENTATION_LIMITED": 5}, "REPRESENTATION_LIMITED", 5),
+    ((3, 3, 3), {"PROBE_LIMITED": 4, "OBSERVATION_LIMITED": 5}, "OBSERVATION_LIMITED", 5),
+    ((3, 3, 3),
+     {"PROBE_LIMITED": 4, "REPRESENTATION_LIMITED": 3, "OBSERVATION_LIMITED": 2},
+     NO_MAJORITY, 5),
+    ((5, 5), {"PROBE_LIMITED": 5, "OBSERVATION_LIMITED": 5}, NO_MAJORITY, 6),
+    ((5, 5), {"PROBE_LIMITED": 6, "OBSERVATION_LIMITED": 4}, "PROBE_LIMITED", 6),
+    ((3, 3, 5),
+     {"PROBE_LIMITED": 5, "REPRESENTATION_LIMITED": 3, "OBSERVATION_LIMITED": 3},
+     NO_MAJORITY, 6),
+    ((3, 3, 5),
+     {"PROBE_LIMITED": 6, "REPRESENTATION_LIMITED": 3, "OBSERVATION_LIMITED": 2},
+     "PROBE_LIMITED", 6),
+], ids=[
+    "nine-five-carries", "nine-representation-five", "nine-four-of-probe-leaves-five-flat",
+    "nine-four-three-two", "ten-a-tie", "ten-six", "eleven-five-is-not-six", "eleven-six",
+])
+def test_a_strict_majority_is_computed_from_the_cells_present(sizes, counts, verdict, bar):
+    """Five of nine carries, four does not; six of eleven carries, FIVE DOES NOT;
+    half of ten is a tie and a tie is not a majority.
+
+    Nine cells cannot tell a computed bar from a stored 5, since both are 5
+    there: the eleven-cell rows can, and read 5 of 11 as a verdict under a
+    stored 5. The ten-cell tie separates a strict majority from half.
+
+    THE BRIEF'S "FOUR DOES NOT CARRY" FIXTURE DID NOT SHOW IT. It put four
+    cells on PROBE_LIMITED and left the other five flat, and five flat cells ARE
+    a strict majority of nine: the reading was OBSERVATION_LIMITED in 5 of 9,
+    and its assertion accepted that or NO_MAJORITY, so it could not fail. The
+    third row keeps that fixture and says what it reads; the fourth is the one
+    in which nothing reaches the bar.
+
+    Reached: the bar stored as 5, a bar of half the cells (`n // 2`), and
+    `>= needed` weakened to `> needed`.
+    """
+    n = sum(sizes)
+    got = reading_ceiling(_cells_for(_layout(*sizes), counts))
+    assert got.verdict == verdict
+    if verdict == NO_MAJORITY:
+        assert f"no verdict reached {bar} of {n} cells" in got.rule
+    else:
+        assert f"{verdict} in {counts[verdict]} of {n} cells" in got.rule
+        assert f"strict majority {bar}" in got.rule
+    assert {k: len(v) for k, v in got.tally.items()} == {
+        name: counts.get(name, 0) for name in VERDICTS
+    }
+
+
+def test_the_tally_names_the_cells_in_sorted_order_whatever_order_they_arrive_in():
+    """Every verdict is a key, each holding its (arm, seed) cells sorted.
+
+    The same nine cells inserted in reverse must tally identically, and the
+    expected tally is written out rather than taken from either reading.
+
+    Reached: `sorted(...)` removed from the tally loop.
+    """
+    counts = {"PROBE_LIMITED": 4, "REPRESENTATION_LIMITED": 3, "OBSERVATION_LIMITED": 2}
+    expected = {
+        "PROBE_LIMITED": (
+            ("frozen_ssl", 0), ("frozen_ssl", 1), ("frozen_ssl", 2), ("pixel_ae", 0),
+        ),
+        "REPRESENTATION_LIMITED": (("pixel_ae", 1), ("pixel_ae", 2), ("random_vit", 0)),
+        "OBSERVATION_LIMITED": (("random_vit", 1), ("random_vit", 2)),
+    }
+    forward = reading_ceiling(_cells_for(_layout(3, 3, 3), counts))
+    backward = reading_ceiling(_cells_for(_layout(3, 3, 3), counts, reverse=True))
+    assert forward.tally == expected
+    assert backward.tally == expected
+    assert isinstance(forward, CeilingStatus) and NO_MAJORITY not in forward.tally
+
+
+def test_two_verdicts_both_holding_the_bar_is_an_error_not_the_first_one(monkeypatch):
+    """The partition guard fires rather than picking a winner.
+
+    Two verdicts cannot both hold a strict majority of the same cells, so a bar
+    that lets both through is a broken bar, and the answer would otherwise be
+    whichever verdict is listed first. The bar is patched to 1 to build the
+    state, and the fixture is shown to put two verdicts above it.
+
+    Reached: the `assert len(winners) <= 1` removed.
+    """
+    cells = _cells_for(_layout(3, 3, 3), {"PROBE_LIMITED": 5, "OBSERVATION_LIMITED": 4})
+    monkeypatch.setattr(ceiling, "strict_majority", lambda n: 1)
+    with pytest.raises(AssertionError, match="partition is broken"):
+        reading_ceiling(cells)
+
+
+def test_a_majority_that_one_arm_alone_supplies_is_not_a_verdict():
+    """`ARMS_REQUIRED` applies to the cells that WIN, not only to the cells present.
+
+    The bar counts cells and not arms: arms of 3 and 9 are twelve cells, the bar
+    is 7, and the nine-seed arm reaches it alone. That is NO_MAJORITY and not a
+    raise, because the inputs were legal and the arms simply did not agree. One
+    cell of the other arm joining the nine makes it a verdict.
+
+    Reached: the check on the winning cells' arms removed.
+    """
+    one_arm = _cells_for(_layout(3, 9), {"OBSERVATION_LIMITED": 3, "PROBE_LIMITED": 9})
+    assert {arm for (arm, _), c in one_arm.cells.items() if c.probe_gain["ci_low"] > 0.0} == {
+        "pixel_ae"
+    }, "fixture: every winning cell must come from one arm"
+    got = reading_ceiling(one_arm)
+    assert got.verdict == NO_MAJORITY
+    assert "held a numeric majority" in got.rule and "spanned only 1 arm" in got.rule
+    assert "pixel_ae" in got.rule
+    assert len(got.tally["PROBE_LIMITED"]) == 9, "the tally still carries every vote"
+
+    two_arms = _cells_for(_layout(3, 9), {"OBSERVATION_LIMITED": 2, "PROBE_LIMITED": 10})
+    assert reading_ceiling(two_arms).verdict == "PROBE_LIMITED"
+
+
+@pytest.mark.parametrize("seeds", [1, 2])
+def test_an_arm_short_of_seeds_minimum_is_refused_by_name(seeds):
+    """`strict_majority(1) == 1`, so without the refusal one lucky cell would
+    establish an arm. The short arm is named, with the seeds it does have, and
+    the arm that is fine is not.
+
+    One seed AND two: the minimum is three, so an arm of two is short too.
+
+    Reached: the refusal removed, and `< SEEDS_MINIMUM` loosened to `<= 1`.
+    """
+    cells = {("frozen_ssl", s): _cell("frozen_ssl", s, _FLAT, _FLAT) for s in (0, 1, 2)}
+    cells.update({("pixel_ae", s): _cell("pixel_ae", s, _FLAT, _FLAT) for s in range(seeds)})
+    with pytest.raises(ValueError, match="SEEDS_MINIMUM") as raised:
+        reading_ceiling(CeilingInputs(cells=cells))
+    assert "pixel_ae" in str(raised.value) and "frozen_ssl" not in str(raised.value)
+
+
+def test_one_arm_is_not_a_comparison_and_an_empty_study_is_not_a_reading():
+    """Three seeds of ONE arm clear SEEDS_MINIMUM and are still not a verdict.
+
+    Reached: the `ARMS_REQUIRED` refusal removed; the empty-cells refusal removed.
+    """
+    one = {("frozen_ssl", s): _cell("frozen_ssl", s, _UP, _FLAT) for s in range(3)}
+    with pytest.raises(ValueError, match="ARMS_REQUIRED"):
+        reading_ceiling(CeilingInputs(cells=one))
+    with pytest.raises(ValueError, match="at least one cell"):
+        reading_ceiling(CeilingInputs(cells={}))
+
+
+def test_a_cell_filed_under_another_arm_or_seed_than_its_own_is_refused():
+    """The dict key and the cell each say which cell it is, and the tally,
+    the seed minimum and the formatter all read the KEY. A cell filed under the
+    wrong one is silently counted in the wrong arm; here a seed-0 cell sits at
+    seed 1 and an arm-pixel cell at an arm-frozen key.
+
+    Reached: the key/cell comparison removed.
+    """
+    good = {k: _cell(*k, _FLAT, _FLAT) for k in _layout(3, 3)}
+    reading_ceiling(CeilingInputs(cells=good))
+    wrong_seed = {**good, ("frozen_ssl", 1): _cell("frozen_ssl", 0, _FLAT, _FLAT)}
+    wrong_arm = {**good, ("frozen_ssl", 1): _cell("pixel_ae", 1, _FLAT, _FLAT)}
+    for cells in (wrong_seed, wrong_arm):
+        with pytest.raises(ValueError, match="filed under"):
+            reading_ceiling(CeilingInputs(cells=cells))
+
+
+def test_the_reading_constants_are_the_ones_the_plan_records():
+    """Change detector for the figures that are STATED, not derived."""
+    assert SEEDS_MINIMUM == 3
+    assert ARMS_REQUIRED == 2
+    assert VERDICTS == ("PROBE_LIMITED", "REPRESENTATION_LIMITED", "OBSERVATION_LIMITED")
+    assert NO_MAJORITY == "NO_MAJORITY"
+    assert NO_MAJORITY not in VERDICTS
+
+
+def _distinct_nine(*, reverse=False):
+    """Nine cells whose three gains all differ, per cell and per column.
+
+    So a column printed under the wrong heading, or a row printed for the wrong
+    cell, changes a figure. The probe resolves in 6 cells, the pixel difference
+    in 2 others, the sequence in 4 (the cell at index 1 sits exactly ON zero and
+    must not be counted), so the rider count of 4 equals neither of the other
+    two nor any verdict's tally.
+    """
+    cells = {}
+    for i, (arm, seed) in enumerate(_layout(3, 3, 3)):
+        probe = ((0.10 + 0.01 * i, 0.05 + 0.01 * i, 0.15 + 0.01 * i)
+                 if i < 6 else (0.01, -0.05 - 0.01 * i, 0.07))
+        pixel = ((0.30 + 0.01 * i, 0.20 + 0.01 * i, 0.40 + 0.01 * i)
+                 if i in (6, 7) else (0.01, -0.06 - 0.01 * i, 0.08))
+        if i in (0, 2, 4, 8):
+            seq = (0.50 + 0.01 * i, 0.40 + 0.01 * i, 0.60 + 0.01 * i)
+        elif i == 1:
+            seq = (0.02, 0.0, 0.09)
+        else:
+            seq = (0.02, -0.07 - 0.01 * i, 0.09)
+        cells[(arm, seed)] = _cell(arm, seed, probe, pixel, seq)
+    items = list(cells.items())
+    return CeilingInputs(cells=dict(reversed(items) if reverse else items))
+
+
+def _fields(line):
+    """A table line cut at READING_WIDTHS, each field stripped."""
+    out, at = [], 0
+    for width in READING_WIDTHS:
+        out.append(line[at:at + width].strip())
+        at += width
+    return tuple(out)
+
+
+def _table(text):
+    body = [ln for ln in text.splitlines() if ln.startswith(_ARMS)]
+    header = next(ln for ln in text.splitlines() if ln.startswith(READING_COLUMNS[0]))
+    return header, body
+
+
+def test_the_formatter_aligns_and_names_the_sequence_rider_separately():
+    """The sequence result is a rider, not a verdict, and must read as one.
+
+    Every figure is checked against a string written out by hand, per column and
+    per cell, from cells whose three gains all differ -- the brief's version
+    built nine identical cells and checked lengths, so a column under the wrong
+    heading, a row for the wrong cell and a rider counted from the wrong gain
+    all passed it. Reached: probe and pixel columns exchanged, the rider counted
+    from `probe_gain`, the rider's bar loosened to `>= 0.0`, and `sorted(...)`
+    removed (the cells arrive reversed).
+    """
+    inputs = _distinct_nine(reverse=True)
+    text = format_reading_ceiling(reading_ceiling(inputs), inputs)
+    header, body = _table(text)
+
+    assert len(header) == sum(READING_WIDTHS)
+    assert _fields(header) == READING_COLUMNS
+    assert len(body) == 9 and all(len(ln) == len(header) for ln in body)
+    assert [ln.split()[0] for ln in body] == [
+        f"{arm}_seed{seed}" for arm, seed in _layout(3, 3, 3)
+    ]
+
+    rows = {_fields(ln)[0]: _fields(ln) for ln in body}
+    assert rows["frozen_ssl_seed0"] == (
+        "frozen_ssl_seed0", "+0.1000 [+0.0500,+0.1500]", "+0.0100 [-0.0600,+0.0800]",
+        "+0.5000 [+0.4000,+0.6000]", "PROBE_LIMITED",
+    )
+    assert rows["frozen_ssl_seed1"] == (
+        "frozen_ssl_seed1", "+0.1100 [+0.0600,+0.1600]", "+0.0100 [-0.0700,+0.0800]",
+        "+0.0200 [+0.0000,+0.0900]", "PROBE_LIMITED",
+    )
+    assert rows["random_vit_seed1"] == (
+        "random_vit_seed1", "+0.0100 [-0.1200,+0.0700]", "+0.3700 [+0.2700,+0.4700]",
+        "+0.0200 [-0.1400,+0.0900]", "REPRESENTATION_LIMITED",
+    )
+    assert rows["random_vit_seed2"] == (
+        "random_vit_seed2", "+0.0100 [-0.1300,+0.0700]", "+0.0100 [-0.1400,+0.0800]",
+        "+0.5800 [+0.4800,+0.6800]", "OBSERVATION_LIMITED",
+    )
+
+    rider = re.search(
+        r"rider:\s+history resolves what one frame cannot in (\d+) of (\d+) cells", text
+    )
+    assert rider is not None and rider.groups() == ("4", "9")
+    assert "history resolves" in text.lower()
+    assert text.endswith("\n") and not text.endswith("\n\n")
+
+
+def test_the_formatter_prints_the_status_it_is_handed_and_does_not_recompute_it():
+    """The verdict and rule lines are the caller's, verbatim.
+
+    A status is built by hand that no tally of these cells would produce: the
+    probe resolves in 6 of the 9, which `reading_ceiling` reads as PROBE_LIMITED
+    (the fixture is shown to hold six from the raw bounds), and the hand-made
+    status says NO_MAJORITY. Reached: the verdict line recomputed from the cells.
+    """
+    inputs = _distinct_nine()
+    assert sum(c.probe_gain["ci_low"] > 0.0 for c in inputs.cells.values()) == 6
+    handed = CeilingStatus(
+        verdict=NO_MAJORITY, rule="a rule written for this test",
+        tally={name: () for name in VERDICTS},
+    )
+    lines = format_reading_ceiling(handed, inputs).splitlines()
+    assert "verdict: NO_MAJORITY" in lines
+    assert "rule:    a rule written for this test" in lines
+    assert "verdict: PROBE_LIMITED" not in lines
+
+
+def test_the_formatter_states_what_a_difference_does_and_does_not_show():
+    """Every directional sentence is conditional, and the unit is named.
+
+    The predecessor licensed `the map does not predict motion` from a test that
+    only failed to reject. The legend says a difference that does not resolve is
+    the ruler failing to find one, and that these are differences in r2 and not
+    in map units: no mean or median error appears in this table, so none is
+    compared with either baseline here.
+    """
+    inputs = _distinct_nine()
+    text = format_reading_ceiling(reading_ceiling(inputs), inputs)
+    assert "not a measurement that there is none" in text
+    assert "differences in r2" in text and "not in map units" in text
+    assert "MINUS the cell's own measured null floor" in text
+    assert "D-C-floor" in READING_COLUMNS[1]
+
+
+def test_a_row_refuses_a_value_count_that_does_not_match_its_widths():
+    """`zip` stops at the shorter, so a widths tuple one short would print a
+    table with its last column silently missing -- and the header, cut the same
+    way, would still be `sum(READING_WIDTHS)` long and look aligned.
+
+    Reached: `strict=True` dropped from `_row`.
+    """
+    assert _row(("a", "b"), (3, 3)) == "a  b  "
+    with pytest.raises(ValueError):
+        _row(("a", "b", "c"), (3, 3))
+    with pytest.raises(ValueError):
+        _row(("a", "b"), (3, 3, 3))
+    assert len(READING_COLUMNS) == len(READING_WIDTHS)
+
+
+# --- the probe gain, read against the cell's own measured floor -------------
+
+
+def _d_and_c():
+    """Two readouts named as the fits name them, `rbf` as D and `linear` as C.
+
+    `_episode_pair` at a milder offset, so the gain of D over C is of the order
+    of a floor (0.058, interval 0.017 to 0.100) rather than far above any.
+    """
+    a, b, truth, episode = _episode_pair(bad=10.0)
+    return dataclasses.replace(a, name="rbf"), dataclasses.replace(b, name="linear"), truth, episode
+
+
+def test_the_floor_comes_off_the_point_and_both_bounds_and_nothing_else():
+    """`D - C - floor`: the cell's measured floor, subtracted from all three.
+
+    Expected values are the unshifted interval from `difference_interval`, called
+    here with the same arguments, less the floor; equality is exact, since the
+    same subtraction on the same floats gives the same float.
+
+    Reached: the floor not subtracted, and subtracted from one bound only.
+    """
+    d, c, truth, episode = _d_and_c()
+    raw = difference_interval(d, c, truth, episode, seed=0)
+    assert 0.0 < raw["ci_low"] < raw["point"] < raw["ci_high"]
+    got = probe_gain_over_floor(d, c, 0.01, truth, episode, seed=0)
+    assert got == {key: raw[key] - 0.01 for key in ("point", "ci_low", "ci_high")}
+
+
+def test_a_gain_the_floor_swallows_is_not_probe_limited():
+    """THE DEFECT TASK 2b EXISTS TO HAVE FIXED, END TO END: a floor read against
+    zero. The same D and C give PROBE_LIMITED at a floor of zero and below the
+    interval's lower bound, and do not once the floor reaches the lower bound.
+
+    The floors come from the interval itself: half its lower bound (the gain
+    survives), the lower bound exactly (the floored bound is exactly 0.0, which
+    does not resolve), and halfway from the bound to the point (it does not
+    survive). Reached: the floor ignored, and `ci_low >= 0.0`.
+    """
+    d, c, truth, episode = _d_and_c()
+    raw = difference_interval(d, c, truth, episode, seed=0)
+    low, point = raw["ci_low"], raw["point"]
+    assert 0.0 < low < point
+
+    def verdict_at(floor):
+        gain = probe_gain_over_floor(d, c, floor, truth, episode, seed=0)
+        return _cell("a", 0, (gain["point"], gain["ci_low"], gain["ci_high"]), _FLAT).verdict()
+
+    assert verdict_at(0.0) == "PROBE_LIMITED"
+    assert verdict_at(low / 2.0) == "PROBE_LIMITED"
+    assert verdict_at(low) == "OBSERVATION_LIMITED"
+    assert verdict_at((low + point) / 2.0) == "OBSERVATION_LIMITED"
+
+
+def test_a_negative_floor_is_never_added_back():
+    """The floor can only RAISE the bar. A null that reads below zero says the
+    ladder under-read a linear task by selection noise, which is no credit to
+    hand the real difference: `-0.05` subtracted literally would add 0.05 and
+    let an interval that includes zero read as PROBE_LIMITED (the measured floors
+    run -0.0016 to +0.0000, so this is the usual sign).
+
+    Reached: the floor subtracted as given rather than clamped at zero.
+    """
+    d, c, truth, episode = _d_and_c()
+    raw = difference_interval(d, c, truth, episode, seed=0)
+    got = probe_gain_over_floor(d, c, -0.05, truth, episode, seed=0)
+    assert got == {key: raw[key] for key in ("point", "ci_low", "ci_high")}
+    assert raw["ci_low"] + 0.05 != raw["ci_low"], "fixture: the literal formula would move it"
+
+
+@pytest.mark.parametrize("d_name, c_name, match", [
+    ("rbf", "linear_shipped", "linear_shipped"),
+    ("rbf", "rbf", "C must be"),
+    ("linear", "rbf", "D must be"),
+    ("knn", "linear", "D must be"),
+])
+def test_the_probe_gain_refuses_readouts_that_are_not_d_and_c(d_name, c_name, match):
+    """`C` is the readout over `CEILING_RIDGES`; the shipped-grid readout is the
+    reconciliation anchor and reads up to ~0.02 BELOW it, so a gain against it
+    is inflated by exactly the ridge-grid resolution Task 2b removed. D and C are
+    both `Readout`s and either can be passed as the other: a swap would return a
+    gain of the wrong sign with nothing to say so but the name.
+
+    Reached: `linear_shipped` accepted as C, D and C exchanged.
+    """
+    d, c, truth, episode = _d_and_c()
+    d, c = dataclasses.replace(d, name=d_name), dataclasses.replace(c, name=c_name)
+    with pytest.raises(ValueError, match=match):
+        probe_gain_over_floor(d, c, 0.0, truth, episode, seed=0)
+
+
+def test_the_probe_gain_refuses_a_floor_that_is_not_a_number():
+    d, c, truth, episode = _d_and_c()
+    for floor in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="floor"):
+            probe_gain_over_floor(d, c, floor, truth, episode, seed=0)
+
+
+def test_the_probe_gain_draws_its_interval_from_its_own_seed_groups_and_targets():
+    """The arguments reach the bootstrap. Each oracle is `difference_interval` at
+    a floor of zero (a no-op), and the alternatives it must not equal are shown
+    to differ first, so a fixed seed or row-level groups could not hide.
+
+    Reached: the seed fixed at 0, and the groups replaced by one label per row.
+    """
+    d, c, truth, episode = _d_and_c()
+
+    def oracle(seed, groups):
+        return difference_interval(d, c, truth, groups, seed=seed)
+
+    rows = np.arange(len(truth))
+    assert oracle(1, episode) != oracle(2, episode), "fixture: the seed must matter"
+    assert oracle(1, episode) != oracle(1, rows), "fixture: the groups must matter"
+    for seed in (1, 2):
+        assert probe_gain_over_floor(d, c, 0.0, truth, episode, seed=seed) == oracle(seed, episode)
+
+
+def test_a_probe_gain_built_from_scored_readouts_feeds_the_cell():
+    """The names the fits give their readouts are the names the guard accepts.
+
+    On the curved task, where the RBF recovers what the linear probe cannot, a
+    real `score_readout("rbf")` over a real `score_readout("linear")` gives a gain
+    that resolves and a cell that reads PROBE_LIMITED -- and the real
+    `score_readout("linear_shipped")` is refused as C.
+    """
+    train, select, score = _curved_task(0), _curved_task(1), _curved_task(2)
+    rbf = score_readout("rbf", train, select, score)
+    linear = score_readout("linear", train, select, score)
+    shipped = score_readout("linear_shipped", train, select, score)
+    assert rbf.r2 - linear.r2 > 0.5, "fixture must put the two readouts far apart"
+    groups = np.arange(score[1].shape[0]) // 60
+
+    gain = probe_gain_over_floor(rbf, linear, 0.0, score[1], groups, seed=0)
+    assert gain["ci_low"] > 0.0
+    cell = CeilingCell(arm="a", seed=0, probe_gain=gain, pixel_gain=_iv(*_FLAT),
+                       sequence_gain=_iv(*_FLAT))
+    assert cell.verdict() == "PROBE_LIMITED"
+    with pytest.raises(ValueError, match="linear_shipped"):
+        probe_gain_over_floor(rbf, shipped, 0.0, score[1], groups, seed=0)

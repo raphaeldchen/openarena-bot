@@ -37,10 +37,12 @@ above ~0.37. See `fit_kernel_probe`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
+from mbfps.eval.burden import strict_majority
 from mbfps.eval.probe import (
     _block_bootstrap_ci, _mean_r2, _validate_groups, apply_probe, fit_probe,
     position_error,
@@ -600,3 +602,292 @@ def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) 
         resamples=RESAMPLES, confidence=CONFIDENCE, seed=seed, groups=labels,
     )
     return {"point": a.r2 - b.r2, "ci_low": low, "ci_high": high}
+
+
+VERDICTS: tuple[str, ...] = (
+    "PROBE_LIMITED", "REPRESENTATION_LIMITED", "OBSERVATION_LIMITED",
+)
+NO_MAJORITY: str = "NO_MAJORITY"
+SEEDS_MINIMUM: int = 3
+ARMS_REQUIRED: int = 2
+
+_INTERVAL_KEYS: tuple[str, ...] = ("point", "ci_low", "ci_high")
+
+
+def _check_interval(where: str, interval: dict) -> None:
+    """Refuse an interval that is not one: a non-finite figure, or bounds crossed.
+
+    `nan > 0.0` is False, so a NaN lower bound would read as `does not resolve`
+    and count toward OBSERVATION_LIMITED: a missing measurement answering as the
+    most consequential of the three verdicts. The point is not required to sit
+    inside the interval, since a percentile interval need not contain it.
+    """
+    for key in _INTERVAL_KEYS:
+        if not math.isfinite(interval[key]):
+            raise ValueError(f"{where}[{key!r}] is {interval[key]}; an interval needs finite figures")
+    if interval["ci_low"] > interval["ci_high"]:
+        raise ValueError(
+            f"{where} has ci_low {interval['ci_low']} above ci_high {interval['ci_high']}"
+        )
+
+
+def _resolvable(interval: dict) -> bool:
+    """The whole interval lies above zero. `ci_low > 0.0`, strictly.
+
+    An interval whose lower bound is exactly 0.0 does not exclude zero, and the
+    reading is a question about exclusion.
+    """
+    return interval["ci_low"] > 0.0
+
+
+def probe_gain_over_floor(
+    d: Readout, c: Readout, floor: float, score_targets, groups, *, seed
+) -> dict:
+    """`D - C - floor`, with its interval: the one place `probe_gain` is formed.
+
+    `D` is the `"rbf"` readout and `C` is the `"linear"` one, the best LINEAR
+    readout over `CEILING_RIDGES`; `"linear_shipped"` is refused as `C`. The
+    shipped-grid readout is the reconciliation anchor and reads up to ~0.02 below
+    `C`, so a gain taken against it is inflated by the ridge-grid resolution that
+    `CEILING_RIDGES` exists to remove, and `PROBE_LIMITED` would fire on it. `D`
+    and `C` are both `Readout`s and either can be passed as the other, which
+    would return a gain of the wrong sign; the names are what tell them apart.
+
+    THE FLOOR IS SUBTRACTED FROM THE POINT AND BOTH BOUNDS, so the verdict's
+    question stays `is the whole interval above zero`, now asked of the gain over
+    what the instrument alone produces on a purely linear task of this cell's
+    shape (`null_floor`). A floor read against zero is the defect Task 2b exists
+    to have fixed.
+
+    A NEGATIVE FLOOR IS CLAMPED TO ZERO. The floor can only raise the bar: a null
+    that reads below zero means the ladder under-read a linear task by selection
+    noise, which is no credit to hand the real difference. Subtracting it as given
+    would add up to |floor| to the lower bound and let an interval that includes
+    zero read as `PROBE_LIMITED`; the measured floors run -0.0016 to +0.0000, so
+    that is the usual sign and not an edge.
+
+    THE FLOOR IS ONE SYNTHETIC DRAW PER CELL and is subtracted as a constant, so
+    its own sampling noise is not in the interval. Over six draws it ranged
+    -0.0005 to +0.0000 at D=1024, against intervals orders of magnitude wider; it
+    is a point estimate all the same, and the record keeps it beside the gain.
+    """
+    if d.name != "rbf":
+        raise ValueError(f"D must be the 'rbf' readout; got {d.name!r}")
+    if c.name != "linear":
+        raise ValueError(
+            f"C must be the 'linear' readout, the best linear one over "
+            f"CEILING_RIDGES; got {c.name!r}"
+        )
+    if not math.isfinite(floor):
+        raise ValueError(f"floor must be a finite number; got {floor}")
+    interval = difference_interval(d, c, score_targets, groups, seed=seed)
+    bar = max(floor, 0.0)
+    return {key: interval[key] - bar for key in _INTERVAL_KEYS}
+
+
+@dataclass(frozen=True)
+class CeilingCell:
+    """One arm at one seed: the three differences the verdict reads."""
+
+    arm: str
+    seed: int
+    probe_gain: dict
+    """`D - C - floor`: the nonlinear readout over the best linear one on the
+    same features, net of this cell's own measured null floor. Formed by
+    `probe_gain_over_floor`, never by subtracting `D.r2 - C.r2` by hand."""
+    pixel_gain: dict
+    """`B - D`: the best readout of raw pixels over the best of the
+    representation. Formed against THIS cell's `D` from the one study-wide
+    `B`, so the nine differences share a term and are correlated. The record
+    says so; it does not make them invalid, since each asks about its own
+    cell's representation."""
+    sequence_gain: dict
+    """`F - B`: a window of frames over one frame. A RIDER, not a verdict."""
+
+    def __post_init__(self):
+        for field in ("probe_gain", "pixel_gain", "sequence_gain"):
+            _check_interval(f"CeilingCell({self.arm!r}, {self.seed}).{field}", getattr(self, field))
+
+    def verdict(self) -> str:
+        """`PROBE_LIMITED` takes precedence when both differences resolve.
+
+        `probe_gain` here is already `D - C - floor`: the cell's own measured
+        floor is subtracted before the interval is read, so `_resolvable` still
+        asks whether the whole interval is above zero. A decade ridge grid alone
+        buys +0.012 to +0.020 on a purely linear task, which would otherwise fire
+        this verdict for a reason that has nothing to do with nonlinear structure.
+
+        If the linear family was the limit, that is the finding regardless of
+        the pixel comparison, because that comparison was made with the weaker
+        estimator on one side and is not yet interpretable.
+
+        `sequence_gain` is never read: it is a rider on the verdict.
+        """
+        if _resolvable(self.probe_gain):
+            return "PROBE_LIMITED"
+        if _resolvable(self.pixel_gain):
+            return "REPRESENTATION_LIMITED"
+        return "OBSERVATION_LIMITED"
+
+
+@dataclass(frozen=True)
+class CeilingInputs:
+    cells: dict[tuple[str, int], CeilingCell]
+
+
+@dataclass(frozen=True)
+class CeilingStatus:
+    verdict: str
+    rule: str
+    tally: dict[str, tuple[tuple[str, int], ...]]
+
+
+def reading_ceiling(inputs: CeilingInputs) -> CeilingStatus:
+    """Strict majority of the cells, bar computed from the cells present.
+
+    THE BAR IS COMPUTED. `strict_majority(len(cells))` returns 5 at nine cells
+    and 6 at eleven, so storing 5 would be a majority at one cell count and a
+    minority at another.
+
+    REFUSES an arm short of `SEEDS_MINIMUM`, fewer than `ARMS_REQUIRED` arms, and
+    a cell filed under a key other than its own, which the tally and the minimum
+    would count in the wrong arm without a word.
+
+    `ARMS_REQUIRED` IS ENFORCED TWICE, because neither check covers the other:
+    the bar counts cells and not arms, so arms of 3 and 9 are twelve cells with a
+    bar of 7 that the nine-seed arm reaches alone. A verdict whose winning cells
+    span fewer than `ARMS_REQUIRED` arms is NO_MAJORITY, not a raise: the inputs
+    were legal and the arms did not agree. It counts the arms the winners come
+    from, not how many cells each contributes, as `headroom.reading_headroom`
+    does. At three seeds in each of three arms it cannot fire, since no arm holds
+    the bar of 5 alone.
+    """
+    if not inputs.cells:
+        raise ValueError("reading_ceiling needs at least one cell")
+    for (arm, seed), cell in inputs.cells.items():
+        if (cell.arm, cell.seed) != (arm, seed):
+            raise ValueError(
+                f"the cell for {(cell.arm, cell.seed)!r} is filed under "
+                f"{(arm, seed)!r}; the tally reads the key, so it would be counted "
+                "as the wrong cell"
+            )
+    by_arm: dict[str, set[int]] = {}
+    for arm, seed in inputs.cells:
+        by_arm.setdefault(arm, set()).add(seed)
+    short = {a: sorted(s) for a, s in by_arm.items() if len(s) < SEEDS_MINIMUM}
+    if short:
+        raise ValueError(
+            f"every arm needs SEEDS_MINIMUM={SEEDS_MINIMUM} seeds before a verdict "
+            f"is tallied; got {short}"
+        )
+    if len(by_arm) < ARMS_REQUIRED:
+        raise ValueError(
+            f"a verdict needs ARMS_REQUIRED={ARMS_REQUIRED} arms; got {sorted(by_arm)}"
+        )
+    tally: dict[str, list[tuple[str, int]]] = {name: [] for name in VERDICTS}
+    for key, cell in sorted(inputs.cells.items()):
+        tally[cell.verdict()].append(key)
+    frozen = {name: tuple(v) for name, v in tally.items()}
+    needed = strict_majority(len(inputs.cells))
+    winners = [n for n in VERDICTS if len(frozen[n]) >= needed]
+    assert len(winners) <= 1, (
+        f"two verdicts cannot both hold a strict majority of {len(inputs.cells)}; "
+        f"got {winners} -- the partition is broken"
+    )
+    counts = ", ".join(f"{n}={len(frozen[n])}" for n in VERDICTS)
+    if not winners:
+        return CeilingStatus(
+            verdict=NO_MAJORITY,
+            rule=f"no verdict reached {needed} of {len(inputs.cells)} cells ({counts})",
+            tally=frozen,
+        )
+    verdict = winners[0]
+    winning_arms = sorted({arm for arm, _ in frozen[verdict]})
+    if len(winning_arms) < ARMS_REQUIRED:
+        return CeilingStatus(
+            verdict=NO_MAJORITY,
+            rule=(
+                f"{verdict} held a numeric majority ({len(frozen[verdict])} of "
+                f"{len(inputs.cells)} cells, strict majority {needed}) but spanned "
+                f"only {len(winning_arms)} {'arm' if len(winning_arms) == 1 else 'arms'} "
+                f"({', '.join(winning_arms)}); ARMS_REQUIRED={ARMS_REQUIRED} arms "
+                f"must agree ({counts})"
+            ),
+            tally=frozen,
+        )
+    return CeilingStatus(
+        verdict=verdict,
+        rule=(
+            f"{verdict} in {len(frozen[verdict])} of {len(inputs.cells)} cells "
+            f"(strict majority {needed}, computed from the cells present; {counts})"
+        ),
+        tally=frozen,
+    )
+
+
+READING_COLUMNS: tuple[str, ...] = (
+    "cell", "D-C-floor (probe)", "B-D (pixels)", "F-B (sequence)", "verdict",
+)
+READING_WIDTHS: tuple[int, ...] = (22, 30, 30, 30, 24)
+
+
+def _row(values, widths) -> str:
+    return "".join(str(v).ljust(w) for v, w in zip(values, widths, strict=True))
+
+
+def _gap(iv: dict) -> str:
+    return f"{iv['point']:+7.4f} [{iv['ci_low']:+7.4f},{iv['ci_high']:+7.4f}]"
+
+
+def format_reading_ceiling(reading: CeilingStatus, inputs: CeilingInputs) -> str:
+    """The table, the verdict, and a legend conditioned on what each test shows.
+
+    EVERY DIRECTIONAL SENTENCE IS CONDITIONAL. The predecessor shipped an
+    unconditional one in three places its own results refuted, and the
+    milestone before that licensed "the map genuinely does not predict motion"
+    from a test that only failed to reject.
+
+    The verdict and rule lines are `reading`'s, as handed over; only the table
+    and the rider count are read from `inputs`. Every figure here is a
+    difference in r2, so no mean or median map-unit error appears, and none is
+    set against a baseline.
+    """
+    lines = [
+        "M3o probe ceiling -- what the readout can reach, independently of the model",
+        "",
+        _row(READING_COLUMNS, READING_WIDTHS),
+    ]
+    for (arm, seed), cell in sorted(inputs.cells.items()):
+        lines.append(_row(
+            (f"{arm}_seed{seed}", _gap(cell.probe_gain), _gap(cell.pixel_gain),
+             _gap(cell.sequence_gain), cell.verdict()),
+            READING_WIDTHS,
+        ))
+    riders = sum(1 for c in inputs.cells.values() if _resolvable(c.sequence_gain))
+    lines += [
+        "",
+        f"verdict: {reading.verdict}",
+        f"rule:    {reading.rule}",
+        f"rider:   history resolves what one frame cannot in {riders} of "
+        f"{len(inputs.cells)} cells (F - B resolvably above zero)",
+        "",
+        "legend",
+        "  All three are differences in r2 (a fraction of variance), not in map units.",
+        "  D-C-floor  the nonlinear readout over the best linear one, on the same",
+        "       features, MINUS the cell's own measured null floor (D - C on a purely",
+        "       linear task of this cell's shape, clamped at zero from below). The",
+        "       interval is read against zero AFTER that subtraction. An RBF nests",
+        "       the linear kernel, so D >= C is near-guaranteed and only a",
+        "       RESOLVABLE difference is evidence of anything.",
+        "  B-D  the best readout of raw pixels over the best of the representation.",
+        "       B is one study-wide number, so the nine differences share a term",
+        "       and are correlated; each still asks about its own representation.",
+        "  F-B  a window of frames over one frame. A RIDER on the verdict, not a",
+        "       verdict: it answers gate criterion 4's question without criterion",
+        "       4's 'A beats B' framing.",
+        "  A difference that does not resolve is the ruler failing to find one,",
+        "  not a measurement that there is none; each interval's upper bound is",
+        "  how much is NOT excluded.",
+        "",
+    ]
+    return "\n".join(lines)
