@@ -1,3 +1,5 @@
+import dataclasses
+import re
 import tracemalloc
 
 import numpy as np
@@ -789,29 +791,33 @@ def test_a_readout_reports_its_error_in_map_units_not_only_r2():
     The expected figures are built here, from the shipped probe functions and
     numpy, never from the `Readout`. The three splits are first shown to give
     different answers, and the median to differ from the mean and from a norm
-    over all four target columns, so that scoring on the wrong split, taking
-    the mean, and including the angle columns each move the number by far more
-    than the tolerance. Reached by the oracle: r2 and the median taken on the
-    selection split instead of the score split, `np.mean` for `np.median`, and
-    a four-column norm.
+    over all four target columns, so that scoring on the wrong split, swapping
+    the two statistics, and including the angle columns each move the number by
+    far more than the tolerance. Reached by the oracle: r2, the mean and the
+    median taken on the selection split instead of the score split, `np.mean`
+    for `np.median` and the reverse, and a four-column norm.
     """
     train, select, score = (_gapped_task(i) for i in range(3))
     probe = fit_linear_probe(*train, *select)
     predicted = apply_probe(probe, score[0])
     errors = np.linalg.norm(predicted[:, :2] - score[1][:, :2], axis=1)
     expected_r2, expected_median = _mean_r2(predicted, score[1]), float(np.median(errors))
+    expected_mean = float(errors.mean())
 
     on_select = apply_probe(probe, select[0])
     select_errors = np.linalg.norm(on_select[:, :2] - select[1][:, :2], axis=1)
     assert abs(_mean_r2(on_select, select[1]) - expected_r2) > 1e-4, "r2 must differ by split"
     assert abs(np.median(select_errors) - expected_median) > 1.0, "median must differ by split"
-    assert abs(errors.mean() - expected_median) > 1.0, "fixture must separate mean from median"
-    four_column = np.median(np.linalg.norm(predicted - score[1], axis=1))
-    assert abs(four_column - expected_median) > 1.0, "fixture must separate position from all four"
+    assert abs(select_errors.mean() - expected_mean) > 1.0, "mean must differ by split"
+    assert abs(expected_mean - expected_median) > 1.0, "fixture must separate mean from median"
+    four_column = np.linalg.norm(predicted - score[1], axis=1)
+    assert abs(np.median(four_column) - expected_median) > 1.0, "must separate position from all four"
+    assert abs(four_column.mean() - expected_mean) > 1.0, "must separate position from all four"
 
     out = score_readout("linear", train, select, score)
     assert out.name == "linear" and 0.0 < out.r2 <= 1.0
     assert out.r2 == pytest.approx(expected_r2, abs=1e-9)
+    assert out.mean_error == pytest.approx(expected_mean, abs=1e-6)
     assert out.median_error == pytest.approx(expected_median, abs=1e-6)
     assert out.capacity == probe["ridge"]
     assert out.predicted.shape == score[1].shape
@@ -828,9 +834,10 @@ def test_the_median_error_is_a_median_of_position_errors_known_by_construction(m
     and the unsorted middle row 0. The two angle columns carry an error of 1000,
     so a norm over more than the first two columns lands nowhere near.
 
-    Reached: `np.mean` for `np.median`, a norm over every column, and indexing
-    the middle row without sorting. Exact equality, not approx: every value here
-    is exactly representable and a tolerance would only widen what survives.
+    Reached: `np.mean` for `np.median` and the reverse, a norm over every
+    column, and indexing the middle row without sorting. Exact equality, not
+    approx: every value here is exactly representable and a tolerance would only
+    widen what survives.
     """
     truth = np.arange(20.0).reshape(5, 4) ** 2
     miss = np.array([[3.0, 4.0], [6.0, 8.0], [0.0, 0.0], [5.0, 12.0], [8.0, 15.0]])
@@ -841,10 +848,57 @@ def test_the_median_error_is_a_median_of_position_errors_known_by_construction(m
     monkeypatch.setattr(ceiling, "apply_readout", lambda readout, x: known)
     out = score_readout("linear", (truth, truth), (truth, truth), (truth, truth))
 
+    assert out.mean_error == 9.0
     assert out.median_error == 10.0
     assert out.capacity == 7.0
     assert out.predicted is known
     assert out.r2 == _mean_r2(known, truth)
+
+
+def test_the_map_unit_metric_is_probes_one_definition_and_is_called_once(monkeypatch):
+    """`position_error` is the codebase's single map-unit metric, and both
+    functions here take their errors from it.
+
+    `rollout`, `diagnostics` and `burden` import it, and `burden`'s docstring
+    records that a second Euclidean distance is the drift that already destroyed
+    a signal once. Equal numbers cannot tell an import from a verbatim copy, so
+    `ceiling.position_error` is replaced by a spy that returns errors no norm of
+    these arrays could produce (1, 2, 3, 4 and 90: mean 20, median 3), and the
+    spy's figures must be the ones that come out.
+
+    Called ONCE per call, so the mean and the median of a readout are statistics
+    of one set of errors rather than of two computations that could drift apart.
+
+    Reached: the metric spelled out locally in either function (the spy is never
+    reached and the real distance, 1414.2, comes out), the import removed (the
+    name is gone, and patching it raises), and one call per statistic.
+    """
+    calls = []
+    errors = np.array([1.0, 2.0, 3.0, 4.0, 90.0])
+
+    def spy(predicted, true):
+        calls.append((predicted, true))
+        return errors
+
+    truth = np.arange(20.0).reshape(5, 4) ** 2
+    known = truth + 1000.0
+    monkeypatch.setattr(ceiling, "position_error", spy)
+    monkeypatch.setitem(ceiling._FITTERS, "linear", lambda fx, fy, vx, vy: {"ridge": 7.0})
+    monkeypatch.setattr(ceiling, "apply_readout", lambda readout, x: known)
+
+    out = score_readout("linear", (truth, truth), (truth, truth), (truth, truth))
+    assert (out.mean_error, out.median_error) == (20.0, 3.0)
+    assert len(calls) == 1, f"one set of errors feeds both statistics; got {len(calls)} calls"
+    assert calls[0][0] is known and calls[0][1] is truth
+
+    calls.clear()
+    fit_targets = truth[::-1] * 0.5
+    assert zero_information_error(fit_targets, truth) == {"mean": 20.0, "median": 3.0}
+    assert len(calls) == 1, f"one set of errors feeds both statistics; got {len(calls)} calls"
+    np.testing.assert_array_equal(
+        calls[0][0], np.tile(fit_targets[:, :2].mean(axis=0), (5, 1))
+    )
+    np.testing.assert_array_equal(calls[0][1], truth)
 
 
 def _selection_case(name, monkeypatch):
@@ -901,6 +955,12 @@ def test_score_readout_selects_its_capacity_on_the_selection_split_not_the_fit_s
     a ridge `probe.RIDGES` does not offer and `"linear_shipped"` one it does.
     Reached: `_FITTERS["linear"]` bound to `fit_probe`, which would put `D - C`
     against the shipped grid again.
+
+    The jitter beside the capacity: a linear readout's is its selected ridge,
+    the same quantity (compared with the oracle's ridge, not with `capacity`),
+    and the k-NN has none. The rbf's is `test_an_rbf_readout_records_...`.
+    Reached: a linear readout's jitter read from the wrong key or left `None`,
+    and a k-NN given one (k itself, here).
     """
     train, splits, score, rungs, scorer = _selection_case(name, monkeypatch)
     expected = {label: max(rungs, key=scorer(split)) for label, split in splits.items()}
@@ -921,6 +981,54 @@ def test_score_readout_selects_its_capacity_on_the_selection_split_not_the_fit_s
         assert out.capacity == expected[label], (
             f"{label}: capacity {out.capacity}, the held-out best is {expected[label]}"
         )
+        if name == "knn":
+            assert out.jitter is None, "a k-NN has no ridge"
+        elif name != "rbf":
+            assert out.jitter == expected[label], (
+                f"{label}: jitter {out.jitter}, the held-out best ridge is {expected[label]}"
+            )
+
+
+@pytest.mark.parametrize("name, fit, select, score, expected_kernel", [
+    ("noisy curved", _curved_task(0, n=60, noise=60.0), _curved_task(1, n=60, noise=60.0),
+     _curved_task(2, n=60), "rbf"),
+    ("noisy linear", _embedding_task(0, n=150, d=60, rank=20),
+     _embedding_task(1, n=150, d=60, rank=20), _embedding_task(2, n=100, d=60, rank=20),
+     "linear"),
+])
+def test_an_rbf_readout_records_the_jitter_it_was_selected_with(
+    name, fit, select, score, expected_kernel
+):
+    """`capacity` keeps only the bandwidth, and the fit is `(capacity, jitter)`.
+
+    `fit_kernel_probe` selects the kernel, bandwidth and jitter jointly; the
+    readout has to carry the jitter or a record cannot name the fit it scored.
+    The expected pair is the argmax of `_brute_force_ladder` over all 231
+    rungs on the selection split, kernel ridge written from its definition.
+
+    The fixture is shown to need the assertion before it is made: the winning
+    jitter is interior to `CEILING_RIDGES` (so a constant at either end is
+    wrong), is worth 0.01 of selection r2 or more over both ends at its own
+    rung (so it is selected, not incidental), and is not numerically the
+    bandwidth (so the two keys cannot be confused). The noisy curved task wants
+    a finite bandwidth and a jitter of ~5.6; the noisy linear one wants the
+    linear rung, so `capacity` is `inf`, and a jitter of ~178.
+    Reached: `jitter` read from the bandwidth's key, left `None`, or taken from
+    either end of the grid.
+    """
+    entries = _brute_force_ladder(fit, select)
+    best = max(entries, key=lambda e: e["select"])
+    rung = [e for e in entries if (e["kernel"], e["bandwidth"]) == (best["kernel"], best["bandwidth"])]
+    assert best["kernel"] == expected_kernel, f"{name}: the oracle selects {best['kernel']}"
+    assert best["jitter"] not in (CEILING_RIDGES[0], CEILING_RIDGES[-1]), (
+        f"{name}: the winning jitter {best['jitter']} must be interior to the grid"
+    )
+    assert best["select"] - rung[0]["select"] > 0.01, f"{name}: the smallest jitter must lose"
+    assert best["select"] - rung[-1]["select"] > 0.01, f"{name}: the largest jitter must lose"
+    assert best["jitter"] != best["bandwidth"], f"{name}: bandwidth and jitter must be told apart"
+
+    out = score_readout("rbf", fit, select, score)
+    assert (out.capacity, out.jitter) == (best["bandwidth"], best["jitter"])
 
 
 def test_score_readout_refuses_a_readout_it_does_not_know():
@@ -932,28 +1040,36 @@ def test_score_readout_refuses_a_readout_it_does_not_know():
 def test_the_zero_information_error_is_the_distance_to_the_fit_mean():
     """The scale every map-unit figure is read against, derived not asserted.
 
-    The expected value is computed here from the arrays, not taken from the
-    function, so a change inside it cannot move both sides.
+    Both statistics, because the readout errors have both: `mean_error` is read
+    against the mean and `median_error` against the median, and a mean over a
+    median is not a ratio. The expected values are computed here from the
+    arrays, not taken from the function, so a change inside it cannot move both
+    sides.
 
     The score split is shifted by (60, -40) so that its own mean sits far from
     the fit split's: unshifted, the two means differ by about 1 map unit in the
     median error and only a 1e-12 tolerance separates them. The alternatives
-    are shown to differ from the expected value before it is compared with.
-    Reached: the SCORE split's mean in place of the fit split's, `np.mean` for
-    `np.median`, and a norm over all four columns.
+    are shown to differ from the expected values before they are compared with.
+    Reached: the SCORE split's mean in place of the fit split's, either
+    statistic taken for the other, and a norm over all four columns.
     """
     _, yf = _linear_task(0); _, ys = _linear_task(2)
     ys = ys + np.array([60.0, -40.0, 0.0, 0.0])
     errors = np.linalg.norm(ys[:, :2] - yf[:, :2].mean(0), axis=1)
-    expected = float(np.median(errors))
+    expected_mean, expected_median = float(errors.mean()), float(np.median(errors))
 
-    own_mean = np.median(np.linalg.norm(ys[:, :2] - ys[:, :2].mean(0), axis=1))
-    assert abs(expected - own_mean) > 10.0, "fixture must separate the two splits' means"
-    assert abs(expected - errors.mean()) > 10.0, "fixture must separate mean from median"
-    four_column = np.median(np.linalg.norm(ys - yf.mean(0), axis=1))
-    assert abs(expected - four_column) > 10.0, "fixture must separate position from all four"
+    own = np.linalg.norm(ys[:, :2] - ys[:, :2].mean(0), axis=1)
+    assert abs(expected_median - np.median(own)) > 10.0, "must separate the two splits' means"
+    assert abs(expected_mean - own.mean()) > 10.0, "must separate the two splits' means"
+    assert abs(expected_mean - expected_median) > 10.0, "fixture must separate mean from median"
+    four_column = np.linalg.norm(ys - yf.mean(0), axis=1)
+    assert abs(expected_median - np.median(four_column)) > 10.0, "must separate position from all four"
+    assert abs(expected_mean - four_column.mean()) > 10.0, "must separate position from all four"
 
-    assert zero_information_error(yf, ys) == pytest.approx(expected, abs=1e-12)
+    out = zero_information_error(yf, ys)
+    assert set(out) == {"mean", "median"}
+    assert out["median"] == pytest.approx(expected_median, abs=1e-12)
+    assert out["mean"] == pytest.approx(expected_mean, abs=1e-12)
 
 
 def test_the_stated_constants_are_the_ones_the_plan_records():
@@ -976,9 +1092,10 @@ def _episode_pair(episodes=8, per_episode=30, bad=20.0, noise=3.0):
 
     Both read the curved target with small independent noise. Readout `b` also
     carries one fixed offset per episode in the first half of the episodes, so
-    its errors are shared by every row of an episode (a fixed `bad` per column, of
-    random sign): the rows of an episode are one observation, not thirty. Built by hand so the r2 fields are the test's
-    own `_mean_r2` and the structure is known by construction.
+    its errors are shared by every row of an episode (a fixed `bad` per column,
+    of random sign): the rows of an episode are one observation, not thirty.
+    Built by hand so the r2 fields are the test's own `_mean_r2` and the
+    structure is known by construction.
     """
     truth = _curved_task(2, n=episodes * per_episode)[1]
     rng = np.random.default_rng(0)
@@ -989,7 +1106,10 @@ def _episode_pair(episodes=8, per_episode=30, bad=20.0, noise=3.0):
     b = truth + rng.normal(size=truth.shape) * noise + offset[episode]
 
     def readout(name, predicted):
-        return Readout(name, _mean_r2(predicted, truth), 0.0, 0.0, predicted)
+        return Readout(
+            name=name, r2=_mean_r2(predicted, truth), mean_error=0.0,
+            median_error=0.0, capacity=0.0, jitter=None, predicted=predicted,
+        )
 
     return readout("a", a), readout("b", b), truth, episode
 
@@ -1123,3 +1243,150 @@ def test_the_difference_interval_refuses_groups_it_cannot_resample():
     with pytest.raises(ValueError, match="one label per scored row"):
         difference_interval(a, b, truth, episode[:-1], seed=0)
     assert difference_interval(a, b, truth, episode, seed=0)["ci_low"] < a.r2 - b.r2
+
+
+@pytest.mark.parametrize("odd", ["a", "b"])
+def test_the_difference_interval_refuses_predictions_over_another_number_of_rows(odd):
+    """A longer `predicted` than the targets used to come back with an answer.
+
+    The point is `a.r2 - b.r2` over every row each readout was scored on, and the
+    interval resamples only the rows `score_targets` has, so a 300-row
+    `a.predicted` against 240 targets gave a point over 300 rows beside an
+    interval over the first 240, and no error.
+
+    That is shown first, through the shipped bootstrap on the same arrays: it
+    accepts the longer array and returns an interval, so it is the guard in
+    `difference_interval` that refuses and not something downstream of it. The
+    expected counts are the fixture's own, 300 and 240.
+    Reached: the row-count check removed, for either readout.
+    """
+    a, b, truth, episode = _episode_pair()
+    readouts = {"a": a, "b": b}
+    longer = readouts[odd].predicted
+    readouts[odd] = dataclasses.replace(
+        readouts[odd], predicted=np.concatenate([longer, longer[:60]])
+    )
+    assert readouts[odd].predicted.shape[0] == 300 and truth.shape[0] == 240
+
+    low, high = _block_bootstrap_ci(
+        readouts["a"].predicted, readouts["b"].predicted, truth,
+        resamples=20, confidence=0.95, seed=0, groups=episode,
+    )
+    assert low < high, "the bootstrap alone must accept the longer array"
+
+    counts = "300, 240 and 240" if odd == "a" else "240, 300 and 240"
+    with pytest.raises(ValueError, match=re.escape(f"same number of rows; got {counts}")):
+        difference_interval(readouts["a"], readouts["b"], truth, episode, seed=0)
+
+
+def test_the_difference_interval_refuses_targets_over_another_number_of_rows():
+    """The same refusal when it is the targets that are longer.
+
+    `groups` is given one label per TARGET row, so the groups check cannot be
+    what fires. The shipped bootstrap on the same arrays does not say what is
+    wrong: it resamples rows the predictions do not have and fails with a bare
+    `IndexError`.
+    """
+    a, b, truth, episode = _episode_pair()
+    targets = np.concatenate([truth, truth[:60]])
+    groups = np.concatenate([episode, episode[:60]])
+    with pytest.raises(IndexError):
+        _block_bootstrap_ci(
+            a.predicted, b.predicted, targets,
+            resamples=20, confidence=0.95, seed=0, groups=groups,
+        )
+    with pytest.raises(ValueError, match=re.escape("same number of rows; got 240, 240 and 300")):
+        difference_interval(a, b, targets, groups, seed=0)
+
+
+@pytest.mark.parametrize("case, culprit", [
+    ("the targets are not the ones both were scored on", "a"),
+    ("a was scored on other targets", "a"),
+    ("b was scored on other targets", "b"),
+])
+def test_the_difference_interval_refuses_a_readout_not_scored_on_these_targets(case, culprit):
+    """The same number of rows is not the same rows.
+
+    A same-length `score_targets` that is not the one the readouts were scored
+    on gave a point over one set of targets beside an interval over another, and
+    no error. The readout's `r2` is recomputed from its own `predicted` against
+    the targets handed in, and a readout that disagrees with it is refused,
+    naming which. All three ways to get there are here: the targets are wrong
+    for both readouts (`a` is reported, it is checked first), `a` was scored on
+    other targets, and `b` was.
+
+    Shown first, per case: the stored r2 is far (> 0.5) from the recomputation,
+    so the refusal is not rounding, and the shipped bootstrap accepts exactly
+    these arguments and returns an interval.
+    Reached: the r2 recomputation removed, for either readout.
+    """
+    a, b, truth, episode = _episode_pair()
+    other = _curved_task(5, n=truth.shape[0])[1]
+    assert other.shape == truth.shape and not np.array_equal(other, truth)
+    if case.startswith("the targets"):
+        first, second, targets = a, b, other
+    else:
+        stray = a if culprit == "a" else b
+        moved = dataclasses.replace(stray, r2=_mean_r2(stray.predicted, other))
+        first, second, targets = (moved, b, truth) if culprit == "a" else (a, moved, truth)
+
+    claimed = {"a": first, "b": second}[culprit]
+    assert abs(claimed.r2 - _mean_r2(claimed.predicted, targets)) > 0.5, "r2 must disagree widely"
+    low, high = _block_bootstrap_ci(
+        first.predicted, second.predicted, targets,
+        resamples=20, confidence=0.95, seed=0, groups=episode,
+    )
+    assert low < high, "the bootstrap alone must accept these arguments"
+
+    with pytest.raises(ValueError, match=re.escape(f"{culprit}.r2 is")) as caught:
+        difference_interval(first, second, targets, episode, seed=0)
+    assert "was not scored on these targets" in str(caught.value)
+
+
+def test_the_difference_interval_tolerates_rounding_and_refuses_a_real_disagreement():
+    """The r2 agreement is a tolerance, and both sides of it are pinned.
+
+    A stored r2 off by 1e-9 is rounding (a caller that scored on a narrower
+    dtype) and is accepted; off by 1e-3 it is a different number and is refused.
+    Honest readouts come first, to show the call succeeds before it is nudged.
+    Reached: a tolerance of exactly zero, and one wide enough to wave a 1e-3
+    disagreement through.
+    """
+    a, b, truth, episode = _episode_pair()
+    honest = difference_interval(a, b, truth, episode, seed=0)
+    assert honest["point"] == a.r2 - b.r2
+
+    rounded = dataclasses.replace(a, r2=a.r2 + 1e-9)
+    assert difference_interval(rounded, b, truth, episode, seed=0)["point"] == rounded.r2 - b.r2
+    with pytest.raises(ValueError, match=re.escape("a.r2 is")):
+        difference_interval(dataclasses.replace(a, r2=a.r2 + 1e-3), b, truth, episode, seed=0)
+
+
+def test_a_readout_is_compared_and_hashed_by_identity_despite_its_array_field():
+    """`eq=False`: the `ndarray` field made the generated `__eq__` and `__hash__`
+    raise, so neither was usable on a `Readout`.
+
+    First shown to be the array: a field-by-field comparison of a readout with a
+    copy of itself (equal in every field, with the array copied so it is a
+    different object) raises the ambiguity error. Then the readout itself: `==`
+    answers instead of raising, `hash` is defined and stable, and a readout keys
+    a dict and fills a set. Identity is the semantics, so the copy is a different
+    readout.
+    Reached: `eq=True` restored (`a == twin` raises `ValueError`, `hash(a)`
+    raises `TypeError`).
+    """
+    a, b, truth, episode = _episode_pair()
+    twin = dataclasses.replace(a, predicted=a.predicted.copy())
+
+    def fields(r):
+        return (r.name, r.r2, r.mean_error, r.median_error, r.capacity, r.jitter, r.predicted)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        fields(a) == fields(twin)
+
+    assert a == a
+    assert (a == twin) is False and (a != twin) is True
+    assert (a == b) is False
+    assert isinstance(hash(a), int) and hash(a) == hash(a)
+    assert {a: "a", b: "b"}[a] == "a"
+    assert len({a, b, twin}) == 3

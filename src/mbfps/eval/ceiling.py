@@ -43,6 +43,7 @@ import numpy as np
 
 from mbfps.eval.probe import (
     _block_bootstrap_ci, _mean_r2, _validate_groups, apply_probe, fit_probe,
+    position_error,
 )
 
 BANDWIDTHS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
@@ -107,6 +108,13 @@ derives the percentile pair from it, so changing it moves both bounds."""
 
 RESAMPLES: int = 2000
 """Episode-clustered bootstrap resamples behind `difference_interval`."""
+
+_R2_AGREEMENT: float = 1e-6
+"""How far a readout's stored `r2` may sit from its recomputation in
+`difference_interval`. Honest inputs agree to the last bit (the same function on
+the same float64 arrays); this leaves room for a caller that scored on a
+narrower dtype, and is far below anything a gain is read to, so a disagreement
+this size is a different number, not rounding."""
 
 
 def _sqdist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -394,34 +402,83 @@ Measured on 12,073 validation frames from 24 episodes. The scale every
 map-unit figure in this milestone is read against. Recomputed as a control
 rather than trusted.
 
-READ THE UNITS BESIDE IT. The shipped rollout probe's floor error of
+READ THE STATISTICS BESIDE IT. The shipped rollout probe's floor error of
 131.88-259.06 is a MEAN over validation windows (`rollout.evaluate_rollout`
 stacks the per-window errors and takes `.mean(axis=0)`), so its like-for-like
-baseline is the zero-information MEAN, 292.82: 45% to 88% of it, which is what
-says that probe carries real information and is not broken. Against this
-MEDIAN the same two figures are 47% and 92%. `Readout.median_error` is a
-median, so it is read against this constant, not against 131.88-259.06 without
-saying which statistic each is."""
+baseline is the zero-information MEAN, which the spec records as 292.82: 45% to
+88% of it, which is what says that probe carries real information and is not
+broken. Against this MEDIAN the same two figures are 47% and 92%, a mean over a
+median, which is not a ratio. `Readout.mean_error` is read against the mean and
+`Readout.median_error` against this constant, and any ratio says which
+statistic sits on each side.
+
+ONLY THE MEDIAN IS PINNED. No verified value for the mean exists in this
+module, so there is no constant for it: `zero_information_error` recomputes it
+beside the median, from the cell's own splits, and it is recorded rather than
+trusted."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Readout:
-    """One estimator scored on one feature set, in both units."""
+    """One estimator scored on one feature set, in both units.
+
+    `eq=False`: the generated `__eq__` compares fields as a tuple, and the
+    `ndarray` in `predicted` makes that comparison ambiguous (`a == b` raised
+    `ValueError`) while the generated `__hash__` of a frozen dataclass hashes the
+    same tuple (`hash(a)` raised `TypeError`). A readout is therefore compared
+    and hashed by IDENTITY, as any plain object is: `a == a` is true, and two
+    separately scored readouts are never equal, whatever they hold.
+
+    `predicted` is stored BY REFERENCE, not copied and not made read-only,
+    because it is the caller's array. A caller that mutates it afterwards
+    invalidates the `r2`, `mean_error` and `median_error` stored beside it, which
+    were computed from the values it held when this was built;
+    `difference_interval` recomputes `r2` from it and refuses a readout whose two
+    no longer agree.
+    """
 
     name: str
     r2: float
-    median_error: float
-    """Median Euclidean position error in MAP UNITS, over the scored rows.
+    mean_error: float
+    """MEAN Euclidean position error in map units, over the scored rows.
 
     Carried beside r2 because r2 is not the unit the decision is made in. M3n
     was unreadable because a 0.576-11.824 signal sat under a 131.88-259.06
-    readout error, and a result in r2 alone cannot be set against that. (Those
-    readout errors are means and this is a median; see
-    `ZERO_INFORMATION_MEDIAN`.)"""
+    readout error, and a result in r2 alone cannot be set against that.
+
+    THE MEAN IS THE ONE THAT COMPARES TO 131.88-259.06. `rollout.py:237`
+    averages the per-window position error across windows, so that figure is a
+    mean; a median reported against it would be a different statistic in the
+    same unit."""
+    median_error: float
+    """MEDIAN of the same errors, carried beside the mean.
+
+    Robust to the tail a readout produces when it extrapolates off its support,
+    and it is the statistic `ZERO_INFORMATION_MEDIAN` is expressed in. Every
+    ratio must state which statistic is on each side: 131.88-259.06 against
+    283.05 is a mean over a median and is not one."""
     capacity: float
+    """The selected ridge, bandwidth or k, by `_CAPACITY_KEY`.
+
+    For the RBF this is the BANDWIDTH ONLY, and it is `inf` when the ladder's
+    linear rung won. The fit is `(capacity, jitter)`; see `jitter`."""
+    jitter: float | None
+    """The selected diagonal jitter, the second half of an RBF cell's fit.
+
+    `fit_kernel_probe` selects the kernel, its bandwidth and the jitter JOINTLY,
+    and `capacity` keeps only the bandwidth, so two RBF cells with one bandwidth
+    and different jitters are different fits that `capacity` alone cannot tell
+    apart. This is what makes a record able to name the fit it scored.
+
+    Per readout: the RBF's selected jitter; for both linear readouts their
+    selected ridge, which is the same quantity (a jitter on the Gram's diagonal
+    IS the dual form of the ridge at that lambda, so the ladder's linear rung
+    at jitter L is `fit_linear_probe` at ridge L, and a record can set the two
+    side by side); and `None` for the k-NN, which has no ridge to select."""
     predicted: np.ndarray
     """The scored-row predictions, kept so a difference between two readouts
-    can be bootstrapped with both held fixed."""
+    can be bootstrapped with both held fixed. Held by reference; see the class
+    docstring."""
 
 
 _FITTERS = {
@@ -444,6 +501,12 @@ _CAPACITY_KEY = {
     "rbf": "bandwidth", "knn": "k",
 }
 
+_JITTER_KEY = {
+    "linear": "ridge", "linear_shipped": "ridge",
+    "rbf": "jitter", "knn": None,
+}
+"""The readout-dict key behind `Readout.jitter`; `None` where there is none."""
+
 
 def score_readout(name: str, fit, select, score) -> Readout:
     """Fit on `fit`, select capacity on `select`, score on `score`.
@@ -457,28 +520,38 @@ def score_readout(name: str, fit, select, score) -> Readout:
         raise KeyError(f"unknown readout {name!r}; expected {sorted(_FITTERS)}")
     readout = _FITTERS[name](fit[0], fit[1], select[0], select[1])
     predicted = apply_readout(readout, score[0])
+    errors = position_error(predicted, score[1])
+    jitter_key = _JITTER_KEY[name]
     return Readout(
         name=name,
         r2=_mean_r2(predicted, score[1]),
-        median_error=float(np.median(
-            np.linalg.norm(predicted[:, :2] - score[1][:, :2], axis=1)
-        )),
+        mean_error=float(np.mean(errors)),
+        median_error=float(np.median(errors)),
         capacity=float(readout[_CAPACITY_KEY[name]]),
+        jitter=None if jitter_key is None else float(readout[jitter_key]),
         predicted=predicted,
     )
 
 
-def zero_information_error(fit_targets, score_targets) -> float:
-    """Median map-unit error of predicting the FIT split's mean position.
+def zero_information_error(fit_targets, score_targets) -> dict:
+    """`{"mean", "median"}` map-unit error of predicting the FIT split's mean
+    position.
 
     The floor of informativeness. A readout that scores above this carries
     nothing; see `ZERO_INFORMATION_MEDIAN` for where the shipped rollout
     probe's floor error sits against it, and in which statistic.
+
+    BOTH STATISTICS, from one set of errors, because the readout errors have
+    both: `Readout.mean_error` is read against the mean and
+    `Readout.median_error` against the median, and a mean over a median is not a
+    ratio. Only the median has a pinned value (`ZERO_INFORMATION_MEDIAN`). The
+    mean has none: it is recomputed here and recorded, never compared with a
+    constant.
     """
     mu = np.asarray(fit_targets, dtype=np.float64)[:, :2].mean(0)
-    return float(np.median(
-        np.linalg.norm(np.asarray(score_targets, dtype=np.float64)[:, :2] - mu, axis=1)
-    ))
+    truth = np.asarray(score_targets, dtype=np.float64)
+    errors = position_error(np.broadcast_to(mu, (truth.shape[0], 2)), truth)
+    return {"mean": float(np.mean(errors)), "median": float(np.median(errors))}
 
 
 def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) -> dict:
@@ -490,12 +563,37 @@ def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) 
     parameter names say joint and embedding, but the computation is generic in
     the two arrays, so no second resampler is written here.
 
-    `groups` is validated first, by the check `gain_from_blocks` uses: with one
+    THE THREE ARGUMENTS MUST DESCRIBE THE SAME ROWS, and nothing downstream can
+    tell: `point` is `a.r2 - b.r2`, taken from whatever each readout was scored
+    on, while the interval resamples `score_targets`. A longer `a.predicted`
+    returned an interval over its first rows beside a point over all of them,
+    and a same-length but wrong `score_targets` put the two on different
+    quantities, both without an error. So, as `GainSplit.rows` does rather than
+    trusting its caller, the row counts are compared, and each readout's `r2` is
+    recomputed against `score_targets` and must match the one it carries. That
+    is two r2 evaluations against the bootstrap's 2000 each.
+
+    `groups` is then validated, by the check `gain_from_blocks` uses: with one
     distinct label every resample is the whole sample, and the interval would
     come back at width zero around the point -- a resolved-looking answer from
     a single resampling unit.
     """
     targets = np.asarray(score_targets, dtype=np.float64)
+    rows = (a.predicted.shape[0], b.predicted.shape[0], targets.shape[0])
+    if len(set(rows)) != 1:
+        raise ValueError(
+            "a.predicted, b.predicted and score_targets must describe the same "
+            f"number of rows; got {rows[0]}, {rows[1]} and {rows[2]}"
+        )
+    for label, readout in (("a", a), ("b", b)):
+        recomputed = _mean_r2(readout.predicted, targets)
+        if not abs(recomputed - readout.r2) <= _R2_AGREEMENT:
+            raise ValueError(
+                f"{label}.r2 is {readout.r2:.6f} but {label}.predicted scores "
+                f"{recomputed:.6f} against score_targets: the readout was not "
+                "scored on these targets, so the point and the interval would "
+                "describe different quantities"
+            )
     labels, _ = _validate_groups(groups, targets.shape[0])
     low, high = _block_bootstrap_ci(
         a.predicted, b.predicted, targets,
