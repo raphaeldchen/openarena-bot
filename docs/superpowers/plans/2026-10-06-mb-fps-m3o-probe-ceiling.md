@@ -1713,10 +1713,13 @@ EOF
   "applied": {"r2": float, "median_error": float},
   "ceiling_ridges": [...],        # the 33 rungs, stored; no literal survives the tests
   "readouts": {
-    "pixels_linear":     {"r2": f, "median_error": f, "capacity": f},
-    "pixels_rbf":        {...}, "embedding_linear": {...},
-    "embedding_rbf":     {...}, "embedding_knn":   {...},
-    "sequence_linear":   {...}, "sequence_rbf":    {...},
+    # every readout carries ALL of these; see Task 3's `Readout`
+    "pixels_linear": {"r2": f, "mean_error": f, "median_error": f,
+                      "capacity": f_or_str, "jitter": f_or_null},
+    "pixels_rbf":        {...}, "embedding_linear":        {...},
+    "embedding_rbf":     {...}, "embedding_knn":           {...},
+    "sequence_linear":   {...}, "sequence_rbf":            {...},
+    "embedding_linear_shipped": {...},   # C_shipped, the reconciliation anchor
   },
   "shipped_grid_r2": float,      # C_shipped: the "linear_shipped" readout's r2
   "null_floor": float,           # ceiling.null_floor(n, d) at THIS cell's shape
@@ -1728,7 +1731,7 @@ EOF
     "harness_r2_matches_study": bool,
     "study_embedding_selection_r2": float,
     "nesting_rbf_at_widest_vs_linear": float,
-    "zero_information_recomputed": float,
+    "zero_information_recomputed": {"mean": float, "median": float},
   },
 }
 ```
@@ -1738,20 +1741,24 @@ reads and what exit 49 fires on.** `embedding_linear` searches `CEILING_RIDGES`
 and is expected up to ~0.02 ABOVE the study's 0.320-0.345 band, so reconciling on
 it would exit 49 on a correct run. Spec §3.3.1.
 
-**`capacity` ALSO DROPS THE RBF'S JITTER.** `fit_kernel_probe` selects bandwidth
-and jitter JOINTLY, and a single-float `capacity` keeps only the bandwidth, so an
-RBF cell's record cannot name the fit it scored. Record both.
+**`capacity` ALSO DROPPED THE RBF'S JITTER — fixed in Task 3, not here.**
+`fit_kernel_probe` selects bandwidth and jitter JOINTLY, and `score_readout`
+discards the fitted dict, so nothing downstream could have recovered the jitter
+without refitting the ladder. `Readout` therefore carries `jitter` beside
+`capacity`: the RBF's selected jitter, the two linear readouts' selected ridge
+(the same quantity in the dual form), and `None` for k-NN. Record it.
 
 **`capacity` IS `inf` ON EVERY CELL WHERE NOTHING NONLINEAR HELPS, and `inf` is
 not JSON.** The RBF ladder's linear rung reports `bandwidth = inf`, which is
 exactly what wins when the representation carries no nonlinear structure — the
 `PROBE_LIMITED`-is-false case, so the common one. `json.dumps` writes it as the
 bare token `Infinity`, which no strict JSON reader accepts, and `allow_nan=False`
-raises instead. Serialise it as the string `"inf"` or as `None` with the kernel
-name carrying the meaning, and **assert in the read phase that no record
-round-trips through `json.loads(..., parse_constant=...)` with a non-finite
-capacity.** Decide once and apply it to every readout's `capacity`, not just the
-RBF's.
+raises instead. **Serialise it as the string `"inf"`** — settled, because that needs nothing
+added to `Readout`, where `None` would require a `kernel` field first. Apply the
+same rule to every readout's `capacity`, not just the RBF's, and **assert in the
+read phase that no record round-trips through
+`json.loads(..., parse_constant=...)` with a non-finite capacity.** `jitter` is
+already `None` for k-NN and serialises as JSON `null`, so it needs no rule.
 
 **`null_floor` is measured at the cell's own `(n, d)`** — the `n` after the
 stride subsample and the `d` of the embedding feature set, the same shape
