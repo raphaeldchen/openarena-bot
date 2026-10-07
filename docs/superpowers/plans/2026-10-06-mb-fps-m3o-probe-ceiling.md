@@ -1093,7 +1093,7 @@ EOF
       predicted: np.ndarray    # kept so a difference can be bootstrapped
 
   def score_readout(name, fit, select, score) -> Readout
-  def zero_information_error(fit_targets, score_targets) -> float
+  def zero_information_error(fit_targets, score_targets) -> dict   # {"mean", "median"}
   def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) -> dict
   ```
   `fit`, `select` and `score` are each a `(features, targets)` pair. `difference_interval` returns `{"point", "ci_low", "ci_high"}` on `a.r2 - b.r2`.
@@ -1240,8 +1240,8 @@ def score_readout(name: str, fit, select, score) -> Readout:
     return Readout(
         name=name,
         r2=_mean_r2(predicted, score[1]),
-        mean_error=float(np.mean(_errors(predicted, score[1]))),
-        median_error=float(np.median(_errors(predicted, score[1]))),
+        mean_error=float(np.mean(position_error(predicted, score[1]))),
+        median_error=float(np.median(position_error(predicted, score[1]))),
         capacity=float(readout[_CAPACITY_KEY[name]]),
         predicted=predicted,
     )
@@ -1276,7 +1276,7 @@ def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) 
     return {"point": a.r2 - b.r2, "ci_low": low, "ci_high": high}
 ```
 
-Add to the module's imports: `from dataclasses import dataclass` and extend the `probe` import with `_block_bootstrap_ci`. `fit_linear_probe` is Task 2b's and is already in this module. Add `CONFIDENCE: float = 0.95` and `RESAMPLES: int = 2000` beside the other constants.
+Add to the module's imports: `from dataclasses import dataclass` and extend the `probe` import with `_block_bootstrap_ci`, `_validate_groups` and **`position_error`** — the codebase's single definition of the map-unit metric. Do not re-spell `np.linalg.norm(...[:, :2] - ...[:, :2], axis=1)`; `burden.py`'s module docstring records that duplicating this metric is the drift that already destroyed a signal once in this project. `fit_linear_probe` is Task 2b's and is already in this module. Add `CONFIDENCE: float = 0.95` and `RESAMPLES: int = 2000` beside the other constants.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1737,6 +1737,10 @@ EOF
 reads and what exit 49 fires on.** `embedding_linear` searches `CEILING_RIDGES`
 and is expected up to ~0.02 ABOVE the study's 0.320-0.345 band, so reconciling on
 it would exit 49 on a correct run. Spec §3.3.1.
+
+**`capacity` ALSO DROPS THE RBF'S JITTER.** `fit_kernel_probe` selects bandwidth
+and jitter JOINTLY, and a single-float `capacity` keeps only the bandwidth, so an
+RBF cell's record cannot name the fit it scored. Record both.
 
 **`capacity` IS `inf` ON EVERY CELL WHERE NOTHING NONLINEAR HELPS, and `inf` is
 not JSON.** The RBF ladder's linear rung reports `bandwidth = inf`, which is
