@@ -2086,7 +2086,38 @@ for p in sorted(glob.glob("runs/m3o_ceiling/ceiling_*.json")):
 EOF
 ```
 
-Required: `harness_r2_matches_study` true in 9 of 9; `study_embedding_selection_r2` within 0.320-0.345; `zero_information_recomputed` within 1.0 of 283.05; `nesting_rbf_at_widest_vs_linear` not materially negative. Also assert the raw-pixel readouts are **identical across all nine records** — that row uses no model, so a difference means a model leaked into a model-free measurement.
+Required, each corrected against what the quantity actually reads — all three of
+the original checks would have misfired on a correct run:
+
+- `harness_r2_matches_study` true in 9 of 9. **Measured: true in 9 of 9**, with
+  `C_shipped` at 0.292-0.313 against the study's 0.3195-0.3451 and a worst gap of
+  0.0398, comfortably inside `HARNESS_R2_TOLERANCE = 0.10`.
+- **`study_embedding_r2` within 0.3195-0.3451** — the criterion-4 field. NOT
+  `study_embedding_selection_r2`, which spans 0.0180-0.3829 and would fail; it is
+  recorded ungated.
+- **`zero_information_recomputed` is reported, not gated against 283.05.** The
+  recomputed pair is 291.36 mean / 275.02 median over all 98 training episodes;
+  the spec's 292.82 / 283.05 come from the leading 24 training episodes, a subset
+  nothing in the study uses. Assert instead that **both** map-unit ratios use the
+  recomputed pair — `mean_error` over the recomputed mean and `median_error` over
+  the recomputed median — because dividing the median by the pinned 283.05 while
+  dividing the mean by a recomputed figure is two different constants in one
+  table.
+- **`nesting_rbf_at_widest_vs_linear` is EXPECTED NEGATIVE** on good cells and is
+  recorded ungated. It is the asymptotic nesting claim, which §3.3 measured to be
+  false in practice. Nesting is structural — the linear kernel is a rung — and is
+  pinned by test, not here. The original "not materially negative" check had the
+  sign backwards.
+- The gap against the study is **one-signed**: the study sits above `C_shipped` in
+  9 of 9, because its ridge is selected on the rows it is scored on. Report that
+  rather than treating it as noise.
+- `fine_minus_shipped_on_score` ranges -0.0083 to +0.0364, mean +0.0071, negative
+  in 4 of 9. All three `pixel_ae` seeds dip 0.006-0.008. Not strongly negative, so
+  the finer grid is not overfitting selection, but report the per-arm pattern.
+
+Also assert the raw-pixel readouts are **identical across all nine records** —
+that row uses no model, so a difference means a model leaked into a model-free
+measurement.
 
 - [ ] **Step 4: Read**
 

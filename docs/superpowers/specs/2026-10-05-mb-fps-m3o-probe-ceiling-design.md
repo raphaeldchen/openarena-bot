@@ -426,7 +426,7 @@ incomplete at that shape.
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
 | RBF at its widest bandwidth against linear, recorded and NOT gated | the ASYMPTOTIC nesting claim, which §3.3 measured to be FALSE in practice — an RBF is linear only to first order and its widest rung is capped far below the ridge the linear probe selects. Expected negative on good cells. Nesting is structural instead: the linear kernel is a RUNG, and that is pinned by test, not by this control |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
-| the zero-information baseline recomputes to 283.05 median, **and its mean is recorded beside it** | the scale every map-unit figure is read against. Two statistics because the readout errors have two; a mean error over a median baseline is not a ratio |
+| the zero-information baseline is **recomputed, both statistics, and both ratios use it** | the scale every map-unit figure is read against. Two statistics because the readout errors have two; a mean error over a median baseline is not a ratio. **It is not gated against 283.05**: recomputed over all 98 training episodes it reads 291.36 mean / 275.02 median, and the 292.82 / 283.05 in §2 come from the leading 24 training episodes — a subset nothing in the study uses, kept only as provenance |
 
 Two are free and bitwise, of the same kind as M3n's two reductions: the
 raw-pixel row's identity across the nine cells, and `C_shipped`'s agreement with
