@@ -1045,6 +1045,15 @@ def require_sound_records(records: dict) -> None:
       UNGATED figures the read phase prints (`fine_minus_shipped_on_score`,
       `controls.nesting_rbf_at_widest_vs_linear`, `controls.study_embedding_selection_r2`)
       is.
+    * Either zero-information baseline (`controls.zero_information_recomputed.mean`,
+      `.median`) is not a finite number greater than zero. Every ratio in the map-unit
+      table is DIVIDED by one of them, so an infinity prints `0.0%` in every cell, a NaN
+      prints `nan%`, and a zero raises `ZeroDivisionError` after the verdict has been
+      taken. `float()` accepts the strings `"Infinity"` and `"nan"`, which is why this is
+      read from the raw value and not from the protocol check's `float(...)`: a string is
+      refused here, by name, whatever it spells. (Run BEFORE the protocol check: a NaN
+      baseline would otherwise be found there as `nan vs nan`, which says nothing of what
+      is wrong.)
     * A readout lacks one of its five fields, carries a non-finite r2 or error, a
       capacity that is neither a finite number nor `"inf"`, or a jitter that is neither
       null nor finite.
@@ -1052,6 +1061,8 @@ def require_sound_records(records: dict) -> None:
       is written into all nine records, so a difference means a model leaked into a
       model-free measurement."""
     items = sorted(records.items())
+    if not items:
+        raise SystemExit("no ceiling record to read")
     for cell, record in items:
         found = _pick(cell, "nonfinite", lambda r: dict(r["nonfinite"]), record)
         if found:
@@ -1079,6 +1090,18 @@ def require_sound_records(records: dict) -> None:
             if not _is_finite_number(value):
                 raise SystemExit(
                     f"{cell[0]} seed {cell[1]}: {field} is {value!r}, not a finite number"
+                )
+        for field, statistic in (("zero_information.mean", "mean"),
+                                 ("zero_information.median", "median")):
+            baseline = _pick(
+                cell, field,
+                lambda r, _s=statistic: r["controls"]["zero_information_recomputed"][_s], record,
+            )
+            if not _is_finite_number(baseline) or baseline <= 0:
+                raise SystemExit(
+                    f"{cell[0]} seed {cell[1]}: {field} "
+                    f"(controls.zero_information_recomputed.{statistic}) is {baseline!r}, not "
+                    "a finite number above zero; every map-unit ratio is divided by it"
                 )
         floor = _pick(cell, "null_floor", lambda r: r["null_floor"], record)
         shape = _pick(cell, "null_floor_shape",
@@ -1303,14 +1326,21 @@ def format_map_units(records: dict) -> str:
     comparable to the mean only, and each `applied` distribution under its own name with the
     comparison IT supports.
 
-    The baselines come from the records: the mean is `controls.zero_information_recomputed`
-    and the median is the stored `zero_information_median` (the protocol check has shown
-    both identical across cells). The raw-pixel readouts are printed once, since they are
-    one number for the study."""
+    BOTH divisors come from the records' `controls.zero_information_recomputed` -- `mean_error`
+    over its mean, `median_error` over its median (the protocol check has shown the pair
+    identical across cells, and `require_sound_records` that it is finite and positive).
+    The stored `zero_information_median` (the spec's pinned 283.05) is NOT a divisor: it is
+    the median over the leading 24 training episodes, a subset nothing in the study uses,
+    and dividing the median by it while the mean is divided by a recomputed figure would put
+    two constants of different provenance in one table (recomputed over every training
+    episode the pair reads 291.36 / 275.02, so every median ratio read against the pinned
+    figure was 2.9% low: 48.6% where 50.0% is right). It stays in the record as provenance
+    and is not printed. The raw-pixel readouts are printed once, since they are one number
+    for the study."""
     items = sorted(records.items())
     first = items[0][1]
     zero_mean = float(first["controls"]["zero_information_recomputed"]["mean"])
-    zero_median = float(first["zero_information_median"])
+    zero_median = float(first["controls"]["zero_information_recomputed"]["median"])
     rows = first["rows_per_split"]
     low, high = M3N_FLOOR_ERROR_MEAN
     lines = [
@@ -1319,10 +1349,12 @@ def format_map_units(records: dict) -> str:
         f"  Rows per split: fit {rows['fit']} (training episodes), select {rows['select']}, "
         f"score {rows['score']} (validation halves); frame stride {first['frame_stride']} "
         f"under a budget of {first['frames']}.",
-        f"  Zero-information baselines, one set of frames: MEAN {zero_mean:.2f} (recomputed), "
-        f"MEDIAN {zero_median:.2f} (pinned). Each error is read against its OWN statistic:",
+        f"  Zero-information baselines, one set of frames, both recomputed over every "
+        f"training episode: MEAN {zero_mean:.2f}, MEDIAN {zero_median:.2f}. Every ratio "
+        "below divides by this pair, each error by its OWN statistic:",
         "  mean_error against the mean, median_error against the median; a mean over a "
-        "median is not a ratio.",
+        "median is not a ratio. (The spec's pinned figures come from the leading 24 "
+        "training episodes and divide nothing.)",
         f"  M3n's floor error, {low:.2f}-{high:.2f} at h=1, is a MEAN over windows: it is "
         "comparable to a mean_error and never to a median_error. Of the two `applied` "
         "distributions below it belongs to real-latent ONLY (its mean_error_h1); the "
@@ -1410,9 +1442,11 @@ def _harness_message(failed) -> str:
 
 def read_phase(args) -> int:
     """Refuse a plan that cannot be read, pool every requested cell (11 names the first
-    missing), refuse records that are not one measurement or not sound, return 49 if any
-    cell's harness disagrees with the study, and otherwise take the reading and return
-    `READ_EXITS.get(reading.verdict, EXIT_OK)`: 0 for a model verdict, 50 for no majority.
+    missing), refuse records that are not sound or not one measurement (in that order: a
+    baseline that is not a number is named as such before two of them are compared),
+    return 49 if any cell's harness disagrees with the study, and otherwise take the reading
+    and return `READ_EXITS.get(reading.verdict, EXIT_OK)`: 0 for a model verdict, 50 for no
+    majority.
 
     THE READING IS PRINTED AND WRITTEN AS ONE STRING, for every verdict, 50 included: it
     is a finding, and the table is what a reader needs to see it. The text carries the
@@ -1434,8 +1468,8 @@ def read_phase(args) -> int:
     except CellMissing as error:
         print(f"NO CELL: {error}")
         return EXIT_NO_CHECKPOINTS
-    require_one_protocol(records)
     require_sound_records(records)
+    require_one_protocol(records)
     failed = harness_failures(records)
     if failed:
         print(_harness_message(failed))

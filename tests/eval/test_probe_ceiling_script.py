@@ -34,6 +34,7 @@ import importlib.util
 import io
 import json
 import math
+import re
 import types
 import zlib
 from pathlib import Path
@@ -1775,6 +1776,15 @@ GAINS_FOR = {
 two so that no exchange of two fields goes unseen."""
 
 
+ZERO_RECOMPUTED = {"mean": 291.36, "median": 275.02}
+"""The zero-information pair as the real run recomputes it, over every training episode
+(`test_the_real_split_and_the_zero_information_figures_are_what_the_script_documents`). The
+records carry it beside `zero_information_median`, the spec's pinned 283.05 from the leading
+24 episodes, and the two MEDIANS DIFFER (275.02 vs 283.05) exactly as they do on the real
+records: a median ratio read against the pinned figure is 2.9% low, and every test that
+reads a percentage can see it."""
+
+
 def _record_for(base, cell, verdict, *, harness=True):
     r = copy.deepcopy(base)
     r["arm"], r["seed"] = cell
@@ -1784,7 +1794,7 @@ def _record_for(base, cell, verdict, *, harness=True):
     r["controls"]["study_embedding_r2"] = (
         r["shipped_grid_r2"] if harness else r["shipped_grid_r2"] + 2 * r["harness_r2_tolerance"]
     )
-    r["controls"]["zero_information_recomputed"] = {"mean": 292.82, "median": 283.05}
+    r["controls"]["zero_information_recomputed"] = dict(ZERO_RECOMPUTED)
     return r
 
 
@@ -1954,7 +1964,7 @@ def test_a_probe_gain_that_lies_below_the_null_floor_does_not_read_probe_limited
             r["arm"], r["seed"] = cell
             r["controls"]["harness_r2_matches_study"] = True
             r["controls"]["study_embedding_r2"] = r["shipped_grid_r2"]
-            r["controls"]["zero_information_recomputed"] = {"mean": 292.82, "median": 283.05}
+            r["controls"]["zero_information_recomputed"] = dict(ZERO_RECOMPUTED)
             records[cell] = r
         status, text = _capture_read(_write_records(tmp_path / f"floor_{floor}", records))
         assert status in (0, 50)
@@ -2407,18 +2417,24 @@ def _readout_line(text, name, *, cell="pixel_ae_seed0"):
 
 
 def test_each_error_is_read_against_its_own_statistics_baseline_and_says_which(tmp_path, record):
-    """A mean error of 146.41 is HALF of the zero-information MEAN (292.82), and a median error
-    of 141.5 is half of the MEDIAN (283.05): both read 50.0%. Against the wrong baseline the
-    two read 51.7% and 48.3%, which is what an exchange of the denominators prints.
+    """A mean error of 145.68 is HALF of the zero-information MEAN (291.36), and a median error
+    of 137.51 is half of the MEDIAN (275.02): both read 50.0%. Against the wrong baseline the
+    two read 53.0% (the mean over the median) and 47.2% (the median over the mean), which is
+    what an exchange of the denominators prints; the median over the spec's PINNED 283.05
+    reads 48.6%, and the mean over the pinned pair's 292.82 reads 49.8%.
 
-    THE MUTATIONS THIS EXISTS FOR: `mean_error / zero_median` and `median_error / zero_mean`."""
-    text = _unit_reading(tmp_path, record, mean_error=146.41, median_error=141.5)
+    THE MUTATIONS THIS EXISTS FOR: `mean_error / zero_median`, `median_error / zero_mean`, and
+    either divisor taken from the pinned constants."""
+    text = _unit_reading(tmp_path, record, mean_error=145.68, median_error=137.51)
     line = _readout_line(text, "embedding_rbf")
-    assert "146.41" in line and "141.50" in line
-    mean_part, median_part = line.split("141.50")[0], line.split("141.50")[1]
+    assert "145.68" in line and "137.51" in line
+    mean_part, median_part = line.split("137.51")[0], line.split("137.51")[1]
     assert " 50.0%" in mean_part and " 50.0%" in median_part
-    assert "51.7%" not in line and "48.3%" not in line
-    assert "MEAN 292.82 (recomputed), MEDIAN 283.05 (pinned)" in text
+    for wrong in ("53.0%", "47.2%", "48.6%", "49.8%"):
+        assert wrong not in line, wrong
+    assert "MEAN 291.36, MEDIAN 275.02" in text
+    assert "both recomputed over every training episode" in text
+    assert "(pinned)" not in text and "283.05" not in text and "292.82" not in text
     assert "mean_error against the mean, median_error against the median" in text
     assert "a mean over a median is not a ratio" in text
     header = [l for l in text.splitlines() if l.startswith("    readout ")][0]
@@ -2427,18 +2443,35 @@ def test_each_error_is_read_against_its_own_statistics_baseline_and_says_which(t
     assert header.index("/ mean") < header.index("median_error") < header.index("/ median")
 
 
-def test_the_baselines_are_the_records_and_not_a_literal(tmp_path, record):
-    """The mean comes from `controls.zero_information_recomputed` and the median from the
-    stored `zero_information_median`: moved in the records, the ratios move with them."""
+def test_the_baselines_are_the_recomputed_pair_and_neither_is_a_literal(tmp_path, record):
+    """BOTH ratios divide by `controls.zero_information_recomputed`: the mean by its `mean`, the
+    median by its `median`. The pinned `zero_information_median` is provenance and divides
+    nothing, so it is set here to a third figure (200) that no divisor may be: a median ratio
+    that reads the stored constant prints 18.0%, one that reads the literal 283.05 prints
+    12.7%, one that reads the literal 275.02 prints 13.1%, and a mean over the literal 291.36
+    prints 17.2%. The two ratios are made different (50% and 40%) so that an exchange shows too,
+    and the same figures go through both `applied` distributions.
+
+    THE MUTATIONS THIS EXISTS FOR: either divisor replaced by a literal, the median divisor
+    read from `zero_information_median`, the two exchanged."""
     records = _records_from(record, ["PROBE_LIMITED"] * 9)
     for r in records.values():
         r["controls"]["zero_information_recomputed"] = {"mean": 100.0, "median": 90.0}
         r["zero_information_median"] = 200.0
-        r["readouts"]["embedding_rbf"].update(mean_error=50.0, median_error=50.0)
+        r["readouts"]["embedding_rbf"].update(mean_error=50.0, median_error=36.0)
+        for name in ("real_latent", "predicted"):
+            r["applied"][name].update(mean_error=50.0, median_error=36.0)
     text = _capture_read(_write_records(tmp_path / "moved", records))[1]
     line = _readout_line(text, "embedding_rbf")
-    assert line.count("50.0%") == 1 and "25.0%" in line  # 50/100 of the mean, 50/200 of the median
-    assert "MEAN 100.00 (recomputed), MEDIAN 200.00 (pinned)" in text
+    assert re.findall(r"\d+\.\d%", line) == ["50.0%", "40.0%"]  # 50 / 100, 36 / 90
+    figures = [l for l in text.split("  pixel_ae_seed0\n")[1].split("\n\n")[0].splitlines()
+               if l.startswith("      r2 ")]
+    assert len(figures) == 2
+    for figure in figures:
+        assert "mean_error 50.00 ( 50.0% of the zero-information mean)" in figure
+        assert "median_error 36.00 ( 40.0% of the zero-information median)" in figure
+    assert "MEAN 100.00, MEDIAN 90.00" in text
+    assert "200.00" not in text  # the stored constant is provenance: not a divisor, not printed
 
 
 def test_m3ns_floor_error_is_stated_as_a_mean_and_belongs_to_the_real_latent_distribution_only(
@@ -2583,23 +2616,24 @@ def test_the_section_prints_the_rows_the_applied_figures_and_the_floor_of_every_
 def test_each_applied_figure_is_read_against_its_own_zero_information_statistic(
     tmp_path, record,
 ):
-    """A mean error of 146.41 is half of the zero-information MEAN and a median of 141.5 half
-    of the MEDIAN, in BOTH distributions: `mean_error_h1` carries no percentage because it is
-    compared with M3n's figure, not with a baseline. Exchanged denominators print 51.7% and
-    48.3%."""
+    """A mean error of 145.68 is half of the zero-information MEAN (291.36) and a median of
+    137.51 half of the MEDIAN (275.02), in BOTH distributions: `mean_error_h1` carries no
+    percentage because it is compared with M3n's figure, not with a baseline. Exchanged
+    denominators print 53.0% and 47.2%, and the median over the pinned 283.05 prints 48.6%."""
     records = _records_from(record, ["PROBE_LIMITED"] * 9)
     for r in records.values():
         for name in ("real_latent", "predicted"):
-            r["applied"][name].update(mean_error=146.41, median_error=141.5)
+            r["applied"][name].update(mean_error=145.68, median_error=137.51)
     text = _capture_read(_write_records(tmp_path / "applied_units", records))[1]
     block = text.split("  pixel_ae_seed0\n")[1].split("\n\n")[0]
     figures = [l for l in block.splitlines() if l.startswith("      r2 ")]
     assert len(figures) == 2
     for line in figures:
         mean_part, median_part = line.split("median_error")
-        assert "mean_error 146.41 ( 50.0% of the zero-information mean)" in mean_part
-        assert "141.50 ( 50.0% of the zero-information median)" in median_part
-        assert "51.7%" not in line and "48.3%" not in line
+        assert "mean_error 145.68 ( 50.0% of the zero-information mean)" in mean_part
+        assert "137.51 ( 50.0% of the zero-information median)" in median_part
+        for wrong in ("53.0%", "47.2%", "48.6%", "49.8%"):
+            assert wrong not in line, wrong
 
 
 def test_a_pixel_row_is_printed_once_and_a_model_row_once_per_cell(tmp_path, record):
@@ -2664,6 +2698,123 @@ def test_a_record_without_its_floor_or_the_floors_shape_is_refused_by_name(tmp_p
     broken[field] = "nan" if field == "null_floor" else {"n": 10, "d": None}
     write_record(path, broken)
     with pytest.raises(SystemExit, match="null_floor .* is not a finite number"):
+        _capture_read(out)
+
+
+_BAD_BASELINES = [
+    "Infinity", "-Infinity", "inf", "nan", "NaN", "291.36", "0", None, True, [291.36], 0, 0.0,
+    -1.0, -291.36,
+]
+_BAD_BASELINE_IDS = [
+    "Infinity string", "-Infinity string", "inf string", "nan string", "NaN string",
+    "numeric string", "zero string", "null", "bool", "list", "zero int", "zero float",
+    "negative", "negative mean",
+]
+
+
+@pytest.mark.parametrize("victims", ["all nine", "the last cell only"])
+@pytest.mark.parametrize("statistic", ["mean", "median"])
+@pytest.mark.parametrize("bad", _BAD_BASELINES, ids=_BAD_BASELINE_IDS)
+def test_a_zero_information_baseline_that_is_not_a_finite_positive_number_is_refused_by_name(
+    tmp_path, record, statistic, bad, victims,
+):
+    """Every ratio in the map-unit table is DIVIDED by one of the two recomputed baselines, so
+    each is as printed a figure as the three the sound check already finite-checks. `float()`
+    accepts the strings `"Infinity"` and `"nan"`, so a record whose baseline is one clears
+    anything that converts first: the read exited 0 and printed `MEAN inf` and `0.0%` for every
+    mean ratio in all nine cells. A zero or negative baseline makes the ratios meaningless (a
+    zero raises ZeroDivisionError once the verdict is taken).
+
+    Run both ways: the SAME bad figure in all nine records (the protocol check finds nine
+    records that agree, which is how the infinity got through) and in one record only (where a
+    NaN used to be found as `disagree on zero_information.mean: nan vs nan`, which says nothing
+    of what is wrong). Both are refused by the sound check, naming the field and the first cell
+    that carries it, and the refusal writes no reading.
+
+    THE MUTATIONS THIS EXISTS FOR: the baselines left out of `require_sound_records`, the
+    positivity half dropped, and the sound check run after the protocol check."""
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    cells = sorted(records)
+    hit = cells if victims == "all nine" else [cells[-1]]
+    for cell in hit:
+        records[cell]["controls"]["zero_information_recomputed"][statistic] = bad
+    out = _write_records(tmp_path / "baseline", records)
+    with pytest.raises(SystemExit) as caught:
+        _capture_read(out)
+    message = str(caught.value)
+    arm, seed = hit[0]
+    assert message.startswith(f"{arm} seed {seed}: zero_information.{statistic} "), message
+    assert f"(controls.zero_information_recomputed.{statistic}) is {bad!r}, not a finite " \
+        "number above zero" in message, message
+    assert "disagree" not in message
+    assert not (out / "ceiling.txt").exists()
+
+
+@pytest.mark.parametrize("statistic", ["mean", "median"])
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), 0.0, -3.5],
+                         ids=["inf", "-inf", "nan", "zero", "negative"])
+def test_the_sound_check_itself_refuses_a_float_baseline_that_is_not_finite_and_positive(
+    record, statistic, bad,
+):
+    """The float forms, which a file cannot carry to the check (`write_record` files a float
+    infinity or NaN under `nonfinite` as `null`, and the read refuses that first, by path):
+    handed to `require_sound_records` in memory with an empty `nonfinite`, as a record this
+    script wrote would have, the check refuses it itself. The clean records pass first, so the
+    refusal is the baseline's and nothing else's."""
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    for r in records.values():
+        r["nonfinite"] = {}
+    script.require_sound_records(records)
+    records[("random_vit", 2)]["controls"]["zero_information_recomputed"][statistic] = bad
+    with pytest.raises(
+        SystemExit,
+        match=rf"random_vit seed 2: zero_information\.{statistic} "
+              rf"\(controls\.zero_information_recomputed\.{statistic}\) is .*, not a finite "
+              "number above zero",
+    ):
+        script.require_sound_records(records)
+
+
+@pytest.mark.parametrize("statistic", ["mean", "median"])
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")], ids=["inf", "nan"])
+def test_a_non_finite_float_baseline_in_a_file_is_refused_by_the_sanitisers_map(
+    tmp_path, record, statistic, bad,
+):
+    """What a float infinity or NaN does on the way through a file: `write_record` writes
+    `null` and files the path under `nonfinite`, and the read refuses the record for it, by
+    that path, before any baseline is divided by."""
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    records[("pixel_ae", 0)]["controls"]["zero_information_recomputed"][statistic] = bad
+    out = _write_records(tmp_path / "float_baseline", records)
+    with pytest.raises(
+        SystemExit,
+        match=rf"pixel_ae seed 0 carries non-finite value\(s\) at "
+              rf"controls\.zero_information_recomputed\.{statistic}",
+    ):
+        _capture_read(out)
+
+
+def test_a_read_over_no_records_still_says_so(tmp_path):
+    """`require_sound_records` now runs before the protocol check, so the empty case it used to
+    be spared (`items[0]` of nothing) is named by it. THE MUTATION THIS EXISTS FOR: dropping
+    the guard, which is an IndexError."""
+    with pytest.raises(SystemExit, match="no ceiling record to read"):
+        _capture_read(tmp_path, seeds=())
+    with pytest.raises(SystemExit, match="no ceiling record to read"):
+        script.require_sound_records({})
+
+
+def test_the_sound_check_runs_before_the_protocol_check_in_the_read(tmp_path, record):
+    """A record that is unsound AND disagrees with the rest on protocol is refused as unsound:
+    a NaN baseline is a bad number before it is a disagreement. (The nan cases above reach
+    this through the baseline; this pins the order itself with a protocol disagreement the
+    protocol check would have named first.)"""
+    records = _records_from(record, ["PROBE_LIMITED"] * 9)
+    victim = records[("random_vit", 2)]
+    victim["step"] = victim["step"] + 1  # a protocol disagreement
+    victim["fine_minus_shipped_on_score"] = "nan"  # and an unsound figure
+    out = _write_records(tmp_path / "both", records)
+    with pytest.raises(SystemExit, match=r"random_vit seed 2: fine_minus_shipped_on_score is"):
         _capture_read(out)
 
 
