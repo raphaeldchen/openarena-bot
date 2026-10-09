@@ -2393,3 +2393,124 @@ pixel ceiling is at least 0.219 and was not measured at its maximum; a stride-1
 measurement of the pixel row alone would cost one ladder at n=9,044 (~8.5 min)
 and is the cheap way to tighten it, since that row uses no model and is computed
 once for the whole study.
+
+---
+
+## Task 7 results
+
+Gated in: `runs/m3o_ceiling/read.log` reads `verdict: PROBE_LIMITED`.
+
+```
+.venv/bin/python scripts/motion_headroom.py --phase measure --out runs/m3o_rescue \
+  --arms ... --seeds ... --ks 1,3,5,15,45 --bootstrap-seed 0 --readout rbf
+.venv/bin/python scripts/motion_headroom.py --phase read  --out runs/m3o_rescue
+```
+
+Nine records in `runs/m3o_rescue/`, measure exit 0, read exit 0. All nine agree
+on `ks`, `bootstrap_seed`, `context`, `horizon`, `readout` and `git_sha`.
+
+### The scope question, and the two reproduction proofs
+
+The plan's Global Constraints and Task 7's own step contradicted each other on
+whether the frozen files could be touched. Resolved by the human: modify
+`diagnostics.py` (`apply_probe` -> `apply_readout` at four call sites) and
+`motion_headroom.py` (opt-in `--readout`, default `linear`), **additively, with
+bitwise reproduction of M3n required as proof.** Both proofs were run:
+
+| check | result |
+| --- | --- |
+| M3n's `frozen_ssl_seed0` re-measured through the changed code, `--readout` **omitted** | **differs in `git_sha` only** — bitwise identical to shipped `runs/m3n_motion/`. The linear record carries neither `readout` nor `readout_fit`, so M3n's schema is untouched |
+| four rbf cells re-measured at HEAD vs their originals from `58861af` | **differ in `git_sha` only** — every measured number bitwise identical |
+
+The second was not planned. The read phase **refused the first pooling attempt**,
+correctly: four cells carried `git_sha` `58861af` and five `19eb877`, and
+`_PROTOCOL_FIELDS` compares that field so "one code state produced all nine
+cells" is a claim the record itself supports. The delta was docs-only and I had
+verified it, but that verification lived in a session note rather than in the
+record, so the four were re-measured rather than waved through. The by-product is
+a measured proof of the code equivalence that was previously only argued.
+
+The no-op property is **structural, not merely tested**: `apply_readout` does
+`kind = readout.get("kind", "linear")` and then returns `apply_probe(readout, x)`
+— delegation to the same function. No pre-existing dict carries a `kind` key
+(`fit_probe` returns exactly `['mean','r2','ridge','scale','w']`), so no existing
+caller can be re-dispatched. The other production callers of `regrounding_sweep`
+are `diagnose_dynamics.py` and `prediction_burden.py`; **the second is M3m's
+script**, whose 18 records stay reproducible because its probe dict has no
+`kind`. `ceiling` imports `burden` and `probe` only, so `diagnostics -> ceiling`
+adds no cycle.
+
+### What the better readout bought
+
+| | M3n (linear) | M3o (rbf) |
+| --- | --- | --- |
+| `skill(1,1)` resolvably positive | 1 of 9 | **1 of 9 — unchanged** |
+| `headroom(1,1)` resolvably positive (the gate) | 5 of 9 | **7 of 9** |
+| gate failures | 4 of 9 | **2 of 9** |
+| verdict / exit | `NO_MAJORITY` / **48** | **`AT_COPYING` / 0** |
+| `headroom(1,1)` range | +0.576 to +11.824 | **-0.858 to +11.046** |
+
+The readout did improve, but far less here than in M3o's own 2x2: fit where
+`rollout.py:195` fits the shipped probe, on predicted embeddings at n=6600, the
+kernel ladder gains **+0.0034 to +0.0151** over the linear probe, against the
+**+0.0403 to +0.0983** that `D - C` measured on real embeddings at `t`. A 5-10x
+smaller advantage. The linear baselines here are 0.3336-0.3829 — and
+`frozen_ssl_seed0`'s 0.3597 is exactly that cell's recorded
+`probe.embedding_selection_r2`, so the comparison is anchored to the shipped
+rollout probe rather than to M3o's `C_shipped`.
+
+**The gate opened and the verdict resolved.** M3n returned `NO_MAJORITY` at exit
+48 — two cells short of a readable majority, no answer available. With the better
+readout, 7 of 9 cells are readable and `AT_COPYING` holds a strict majority of 5.
+**M3o's rescue converted a non-result into a result.**
+
+**But it did not rescue the model.** `skill(1,1)` is resolvably positive in
+**1 of 9 cells, exactly as in M3n** — `random_vit_seed1`, at +4.124
+[+0.528, +7.839]. The one-step map still fails to beat copying in 8 of 9 cells.
+The better readout did not reveal hidden skill; it made the absence of skill
+LEGIBLE. That is a worse finding for the model and a better one for the arc,
+because `AT_COPYING` at exit 0 is actionable where `NO_MAJORITY` at exit 48 was
+not.
+
+### THE PREDICTION IS REFUTED
+
+Spec 5.2 predicted that as the readout improves, `headroom` converges toward the
+true one-step displacement **3.9694722203504225** from both sides, with a
+tightening interval. Measured:
+
+| cell | M3n point | \|dev\| | M3o point | \|dev\| | M3n width | M3o width |
+| --- | --- | --- | --- | --- | --- | --- |
+| frozen_ssl_seed0 | +3.170 | 0.799 | +3.718 | **0.251** | 9.013 | 9.607 |
+| frozen_ssl_seed1 | +9.807 | 5.838 | +9.506 | **5.536** | 13.439 | **11.855** |
+| frozen_ssl_seed2 | +3.068 | 0.902 | +3.277 | **0.693** | 6.195 | **5.275** |
+| pixel_ae_seed0 | +11.824 | 7.854 | +11.046 | **7.077** | 12.803 | 13.388 |
+| pixel_ae_seed1 | +0.576 | 3.394 | **-0.858** | 4.828 | 5.779 | **5.272** |
+| pixel_ae_seed2 | +6.739 | 2.770 | +5.159 | **1.189** | 9.979 | 10.145 |
+| random_vit_seed0 | +3.050 | 0.920 | +5.306 | 1.336 | 8.669 | **5.420** |
+| random_vit_seed1 | +5.811 | 1.842 | +5.864 | 1.894 | 7.018 | 7.220 |
+| random_vit_seed2 | +3.921 | **0.048** | +6.888 | 2.919 | 11.031 | 12.175 |
+
+- **mean \|headroom - 3.9695\|: 2.707 -> 2.858. FURTHER, not closer.** Closer in
+  5 of 9 cells, further in 4.
+- **mean interval width: 9.325 -> 8.929.** Tighter by 4.2%, but in only 4 of 9
+  cells. Not the tightening the prediction described.
+
+So **the prediction fails on its first clause and is marginal on its second.**
+The sharpest single datum is `random_vit_seed2`: it sat at +3.921, within
+**0.048** of the target, and the better readout moved it to +6.888, a deviation
+of 2.919. A quantity converging on 3.9695 does not do that. Its earlier
+proximity was coincidence.
+
+**What the refutation means.** The prediction assumed `headroom`'s displacement
+from 3.9695 was readout error. It is not. With a materially better readout
+`headroom` still spans -0.858 to +11.046 — a 12-unit spread around a 3.97
+target, one cell negative — so the spread is a property of the per-cell `hold`
+and `floor` terms, not noise the readout was adding. **`headroom` is not an
+estimator of the one-step displacement**, and spec 5.2 was wrong to treat it as
+one. It is the gap between a held and a floor reading, and those two differ per
+cell for reasons M3o did not measure.
+
+This is the outcome Task 7's brief named as the more interesting one, and it
+lands that way: the rescue works for the VERDICT (48 -> 0) and fails for the
+PREDICTION, and the second failure says the arc has been attributing to the
+readout a spread that does not belong to it.
