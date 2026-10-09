@@ -2249,3 +2249,147 @@ results: whether a better readout rescues M3n's measurement
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF
 ```
+
+---
+
+## Task 6 results
+
+```
+mkdir -p runs/m3o_ceiling
+.venv/bin/python scripts/probe_ceiling.py --phase measure --out runs/m3o_ceiling \
+  --arms frozen_ssl,pixel_ae,random_vit --seeds 0,1,2 \
+  --frames 4000 --bootstrap-seed 0 > runs/m3o_ceiling/measure.log 2>&1
+```
+
+Measure exit 0, read exit 0, nine records in `runs/m3o_ceiling/`. Wall time
+~50 minutes, 5.5 min/cell — **not the ~15 minutes budgeted.** The budget counted
+the kernel ladders and omitted `applied_quality`'s `reference_trajectories`
+pass, which dominates. `frame_stride` 3 and `rows_per_split` fit 3016 / select
+1905 / score 2088 in all nine, as planned.
+
+### The verdict
+
+**`PROBE_LIMITED` in 7 of 9 cells** (strict majority 5, computed). Exit 0.
+`PROBE_LIMITED`=7, `REPRESENTATION_LIMITED`=0, `OBSERVATION_LIMITED`=2.
+
+| cell | `D-C-floor` (probe) | `B-D` (pixels) | `F-B` (sequence) | verdict |
+| --- | --- | --- | --- | --- |
+| frozen_ssl_seed0 | +0.0414 [+0.0283,+0.0738] | -0.1398 [-0.3534,-0.0354] | +0.1533 [+0.0602,+0.3617] | `PROBE_LIMITED` |
+| frozen_ssl_seed1 | +0.0384 [+0.0286,+0.0641] | -0.1474 [-0.3512,-0.0491] | +0.1734 [+0.0849,+0.3819] | `PROBE_LIMITED` |
+| frozen_ssl_seed2 | +0.0425 [+0.0288,+0.0793] | -0.1382 [-0.3654,-0.0400] | +0.1584 [+0.0654,+0.3871] | `PROBE_LIMITED` |
+| pixel_ae_seed0 | +0.0381 [+0.0213,+0.0615] | -0.0998 [-0.2916,+0.0116] | +0.1142 [+0.0034,+0.3139] | `PROBE_LIMITED` |
+| pixel_ae_seed1 | +0.0402 [+0.0243,+0.0656] | -0.0999 [-0.3030,+0.0126] | +0.1147 [+0.0054,+0.3272] | `PROBE_LIMITED` |
+| pixel_ae_seed2 | +0.0336 [+0.0183,+0.0578] | -0.1010 [-0.2853,+0.0127] | +0.1136 [+0.0041,+0.3019] | `PROBE_LIMITED` |
+| random_vit_seed0 | +0.0431 [+0.0131,+0.0838] | -0.1130 [-0.3190,-0.0159] | +0.1313 [+0.0405,+0.3405] | `PROBE_LIMITED` |
+| random_vit_seed1 | +0.0322 [**-0.0012**,+0.0682] | -0.1083 [-0.2967,-0.0112] | +0.1189 [+0.0237,+0.3101] | `OBSERVATION_LIMITED` |
+| random_vit_seed2 | +0.0247 [**-0.0152**,+0.0575] | -0.0996 [-0.2865,-0.0061] | +0.1197 [+0.0305,+0.3098] | `OBSERVATION_LIMITED` |
+
+The two dissenters are not a different finding; they are the same point estimate
+failing to resolve. Their probe gains, +0.0322 and +0.0247, are the two smallest
+of the nine and their intervals cross zero by 0.0012 and 0.0152. Under the
+rule as written that is `OBSERVATION_LIMITED`, because a non-resolvable probe
+gain beside a negative pixel gain leaves the observation as the remaining
+explanation. **It should be read as "this cell did not resolve", not as evidence
+that position is unrecoverable there.**
+
+**`REPRESENTATION_LIMITED` got zero votes**, and not by a near miss: `B - D` is
+resolvably NEGATIVE in 6 of 9 and negative in point estimate in 9 of 9. Raw
+pixels read WORSE than the representation, so the encoders are not discarding
+position the frames carry. That disposes of the hypothesis thirteen milestones
+would have been debugging the wrong stage for.
+
+**Rider: `F - B` is resolvably positive in 9 of 9.** History resolves what one
+frame cannot, in every cell, by +0.11 to +0.17 of r2. This answers gate
+criterion 4's question without criterion 4's "A beats B" framing.
+
+### What the better readout buys
+
+| | shipped probe | best readout | gain |
+| --- | --- | --- | --- |
+| r2 | 0.2792-0.2951 | 0.3326-0.3925 | **+0.0403 to +0.0983** |
+| mean error | 136.7-152.9 | 106.3-126.2 | **16.2 to 33.4 map units** |
+
+`sequence_rbf` is the best readout in all nine cells. Per cell, r2 by readout:
+
+| cell | shipped | linear (fine) | emb RBF | emb kNN | seq linear | seq RBF |
+| --- | --- | --- | --- | --- | --- | --- |
+| frozen_ssl_seed0 | 0.2838 | 0.3173 | 0.3588 | 0.3190 | 0.3334 | **0.3724** |
+| frozen_ssl_seed1 | 0.2946 | 0.3280 | 0.3665 | 0.3190 | 0.3612 | **0.3925** |
+| frozen_ssl_seed2 | 0.2792 | 0.3146 | 0.3572 | 0.3264 | 0.3481 | **0.3775** |
+| pixel_ae_seed0 | 0.2930 | 0.2806 | 0.3188 | 0.2478 | 0.3134 | **0.3332** |
+| pixel_ae_seed1 | 0.2913 | 0.2786 | 0.3190 | 0.2425 | 0.3147 | **0.3337** |
+| pixel_ae_seed2 | 0.2921 | 0.2864 | 0.3200 | 0.2473 | 0.3133 | **0.3326** |
+| random_vit_seed0 | 0.2889 | 0.2889 | 0.3320 | 0.2447 | 0.3031 | **0.3504** |
+| random_vit_seed1 | 0.2951 | 0.2951 | 0.3273 | 0.2174 | 0.3085 | **0.3380** |
+| random_vit_seed2 | 0.2804 | 0.2938 | 0.3186 | 0.1476 | 0.2964 | **0.3387** |
+
+`embedding_knn` is the one readout that separates the arms: 0.319-0.326 on
+`frozen_ssl` against 0.148-0.248 on the other two. k-NN asks whether
+near-in-feature-space implies near-in-position, so `frozen_ssl`'s feature space
+is the least aliased of the three. Nothing in the verdict rests on this.
+
+### THE FINDING THAT IS NOT THE VERDICT
+
+The representations are nearly equally readable. The probe that reads them is not.
+
+| | across the nine cells | sd | span |
+| --- | --- | --- | --- |
+| `embedding_linear` r2 (the 2x2) | 0.2786 - 0.3280 | 0.0176 | 0.049 |
+| applied rollout-probe r2 (real-latent) | 0.1391 - 0.7414 | 0.1903 | 0.602 |
+
+**10.8x wider by standard deviation, 12.2x by range.** And the spread is WITHIN
+an arm, not between arms: `pixel_ae` seeds 0, 1 and 2 give applied r2 of 0.7414,
+0.1391 and 0.5673 while their representation readouts sit at 0.2806, 0.2786 and
+0.2864 — a 0.60 spread beside a 0.008 one, on three seeds of the same
+architecture.
+
+So the between-cell variation that this arc has been comparing lives in the
+**rollout probe's fit**, not in how much position the representations carry.
+`pixel_ae` seed 1 — the cell whose floor error is M3n's worst, 259.06 — has an
+`embedding_linear` r2 of 0.2786, within 0.02 of every other cell. Its
+representation is ordinary; its rollout probe is not.
+
+This is what spec 3.1 was added to detect, and it fired. The caveat it carries
+is the spec's own: if the two distributions differ this much, a better readout
+measured on real embeddings at `t` says less about the rollout probe than the
+2x2 alone would suggest. **`PROBE_LIMITED` is a finding about the readout
+family; it is not yet a measurement that fixing the readout fixes the rollout.**
+Task 7 is the phase that would test that, by refitting the readout where
+`rollout.py:195` fits the shipped one.
+
+### Controls
+
+| control | result |
+| --- | --- |
+| `harness_r2_matches_study` | **true 9 of 9**; `C_shipped` 0.279-0.295 against the study's 0.3195-0.3451, gap +0.0290 to +0.0561 against a 0.10 tolerance |
+| the gap's sign | **one-signed, study above in 9 of 9** — its ridge is selected on the rows it is scored on, so this is expected, not noise |
+| `mean_error_h1` against M3n's floor | **both endpoints reproduced exactly**: 131.8767 (frozen_ssl seed 2) and 259.0584 (pixel_ae seed 1) against M3n's recorded 131.88-259.06 |
+| `null_floor` | **+7.53e-05 in all nine**, identical — the null task depends only on shape and all nine share n=3016, d=2048. The grid fix of 3.3.1 holds at the real shape |
+| raw-pixel readouts | **bitwise identical across all nine**. That row uses no model; the free control passes |
+| `study_embedding_selection_r2` | 0.018-0.383, recorded ungated — outside the band in 5 of 9, confirming it is a different quantity from the gated field |
+| `C - C_shipped` on the score split | +0.033 to +0.035 (frozen_ssl), **-0.006 to -0.013 (pixel_ae)**, +0.000 to +0.013 (random_vit); negative in 3 of 9, all `pixel_ae`. Small, so the finer grid is not overfitting selection |
+| `nesting_rbf_at_widest_vs_linear` | **+0.0067 to +0.0228, positive in all nine** |
+
+**Two expectations written into the spec were wrong, both benignly.**
+`nesting_rbf_at_widest_vs_linear` was specified "expected negative on good
+cells" and came back positive in every cell — the asymptotic claim is not as
+false at this shape as 3.3 measured it to be at others. And `C - C_shipped` was
+expected non-negative by containment on the selection split; on the SCORE split
+it dips slightly negative for all three `pixel_ae` cells, which is the selection
+noise 3.3.1 said to watch for. Neither is gated and neither touches the verdict.
+
+### What the reduced `n` costs row B
+
+The run used `--frames 4000`, stride 3, so every readout is fit on 3,016 rows
+rather than the 9,044 available. **B and D share that `n`**, which is what
+matters: both levels are understated by whatever more rows would buy, but the
+DIFFERENCE `B - D` is measured on equal footing, so the `REPRESENTATION_LIMITED`
+= 0 result does not rest on the budget.
+
+As a ceiling claim, B is weaker than it would be at stride 1. A kernel readout
+with more anchors can only improve, so **B = 0.2191 is a LOWER BOUND on what a
+readout of one raw frame can reach.** The honest statement is that the one-frame
+pixel ceiling is at least 0.219 and was not measured at its maximum; a stride-1
+measurement of the pixel row alone would cost one ladder at n=9,044 (~8.5 min)
+and is the cheap way to tighten it, since that row uses no model and is computed
+once for the whole study.
