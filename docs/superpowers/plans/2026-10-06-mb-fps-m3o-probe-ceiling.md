@@ -2622,6 +2622,24 @@ estimator of the one-step displacement**, and spec 5.2 was wrong to treat it as
 one. It is the gap between a held and a floor reading, and those two differ per
 cell for reasons M3o did not measure.
 
+### One record does not reproduce from HEAD, and it is a label rather than a measurement
+
+`runs/m3o_rescue/headroom_random_vit_seed1.json` is the one cell of eighteen
+where the kernel ladder's LINEAR rung won. It records `bandwidth: null`; HEAD,
+after `capacity_for_record` unified the two scripts' spellings, would write
+`"inf"`. Nothing else in either directory differs from what HEAD produces.
+
+**Left as it is, deliberately.** The field is the NAME of a selected capacity,
+not a measured quantity: it feeds no gain, no interval and no verdict, and the
+same record's `kernel: "linear"` makes it unambiguous. Fixing it would mean
+re-running all nine rescue cells rather than the one, because re-measuring a
+single cell would leave eight at the old `git_sha` and the read phase refuses a
+pool that mixes code states — about 70 minutes to change one label's spelling.
+
+Read `bandwidth: null` beside `kernel: "linear"` in that file as `"inf"`. A
+future re-run of the rescue will write `"inf"` and will then be internally
+consistent.
+
 This is the outcome Task 7's brief named as the more interesting one, and it
 lands that way: the rescue works for the VERDICT (48 -> 0) and fails for the
 PREDICTION, and the second failure says the arc has been attributing to the
