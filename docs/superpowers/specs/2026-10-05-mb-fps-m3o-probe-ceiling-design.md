@@ -307,9 +307,17 @@ Per the resolvability of each difference against an episode-clustered interval:
 
 | verdict | condition | meaning |
 | --- | --- | --- |
-| `PROBE_LIMITED` | `D - C` resolvably > 0 | the linear family was the limit |
+| `PROBE_LIMITED` | **`D - C - max(null_floor, 0)` resolvably > 0** | the linear family was the limit |
 | `REPRESENTATION_LIMITED` | `B - D` resolvably > 0 | the observation carries more than the representation preserves |
 | `OBSERVATION_LIMITED` | none of B, C, D resolvably separated | the scenario aliases; no readout recovers more |
+
+**`PROBE_LIMITED` IS READ AGAINST THE MEASURED FLOOR, NEVER AGAINST ZERO**, and
+the table above says so because an earlier revision of it did not. §6.1 has the
+reasoning and §3.3.1 the mechanism: the floor is subtracted from the point AND
+BOTH BOUNDS before the interval is asked about zero, and a negative floor clamps.
+The shipped reading's column header is `D-C-floor (probe)` for the same reason.
+Reading §5 alone and comparing `D - C` to zero reproduces the exact defect
+§3.3.1 exists to have fixed.
 
 Crosscutting rider: **`F - B` resolvably > 0** means history resolves what one
 frame cannot. That is gate criterion 4's question asked without criterion 4's
@@ -424,7 +432,7 @@ incomplete at that shape.
 | `C_shipped` reproduces the shipped `filtering.criterion_4.embedding_r2` (0.3195-0.3451), within 0.10 | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1). The tolerance is set against a measured worst gap of 0.035 once the fit split is the study's training episodes (§3.4) |
 | `C >= C_shipped` on the SELECTION split, exactly | containment: `CEILING_RIDGES` contains `RIDGES`. On the SCORE split it may dip by selection noise, but a large systematic dip means the finer grid is overfitting selection, so the score-split difference is recorded per cell |
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
-| RBF at its widest bandwidth against linear, recorded and NOT gated | the ASYMPTOTIC nesting claim, which §3.3 measured to be FALSE in practice — an RBF is linear only to first order and its widest rung is capped far below the ridge the linear probe selects. Expected negative on good cells. Nesting is structural instead: the linear kernel is a RUNG, and that is pinned by test, not by this control |
+| RBF at its widest bandwidth against linear, recorded and NOT gated | the ASYMPTOTIC nesting claim, which §3.3 measured to be FALSE in practice — an RBF is linear only to first order and its widest rung is capped far below the ridge the linear probe selects. **Expected negative ONLY once linear r2 exceeds ~0.37**; the nine cells reached 0.2786-0.3280, so all nine read POSITIVE (+0.0067 to +0.0228) and that is consistent, not a refutation. Nesting is structural instead: the linear kernel is a RUNG, pinned by test, not by this control |
 | **the raw-pixel row is identical across all nine cells** | it uses no model; a difference means a model leaked into a model-free measurement |
 | the zero-information baseline is **recomputed, both statistics, and both ratios use it** | the scale every map-unit figure is read against. Two statistics because the readout errors have two; a mean error over a median baseline is not a ratio. **It is not gated against 283.05**: recomputed over all 98 training episodes it reads 291.36 mean / 275.02 median, and the 292.82 / 283.05 in §2 come from the leading 24 training episodes — a subset nothing in the study uses, kept only as provenance |
 
@@ -445,11 +453,22 @@ Named for the quantity, following `burden.py`, `capacity.py`, `retention.py`,
 **Exit codes.** 43-44 are `latent_capacity`'s, 45-46 `prediction_burden`'s,
 47-48 `motion_headroom`'s, and nothing uses a higher number, so:
 
-- **49 `EXIT_HARNESS_DISAGREES`** — `C_shipped` failed to reproduce the shipped
-  `embedding_selection_r2` (§6). M3o is then measuring something other than
-  what the study measured, and no verdict is available. Read on `C_shipped`,
-  never on `C`: `C` searches the finer `CEILING_RIDGES` and is expected above
-  the shipped band, so gating on it would exit 49 on a correct run.
+- **49 `EXIT_HARNESS_DISAGREES`** — `C_shipped` failed to reproduce the study's
+  **`filtering.criterion_4.embedding_r2`** (0.3195-0.3451), within
+  `HARNESS_R2_TOLERANCE`. M3o is then measuring something other than what the
+  study measured, and no verdict is available.
+
+  **TWO FIELDS, AND ONLY ONE IS THE GATE** — §2 is the section about not
+  conflating them, and an earlier revision of this line conflated them anyway.
+  `probe.embedding_selection_r2` is the ROLLOUT probe's and spans 0.0180-0.3829
+  over the same nine cells; it is recorded as `study_embedding_selection_r2` and
+  gates nothing. Measured: gating `C_shipped` (0.2792-0.2951) on that field at
+  tolerance 0.10 fires in **5 of 9 cells** — `pixel_ae` seed 1 worst, 0.291
+  against 0.018 — so a reader implementing this line as it stood would exit 49
+  on a correct run.
+
+  Read on `C_shipped`, never on `C`: `C` searches the finer `CEILING_RIDGES` and
+  is expected above the band, so gating on it would also fail a correct run.
 - **50 `EXIT_NO_MAJORITY`** — no verdict held a strict majority of the nine
   cells.
 

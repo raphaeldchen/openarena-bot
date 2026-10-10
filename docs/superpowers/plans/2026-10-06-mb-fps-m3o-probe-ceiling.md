@@ -1910,8 +1910,13 @@ Follow `scripts/motion_headroom.py` structurally. The pieces that are M3o's:
 
 ```python
 EXIT_HARNESS_DISAGREES: int = 49
-"""RETURNED BY THE READ PHASE when cell `C` fails to reproduce the study's own
-`embedding_selection_r2` (0.320-0.345 across the nine cells).
+"""RETURNED BY THE READ PHASE when `C_shipped` fails to reproduce the study's own
+`filtering.criterion_4.embedding_r2` (0.3195-0.3451 across the nine cells).
+
+NOT `C`, and NOT `probe.embedding_selection_r2`. `C` searches the finer grid and
+is expected above the band; that other field is the rollout probe's and spans
+0.0180-0.3829, so gating on either fails a correct run -- measured, the second
+fires in 5 of 9 cells.
 
 M3o is then measuring something other than what the study measured, and no
 verdict about the model is available. This is a statement about the HARNESS,
@@ -2370,13 +2375,27 @@ Task 7 is the phase that would test that, by refitting the readout where
 | `C - C_shipped` on the score split | +0.033 to +0.035 (frozen_ssl), **-0.006 to -0.013 (pixel_ae)**, +0.000 to +0.013 (random_vit); negative in 3 of 9, all `pixel_ae`. Small, so the finer grid is not overfitting selection |
 | `nesting_rbf_at_widest_vs_linear` | **+0.0067 to +0.0228, positive in all nine** |
 
-**Two expectations written into the spec were wrong, both benignly.**
-`nesting_rbf_at_widest_vs_linear` was specified "expected negative on good
-cells" and came back positive in every cell — the asymptotic claim is not as
-false at this shape as 3.3 measured it to be at others. And `C - C_shipped` was
-expected non-negative by containment on the selection split; on the SCORE split
-it dips slightly negative for all three `pixel_ae` cells, which is the selection
-noise 3.3.1 said to watch for. Neither is gated and neither touches the verdict.
+**One expectation was INAPPLICABLE rather than wrong, and saying "wrong" was
+itself an error.** `nesting_rbf_at_widest_vs_linear` was specified "expected
+negative on **good** cells", and `widest_rbf_r2`'s own docstring names the
+threshold: an RBF without the linear rung reads below linear once linear r2
+passes **~0.37**. The nine cells' `embedding_linear` r2 runs **0.2786 to
+0.3280** — **not one cell reached 0.37**. So nine positive values are consistent
+with the documented mechanism and nothing was refuted; the prediction was made
+about a regime this run never entered. The spec, the docstring and the printed
+reading all state the expectation without the threshold or where these cells sit
+against it, which is what made it look like a refutation.
+
+**`C - C_shipped` dips are real, and `PROBE_LIMITED` survives their worst case.**
+On the SCORE split it dips -0.0057 to -0.0127 across all three `pixel_ae` cells,
+same sign, which is the selection-overfit signature §3.3.1 said to watch. If that
+is what it is, `C` is understated there and `D - C` inflated by at most the dip.
+Subtracting the whole dip: the smallest `pixel_ae` probe-gain lower bound is
+**+0.0183**, and 0.0183 - 0.0127 = **+0.0056, still above zero.** All three cells
+still resolve, the `PROBE_LIMITED` count stays 7, and the bar of 5 is untouched.
+Not gating is sound rather than convenient, and this subtraction is why.
+
+Neither control is gated and neither touches the verdict.
 
 ### What the reduced `n` costs row B
 
@@ -2450,14 +2469,32 @@ adds no cycle.
 | verdict / exit | `NO_MAJORITY` / **48** | **`AT_COPYING` / 0** |
 | `headroom(1,1)` range | +0.576 to +11.824 | **-0.858 to +11.046** |
 
-The readout did improve, but far less here than in M3o's own 2x2: fit where
-`rollout.py:195` fits the shipped probe, on predicted embeddings at n=6600, the
-kernel ladder gains **+0.0034 to +0.0151** over the linear probe, against the
-**+0.0403 to +0.0983** that `D - C` measured on real embeddings at `t`. A 5-10x
-smaller advantage. The linear baselines here are 0.3336-0.3829 — and
-`frozen_ssl_seed0`'s 0.3597 is exactly that cell's recorded
-`probe.embedding_selection_r2`, so the comparison is anchored to the shipped
-rollout probe rather than to M3o's `C_shipped`.
+**CORRECTED. The first version of this paragraph was an overclaim of exactly the
+kind this arc keeps producing**, written from the four cells that existed when
+the run was interrupted and never recomputed once the other five landed, against
+a mislabelled comparator. All four figures were wrong. What the nine records say:
+
+| | range over the nine | mean |
+| --- | --- | --- |
+| rescue, rbf minus linear (predicted embeddings, n=6600) | **+0.0006 to +0.0454** | **+0.0169** |
+| its linear baselines | **0.0180 to 0.3829** | — |
+| `gains.probe`, i.e. `D - C - floor` (real embeddings at `t`, n=3016) | **+0.0247 to +0.0431** | **+0.0371** |
+
+So the honest ratio is **2.2x, not the 5-10x first claimed**, and
+`pixel_ae` seed 2's rescue gain of **+0.0454 exceeds every `gains.probe` in the
+study**. The withdrawn figures were: "+0.0034 to +0.0151", which is only the three
+`frozen_ssl` cells; "0.3336-0.3829", likewise frozen_ssl's baselines alone; and
+"+0.0403 to +0.0983 that `D - C` measured", which is not `D - C` at all but `best
+readout minus shipped probe` from the Task 6 table, where it is correctly
+labelled.
+
+The qualitative point survives in weakened form and must be stated that way: the
+kernel buys **less** on the rollout distribution than on real embeddings at `t`,
+by about a factor of two on the means — not the near-elimination the first
+version implied, and not uniformly, since one cell gains more there than any cell
+gains in the 2x2. `frozen_ssl_seed0`'s linear baseline of 0.3597 is exactly that
+cell's recorded `probe.embedding_selection_r2`, so the comparison is anchored to
+the shipped rollout probe rather than to M3o's `C_shipped`.
 
 **The gate opened and the verdict resolved.** M3n returned `NO_MAJORITY` at exit
 48 — two cells short of a readable majority, no answer available. With the better
