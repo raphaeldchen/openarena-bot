@@ -45,12 +45,14 @@ import torch.nn as nn
 from mbfps.data.episode import load_episode, save_episode
 from mbfps.eval import headroom as H
 from mbfps.eval import pooling
+from mbfps.eval.ceiling import fit_kernel_probe
 from mbfps.eval import probe as probe_module
 from mbfps.eval.diagnostics import REGROUNDING_KS, RegroundingSweep, ground_step, regrounding_sweep
 from mbfps.eval.probe import apply_probe, fit_probe, fit_probes, probe_targets
 from mbfps.eval.rollout import RolloutResult, evaluate_rollout
 from mbfps.eval.study import SPLIT_SEED, git_sha, load_record, write_record
 from mbfps.eval.windows import window_starts
+from tests.eval.test_ceiling import _curved_task, _linear_task
 from tests.eval.test_rollout import (
     KEYS, STEP, DriftingModel, OracleModel, _OracleRSSM, oracle_probe, real_model_and_probe,
     synthetic_episode,
@@ -3083,6 +3085,54 @@ def test_the_rbf_phase_fits_the_readout_and_reads_the_reference_through_it(
     assert record["nonfinite"] == {}
     out = capsys.readouterr().out
     assert "rbf readout" in out and readout["kernel"] in out
+
+
+@pytest.mark.parametrize("task, kernel", [("linear", "linear"), ("curved", "rbf")])
+def test_the_linear_rungs_bandwidth_is_the_string_inf_as_probe_ceiling_writes_it(
+    task, kernel, tmp_path, monkeypatch,
+):
+    """The same datum, spelled the same way in both scripts. `probe_ceiling` writes a
+    linear rung's infinite bandwidth as the string "inf", where `null` means a
+    readout has no such quantity; this script wrote `null` for it, so a reader
+    pooling the M3o rescue records with the ceiling records took a rung that WON for
+    a readout with no bandwidth. An RBF rung's bandwidth stays the number it is.
+
+    Both readouts are GENUINE ladder outputs, and the fixture is shown to produce
+    each: the linear task selects the linear kernel (infinite bandwidth), the curved
+    one an RBF rung (finite). The record is written through `write_record`, so that
+    a bandwidth the file cannot carry shows up as `nonfinite` or a bare token.
+
+    THE MUTATION THIS EXISTS FOR, run against it: `rbf_cell_inputs` writing `None`
+    for a non-finite bandwidth, as it did."""
+    tasks = {"linear": (_linear_task(0), _linear_task(1)), "curved": (_curved_task(0), _curved_task(1))}
+    readout = fit_kernel_probe(*tasks[task][0], *tasks[task][1])
+    assert readout["kernel"] == kernel
+    assert np.isinf(readout["bandwidth"]) == (kernel == "linear")
+
+    monkeypatch.setattr(script, "fit_embedding_readout", lambda *a, **k: readout)
+    monkeypatch.setattr(
+        script, "reference_trajectories", lambda *a, **k: types.SimpleNamespace(band="band"),
+    )
+    prepared = types.SimpleNamespace(
+        model=object(), common={"feature_backbone": None}, context=3, horizon=5,
+        embedding_probe={"ridge": 1000.0, "r2": 0.3},
+    )
+    _, _, fit = script.rbf_cell_inputs(
+        prepared, types.SimpleNamespace(seed=0), [], [], CPU,
+    )
+    expected = "inf" if kernel == "linear" else readout["bandwidth"]
+    assert fit["rbf"]["bandwidth"] == expected
+    assert fit["rbf"]["kernel"] == kernel
+
+    path = tmp_path / "record.json"
+    written = write_record(path, {"readout_fit": fit})
+    assert written["nonfinite"] == {}
+
+    def refuse(token):
+        raise AssertionError(f"bare {token} in the file")
+
+    loaded = json.loads(path.read_text(), parse_constant=refuse)
+    assert loaded["readout_fit"]["rbf"]["bandwidth"] == expected
 
 
 def test_the_rbf_records_say_which_readout_they_were_read_through_at_the_read_phase(

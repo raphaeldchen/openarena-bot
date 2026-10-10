@@ -251,7 +251,19 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
     The readout records which kernel was selected, as `kernel`, because the
     linear and RBF rungs apply differently. `kind` stays "rbf", the name of
     this estimator in the M3o readouts, whichever rung won. `bandwidth` is
-    `inf` for a linear rung and `gamma` is None.
+    `inf` for a linear rung and `gamma` is None; a record writes it with
+    `capacity_for_record`.
+
+    A NON-FINITE SELECTION SCORE IS REFUSED BY NAME, not compared. `nan > x` is
+    False, so a NaN on the first rung (the linear kernel at the smallest jitter)
+    would win and no later rung could beat it: the ladder returned that rung with
+    `r2 = nan` for one `inf` in `val_x`, and `score_readout` recomputes r2 on the
+    score split, so the pinned readout then scored a plausible number and every
+    finite check downstream passed. The direction of the error is an understated
+    `D`, which reads as `OBSERVATION_LIMITED` where `PROBE_LIMITED` holds. It did
+    not fire in the recorded run (every cell selected an interior bandwidth and
+    jitter). `probe.fit_probe` keeps its own comparison, unchanged, since every
+    number recorded in the project came through it.
     """
     if len(CEILING_RIDGES) == 0:
         raise ValueError(
@@ -271,6 +283,13 @@ def fit_kernel_probe(x, y, val_x, val_y) -> dict:
         for jitter in CEILING_RIDGES:
             alpha = vecs @ (coords / (vals + jitter)[:, None])
             score = _mean_r2(query @ alpha + centre, val_y)
+            if not math.isfinite(score):
+                raise ValueError(
+                    f"fit_kernel_probe: non-finite selection score {score} at kernel "
+                    f"{kernel!r} (bandwidth {bandwidth}), jitter {jitter:g}; "
+                    "`nan > x` is False, so it would win and no later rung could "
+                    "beat it. The selection split or its targets are not finite"
+                )
             if best is None or score > best[0]:
                 best = (score, kernel, gamma, bandwidth, jitter, alpha)
     return {
@@ -285,6 +304,10 @@ def fit_knn_probe(x, y, val_x, val_y) -> dict:
 
     Assumption-free, and the most direct test of aliasing: it asks whether
     near-in-feature-space implies near-in-position, which is the question.
+
+    A NON-FINITE SELECTION SCORE IS REFUSED BY NAME, for the reason
+    `fit_kernel_probe` gives: `nan > x` is False, so a NaN at k = 1 would pin the
+    readout to the one rung that reproduces the fit rows it is handed.
     """
     x = np.asarray(x, dtype=np.float64); y = np.asarray(y, dtype=np.float64)
     mean, scale = x.mean(0), x.std(0) + 1e-8
@@ -295,6 +318,12 @@ def fit_knn_probe(x, y, val_x, val_y) -> dict:
         if k > xs.shape[0]:
             continue
         score = _mean_r2(_knn_predict(xs, y, xv, k), val_y)
+        if not math.isfinite(score):
+            raise ValueError(
+                f"fit_knn_probe: non-finite selection score {score} at k={k}; "
+                "`nan > x` is False, so it would win and no later rung could "
+                "beat it. The selection split or its targets are not finite"
+            )
         if best is None or score > best[0]:
             best = (score, k)
     if best is None:
@@ -349,7 +378,12 @@ def fit_linear_probe(x, y, val_x, val_y) -> dict:
 
 
 _NULL_RANK: int = 40
+"""Dimension of the latent signal behind `_null_split`'s features: the rank of the purely
+linear task `null_floor` runs on."""
+
 _NULL_NOISE: float = 120.0
+"""Std of the label noise `_null_split` adds to its targets, in the targets' own units;
+with the feature noise of 3.0 it sets how much of the target a linear readout recovers."""
 
 NULL_DRAWS: int = 3
 """How many independent synthetic draws `null_floor` averages.
@@ -425,9 +459,10 @@ FRAME_BUDGET: int = 12000
 """Rows each split is brought within, by one fixed stride (`scripts/probe_ceiling.py`).
 
 The splits are the study's 20 training episodes (fit; 9,044 rows on the shipped data) and
-the two halves of the validation episodes (select and score; ~6,000 each), so the budget
-does not bind on the shipped split and the stride is 1. Cost is cubic in the fit split's
-rows, which is why `--frames` exists.
+the two halves of the validation episodes (select and score; 5,713 and 6,264 rows), so AT
+THIS DEFAULT the budget does not bind on the shipped split and the stride is 1. The recorded
+run did not use the default: it passed `--frames 4000`, stride 3, which holds 3,016 / 1,905 /
+2,088 rows. Cost is cubic in the fit split's rows, which is why `--frames` exists.
 
 STATED RATHER THAN DISCOVERED. `_solve`'s dual branch costs n^2 float64s:
 12,000 frames is 1.15 GB (the whole 12,073-frame validation set is 1.17 GB),
@@ -435,11 +470,21 @@ STATED RATHER THAN DISCOVERED. `_solve`'s dual branch costs n^2 float64s:
 which is the failure this constant exists to prevent."""
 
 ZERO_INFORMATION_MEDIAN: float = 283.05
-"""Median error of predicting the training mean, on the shipped split.
+"""Median error of predicting the training mean, on the spec's definition.
 
-Measured on 12,073 validation frames from 24 episodes. The scale every
-map-unit figure in this milestone is read against. Recomputed as a control
-rather than trusted.
+PROVENANCE, NOT A DIVISOR. Measured on 12,073 validation frames from 24 episodes
+against the mean position of the LEADING 24 training episodes, a subset nothing
+in the study uses (criterion 4's probe and the rollout probe both take 20). Every
+map-unit ratio `scripts/probe_ceiling.py` prints divides by the pair
+`zero_information_error` RECOMPUTES over every training episode, stored per cell
+as `controls.zero_information_recomputed` and 291.36 mean / 275.02 median on the
+shipped data. Divided by this constant instead, every median ratio would read
+2.8% low (48.6% where 50.0% is right), because 283.05 is 2.9% above 275.02, and
+the table would put two constants of different provenance side by side.
+
+What it is FOR: every record stores it as `zero_information_median`, the recomputed
+pair beside it, so a reader sees the spec's figure and the one the ratios used; the
+read phase refuses records that disagree on it; and a change detector pins it.
 
 READ THE STATISTICS BESIDE IT. The shipped rollout probe's floor error of
 131.88-259.06 is a MEAN over validation windows (`rollout.evaluate_rollout`
@@ -447,9 +492,9 @@ stacks the per-window errors and takes `.mean(axis=0)`), so its like-for-like
 baseline is the zero-information MEAN, which the spec records as 292.82: 45% to
 88% of it, which is what says that probe carries real information and is not
 broken. Against this MEDIAN the same two figures are 47% and 92%, a mean over a
-median, which is not a ratio. `Readout.mean_error` is read against the mean and
-`Readout.median_error` against this constant, and any ratio says which
-statistic sits on each side.
+median, which is not a ratio. `Readout.mean_error` is read against the recomputed
+mean and `Readout.median_error` against the recomputed median, and any ratio says
+which statistic sits on each side.
 
 ONLY THE MEDIAN IS PINNED. No verified value for the mean exists in this
 module, so there is no constant for it: `zero_information_error` recomputes it
@@ -518,6 +563,37 @@ class Readout:
     """The scored-row predictions, kept so a difference between two readouts
     can be bootstrapped with both held fixed. Held by reference; see the class
     docstring."""
+
+
+def capacity_for_record(value: float) -> float | str:
+    """A selected capacity as a record writes it: a float, or `"inf"` for a linear rung.
+
+    The kernel ladder's linear rung has `bandwidth = inf`, and `inf` is not JSON:
+    `json.dumps` writes the bare token `Infinity`, which no strict reader takes,
+    and `study.write_record` would null it and file it under `nonfinite`. So the
+    rung is written as the STRING `"inf"`: it needs no field beside it, and the
+    record's `nonfinite` map stays empty.
+
+    NOT `null`. In these records `null` means "this readout has no such quantity"
+    (the k-NN's `jitter`), and a linear rung does have a bandwidth: an infinite one,
+    the limit of the RBF family. A reader pooling records who sees `null` beside
+    `kernel: "linear"` would take a rung that WON for a readout with no bandwidth.
+
+    ONE FUNCTION FOR EVERY WRITER. `scripts/probe_ceiling.py` (each readout's
+    `capacity`) and `scripts/motion_headroom.py` (`readout_fit.rbf.bandwidth`)
+    both call it. They once spelled the same datum two ways, and one record
+    written before they agreed survives:
+    `runs/m3o_rescue/headroom_random_vit_seed1.json` says `bandwidth: null` where
+    its linear rung won. Read that `null`, beside `kernel: "linear"`, as `"inf"`.
+
+    NaN and -inf are refused: they are not capacities.
+    """
+    value = float(value)
+    if math.isinf(value) and value > 0.0:
+        return "inf"
+    if not math.isfinite(value):
+        raise ValueError(f"a readout's capacity is {value}; only +inf (a linear rung) is a capacity")
+    return value
 
 
 _FITTERS = {
@@ -732,9 +808,12 @@ def probe_gain_over_floor(
     verdict is read against, so it is estimated more precisely than the quantity
     it bounds. On `CEILING_RIDGES` it measured -0.0001 at D=1024 and -0.0000 at
     D=2048 (means over 6 draws, n=2000), and -0.0016 to +0.0000 on the n=300,
-    D=150 fixture (taken before the draws were averaged); how that compares with
-    the real intervals' widths is not yet measured. It is a point estimate, and
-    the record keeps it beside the gain.
+    D=150 fixture (taken before the draws were averaged). On the recorded run all nine
+    cells share one shape (n=3016, d=2048) and so one floor, +7.53e-05, against
+    probe-gain intervals 0.0356-0.0727 wide: 0.10% to 0.21% of a width. It moved no
+    verdict; the nearest lower bound to zero, `random_vit` seed 1's, is -0.0012
+    with the floor taken off and -0.0011 without. It is a point estimate, and the
+    record keeps it beside the gain.
 
     `score_targets` must be the exact targets both readouts were scored on, and
     `groups` the episode label of each of those rows: `difference_interval`
@@ -816,11 +895,17 @@ class CeilingCell:
 
 @dataclass(frozen=True)
 class CeilingInputs:
+    """What `reading_ceiling` tallies: the cells, filed under their own `(arm, seed)`."""
+
     cells: dict[tuple[str, int], CeilingCell]
 
 
 @dataclass(frozen=True)
 class CeilingStatus:
+    """What `reading_ceiling` returns: the verdict (one of `VERDICTS`, or `NO_MAJORITY`),
+    the `rule` sentence saying why, and the `tally` of cells per verdict as sorted
+    `(arm, seed)` tuples."""
+
     verdict: str
     rule: str
     tally: dict[str, tuple[tuple[str, int], ...]]

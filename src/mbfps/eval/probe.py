@@ -77,6 +77,25 @@ def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges: Sequence[float]) -> list
     a mean of 5. Agreement is worst at the smallest ridge, where the Gram is
     worst conditioned.
 
+    THAT SHAPE CANNOT OCCUR IN PRODUCTION, so here is the behaviour at the ones that
+    do. An embedding is D = 2048 and `n` is the fit split's rows (9,044 at stride 1;
+    3,016 at the recorded run's `--frames 4000`). There `d < n` and the PRIMAL path
+    runs, and it is BITWISE the implementation it replaced (`np.array_equal` against
+    the old `design.T @ design + ridge * eye` solve, at every rung of `RIDGES`): at
+    n = 9044, 7236 and 2049 on synthetic features, and at n = 3016 and 2049 on the
+    real encoder embeddings of each arm (seed 0). The branch is STRICT, `d < n`, so
+    `n == D` is already dual, and the dual is reached only when `n <= D`: a run with
+    few enough episodes, or a small enough `--frames`, to leave fewer than 2049 fit
+    rows would cross into it. Measured there, at n = D = 2048 and n = 2047 on those
+    real embeddings (standardised, as `fit_probe` hands them): the dual differs from
+    the primal by at most 4.4e-08 in any weight at ridge 1e-1, 1.5e-10 at 1e1 and
+    1.3e-12 at 1e3, and by at most 3.8e-07 map units in a prediction on the selection
+    split. M3o's embedding-width fits are all primal (n = 3016 > 2048), where the
+    synthetic n = 2000, D = 2048 draws behind `ceiling.CEILING_RIDGES`' figures are
+    dual (n < D). The dual is what M3o's raw-pixel (D = 37632) and sequence
+    (D = 10240) readouts run on at every n this project uses (n <= 9,044), and the
+    raw-pixel one has no primal to compare with, which is why the branch exists.
+
     THE GRAM DEPENDS ON `x` ALONE, NOT ON THE RIDGE, so it is built once and
     only its diagonal is rewritten between rungs. Each rung is written from a
     pristine copy of that diagonal rather than added to the last rung's, so no

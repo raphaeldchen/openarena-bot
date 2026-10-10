@@ -161,7 +161,7 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.eval.aggregate import SEEDS
-from mbfps.eval.ceiling import fit_kernel_probe
+from mbfps.eval.ceiling import capacity_for_record, fit_kernel_probe
 from mbfps.eval.diagnostics import (
     REGROUNDING_KS, RegroundingSweep, reference_trajectories, regrounding_sweep,
 )
@@ -375,9 +375,14 @@ def rbf_cell_inputs(prepared, cell, train, val, device) -> tuple[dict, RolloutRe
     reference is `reference_trajectories`' band THROUGH THAT READOUT -- the
     controls compare the sweep with it, and the one `prepare_cell` verified was
     read through the linear probe (module docstring). `fit` is what the record
-    carries about the two fits, finite throughout: `write_record` nulls a
-    non-finite value into the `nonfinite` map and the read phase refuses a record
-    that has one, so the linear rung's infinite bandwidth is written as null.
+    carries about the two fits, with no non-finite float in it: `write_record`
+    nulls a non-finite value into the `nonfinite` map and the read phase refuses a
+    record that has one, so the linear rung's infinite bandwidth is written as the
+    string `"inf"` -- `ceiling.capacity_for_record`, the function `probe_ceiling`
+    writes a capacity with, so the two scripts spell the datum the same way and
+    `null` is left to mean "no such quantity".
+    `runs/m3o_rescue/headroom_random_vit_seed1.json`, the one rescue record whose
+    linear rung won, was written before they agreed and says `bandwidth: null`.
     """
     readout = fit_embedding_readout(
         prepared.model, train, prepared.common["feature_backbone"], device,
@@ -385,11 +390,10 @@ def rbf_cell_inputs(prepared, cell, train, val, device) -> tuple[dict, RolloutRe
     )
     reference = reference_trajectories(prepared.model, val, readout, **prepared.common).band
     linear = prepared.embedding_probe
-    bandwidth = float(readout["bandwidth"])
     fit = {
         "rbf": {
             "kernel": readout["kernel"],
-            "bandwidth": bandwidth if math.isfinite(bandwidth) else None,
+            "bandwidth": capacity_for_record(readout["bandwidth"]),
             "jitter": float(readout["jitter"]),
             "r2": float(readout["r2"]),
             "n_fit": int(readout["anchors"].shape[0]),

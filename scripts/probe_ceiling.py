@@ -25,9 +25,12 @@ A row is a frame `t` of one episode with `SEQUENCE_FRAMES - 1` frames of real hi
 behind it, so the first `SEQUENCE_FRAMES - 1` frames of every episode are not rows. One
 stride, recorded as `frame_stride`, is the smallest that brings every split within the
 budget (`ceiling.FRAME_BUDGET` or `--frames`); the rows each split actually holds are
-recorded beside it as `rows_per_split`. ON THE SHIPPED SPLIT THE BUDGET DOES NOT BIND:
-fit holds 9,044 rows, select 5,713 and score 6,264, against a cap of 12,000, so the stride
-is 1.
+recorded beside it as `rows_per_split`. AT THE DEFAULT BUDGET, `ceiling.FRAME_BUDGET` =
+12,000, THE BUDGET DOES NOT BIND ON THE SHIPPED SPLIT: fit holds 9,044 rows, select 5,713
+and score 6,264, so the stride is 1. THE RECORDED RUN DID NOT USE THE DEFAULT. It passed
+`--frames 4000`, which binds on all three: stride 3, and 3,016 / 1,905 / 2,088 rows in each
+of the nine records (`frames: 4000`, `frame_stride: 3`). The 9,044-row figures below are the
+stride-1 case, which was not run.
 
 THE COST MOVED WITH THE FIT SPLIT. It is about 2.3 times the 8-episode one, and a kernel
 ladder is dominated by one eigendecomposition per rung, cubic in the fit rows. MEASURED, on
@@ -151,8 +154,9 @@ left.
 
 MAP UNITS ARE COMPARED HERE, and nowhere in `ceiling.py`. The reading is in r2; the
 section this script appends to it sets each readout's `mean_error` against the
-zero-information MEAN and its `median_error` against `ZERO_INFORMATION_MEDIAN`, each
-ratio naming its statistic, and sets M3n's 131.88-259.06 -- a mean -- only against a
+zero-information MEAN and its `median_error` against the zero-information MEDIAN, both
+recomputed over every training episode (`controls.zero_information_recomputed`; the pinned
+`ceiling.ZERO_INFORMATION_MEDIAN` divides nothing), each ratio naming its statistic, and sets M3n's 131.88-259.06 -- a mean -- only against a
 `mean_error`: of the two `applied` distributions, against the real-latent one's
 `mean_error_h1`, which is the same statistic on the same distribution. A third section
 prints the controls that are recorded but not gated (`C - C_shipped` on the score split,
@@ -254,25 +258,33 @@ HARNESS_R2_TOLERANCE: float = 0.10
 """How far `shipped_grid_r2` may sit from the study's `criterion_4.embedding_r2` before the
 harness is said to measure something else.
 
-JUSTIFIED BY MEASUREMENT, not a stated guess. A ONE-OFF CHECK OUTSIDE THE STUDY, on the nine
-real checkpoints (this module's own `build_splits` and `encode_rows`, the two LINEAR readouts
-only, no record written):
+JUSTIFIED BY MEASUREMENT, and the measurement that counts is the run it gates.
 
-  * FIT ON THE STUDY'S 20 TRAINING EPISODES (this script's split, 12 / 12 validation halves):
-    `C_shipped` reads 0.292-0.313 against the study's 0.3195-0.3451, worst gap 0.0398
-    (frozen_ssl seed 2), best 0.0248. An earlier run of the same rows scored on 8-episode
-    thirds read 0.300-0.342 and a worst gap of 0.035. So 0.10 is 2.5 times the worst gap the
-    correct pipeline shows.
+  * THE RECORDED RUN (`runs/m3o_ceiling`: `--frames 4000`, fit on the study's 20 training
+    episodes at stride 3, 3,016 rows, 12 / 12 validation halves): `C_shipped` reads
+    0.2792-0.2951 against the study's 0.3195-0.3451. The gap is 0.0290-0.0561 (worst
+    frozen_ssl seed 2, best random_vit seed 1), so 0.10 is 1.78 times the worst gap and
+    3.4 times the best, and no cell sits nearer than 0.044 to it. Recomputed from the nine
+    records as `controls.study_embedding_r2 - shipped_grid_r2`.
+  * THE PRE-RUN CHECK THAT SET IT, a one-off outside the study on the nine real checkpoints
+    (this module's own `build_splits` and `encode_rows`, the two LINEAR readouts only, no
+    record written), read `C_shipped` 0.292-0.313, worst gap 0.0398, and called 0.10 2.5
+    times that. THE RUN DID NOT REPRODUCE IT: its readings are lower and its worst gap is
+    0.0163 wider. The check's budget is not recorded, so why is not claimed here; the
+    figures are kept as the check that led to 0.10, not as a measurement of the harness.
+    An earlier run of the same rows scored on 8-episode thirds read 0.300-0.342 and a worst
+    gap of 0.035.
   * FIT ON 8 VALIDATION EPISODES (the revision this replaced): -0.026 to +0.166, a gap of
     0.17 to 0.35 in every cell. A tolerance that admits that admits a broken harness, and
-    0.10 refuses all nine.
+    0.10 refuses all nine. (A superseded revision with no record on disk: not recomputed.)
 
 THE GAP IS ONE-SIGNED, and expected to be: the study's number is optimistically biased (its
 ridge is selected on the very rows it is scored on, a maximum over `RIDGES` on the scored
 split; `probe.filtering_comparison` says so), scored on all 24 validation episodes, while
 `C_shipped` selects on `select` and scores on `score`. The study sat above `C_shipped` in
 nine of nine cells. The two are not the same measurement, which is why this is a tolerance
-and not an equality; tightening it toward 0.04 would fire on a correct run."""
+and not an equality; tightening it toward 0.04 would fire on a correct run (the recorded
+gap exceeds 0.04 in 7 of 9 cells)."""
 
 M3N_FLOOR_ERROR_MEAN: tuple[float, float] = (131.88, 259.06)
 """The shipped rollout probe's FLOOR error at h=1 across M3n's nine cells,
@@ -640,15 +652,10 @@ def widest_rbf_r2(fit, select, score) -> float:
     return float(_mean_r2(on_score @ best[1] + centre, score[1]))
 
 
-def _capacity(value: float):
-    """`float(value)`, or the string `"inf"` for a positive infinity: the linear rung
-    of the kernel ladder. NaN and -inf are not capacities and are refused."""
-    value = float(value)
-    if math.isinf(value) and value > 0.0:
-        return "inf"
-    if not math.isfinite(value):
-        raise ValueError(f"a readout's capacity is {value}; only +inf (a linear rung) is a capacity")
-    return value
+_capacity = ceiling.capacity_for_record
+"""`float(value)`, or the string `"inf"` for a positive infinity: the linear rung of the
+kernel ladder. NaN and -inf are not capacities and are refused. `ceiling`'s function, not a
+copy: `scripts/motion_headroom.py` writes the same datum and calls the same one."""
 
 
 def _readout_record(readout) -> dict:
@@ -1334,7 +1341,7 @@ def format_map_units(records: dict) -> str:
     and dividing the median by it while the mean is divided by a recomputed figure would put
     two constants of different provenance in one table (recomputed over every training
     episode the pair reads 291.36 / 275.02, so every median ratio read against the pinned
-    figure was 2.9% low: 48.6% where 50.0% is right). It stays in the record as provenance
+    figure would be 2.8% low: 48.6% where 50.0% is right). It stays in the record as provenance
     and is not printed. The raw-pixel readouts are printed once, since they are one number
     for the study."""
     items = sorted(records.items())

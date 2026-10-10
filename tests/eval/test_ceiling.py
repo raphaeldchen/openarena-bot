@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import math
 import re
 import tracemalloc
 
@@ -15,7 +16,7 @@ from mbfps.eval.ceiling import (
     Readout, _gap, _median_scale, _row, apply_readout, difference_interval,
     fit_kernel_probe, fit_knn_probe, fit_linear_probe, format_reading_ceiling,
     null_floor, probe_gain_over_floor, reading_ceiling, score_readout,
-    zero_information_error,
+    zero_information_error, capacity_for_record,
 )
 from mbfps.eval.probe import RIDGES, _block_bootstrap_ci, _mean_r2, apply_probe, fit_probe
 
@@ -362,6 +363,87 @@ def test_the_knn_skips_rungs_larger_than_the_fit_set():
     fit_x, fit_y = _curved_task(0, n=3)
     readout = fit_knn_probe(fit_x, fit_y, *_curved_task(1, n=5))
     assert readout["k"] == 1
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+@pytest.mark.parametrize("poison", ["an inf in the selection features", "a nan in the selection targets"])
+def test_the_kernel_probe_refuses_a_non_finite_selection_score_rather_than_pinning_the_first_rung(
+    poison,
+):
+    """`nan > x` is False, so a NaN score on the FIRST rung is never beaten by a later
+    one: the ladder returned its first rung (the linear kernel at the smallest jitter)
+    with `r2 = nan`, and `score_readout` recomputes r2 on the score split, so the
+    pinned readout then scored a plausible number and every finite check downstream
+    passed. The failure direction is an understated `D`, which reads as
+    `OBSERVATION_LIMITED` where `PROBE_LIMITED` holds.
+
+    The fixture is shown to discriminate before anything is asserted: on the clean
+    selection split the ladder selects an RBF rung, so pinning the first rung (linear)
+    would be a visibly different readout, and applying that readout to the poisoned
+    split scores non-finite, so the poison does reach the selection score.
+
+    THE MUTATION THIS EXISTS FOR, run against it: delete the guard in
+    `fit_kernel_probe`'s jitter loop."""
+    train, select = _curved_task(0), _curved_task(1)
+    clean = fit_kernel_probe(*train, *select)
+    assert math.isfinite(clean["r2"])
+    assert clean["kernel"] == "rbf", "pinning the first rung (the linear kernel) must be a visible change"
+
+    val_x, val_y = select[0].copy(), select[1].copy()
+    if "features" in poison:
+        val_x[3, 1] = np.inf
+    else:
+        val_y[3, 1] = np.nan
+    assert not math.isfinite(_mean_r2(apply_readout(clean, val_x), val_y)), "the poison must reach the score"
+
+    with pytest.raises(ValueError, match="non-finite selection score") as caught:
+        fit_kernel_probe(*train, val_x, val_y)
+    message = str(caught.value)
+    assert "fit_kernel_probe" in message and "'linear'" in message
+    assert f"{CEILING_RIDGES[0]:g}" in message, "the refusal names the rung it stopped at"
+
+
+def test_the_knn_probe_refuses_a_non_finite_selection_score_rather_than_pinning_the_first_rung():
+    """The same defect in the k ladder: a NaN score at k = 1 is never beaten, so the
+    readout is pinned to k = 1, the one rung that reproduces the fit rows it is
+    handed. An inf in the selection FEATURES does not reach this estimator's score
+    (its NaN distances only reorder a poisoned row's neighbours, and the targets
+    stay finite), so the poison is a NaN in the selection TARGETS, which poisons
+    every rung's r2 alike.
+
+    The fixture is shown to discriminate: on the clean noisy split the ladder selects
+    a k other than 1, so a pinned readout would be a visibly different one.
+
+    THE MUTATION THIS EXISTS FOR, run against it: delete the guard in
+    `fit_knn_probe`'s loop."""
+    train, select = _curved_task(0, noise=20.0), _curved_task(1, noise=20.0)
+    clean = fit_knn_probe(*train, *select)
+    assert math.isfinite(clean["r2"])
+    assert clean["k"] != NEIGHBOURS[0], "pinning the first rung (k = 1) must be a visible change"
+
+    val_y = select[1].copy()
+    val_y[3, 1] = np.nan
+    assert not math.isfinite(_mean_r2(apply_readout(clean, select[0]), val_y)), "the poison must reach the score"
+
+    with pytest.raises(ValueError, match="non-finite selection score") as caught:
+        fit_knn_probe(*train, select[0], val_y)
+    message = str(caught.value)
+    assert "fit_knn_probe" in message and f"k={NEIGHBOURS[0]}" in message
+
+
+def test_a_capacity_is_recorded_as_a_float_or_the_string_inf_and_nothing_else():
+    """The one spelling of a linear rung's infinite bandwidth, for every writer of a
+    record. Shown on a genuine linear-rung readout first: the ladder on a purely
+    linear task selects the linear kernel, whose bandwidth is `inf`, so the string
+    is what a real readout reaches and not only a literal."""
+    readout = fit_kernel_probe(*_linear_task(0), *_linear_task(1))
+    assert readout["kernel"] == "linear" and math.isinf(readout["bandwidth"])
+    assert capacity_for_record(readout["bandwidth"]) == "inf"
+    assert capacity_for_record(np.float64(0.25)) == 0.25
+    assert capacity_for_record(16) == 16.0 and isinstance(capacity_for_record(16), float)
+    for bad in (float("nan"), float("-inf")):
+        with pytest.raises(ValueError, match="capacity"):
+            capacity_for_record(bad)
 
 
 def test_apply_readout_sends_a_linear_probe_to_the_shipped_path_unchanged():

@@ -719,14 +719,15 @@ def test_the_harness_flag_is_read_against_the_criterion_4_probe_not_the_rollout_
 
 def test_the_tolerance_sits_between_what_a_correct_pipeline_measures_and_what_a_starved_fit_does():
     """The justification of `HARNESS_R2_TOLERANCE = 0.10`, as numbers, so the docstring cannot
-    drift from them. MEASURED on the nine real checkpoints (a one-off outside the study, the
-    two linear readouts only): with the fit split the study's 20 training episodes the worst
-    gap between `C_shipped` and the study's `criterion_4.embedding_r2` was 0.0398; fit on 8
-    validation episodes every gap was 0.17 to 0.35. A tolerance at or below the first fires
-    on a correct run (exit 49 on nine of nine); at or above the second it admits a broken
-    harness."""
+    drift from them. With the fit split the study's 20 training episodes, the RECORDED RUN's
+    worst gap between `C_shipped` and the study's `criterion_4.embedding_r2` is 0.0561
+    (`controls.study_embedding_r2 - shipped_grid_r2` over the nine records, frozen_ssl
+    seed 2; the pre-run one-off check had read 0.0398 and the run did not reproduce it); fit
+    on 8 validation episodes every gap was 0.17 to 0.35 (a superseded revision, not
+    recomputable). A tolerance at or below the first fires on a correct run (exit 49); at or
+    above the second it admits a broken harness."""
     assert script.HARNESS_R2_TOLERANCE == 0.10
-    assert 0.0398 < script.HARNESS_R2_TOLERANCE < 0.17
+    assert 0.0562 < script.HARNESS_R2_TOLERANCE < 0.17
 
 
 def test_fine_minus_shipped_is_c_less_c_shipped_on_the_score_split_by_value(world, record):
@@ -869,6 +870,9 @@ def test_a_linear_rung_is_written_as_the_string_inf_and_the_file_is_strict_json(
 
 
 def test_a_capacity_is_a_finite_number_or_positive_infinity_and_nothing_else():
+    """`_capacity` IS `ceiling.capacity_for_record`, the function `motion_headroom` writes
+    its bandwidth with: the two scripts once spelled the same datum `"inf"` and `null`."""
+    assert script._capacity is ceiling.capacity_for_record
     assert script._capacity(float("inf")) == "inf"
     assert script._capacity(np.float64(0.25)) == 0.25
     assert script._capacity(16) == 16.0
