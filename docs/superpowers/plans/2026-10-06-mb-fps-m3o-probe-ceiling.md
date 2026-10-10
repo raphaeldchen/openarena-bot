@@ -32,8 +32,8 @@
 - **`probe.RIDGES` IS FROZEN** at `(1e-1, 1e1, 1e3, 1e5, 1e7)`. Thirteen milestones of recorded numbers came through it and `fit_probe` keeps it as the default for its new `ridges=` parameter. A task that changes its value is wrong.
 - **`C` is the best LINEAR readout and is NOT the shipped probe.** `C` searches `CEILING_RIDGES` and is expected ABOVE the shipped `embedding_selection_r2` band (0.320-0.345) by up to ~0.02. The reconciliation and **exit 49 read `C_shipped`** — the same fit over `probe.RIDGES`, recorded as `shipped_grid_r2`. Gating on `C` would exit 49 on a correct run. Spec §3.3.1, §6.
 - **`PROBE_LIMITED` is read against a MEASURED FLOOR, never against zero.** The floor is sharply shape-dependent — ~0 at D=37632 even on the coarse grid, largest at D=2048 — so Task 2b's three shapes do not license nine cells. Each cell measures `ceiling.null_floor(n, d)` at its own shape; `PROBE_LIMITED` requires the real `D - C` resolvably above it. A `null_floor` materially above zero is a finding about the instrument, not a number to subtract. Spec §6.1. **Task 2b implements it, Task 4 reads it, Task 5 records it.**
-- Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05`, `DISPLACEMENT_TARGET = 3.9694722203504225`, `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. `RIDGES` is inherited from `probe.py`, not redefined. `CEILING_RIDGES` is `tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))` — 33 rungs, and it contains `RIDGES` bitwise as every 8th rung.
-- **THE RUN IS `--frames 4000`, SETTLED BY THE HUMAN.** With the fit split moved to the study's 20 TRAINING episodes (§3.4), stride 1 gives fit 9,044 / select 5,713 / score 6,264 rows, and the kernel ladder's `n^3.04` makes that ~7 hours for nine cells with an unmeasured multi-GB raw-pixel ladder. `--frames 4000` gives stride 3 — fit 3,016 / select 1,905 / score 2,088 — for ~15 minutes total and 0.37 GiB per raw-pixel split.
+- Exact constants, copied verbatim: `FRAME_BUDGET = 12000`, `CONFIDENCE = 0.95`, `RESAMPLES = 2000`, `SEEDS_MINIMUM = 3`, `ARMS_REQUIRED = 2`, `ZERO_INFORMATION_MEDIAN = 283.05` (provenance, not a divisor: the ratios divide by the recomputed pair), `EXIT_HARNESS_DISAGREES = 49`, `EXIT_NO_MAJORITY = 50`. **`DISPLACEMENT_TARGET` is NOT defined by M3o**: an earlier revision listed it here, and it is in neither `ceiling.py` nor `probe_ceiling.py`. The value, 3.9694722203504225, is `headroom.DISPLACEMENT_RECORDED_ONLY` (M3n's, used in no statistic) and M3o reads against it in Task 7's prose only. `RIDGES` is inherited from `probe.py`, not redefined. `CEILING_RIDGES` is `tuple(10.0 ** (-1.0 + 8.0 * i / 32) for i in range(33))` — 33 rungs, and it contains `RIDGES` bitwise as every 8th rung.
+- **THE RUN IS `--frames 4000`, SETTLED BY THE HUMAN.** With the fit split moved to the study's 20 TRAINING episodes (§3.4), stride 1 gives fit 9,044 / select 5,713 / score 6,264 rows, and the kernel ladder's `n^3.04` makes that ~7 hours for nine cells with an unmeasured multi-GB raw-pixel ladder. `--frames 4000` gives stride 3 — fit 3,016 / select 1,905 / score 2,088 — budgeted at ~15 minutes total (the run measured ~50: the budget omitted `applied_quality`'s `reference_trajectories` pass, see Task 6 results) and 0.37 GiB per raw-pixel split.
 
   **The reason is statistical, not only cost.** Striding keeps every episode and thins only within-episode density, which is where the redundancy is: this project measured a 1.26x-2.17x clustering penalty for treating adjacent Doom frames as independent, so the thinned rows carry nearly the information the full set does. The run records `rows_per_split` and `frame_stride`, so the choice is visible in every record.
 
@@ -43,10 +43,10 @@
 
   | per split | one kernel ladder | `null_floor`, 3 draws | nine cells of floors | raw pixels, D=37632 |
   | --- | --- | --- | --- | --- |
-  | n ≈ 4,000 (actual) | 36 s | 109 s | **17 min** | 1.12 GiB/split, 3.36 GiB for three |
+  | n ≈ 4,000 (the assumption this table was built on; the run's fit n is 3,016) | 36 s | 109 s | **17 min** | 1.12 GiB/split, 3.36 GiB for three |
   | n = 12,000 (the cap) | 1,027 s | 3,082 s | **7.7 hours** | 3.36 GiB/split, 10.1 GiB for three |
 
-  Measured: 0.93 s at n=1200 and 63.2 s at n=4800, which is `n^3.04` — the seven eigendecompositions in `fit_kernel_probe`. **So the planned run is comfortable and needs no reduced budget.** Do not add one. But a change that lets `n` reach the cap turns 17 minutes into 7.7 hours, so `measure_cell` records the rows per split beside `frame_stride`, and the read phase prints them.
+  Measured: 0.93 s at n=1200 and 63.2 s at n=4800, which is `n^3.04` — the seven eigendecompositions in `fit_kernel_probe`. **SUPERSEDED: an earlier revision concluded from this table that the planned run is comfortable and needs no reduced budget, and told the implementer not to add one.** That rested on n ≈ 4,000. With the fit split the study's 20 training episodes, stride 1 is n = 9,044, the same law puts nine cells near 7 hours, and the settled run is `--frames 4000` (above). The table is the scaling, not a forecast of the run: the run took ~50 minutes, not 17 or 15 (Task 6 results). A change that lets `n` reach the cap turns 17 minutes into 7.7 hours, so `measure_cell` records the rows per split beside `frame_stride`, and the read phase prints them.
 
   Two corrections to what an earlier revision of this line claimed. The 18 GB allocation that stopped this milestone's first attempt was `_solve`'s PRIMAL path building `np.eye(37632)` at 11.3 GiB; **Task 1 fixed that** by branching on `min(n, D)`, and the dual Gram at n ≈ 4,000 is 128 MiB. And `FRAME_BUDGET`'s own docstring reasons from the Gram, which is right — it was the feature matrix that needed checking, and at the real `n` that is 1.12 GiB, not the 3.36 GiB the cap implies.
 - The strict-majority bar is **computed**, never stored: `burden.strict_majority(len(cells))`. It returns 5 at nine cells and 6 at eleven.
@@ -1147,8 +1147,11 @@ def test_the_zero_information_error_is_the_distance_to_the_fit_mean():
     function, so a change inside it cannot move both sides.
     """
     _, yf = _linear_task(0); _, ys = _linear_task(2)
-    expected = float(np.median(np.linalg.norm(ys[:, :2] - yf[:, :2].mean(0), axis=1)))
-    assert zero_information_error(yf, ys) == pytest.approx(expected, abs=1e-12)
+    errors = np.linalg.norm(ys[:, :2] - yf[:, :2].mean(0), axis=1)
+    out = zero_information_error(yf, ys)
+    assert set(out) == {"mean", "median"}
+    assert out["median"] == pytest.approx(float(np.median(errors)), abs=1e-12)
+    assert out["mean"] == pytest.approx(float(errors.mean()), abs=1e-12)
 
 
 def test_a_difference_interval_is_clustered_on_the_groups_it_is_given():
@@ -1183,19 +1186,50 @@ Append to `src/mbfps/eval/ceiling.py`:
 
 ```python
 FRAME_BUDGET: int = 12000
-"""Frames drawn from the validation episodes, by a fixed stride.
+"""Rows each split is brought within, by one fixed stride (`scripts/probe_ceiling.py`).
 
-STATED RATHER THAN DISCOVERED. `_solve`'s dual branch costs n^2: 12,000 frames
-is 1.17 GB, 20,000 is 3.2 GB. M3o's predecessor found an 18 GB allocation at
-run time, which is the failure this constant exists to prevent."""
+The splits are the study's 20 training episodes (fit; 9,044 rows on the shipped data) and
+the two halves of the validation episodes (select and score; 5,713 and 6,264 rows), so AT
+THIS DEFAULT the budget does not bind on the shipped split and the stride is 1. The recorded
+run did not use the default: it passed `--frames 4000`, stride 3, which holds 3,016 / 1,905 /
+2,088 rows. Cost is cubic in the fit split's rows, which is why `--frames` exists.
+
+STATED RATHER THAN DISCOVERED. `_solve`'s dual branch costs n^2 float64s:
+12,000 frames is 1.15 GB (the whole 12,073-frame validation set is 1.17 GB),
+20,000 is 3.2 GB. M3o's predecessor found an 18 GB allocation at run time,
+which is the failure this constant exists to prevent."""
 
 ZERO_INFORMATION_MEDIAN: float = 283.05
-"""Median error of predicting the training mean, on the shipped split.
+"""Median error of predicting the training mean, on the spec's definition.
 
-Measured on 12,073 validation frames from 24 episodes. The scale every
-map-unit figure in this milestone is read against: the shipped rollout probe's
-floor error of 131.88-259.06 is 45% to 88% of it, so that probe carries real
-information and is not broken. Recomputed as a control rather than trusted."""
+PROVENANCE, NOT A DIVISOR. Measured on 12,073 validation frames from 24 episodes
+against the mean position of the LEADING 24 training episodes, a subset nothing
+in the study uses (criterion 4's probe and the rollout probe both take 20). Every
+map-unit ratio `scripts/probe_ceiling.py` prints divides by the pair
+`zero_information_error` RECOMPUTES over every training episode, stored per cell
+as `controls.zero_information_recomputed` and 291.36 mean / 275.02 median on the
+shipped data. Divided by this constant instead, every median ratio would read
+2.8% low (48.6% where 50.0% is right), because 283.05 is 2.9% above 275.02, and
+the table would put two constants of different provenance side by side.
+
+What it is FOR: every record stores it as `zero_information_median`, the recomputed
+pair beside it, so a reader sees the spec's figure and the one the ratios used; the
+read phase refuses records that disagree on it; and a change detector pins it.
+
+READ THE STATISTICS BESIDE IT. The shipped rollout probe's floor error of
+131.88-259.06 is a MEAN over validation windows (`rollout.evaluate_rollout`
+stacks the per-window errors and takes `.mean(axis=0)`), so its like-for-like
+baseline is the zero-information MEAN, which the spec records as 292.82: 45% to
+88% of it, which is what says that probe carries real information and is not
+broken. Against this MEDIAN the same two figures are 47% and 92%, a mean over a
+median, which is not a ratio. `Readout.mean_error` is read against the recomputed
+mean and `Readout.median_error` against the recomputed median, and any ratio says
+which statistic sits on each side.
+
+ONLY THE MEDIAN IS PINNED. No verified value for the mean exists in this
+module, so there is no constant for it: `zero_information_error` recomputes it
+beside the median, from the cell's own splits, and it is recorded rather than
+trusted."""
 
 
 @dataclass(frozen=True)
@@ -1270,17 +1304,22 @@ def score_readout(name: str, fit, select, score) -> Readout:
     )
 
 
-def zero_information_error(fit_targets, score_targets) -> float:
-    """Median map-unit error of predicting the FIT split's mean position.
+def zero_information_error(fit_targets, score_targets) -> dict:
+    """`{"mean", "median"}` map-unit error of predicting the FIT split's mean
+    position.
 
     The floor of informativeness. A readout that scores above this carries
     nothing, and one at 45% of it -- which is where the shipped rollout probe's
     best cell sits -- carries a great deal.
+
+    BOTH STATISTICS, from one set of errors: `Readout.mean_error` is read
+    against the mean and `Readout.median_error` against the median, and a mean
+    over a median is not a ratio.
     """
     mu = np.asarray(fit_targets, dtype=np.float64)[:, :2].mean(0)
-    return float(np.median(
-        np.linalg.norm(np.asarray(score_targets, dtype=np.float64)[:, :2] - mu, axis=1)
-    ))
+    truth = np.asarray(score_targets, dtype=np.float64)
+    errors = position_error(np.broadcast_to(mu, (truth.shape[0], 2)), truth)
+    return {"mean": float(np.mean(errors)), "median": float(np.median(errors))}
 
 
 def difference_interval(a: Readout, b: Readout, score_targets, groups, *, seed) -> dict:
@@ -1597,7 +1636,7 @@ def reading_ceiling(inputs: CeilingInputs) -> CeilingStatus:
 
 
 READING_COLUMNS: tuple[str, ...] = (
-    "cell", "D-C (probe)", "B-D (pixels)", "F-B (sequence)", "verdict",
+    "cell", "D-C-floor (probe)", "B-D (pixels)", "F-B (sequence)", "verdict",
 )
 READING_WIDTHS: tuple[int, ...] = (22, 30, 30, 30, 24)
 
@@ -1638,9 +1677,13 @@ def format_reading_ceiling(reading: CeilingStatus, inputs: CeilingInputs) -> str
         f"{len(inputs.cells)} cells (F - B resolvably above zero)",
         "",
         "legend",
-        "  D-C  the nonlinear readout over the linear one, on the same features.",
-        "       An RBF nests the linear kernel, so D >= C is near-guaranteed and",
-        "       only a RESOLVABLE difference is evidence of anything.",
+        "  D-C-floor  the nonlinear readout over the best linear one, on the same",
+        "       features, MINUS the cell's own measured null floor (D - C on a purely",
+        f"       linear task of this cell's shape, the mean of {NULL_DRAWS} draws, THEN",
+        "       clamped at zero from below). The interval is read against zero AFTER",
+        "       that subtraction. An RBF nests the linear kernel, so D >= C is",
+        "       near-guaranteed and only a RESOLVABLE difference is evidence of",
+        "       anything.",
         "  B-D  the best readout of raw pixels over the best of the representation.",
         "       B is one study-wide number, so the nine differences share a term",
         "       and are correlated; each still asks about its own representation.",
@@ -1727,13 +1770,19 @@ EOF
 {
   "arm": str, "seed": int, "step": int,
   "git_sha": str, "record_git_sha": str, "torch_version": str, "device": str,
-  "frames": 12000, "frame_stride": int, "rows_per_split": {"fit": int, "select": int, "score": int},
-  "confidence": 0.95, "resamples": 2000,
+  "frames": int,   # --frames: 4000 in the recorded run; the default is FRAME_BUDGET = 12000
+  "frame_stride": int, "rows_per_split": {"fit": int, "select": int, "score": int},
+  "sequence_frames": 5, "confidence": 0.95, "resamples": 2000, "null_draws": 3,
   "bootstrap_seed": int, "cell_bootstrap_seed": int, "split_seed": int,
-  "zero_information_median": 283.05,
+  "zero_information_median": 283.05,   # provenance; the ratios use controls.zero_information_recomputed
+  "harness_r2_tolerance": 0.10,
   "episodes": {"fit": [...], "select": [...], "score": [...]},
   "groups": [...],
-  "applied": {"r2": float, "median_error": float},
+  "applied": {                    # spec 3.1: BOTH distributions, never one
+    "real_latent": {"r2": f, "mean_error": f, "mean_error_h1": f, "median_error": f,
+                    "compares_to": str},   # the FLOOR; M3n's 131.88-259.06 is its mean_error_h1
+    "predicted":   {...},                  # the model's imagined embeddings; no prior figure
+  },
   "ceiling_ridges": [...],        # the 33 rungs, stored; no literal survives the tests
   "readouts": {
     # every readout carries ALL of these; see Task 3's `Readout`
@@ -1749,13 +1798,15 @@ EOF
                                  # large systematic dip means the finer grid is
                                  # overfitting selection. Recorded, not gated.
   "null_floor": float,           # ceiling.null_floor(n, d) at THIS cell's shape
+  "null_floor_shape": {"n": int, "d": int},
   "gains": {
     "probe":    {"point": f, "ci_low": f, "ci_high": f},
     "pixel":    {...}, "sequence": {...},
   },
   "controls": {
     "harness_r2_matches_study": bool,
-    "study_embedding_selection_r2": float,
+    "study_embedding_r2": float,          # filtering.criterion_4.embedding_r2: the field exit 49 reads
+    "study_embedding_selection_r2": float,   # a different quantity; recorded, never gated
     "nesting_rbf_at_widest_vs_linear": float,
     "zero_information_recomputed": {"mean": float, "median": float},
   },
@@ -1941,24 +1992,44 @@ def ceiling_record_path(out: Path, arm: str, seed: int) -> Path:
     return Path(out) / f"ceiling_{arm}_seed{seed}.json"
 ```
 
-**`applied` is spec §3.1 and must be computed, not inferred from the schema.** It is the shipped rollout probe's quality on the distribution `evaluate_rollout` actually uses it on — predicted embeddings over an imagined rollout — which is recorded nowhere today. The rows exist: `diagnostics.reference_trajectories` returns `positions` (the probe's own output at each imagined step, `(n_windows, horizon, 2)`) and `true_positions` (the same shape). So:
+**`applied` is spec §3.1 and must be computed, not inferred from the schema.** It is the shipped rollout probe's quality on BOTH distributions it is read on, because they are not the same and M3n's figure belongs to only one of them. An earlier draft of this block returned `{"r2", "median_error"}` from `positions` alone and set it against 131.88-259.06: that is the category error §3.1 was amended to forbid. **131.88-259.06 is the FLOOR, the probe's error given perfect dynamics, so it belongs to the real-latent distribution, and it is a MEAN** (`rollout.py:218`); the predicted distribution has no prior figure at all. The rows exist: `diagnostics.reference_trajectories` returns `positions_real` (the embedding head on the posterior from the TRUE frames, `rollout.py:161`), `positions` (the probe's own output at each imagined step, `(n_windows, horizon, 2)`) and `true_positions` (the same shape). What shipped, as `{"real_latent", "predicted"}` x `{r2, mean_error, mean_error_h1, median_error, compares_to}`:
 
 ```python
-def applied_quality(trajectories) -> dict:
-    """The rollout probe's r2 and median map-unit error on PREDICTED embeddings.
+APPLIED_COMPARISONS = {
+    "real_latent": "M3n's floor error, 131.88-259.06 at h=1, a MEAN (rollout.py:218): "
+                   "comparable to mean_error_h1 ONLY, never to a median or to r2",
+    "predicted": "nothing earlier: no prior figure exists for the rollout probe on its own "
+                 "imagined embeddings (M3n's 131.88-259.06 is the real-latent floor, not this)",
+}
 
-    Spec section 3.1, and the reason it is measured first: the 2x2 below is
-    fit on REAL encoder embeddings at frame t, while the error that made M3n
-    unreadable is this one. `embedding_selection_r2` spans 0.320-0.345 across
-    the nine cells while the floor error spans 131.88-259.06 -- 8% against
-    nearly 2x -- so the two distributions demonstrably differ, and a better
-    probe on the first says little about the second until this is recorded.
-    """
-    predicted = trajectories.positions.reshape(-1, 2)
-    truth = trajectories.true_positions.reshape(-1, 2)
+
+def _applied_entry(name, predicted, truth, first_step) -> dict:
+    """r2 and map-unit errors of one distribution: pooled over every window and horizon
+    step, and the mean over windows at the first imagined step alone."""
+    errors = position_error(predicted.reshape(-1, 2), truth.reshape(-1, 2))
     return {
-        "r2": _mean_r2(predicted, truth),
-        "median_error": float(np.median(np.linalg.norm(predicted - truth, axis=1))),
+        "r2": float(_mean_r2(predicted.reshape(-1, 2), truth.reshape(-1, 2))),
+        "mean_error": float(np.mean(errors)),
+        "mean_error_h1": float(np.mean(first_step)),   # the statistic M3n's figure is
+        "median_error": float(np.median(errors)),
+        "compares_to": APPLIED_COMPARISONS[name],
+    }
+
+
+def applied_quality(trajectories) -> dict:
+    """The shipped rollout probe on BOTH distributions, `{"real_latent", "predicted"}`.
+
+    Spec section 3.1, and the reason it is measured first: the 2x2 is fit on REAL
+    encoder embeddings at frame t, while the error that made M3n unreadable comes from
+    the rollout probe's distributions, and M3n's figure belongs to only one of them.
+    """
+    truth = trajectories.true_positions
+    return {
+        name: _applied_entry(name, positions, truth, position_error(positions[:, 0], truth[:, 0]))
+        for name, positions in (
+            ("real_latent", trajectories.positions_real),
+            ("predicted", trajectories.positions),
+        )
     }
 ```
 
@@ -2002,7 +2073,7 @@ different quantity. Gate `harness_r2_matches_study` on
 `study_embedding_r2` (the criterion-4 field) and record
 `study_embedding_selection_r2` beside it, ungated. Spec §2.
 
-`measure_cell` then builds the remaining splits by **episode** from `episode_split`, subsamples to `FRAME_BUDGET` by a fixed stride recorded as `frame_stride`, scores the seven readouts through `ceiling.score_readout`, forms the three gains through `ceiling.difference_interval` at `cell_bootstrap_seed(...)`, and records the four controls. The raw-pixel readouts use no model, so compute them once and reuse across cells — assert they are identical across the nine records in the read phase, which is the free bitwise control.
+`measure_cell` then builds the remaining splits by **episode** from `episode_split`, subsamples to `FRAME_BUDGET` by a fixed stride recorded as `frame_stride`, scores the eight readouts (the seven the brief names, plus `embedding_linear_shipped`) through `ceiling.score_readout`, forms the PROBE gain through `ceiling.probe_gain_over_floor` (never `difference_interval`: that reads every cell against zero) and the pixel and sequence gains through `ceiling.difference_interval`, all at `cell_bootstrap_seed(...)`, and records the controls. The raw-pixel readouts use no model, so compute them once and reuse across cells — assert they are identical across the nine records in the read phase, which is the free bitwise control.
 
 `read_phase` loads every record, refuses on a protocol disagreement, checks `controls.harness_r2_matches_study` and exits 49 if any cell fails, builds `CeilingInputs`, calls `reading_ceiling`, writes `format_reading_ceiling`'s text to stdout **and** `<out>/ceiling.txt`, and exits `READ_EXITS.get(reading.verdict, 0)`. **Print `reading.rule`, not only `reading.verdict`.**
 
@@ -2116,9 +2187,13 @@ EOF
 Required, each corrected against what the quantity actually reads — all three of
 the original checks would have misfired on a correct run:
 
-- `harness_r2_matches_study` true in 9 of 9. **Measured: true in 9 of 9**, with
-  `C_shipped` at 0.292-0.313 against the study's 0.3195-0.3451 and a worst gap of
-  0.0398, comfortably inside `HARNESS_R2_TOLERANCE = 0.10`.
+- `harness_r2_matches_study` true in 9 of 9. **Measured in the run: true in 9 of 9**, with
+  `C_shipped` at 0.2792-0.2951 against the study's 0.3195-0.3451 and a worst gap of
+  0.0561 (frozen_ssl seed 2; the best is 0.0290), inside `HARNESS_R2_TOLERANCE = 0.10`
+  at 1.78 times the worst gap. (The pre-run one-off check had read 0.292-0.313 and a
+  worst gap of 0.0398, and called 0.10 2.5 times that; the run did not reproduce it.
+  The recomputation is `controls.study_embedding_r2 - shipped_grid_r2` over the nine
+  records.)
 - **`study_embedding_r2` within 0.3195-0.3451** — the criterion-4 field. NOT
   `study_embedding_selection_r2`, which spans 0.0180-0.3829 and would fail; it is
   recorded ungated.
@@ -2138,8 +2213,8 @@ the original checks would have misfired on a correct run:
 - The gap against the study is **one-signed**: the study sits above `C_shipped` in
   9 of 9, because its ridge is selected on the rows it is scored on. Report that
   rather than treating it as noise.
-- `fine_minus_shipped_on_score` ranges -0.0083 to +0.0364, mean +0.0071, negative
-  in 4 of 9. All three `pixel_ae` seeds dip 0.006-0.008. Not strongly negative, so
+- `fine_minus_shipped_on_score` ranges -0.0127 to +0.0354, mean +0.0094, negative
+  in 3 of 9. All three `pixel_ae` seeds dip 0.0057-0.0127. Not strongly negative, so
   the finer grid is not overfitting selection, but report the per-arm pattern.
 
 Also assert the raw-pixel readouts are **identical across all nine records** —
@@ -2174,7 +2249,7 @@ Append `## Task 6 results`. Every number must be re-derivable from the records b
 
 - the verdict and exit code, with the `rule:` line
 - all four controls per cell, and the raw-pixel identity check
-- the full seven-readout table in both r2 and map units
+- the full eight-readout table (the seven plus `embedding_linear_shipped`) in both r2 and map units
 - the three gains with their intervals, and how many cells each resolves in
 - the sequence rider: in how many cells `F - B` resolves
 - **what the result licenses, in the spec's own §8 words, not new ones**

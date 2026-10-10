@@ -114,7 +114,18 @@ on each side.
 - **A vs C** — does the encoder lose anything a linear probe could have used?
 - **C vs D** — was the linear family the limit?
 - **B** — the ceiling for any readout of one frame.
-- **E, F** — does history resolve what one frame cannot?
+- **E, F** — does a WINDOW OF EMBEDDINGS resolve what one raw frame cannot?
+
+**THE WINDOW IS OF ENCODER EMBEDDINGS, NOT OF RAW FRAMES, and `k` is 4.** The
+sequence row is per model (§5: `C`, `D`, `E` and `F` are nine each), so `E` and
+`F` read the encoder outputs of frames `t-4..t` concatenated, oldest first: five
+frames (`SEQUENCE_FRAMES = 5`, the rollout's own context length), `5 x 2048` =
+10,240 values a row. A window of raw frames would be 188,160 values a row. So
+`F - B` sets a window of embeddings through ONE model's encoder against ONE raw
+frame, and a representation that discards position can hide a history gain
+inside it. Read it as "does history, seen through this encoder, beat the raw
+frame", not as "does history help"; the plain history question would compare `F`
+with `D`, which §5 does not form.
 
 **The raw-pixel row is model-independent.** It uses no checkpoint, so it is one
 number for the whole study rather than nine — which also makes it a free
@@ -180,8 +191,8 @@ mechanism: the RBF ladder was not finding nonlinear structure, it was
 interpolating the ridge grid. Where the ridge response has no sharp interior
 optimum — the raw-pixel row, D >> n — there is no gap to interpolate and no
 floor even on the coarse grid. Refining the step removes it at every shape
-measured, and `C` rises to the oracle's value exactly: 0.4964 at D=1024 (from
-0.4855), 0.5164 at D=2048 (from 0.4957).
+measured, and `C` rises to within 0.0001 of the oracle's value: 0.4964 at D=1024
+(from 0.4855; oracle 0.4964), 0.5164 at D=2048 (from 0.4957; oracle 0.5165).
 
 So `CEILING_RIDGES` is **33 rungs at a 10^0.25 step over the shipped span
 [1e-1, 1e7]**, and BOTH `C` and the ladder's jitters use it. The span is
@@ -217,8 +228,10 @@ same order. M3o does not re-measure the gate.
 
 ### 3.4 Split discipline
 
-Three splits — fit / select / score — as `probe.gain_from_blocks` already
-enforces. Capacity is selected on a split that is neither the fit nor the score
+Three splits — fit / select / score — the discipline `probe.gain_from_blocks`
+enforces through `_fit_and_score`. `_fit_and_score` takes no estimator, so
+`ceiling.score_readout` REIMPLEMENTS the discipline for the new estimators
+rather than plugging into it. Capacity is selected on a split that is neither the fit nor the score
 split, or a high-capacity probe selects itself in. That is exactly the confound
 that makes a nonlinear probe untrustworthy as evidence.
 
@@ -297,9 +310,17 @@ approximation.
 
 **The cost flips, and the spec states the budget rather than discovering it.**
 The dual costs n^2: at 12,073 validation frames that is 1.17 GB, at 20,000 it
-is 3.2 GB. **M3o's frame budget is 12,000 frames**, subsampled by a fixed
-stride from the validation episodes, recorded in every record. Only the
-raw-pixel row needs the dual at all.
+is 3.2 GB. **M3o's frame budget is 12,000 frames**, the cap and the default of
+`--frames`: each split is brought within it by ONE fixed stride, recorded in every
+record as `frame_stride` with the rows each split holds. The splits are the
+study's 20 TRAINING episodes (fit) and the two halves of the validation episodes
+(select, score), so the budget is not drawn from the validation episodes alone.
+At the default it does not bind on the shipped split (stride 1: 9,044 / 5,713 /
+6,264 rows). **THE RECORDED RUN DID NOT USE THE DEFAULT.** It passed `--frames
+4000`, which binds on all three: stride 3, and 3,016 / 1,905 / 2,088 rows in each
+of the nine records (`frames: 4000`, `frame_stride: 3`). Only the raw-pixel row
+NEEDS the dual (its primal is 11.3 GB); the sequence window (D = 10,240 > n) is
+solved by it too, because the branch is on `min(n, D)`.
 
 ## 5. The reading
 
@@ -319,8 +340,8 @@ The shipped reading's column header is `D-C-floor (probe)` for the same reason.
 Reading §5 alone and comparing `D - C` to zero reproduces the exact defect
 §3.3.1 exists to have fixed.
 
-Crosscutting rider: **`F - B` resolvably > 0** means history resolves what one
-frame cannot. That is gate criterion 4's question asked without criterion 4's
+Crosscutting rider: **`F - B` resolvably > 0** means a window of
+EMBEDDINGS (`t-4..t`, §3.2) resolves what one raw frame cannot. That is gate criterion 4's question asked without criterion 4's
 "A beats B" framing, which the shipped `gain` measurement already shows is the
 wrong shape — the latent ADDS a resolvable +0.024 to +0.076 r2 in 4 of 9 cells
 while losing "latent beats embedding" in 8 of 9.
@@ -346,8 +367,8 @@ the probes held fixed, and returns a percentile interval on the r2 difference.
 Its parameter names say `joint_predicted` and `embedding_predicted`, but the
 computation is generic in the two arrays, so the estimator-versus-estimator
 comparison passes the RBF's and the linear's predictions on the same scored
-rows. The sequence column uses `gain_from_blocks`, which wraps the same
-helper.
+rows. The sequence column is formed the same way, by `difference_interval`
+(`gain_from_blocks` is not called; it survives only in a docstring).
 
 ### 5.1 The falsifiable target
 
@@ -429,7 +450,7 @@ incomplete at that shape.
 | --- | --- |
 | dual equals primal at every rung of `RIDGES` | the prerequisite changed no arithmetic |
 | `D - C` on a synthetic linear task at this cell's `n` and `D` | the floor `PROBE_LIMITED` must clear. ~0 once both sides share `CEILING_RIDGES`; it was +0.012 to +0.020 on the shipped grid, so this is what keeps that fix honest per cell |
-| `C_shipped` reproduces the shipped `filtering.criterion_4.embedding_r2` (0.3195-0.3451), within 0.10 | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1). The tolerance is set against a measured worst gap of 0.035 once the fit split is the study's training episodes (§3.4) |
+| `C_shipped` reproduces the shipped `filtering.criterion_4.embedding_r2` (0.3195-0.3451), within 0.10 | M3o's harness measures what the study measured, not something adjacent. `C` searches a finer grid and is expected ABOVE that band (§3.3.1). The tolerance was set against a pre-run worst gap of 0.035 once the fit split is the study's training episodes (§3.4); the recorded run's worst gap is 0.0561, which makes 0.10 1.78 times it |
 | `C >= C_shipped` on the SELECTION split, exactly | containment: `CEILING_RIDGES` contains `RIDGES`. On the SCORE split it may dip by selection noise, but a large systematic dip means the finer grid is overfitting selection, so the score-split difference is recorded per cell |
 | `_solve_ladder` over `CEILING_RIDGES`, at the 5 shipped rungs, is bitwise `_solve_ladder` over `RIDGES` | `CEILING_RIDGES` ADDED rungs and changed no arithmetic; `ridges=` is a pure extension |
 | RBF at its widest bandwidth against linear, recorded and NOT gated | the ASYMPTOTIC nesting claim, which §3.3 measured to be FALSE in practice — an RBF is linear only to first order and its widest rung is capped far below the ridge the linear probe selects. **Expected negative ONLY once linear r2 exceeds ~0.37**; the nine cells reached 0.2786-0.3280, so all nine read POSITIVE (+0.0067 to +0.0228) and that is consistent, not a refutation. Nesting is structural instead: the linear kernel is a RUNG, pinned by test, not by this control |
@@ -474,12 +495,19 @@ Named for the quantity, following `burden.py`, `capacity.py`, `retention.py`,
 
 The three model verdicts of §5 all exit 0: each is an answer.
 
-Reused: `fit_probe` and `RIDGES`, `probe_targets`, `probe_r2`, `episode_split`,
-`gain_from_blocks` for the sequence column, `_block_bootstrap_ci` for every
-interval, and `_fit_and_score` — which already factors out the three-split
-discipline for ONE feature set and is the seam the new estimators plug into.
-New: the dual path, the RBF kernel, the k-NN readout, and a dispatching
-`apply_readout`.
+Reused, as shipped: `probe.fit_probe` (the linear reference `C` through
+`ceiling.fit_linear_probe`, and `C_shipped` as `fit_probe` itself, over its own
+default `RIDGES`, which `ceiling.py` does not import), `apply_probe`, `_mean_r2`,
+`position_error`, `_validate_groups`, `_block_bootstrap_ci` for every interval,
+`burden.strict_majority`, and in the script `probe_targets`, `probe_episodes`
+and `episode_split`.
+**Not reused, although an earlier revision of this list named them:**
+`_fit_and_score` is unchanged and has no estimator parameter, so it is NOT the
+seam the new estimators plug into; `ceiling.score_readout` reimplements its
+fit / select / score discipline. `gain_from_blocks` survives only in a docstring
+and `probe_r2` is never called.
+New: the dual path (`probe._solve_ladder`, and `fit_probe`'s `ridges=`), the RBF
+kernel, the k-NN readout, `CEILING_RIDGES`, and a dispatching `apply_readout`.
 
 ## 8. What each outcome licenses
 
