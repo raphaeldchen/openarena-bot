@@ -64,6 +64,43 @@ def _readings(stack: dict, labels, c_r, c_c, resamples) -> tuple[dict, dict]:
     return imagined, posterior
 
 
+def _lengths(paths) -> list[int]:
+    """Transitions per episode, read from the one array that needs no decoding."""
+    out = []
+    for path in paths:
+        with np.load(path) as d:
+            out.append(int(d["actions"].shape[0]))
+    return out
+
+
+def position_unreadable(train_paths, val_paths, context: int, horizon: int) -> str | None:
+    """Why the reported-only position step cannot run, or None when it can.
+
+    Pre-checks the exact window rule both sides use (`window_starts`), so a
+    data set too short for it skips the step instead of letting `evaluate_rollout`
+    or `fit_probes` raise after the gated readings are computed. A genuine bug
+    still crashes: nothing here is a catch-all.
+    """
+    from mbfps.eval.probe import PROBE_EPISODE_LIMIT, probe_episodes
+    from mbfps.eval.windows import window_starts
+
+    need = context + horizon
+    if not any(window_starts(n, context, horizon) for n in _lengths(val_paths)):
+        return f"no held-out episode >= {need + 1} frames"
+    used, _ = probe_episodes(train_paths, PROBE_EPISODE_LIMIT)
+    if not used:
+        return "no training episodes to fit the probe on"
+    # fit_probes' own split: with spare episodes it gathers the leading block
+    # and the held-back block separately, and each must yield a window.
+    select_episodes = 4
+    spare = len(used) - select_episodes
+    groups = [used[:spare], used[spare:]] if spare >= 1 else [used]
+    for group in groups:
+        if not any(window_starts(n, context, horizon) for n in _lengths(group)):
+            return f"no training episode >= {need + 1} frames for the probe fit"
+    return None
+
+
 def measure(args) -> int:
     start = time.perf_counter()
     device = get_device(prefer=args.device)
@@ -102,8 +139,12 @@ def measure(args) -> int:
     labels = np.concatenate(labels)
     imagined, posterior = _readings(stack, labels, c_r, c_c, args.resamples)
 
-    position = None
-    if not args.no_position:
+    position, position_note = None, None
+    if args.no_position:
+        position_note = "skipped by --no-position"
+    else:
+        position_note = position_unreadable(train_paths, val_paths, 5, HORIZON)
+    if position_note is None:
         from mbfps.eval.probe import fit_probes
         from mbfps.eval.rollout import evaluate_rollout
 
@@ -113,6 +154,8 @@ def measure(args) -> int:
                                    horizon=HORIZON, seed=seed, device=device,
                                    feature_backbone=backbone)
         position = float(rollout.position_gap_closed()[-1])
+    elif not args.no_position:
+        print(f"position step skipped: {position_note}", file=sys.stderr)
 
     record = {
         "arm": arm, "seed": seed, "role": args.role,
@@ -125,6 +168,7 @@ def measure(args) -> int:
                    "slots": int(stack["valid"].sum()), "kills": kills,
                    "terminations": terminations},
         "position_gap_closed_h15": position,
+        "position_note": position_note,
         "git_sha": git_sha(), "seconds": time.perf_counter() - start,
     }
     if args.role == "cell":
@@ -159,17 +203,20 @@ def read(args) -> int:
         "posterior reference (reported):",
         _line("return R^2", cell["posterior"]["return"]),
         _line("continue Brier skill", cell["posterior"]["continue"]),
-        f"position gap_closed at h=15 (reported): {cell['position_gap_closed_h15']}",
+        f"position gap_closed at h=15 (reported): {cell['position_gap_closed_h15']}"
+        + (f" ({cell['position_note']})" if cell.get("position_note") else ""),
         "control (M3 my_way_home model; Reading R must FAIL):",
         _line("return R^2", control["imagined"]["return"]),
         _line("continue Brier skill", control["imagined"]["continue"]),
     ]
-    verdict = "CONTROL_BROKEN" if broken else cell["verdict"]
+    # Recomputed, never the stored string: a stale or edited record cannot be believed.
+    cell_verdict = entry_verdict(cell["imagined"], cell["posterior"])
+    verdict = "CONTROL_BROKEN" if broken else cell_verdict
     lines.append(f"VERDICT: {verdict}")
     text = "\n".join(lines) + "\n"
     (args.out / "entry.txt").write_text(text)
     print(text, end="")
-    return EXIT_CONTROL_BROKEN if broken else READ_EXITS[cell["verdict"]]
+    return EXIT_CONTROL_BROKEN if broken else READ_EXITS[cell_verdict]
 
 
 def _parser() -> argparse.ArgumentParser:
