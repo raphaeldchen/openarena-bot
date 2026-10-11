@@ -3413,3 +3413,146 @@ results: Stage C -- <what the run found, no more>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+
+## Stage A results
+
+Run on 2026-10-10 and 2026-10-11, one cell (`frozen_ssl`, seed 0, scenario `basic`, 4 actions, symlog reward head) plus the known-negative control. Branch `claude/project-recap-ba6e4a`. Paths below are worktree-relative; `runs` and `data` are symlinks into the main checkout (ledger ruling R2). The ledger is `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/progress.md` (lines beginning `Task 8:`); run logs are in `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/`. Python below means `PYTHONPATH=src /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python` (ruling R1).
+
+### Verdict
+
+**ENTRY_PASS, exit code 0.** Both gated readings have `ci_low > 0` and the control fails Reading R as required. Spec §4.7 row, in the spec's words: "both readings pass, control fails | Stage B". Stage B is licensed to run.
+
+- Record: `runs/m4a_entry/read.log` (last line `VERDICT: ENTRY_PASS`); exit 0 is the ledger line `Task 8: step 7: read exit 0 ENTRY_PASS`. Re-derive: copy `runs/m4a_entry/entry_*.json` into an empty directory `D` and run `python scripts/entry_check.py --phase read --out D --arm frozen_ssl --seed 0; echo $?`. The read recomputes the verdict from the two JSONs; it printed `VERDICT: ENTRY_PASS` and exited 0 when re-run at write time.
+- The result is one cell and one seed. It licenses Stage B for this cell only.
+
+### Commits, suite, and what ran where
+
+| item | value | source |
+|---|---|---|
+| suite | 3077 passed, in 6701.94 s (1:51:41); the log's last line is `3077 passed in 6701.94s (1:51:41)` | `tail -1 .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4a_suite.log`; ledger `Task 8: step 1` |
+| suite commit | `d674ab7`, the commit the world model trained at | ledger `Task 8: step 1`; `python3 -c "import json;print(json.load(open('runs/m4a_world/train_frozen_ssl_seed0.json'))['git_sha'])"` prints `d674ab7306689fc580e90cf58e9b88bc3e0913c9` |
+| entry check commit | `03be77b` | `python3 -c "import json;[print(json.load(open(f'runs/m4a_entry/{n}.json'))['git_sha']) for n in ('entry_frozen_ssl_seed0','entry_control')]"` prints `03be77b1f70ca925a5e42d62ab1cfcfd8798fbb0` twice |
+
+The suite was green at `d674ab7`, not at `03be77b`. The entry check ran at `03be77b` because the first measure attempts exposed a run-time bug (see "Failed measure attempts"). The diff between the two commits is confined to the entry-check module and its test: `git diff --stat d674ab7..03be77b` prints
+
+```
+ src/mbfps/eval/entry.py  |  3 ++-
+ tests/eval/test_entry.py | 21 +++++++++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+```
+
+so "suite green at the commit being run" is met by the full suite at `d674ab7` plus the covering tests at `03be77b` (ruling R7). The full suite was not re-run at `03be77b`.
+
+### Collection mix decision (before collecting)
+
+Pre-registered rule (Task 8 Step 2): collect `--policies random,scripted` if `scripted_sweep10`'s kill rate is at least 0.10, otherwise `random` alone. Both rates are from 200 episodes each (`cat .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4a_mix.log`):
+
+| policy | kill_rate | median_len |
+|---|---|---|
+| random | 0.545 | 59 |
+| scripted_sweep10 | 0.610 | 48 |
+
+0.610 >= 0.10, so the rule selects `--policies random,scripted` (ledger `Task 8: step 2`). The mix was not revisited after training.
+
+### Dataset: `data/basic`
+
+Collection: 1200 episodes kept, 0 crashes, 53,966 transitions (below the 60,000 capacity, so nothing was evicted), 259.0 s (`tail -5 .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4a_collect.log`). dinov2 features cached for 1200 episodes in 426 s on mps, exit 0 (`tail -3 .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4a_cache.log`).
+
+Counts below come from loading every `data/basic/ep_*_len*.npz` (`ls data/basic/ep_*_len*.npz | wc -l` prints 1200). A "kill" is a reward above 50 (`rewards > 50`), the same threshold `scripts/entry_check.py` uses; the reward values present in the dataset are exactly {-9, -4, -1, 97, 98, 99}, and 709 are above 50. A "termination" is an episode with `terminated.any()`; "truncated" is an episode with `truncated.any()`. Script:
+
+```python
+from pathlib import Path
+import numpy as np
+from mbfps.data.split import episode_split, VAL_FRACTION
+paths = sorted(Path("data/basic").glob("ep_*_len*.npz"))
+train, val = episode_split(paths, val_fraction=VAL_FRACTION, seed=0)   # VAL_FRACTION = 0.2
+def stats(ps, policy=None):
+    eps = [np.load(p) for p in ps]
+    eps = [d for d in eps if policy is None or str(d["policy_name"]) == policy]
+    return dict(episodes=len(eps), transitions=sum(len(d["actions"]) for d in eps),
+                kills=sum(int((d["rewards"] > 50).sum()) for d in eps),
+                terminated=sum(int(d["terminated"].any()) for d in eps),
+                truncated=sum(int(d["truncated"].any()) for d in eps))
+```
+
+| set | policy | episodes | transitions | kills | terminated episodes | truncated episodes |
+|---|---|---|---|---|---|---|
+| full | random | 600 | 27,531 | 340 | 340 | 260 |
+| full | scripted | 600 | 26,435 | 369 | 369 | 231 |
+| full | all | 1200 | 53,966 | 709 | 709 | 491 |
+| held-out (240) | random | 126 | 5,593 | 73 | 73 | 53 |
+| held-out (240) | scripted | 114 | 4,867 | 71 | 71 | 43 |
+| held-out (240) | all | 240 | 10,460 | 144 | 144 | 96 |
+| training (960) | all | 960 | 43,506 | 565 | 565 | 395 |
+
+Every terminated episode holds exactly one kill (kills equal terminations in every row). The held-out split is `episode_split(paths, val_fraction=0.2, seed=0)`: 240 held-out and 960 training episodes. The held-out totals (240 episodes, 144 kills, 144 terminations) match the entry record: `python3 -c "import json;print(json.load(open('runs/m4a_entry/entry_frozen_ssl_seed0.json'))['counts'])"` prints `{'episodes': 240, 'starts': 10220, 'slots': 131553, 'kills': 144, 'terminations': 144}`. The 10,220 starts equal the held-out transitions minus one per episode (10,460 - 240), which follows from the spec's `i < T - 1` start rule.
+
+### World model
+
+Record `runs/m4a_world/train_frozen_ssl_seed0.json`, log `runs/m4a_world/train.log` (`python3 -c "import json;d=json.load(open('runs/m4a_world/train_frozen_ssl_seed0.json'));print({k:d[k] for k in ('steps','seconds','kl_rate_above_free_bits','kl_dyn_max','n_actions','pad_short','reward_transform')})"`):
+
+| quantity | value |
+|---|---|
+| steps | 20,000 |
+| `seconds` | 12,820.69 (the log rounds to 12,821 and prints `steps_per_second=1.56`) |
+| `kl_rate_above_free_bits` | 0.9901 |
+| `kl_dyn_max` | 1.92509 |
+| `loss_first20` / `loss_last20` | 3.70965 / 0.55078 (`tail -8 runs/m4a_world/train.log`) |
+| `nonfinite` | `{}` |
+
+The wall clock was inflated by the full test suite running concurrently on the same machine (ledger `Task 8: step 5`: "slowed by the concurrent suite"). The plan's Step 5 expected about 90 minutes; the run took 12,821 s (3 h 34 min). The records do not separate how much of the difference is the suite, so 12,821 s is not a measure of this arm's training cost.
+
+### Gated readings (imagined, horizon 15)
+
+Record `runs/m4a_entry/entry_frozen_ssl_seed0.json`; table printed in `runs/m4a_entry/entry.txt` (identical to `runs/m4a_entry/read.log`). Re-derive: `python3 -c "import json;d=json.load(open('runs/m4a_entry/entry_frozen_ssl_seed0.json'));print(d['imagined']);print(d['posterior']);print(d['c_R'],d['c_C'],d['seconds'])"`. Intervals are 95% percentile intervals from 2,000 episode-clustered bootstrap resamples over the 240 held-out episodes (spec §4.5). Constants from the 960 training episodes: `c_R` = -44.510, `c_C` = 0.9885.
+
+| reading | point | 95% interval | rows | gate |
+|---|---|---|---|---|
+| Reading R, `R2_return` | +0.4334 | [+0.4007, +0.4680] | 10,220 starts | `ci_low` > 0: pass |
+| Reading C, `brier_skill` | +0.1190 | [+0.0836, +0.1555] | 131,553 imagined steps | `ci_low` > 0: pass |
+
+Both lower bounds are above zero. The continue reading clears zero by a smaller margin than the return reading (point 0.119 against a base rate `c_C` of 0.9885, so most imagined steps are non-terminating).
+
+### Posterior references (reported, not gated)
+
+Same two readings with the heads applied to the posterior states (teacher-forced), same rows (`d['posterior']` in the same record):
+
+| reading | point | 95% interval |
+|---|---|---|
+| `R2_return` | +0.7162 | [+0.6735, +0.7593] |
+| `brier_skill` | +0.6816 | [+0.5999, +0.7621] |
+
+Both posterior readings are above their imagined counterparts (return +0.7162 against +0.4334; continue +0.6816 against +0.1190), and the intervals do not overlap for either reading. The imagined continue skill is the larger relative drop. These references attribute a failure under §4.7; since neither gated reading failed, they are context for Stage B and attribute nothing here.
+
+### Position `gap_closed` at h = 15 (reported, not gated)
+
+`python3 -c "import json;d=json.load(open('runs/m4a_entry/entry_frozen_ssl_seed0.json'));print(d['position_gap_closed_h15'],d['position_note'])"` prints `0.7961103530158837 None`: the position step ran (`position_note` is null, so it was not skipped) and the value is +0.796.
+
+What it is: `position_gap_closed()[-1]` from `mbfps.eval.rollout.evaluate_rollout`, with probes fit by `fit_probes` on the training episodes, context 5, horizon 15, the dimensionless fraction of the persistence-to-floor band the model closes at the last horizon step (`src/mbfps/eval/rollout.py` module docstring). What it is not: it gates nothing in §4.5 and does not enter the verdict. It is one cell and one seed, with no interval. The record stores the ratio only, not the band width, so the band-width caveat in the `rollout.py` docstring cannot be checked from this record. It is on a different scenario (`basic`) and a different dataset from M3's `my_way_home` numbers, and is not compared to them here.
+
+### Known-negative control (spec §4.6)
+
+Record `runs/m4a_entry/entry_control.json`: M3's `runs/m3_study_v2/world_model_frozen_ssl_seed0.pt` over `data/my_way_home`'s held-out split, reward head read as `identity`, 6 actions, position skipped (`--no-position`). Re-derive: `python3 -c "import json;d=json.load(open('runs/m4a_entry/entry_control.json'));print(d['imagined']);print(d['counts'],d['reward_transform'],d['position_note'])"`.
+
+| reading | point | 95% interval | rows | required |
+|---|---|---|---|---|
+| Reading R, `R2_return` (imagined) | -0.0049 | [-0.1017, +0.1382] | 12,025 starts, 24 episodes | `ci_low` <= 0 |
+| Reading C, `brier_skill` (imagined) | +0.0104 | [+0.0004, +0.8038] | 177,855 steps, 24 episodes | reported only |
+
+**The control failed Reading R as required** (`ci_low` = -0.1017 <= 0), so the instrument is not reading skill into a head with none. Reading C on the control is reported only: its held-out split holds 0 kills and 2 terminations in 24 episodes (`counts` in the record), and the interval is correspondingly wide ([+0.0004, +0.8038]); the lower bound sits just above zero and nothing is concluded from it.
+
+### Failed measure attempts (no records)
+
+The Step 6 measure commands ran three times. Only the third produced the records above.
+
+1. Attempt 1: both measures failed before running with exit 127. Cause: a controller shell-quoting error (zsh did not word-split a `$PY` variable). Not a code defect (ledger `Task 8: step 6 attempt 1`).
+2. Attempt 2: both measures crashed in `entry.py`'s `episode_arrays`, which cast with `x.detach().double().cpu()`; the MPS backend has no float64. A Task 6 defect visible only on mps, because the unit tests run on cpu (ledger `Task 8: step 6 attempt 2`). Fixed at `03be77b` ("episode_arrays moves to the CPU before the float64 cast"), which added an mps regression test that skips when mps is absent.
+3. Attempt 3, at `03be77b`: cell and control both exit 0 (ledger `Task 8: step 6`). Cell 74.6 s, control 23.9 s (`seconds` in each record; `runs/m4a_entry/measure_cell.log` and `measure_control.log` each contain only the `wrote ...` line).
+
+Neither failed attempt wrote a record. The only files in `runs/m4a_entry/` are the final `entry_frozen_ssl_seed0.json`, `entry_control.json`, `entry.txt`, `read.log` and the two measure logs, and both JSONs carry `git_sha` `03be77b`. The failed attempts' own console output is not retained in the repository.
+
+### Not established by this run
+
+- One cell (`frozen_ssl`) and one seed (0): no between-arm or between-seed statement is made.
+- The entry check reads reward and continue under 15-step imagination from held-out posterior starts. It does not read policy quality; that is Stage B's job.
+- Stage A's world model is the model Stage B loads (`runs/m4a_world/world_model_frozen_ssl_seed0.pt`).
