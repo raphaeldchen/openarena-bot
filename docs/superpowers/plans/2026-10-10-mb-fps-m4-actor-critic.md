@@ -3441,7 +3441,7 @@ The suite was green at `d674ab7`, not at `03be77b`. The entry check ran at `03be
  2 files changed, 23 insertions(+), 1 deletion(-)
 ```
 
-so "suite green at the commit being run" is met by the full suite at `d674ab7` plus the covering tests at `03be77b` (ruling R7). The full suite was not re-run at `03be77b`.
+so "suite green at the commit being run" is treated as met under ruling R7 (the full suite at `d674ab7` plus the covering tests at `03be77b`). The full suite was not re-run at `03be77b`.
 
 ### Collection mix decision (before collecting)
 
@@ -3539,7 +3539,7 @@ Record `runs/m4a_entry/entry_control.json`: M3's `runs/m3_study_v2/world_model_f
 | Reading R, `R2_return` (imagined) | -0.0049 | [-0.1017, +0.1382] | 12,025 starts, 24 episodes | `ci_low` <= 0 |
 | Reading C, `brier_skill` (imagined) | +0.0104 | [+0.0004, +0.8038] | 177,855 steps, 24 episodes | reported only |
 
-**The control failed Reading R as required** (`ci_low` = -0.1017 <= 0), so the instrument is not reading skill into a head with none. Reading C on the control is reported only: its held-out split holds 0 kills and 2 terminations in 24 episodes (`counts` in the record), and the interval is correspondingly wide ([+0.0004, +0.8038]); the lower bound sits just above zero and nothing is concluded from it.
+**The control failed Reading R as required** (`ci_low` = -0.1017 <= 0), so the check does not find skill in this head, as §4.6 requires. On 24 episodes its interval still reaches +0.138, so this is a failure to find skill, not a measurement that there is none. Reading C on the control is reported only: its held-out split holds 0 kills and 2 terminations in 24 episodes (`counts` in the record), and the interval is correspondingly wide ([+0.0004, +0.8038]); the lower bound sits just above zero and nothing is concluded from it.
 
 ### Failed measure attempts (no records)
 
