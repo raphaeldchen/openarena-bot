@@ -3556,3 +3556,159 @@ Neither failed attempt wrote a record. The only files in `runs/m4a_entry/` are t
 - One cell (`frozen_ssl`) and one seed (0): no between-arm or between-seed statement is made.
 - The entry check reads reward and continue under 15-step imagination from held-out posterior starts. It does not read policy quality; that is Stage B's job.
 - Stage A's world model is the model Stage B loads (`runs/m4a_world/world_model_frozen_ssl_seed0.pt`).
+
+## Stage B results
+
+Run on 2026-10-11, one cell (`frozen_ssl`, seed 0, scenario `basic`, 4 actions), loading Stage A's world model `runs/m4a_world/world_model_frozen_ssl_seed0.pt` and the fixed dataset `data/basic`. Branch `claude/project-recap-ba6e4a`. Paths are worktree-relative; `runs` and `data` are symlinks into the main checkout (ledger ruling R2). The ledger is `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/progress.md` (lines beginning `Task 13:` and `Task 10:`); run logs are in `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/`. Python below means `PYTHONPATH=src /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python` (ruling R1). Training and live runs were executed by the controller (ruling R5).
+
+### Verdict
+
+**PASS, exit code 0.** The paired gate at update 10,000 has `ci_low` = +191.86 > 0, the untrained control's interval includes zero (it fails the gate, as §5.6 requires), and `isolation_ok` is True. The last line of `runs/m4b_agent/read.log` is `VERDICT: PASS`; the exit code is the ledger line `Task 13: step 5-6: read exit 0 PASS`.
+
+Re-derive (into a scratch directory so the records are not rewritten; the read writes `live_frozen_ssl_seed0.txt` beside its input):
+
+```bash
+D=$(mktemp -d); cp runs/m4b_agent/live_frozen_ssl_seed0.json runs/m4b_agent/train_frozen_ssl_seed0.json "$D"
+python scripts/eval_live.py --phase read --out "$D" --agent-dir "$D" --arm frozen_ssl --seed 0 --final-step 10000 > "$D/second.txt"; echo $?
+diff runs/m4b_agent/read.log "$D/second.txt" && echo byte-identical
+```
+
+At write time this printed exit `0` and `byte-identical`. That is the Step 6 reproducibility check: the read is a pure function of the two JSONs. It does not re-run the live episodes.
+
+This is a statement about one cell, one scenario and a fixed dataset; see "Not established by this run".
+
+### Commits, suite, and what ran where
+
+| item | value | source |
+|---|---|---|
+| suite | 3113 passed, 0 failed, 2582.48 s (0:43:02); the log's last line is `3113 passed in 2582.48s (0:43:02)` | `tail -1 .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4b_suite.log`; ledger `Task 13: step 1` |
+| suite commit | `2535828` (the log itself records no SHA; the commit is from the ledger line) | ledger `Task 13: step 1` |
+| timing run commit | `2535828` | `python3 -c "import json;print(json.load(open('runs/m4b_agent/timing/train_frozen_ssl_seed0.json'))['git_sha'])"` |
+| training and live run commit | `0a9506d` | `python3 -c "import json;[print(json.load(open(f'runs/m4b_agent/{n}_frozen_ssl_seed0.json'))['git_sha']) for n in ('train','live')]"` prints `0a9506df437701ed115f0f24939eaf78650e73a1` twice |
+
+The suite was green at `2535828`, not at `0a9506d`. The run is at `0a9506d` because the first training attempt crashed (below) and the fix landed after the suite ran. The diff between the two commits is confined to the trainer and its test: `git diff --stat 2535828..0a9506d` prints
+
+```
+ src/mbfps/training/ac_trainer.py  |  6 ++++++
+ tests/training/test_ac_trainer.py | 26 ++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+```
+
+Ruling R9 treats "suite green at the commit being run" as met by the full suite at `2535828` (3113 passed) plus the covering tests at `0a9506d` (`tests/training/test_ac_trainer.py` and `tests/models`, 124 passed per R9; that second run is recorded in the ledger only, not in a run log). The full suite was not re-run at `0a9506d`. A regression outside the two changed files is impossible from this diff; a regression inside `ac_trainer.py` that its test does not cover is not excluded by the suite, only by the run itself completing.
+
+### Budget decision (§5.7), made before the training run
+
+Measured at `2535828` by the Step 2 commands, 200 updates and 10 seeds, records in `runs/m4b_agent/timing/`: `python3 -c "import json;a=json.load(open('runs/m4b_agent/timing/train_frozen_ssl_seed0.json'));b=json.load(open('runs/m4b_agent/timing/live_frozen_ssl_seed0.json'));print(a['seconds'],a['seconds_per_update'],a['isolation_ok']);print(b['seconds'],b['seconds_per_episode'])"`.
+
+| quantity | value |
+|---|---|
+| `seconds_per_update` | 0.48766 (97.53 s over 200 updates) |
+| `seconds_per_episode` | 0.52265 (20.91 s over 40 episodes: 10 seeds x random, untrained, sample, argmax) |
+| `train_hours` = 0.48766 x 10,000 / 3600 | 1.355 h |
+| `eval_hours` = 0.52265 x (200 + 5 x 200) / 3600 | 0.174 h |
+| sum | 1.529 h, against the 12 h limit |
+
+1.529 h < 12 h, so the budget was left at the default: 10,000 updates, `--checkpoint-every 2000`, gate at 10,000 (ledger `Task 13: step 2`). No revision was made, and none was made after any result was seen. The first timing attempt was interrupted by a session restart before writing anything (empty `train.log`, no checkpoint, no live process) and was rerun (ledger `Task 13: step 2 attempt 1`).
+
+Realised cost, for the record, from the final runs: training took 3,967.13 s (66.1 min, `seconds` in `runs/m4b_agent/train_frozen_ssl_seed0.json`), 0.39671 s per update; the live measure took 338.28 s (`seconds` in `runs/m4b_agent/live_frozen_ssl_seed0.json`), 0.28190 s per episode over 1,200 episodes. The timing run was made on the code before the memory fix and ran only 200 updates, fewer than the ~350 at which the first attempt crashed; why the final per-update and per-episode costs are lower than the measured ones is not attributed by these records.
+
+### The first training attempt: MPS out-of-memory crash, diagnosis, fix
+
+Attempt 1 of Step 3, at `2535828`, crashed with an MPS out-of-memory error at about update 350 (MPS allocated 2.10 GiB, other allocations 17.98 GiB; ledger `Task 13: step 3 attempt 1`). The first rung is at update 2,000, so **no checkpoint was written**. The console output of that attempt is not retained (`runs/m4b_agent/train.log` was overwritten by the successful attempt), so the figures in this paragraph are the ledger's.
+
+Root cause, measured by a diagnostic script that changes no repository code (`runlogs/mps_mem_probe.py`, ledger `Task 13: root cause`): the number of start states N per update varies with the mask, so every update allocates tensors of new shapes and MPS's caching allocator never reuses blocks. Allocated memory stays flat while driver memory grows. From `runlogs/probe_plain.log` (250 updates, no release):
+
+| update | N | allocated (GiB) | driver (GiB) |
+|---|---|---|---|
+| 25 | 541 | 0.24 | 3.93 |
+| 100 | 781 | 0.32 | 8.69 |
+| 200 | 777 | 0.33 | 14.40 |
+| 250 | 544 | 0.24 | 16.52 |
+
+N ranged over 541..781 in the logged updates; allocated stayed in 0.24..0.33 GiB; driver memory grew by 12.59 GiB between updates 25 and 250, about 57 MiB per update. With `torch.mps.empty_cache()` once per update (`runlogs/probe_empty.log`, same 250 updates) the driver figure is 1.10 GiB at every logged update except update 200, where it is 1.11 GiB, and the 250 updates took 91.22 s of wall time (`real` line of that log). Re-derive: `cat .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/probe_plain.log .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/probe_empty.log`. The probes ran 250 updates and did not themselves reach the out-of-memory point.
+
+Fix: commit `0a9506d` ("fix: release the MPS cache each actor-critic update; the varying start-state count defeats block reuse"), six lines in `src/mbfps/training/ac_trainer.py` calling `torch.mps.empty_cache()` once per update when the device is mps, plus a test (mps test RED to GREEN; a cpu test asserts no call; ledger `Task 10: fix round 1/5`). The fix changes only memory release; it adds no operation to the computation.
+
+No checkpoint from the failed attempt exists or was used: `runs/m4b_agent/` holds exactly five checkpoints, `actor_critic_frozen_ssl_seed0_step{2000,4000,6000,8000,10000}.pt`, with file times 14:02 to 14:56 on 2026-10-11, after the fix commit (13:49:01, `git log -1 --format=%ad --date=iso 0a9506d`); `train_frozen_ssl_seed0.json` lists exactly these five in `checkpoints`, and carries `git_sha` `0a9506d`. The only other checkpoint is `runs/m4b_agent/timing/actor_critic_frozen_ssl_seed0_step200.pt`, from the timing run, in its own directory; the live evaluation read `--agent-dir runs/m4b_agent`. The successful attempt trained 10,000 updates with `isolation_ok` True and `nonfinite` empty (`train_frozen_ssl_seed0.json`).
+
+### Training
+
+Record `runs/m4b_agent/train_frozen_ssl_seed0.json`, log `runs/m4b_agent/train.log`. Config as recorded: horizon 15, gamma 0.997, lambda 0.95, actor and critic learning rate 3e-5, entropy 3e-4, critic EMA 0.98, batch 16 sequences of 64, seed 0, device mps. The imagined start-state lambda-return `G0` printed every 100 updates (a mean over that update's start states, so a noisy per-batch figure): -17.75 at 1,000; +11.11 at 2,000; +20.34 at 4,000; +17.54 at 6,000; +17.75 at 8,000; +32.44 at 10,000 (`grep -E 'update (1000|2000|4000|6000|8000|10000)/' runs/m4b_agent/train.log`; ledger `Task 13: step 3`). `G0` was -45.18 at update 100 and first positive at update 1,300 (+9.64). The last five logged values (9,600 to 10,000) are +34.86, +12.98, +19.55, +21.07, +32.44, so the single-batch figure moves by more than 20 between prints late in training and the 10,000 value should not be read as a trend. The critic loss fell from 363.96 at update 100 to 72.50 at update 10,000 and stayed between 46.16 and 74.45 at the printed updates from 2,000 on.
+
+### Live evaluation: the gate, the control, the learning curve
+
+Record `runs/m4b_agent/live_frozen_ssl_seed0.json` (printed table: `runs/m4b_agent/read.log`, identical to `live_frozen_ssl_seed0.txt`). 100 evaluation episodes on seeds 1,000,000 to 1,000,099 (`d['seeds']`), the same seeds for random, untrained and every rung and mode; the read refuses with `SEED_MISMATCH` otherwise. Each entry below is the mean of `return` over the 100 episodes of that list; the "gate" column is the mean of the per-seed difference from `random`, with a 95% percentile interval from 2,000 seed resamples at a fixed seed (`paired_gate` in `src/mbfps/eval/live.py`). Re-derive:
+
+```python
+import json, numpy as np
+from mbfps.eval.live import paired_gate
+d = json.load(open("runs/m4b_agent/live_frozen_ssl_seed0.json"))
+r = [e["return"] for e in d["random"]]
+for name, l in [("untrained", d["untrained"])] + [(f"{s} {m}", d["rungs"][s][m]) for s in d["rungs"] for m in ("sample", "argmax")]:
+    a = [e["return"] for e in l]; g = paired_gate(a, r)
+    print(name, np.mean(a), np.std(a), np.mean([e["killed"] for e in l]), np.median([e["length"] for e in l]),
+          g["point"], g["ci_low"], g["ci_high"], g["passed"])
+```
+
+| list | mean return | sd | kill rate | median length | gate: point [95% interval] |
+|---|---|---|---|---|---|
+| random (`RandomPolicy`) | -164.21 | 186.19 | 0.57 | 59 | (baseline) |
+| untrained actor (control) | -159.86 | 181.09 | 0.59 | 52 | +4.35 [-41.91, +50.70] |
+| step 2,000, sample | +65.06 | 20.81 | 1.00 | 9 | +229.27 [+193.47, +264.82] |
+| step 2,000, argmax | +66.55 | 19.60 | 1.00 | 8 | +230.76 [+195.03, +266.57] |
+| step 4,000, sample | +61.96 | 21.38 | 1.00 | 10 | +226.17 [+191.01, +261.73] |
+| step 4,000, argmax | +66.60 | 17.66 | 1.00 | 8 | +230.81 [+195.11, +266.08] |
+| step 6,000, sample | +62.36 | 22.36 | 1.00 | 9 | +226.57 [+190.91, +261.76] |
+| step 6,000, argmax | +64.84 | 20.02 | 1.00 | 9 | +229.05 [+194.00, +264.34] |
+| step 8,000, sample | +63.62 | 22.89 | 1.00 | 9 | +227.83 [+192.01, +262.63] |
+| step 8,000, argmax | +65.18 | 19.10 | 1.00 | 9 | +229.39 [+193.49, +264.85] |
+| **step 10,000, sample (the gate)** | **+63.18** | 22.45 | 1.00 | 9 | **+227.39 [+191.86, +262.69]** |
+| step 10,000, argmax | +65.26 | 18.85 | 1.00 | 9 | +229.47 [+193.87, +264.74] |
+
+The standard deviations are population sd (`numpy` default), as `scripts/eval_live.py` prints them. The `random` and `untrained` rows of the table above agree with `read.log`; the intervals for the non-gate rows were computed with the same `paired_gate` call and are not printed by `read.log` (the script prints only the control's and the 10,000-sample gate's).
+
+**The gate.** Read at update 10,000, sample mode, as fixed in §5.7: +227.39, 95% interval [+191.86, +262.69], `ci_low` > 0. The gate was read at 10,000 only; the other rungs are a learning curve and were not used to select a checkpoint.
+
+**The control (§5.6).** The untrained actor (seeded initialisation, zero updates) goes through the same evaluation: +4.35 [-41.91, +50.70]. `ci_low` is below zero, so it fails the gate as §5.6 requires and the evaluation is not shown broken. The interval is wide (it reaches +50.70); this is a failure to find an effect, not a measurement that the untrained actor equals random. Its kill rate (0.59) and median length (52) are close to random's (0.57, 59).
+
+**The learning curve.** Every rung from 2,000 on has sample-mode mean return between +61.96 and +65.06 and a kill rate of 1.00; argmax-mode between +64.84 and +66.60. Every rung's paired-gate interval has `ci_low` above +190. The curve is flat from the first rung: the first evaluation, at update 2,000, already passes the gate by the same margin as update 10,000, so these records show no improvement in live return between 2,000 and 10,000 updates. They say nothing about the first 2,000 updates, which were not evaluated live (the imagined `G0` in the training log was negative until update ~1,300). The rung-to-rung differences in mean return (range 3.1 in sample mode) are about the size of the standard error of one rung mean (sd roughly 21 to 23 over 100 episodes, so about 2.2); no test of rung against rung was run, and none is claimed. Argmax mean exceeds sample mean at every rung (by 1.5 to 4.6); no interval was computed for that difference and it is not gated. Only 33 of the 100 episodes at 10,000 have identical returns in the two modes.
+
+### Per-seed facts
+
+All derived from the live record; the script that produced them is in the box below (needs `numpy` only).
+
+```python
+import json, numpy as np
+d = json.load(open("runs/m4b_agent/live_frozen_ssl_seed0.json"))
+r = np.array([e["return"] for e in d["random"]]); k = np.array([e["killed"] for e in d["random"]])
+l = d["rungs"]["10000"]["sample"]; a = np.array([e["return"] for e in l])
+print((a > r).sum(), (a == r).sum(), (a < r).sum())
+for m in (k, ~k): print(m.sum(), (a > r)[m].sum(), (a == r)[m].sum(), (a < r)[m].sum(), r[m].mean(), a[m].mean(), (a - r)[m].mean())
+im = np.array([e["imagined_return"] for e in l]); print(im.mean(), a.mean(), (im > a).sum(), (im < a).sum(), np.corrcoef(im, a)[0, 1])
+```
+
+At the gate (update 10,000, sample mode), against random on the same seed:
+
+- The agent's return is higher on **90 of 100 seeds**, equal on 3, lower on 7. By rung (sample mode) the "higher" counts are 89 (2,000), 90 (4,000), 89 (6,000), 90 (8,000), 90 (10,000); in argmax mode 87, 89, 87, 86, 87. The untrained control beats random on 44 seeds, ties on 7, loses on 49 (`d['untrained']` against `d['random']`).
+- All three ties are 91 against 91. The seven losses are seeds 1000004 (agent 71, random 79), 1000014 (67, 87), 1000015 (91, 95), 1000021 (24, 55), 1000027 (91, 95), 1000044 (91, 95), 1000098 (91, 95): the random policy killed on each of these, quickly.
+- Kill rate: the agent killed on 100 of 100 episodes at every rung and in both modes (`killed` is the environment's `terminated`), with no truncated episode; the maximum agent episode length is 26 at 10,000 sample (18 at argmax) against the 75-step maximum for random. Random killed on 57 of 100 (43 truncated); the untrained actor on 59 of 100 (41 truncated).
+- Where the +227.39 comes from. On the 57 seeds where random killed, random's mean return is -18.96 and the agent's is +69.79, a mean difference of +88.75 (agent higher on 47, equal on 3, lower on 7). On the 43 seeds where random was truncated without a kill, random's mean return is -356.74 and the agent's is +54.42, a mean difference of +411.16 (agent higher on all 43). Weighted by 57 and 43 these give 50.59 + 176.80 = 227.39. So about three quarters of the gate's point estimate comes from seeds on which random never killed. The gate is a mean over seeds and does not separate these two groups; random's long, penalty-accumulating truncated episodes set much of the baseline's low mean.
+- The agent's best episode (+95) equals random's best (+95); the agent's lowest at 10,000 sample is -21, random's is -375. The agent's returns span -21 to +95 (sd 22.45); a kill ends the episode, and the agent kills in a median of 9 steps.
+
+### Imagined-vs-real gap (reported, not gated)
+
+At update 10,000, sample mode: mean imagined start-state lambda-return +38.33, mean real return +63.18, **gap -24.85** (`read.log`: `imagined-vs-real gap at step 10000: -24.85 (imagined +38.33, real +63.18)`). The imagined value is `imagined_return` in each episode of the rung, computed at that episode's first state; the random and untrained lists carry `None` for it. Per rung (sample / argmax): 2,000: -38.34 / -38.07; 4,000: -30.24 / -32.64; 6,000: -27.77 / -25.09; 8,000: -26.73 / -26.52; 10,000: -24.85 / -26.65 (imagined minus real, from the same loop over `d["rungs"]`). Per episode at 10,000 sample, imagined is below real on 88 of 100 and above on 12, and the correlation between the two is +0.18.
+
+What the sign does and does not mean. §5.5 names a large **positive** gap as the signature of an actor exploiting the model's errors. The gap here is negative at every rung and in both modes, so that signature is absent in this cell. That is the only reading these records support. It does not show the world model is accurate, and the two quantities are not the same quantity: the imagined number is a 15-step lambda-return in the model's latent space, discounted by `gamma * sigmoid(continue)` at each step and bootstrapped at the horizon from the slow critic's value (`AgentPolicy._imagined_return` in `src/mbfps/eval/live.py`), while the real number is an undiscounted sum of environment rewards to the end of a real episode (median length 9). A discounted, critic-bootstrapped estimate being below an undiscounted real return does not by itself say anything about model error, and a negative gap of -24.85 should not be read as "the model is pessimistic" or "the critic is under-confident" without a like-for-like comparison, which was not run. The per-episode correlation of +0.18 is low, so the imagined figure also does not predict which seeds the agent scores well on. The training-log `G0` at update 10,000 (+32.44) is a different sample (one training batch of replay start states) from the +38.33 (the 100 live first states) and the two should not be compared as a check.
+
+### Imagination isolation
+
+`isolation_ok: True` (`runs/m4b_agent/train_frozen_ssl_seed0.json`, also `read.log`; the timing run's record also says True). The flag is set in `train_actor_critic` at update 1: every world-model parameter's `.grad` is `None` after the first actor-critic step, and the trainer raises if not. It is therefore checked once, at the first update, in this run; the unit test for the same property (`tests/training/test_ac_trainer.py::test_isolation_world_model_untouched`) is part of the suite counted above. The trainer draws its start states only from the replay buffer over `data/basic`; the live episodes are run by `scripts/eval_live.py`, a separate script, and the records do not show any live transition used in training.
+
+### Not established by this run
+
+- One cell (`frozen_ssl`) and one seed (0), one scenario (`basic`), and the fixed dataset of Stage A (1,200 scripted-and-random episodes). No between-arm or between-seed statement is made; nothing here compares arms, which is Stage C.
+- The 100 evaluation seeds are one fixed set (1,000,000 to 1,000,099); the intervals resample these seeds and do not cover variation in the agent's training seed or in the world model.
+- The gate shows the agent's mean return exceeds a uniform-random policy's on `basic`. It does not show the agent is a strong policy: no scripted or other non-random baseline was evaluated here, and the return difference is largely random's truncated episodes (see "Per-seed facts").
+- Whether the flat learning curve reflects a quickly saturated task, a ceiling set by the environment, or the learning rate was not tested; no ablation was run.
+- No claim is made about the world model's accuracy from the imagined-vs-real gap.
