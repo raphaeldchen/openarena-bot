@@ -145,3 +145,24 @@ def test_episode_arrays_on_a_tiny_model():
     assert a.valid.sum() == sum(min(HORIZON, t - 1 - i) for i in range(t - 1))
     b = episode_arrays(model, obs, actions, r, term, trunc, torch.device("cpu"), seed=0)
     assert np.array_equal(a.imagined_reward, b.imagined_reward)  # seeded
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an MPS device")
+def test_episode_arrays_run_on_mps():
+    """MPS has no float64: the arrays must be moved to the CPU before the cast."""
+    from mbfps.eval.entry import episode_arrays
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    device = torch.device("mps")
+    cfg = get_config("cnn", device="mps", n_actions=4, reward_transform="symlog")
+    model = WorldModel(cfg).to(device).eval()
+    t = 8
+    obs = np.zeros((t + 1, 112, 112, 3), dtype=np.uint8)
+    r, term, trunc = _episode([-4] * 6 + [97, -1], [0] * 7 + [1])
+    a = episode_arrays(model, obs, np.arange(t) % 4, r, term, trunc, device, seed=0)
+    for name in ("imagined_reward", "imagined_continue", "posterior_reward",
+                 "posterior_continue", "real_reward", "real_continue"):
+        arr = getattr(a, name)
+        assert isinstance(arr, np.ndarray) and arr.dtype == np.float64, name
+        assert arr.shape == (t - 1, HORIZON), name

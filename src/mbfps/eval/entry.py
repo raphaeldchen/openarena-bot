@@ -91,7 +91,8 @@ def episode_arrays(
     post_index = torch.where(valid_t, index, 0)
 
     real_r, real_c, valid = real_arrays(rewards, terminated, truncated, horizon)
-    as_np = lambda x: x.detach().double().cpu().numpy()
+    # CPU first, then float64: MPS has no float64 to cast to.
+    as_np = lambda x: x.detach().cpu().double().numpy()
     return EpisodeArrays(
         imagined_reward=as_np(read_reward(heads_im["reward"], transform)),
         imagined_continue=as_np(torch.sigmoid(heads_im["continue_logit"])),
