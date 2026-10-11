@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from mbfps.models.heads import WorldModelHeads, continue_target
+from mbfps.models.heads import Actor, Critic, WorldModelHeads, continue_target
 from mbfps.models.rssm import LATENT_DIM
 
 B, T = 3, 5
@@ -125,3 +125,18 @@ def test_all_parameters_and_outputs_are_float32():
     assert out["embedding"].dtype == torch.float32
     assert out["reward"].dtype == torch.float32
     assert out["continue_logit"].dtype == torch.float32
+
+
+def test_actor_and_critic_shapes():
+    latent = torch.randn(5, LATENT_DIM)
+    actor, critic = Actor(n_actions=4), Critic()
+    assert actor(latent).shape == (5, 4)
+    assert actor.dist(latent).sample().shape == (5,)
+    assert critic(latent).shape == (5,)
+
+
+def test_actor_and_critic_are_seeded():
+    a, b = Actor(4, seed=3), Actor(4, seed=3)
+    for p, q in zip(a.parameters(), b.parameters()):
+        assert torch.equal(p, q)
+    assert not torch.equal(next(Actor(4, seed=4).parameters()), next(a.parameters()))

@@ -14,6 +14,7 @@ This module is arm-invariant: it consumes the 2048-d embedding that M2
 equalises across arms, so `encoders.py` remains the only module that differs.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -188,6 +189,32 @@ class RSSM(nn.Module):
             z = self._sample(prior_logits, temperature)
             hs.append(h); zs.append(z); priors.append(prior_logits)
         return self._pack(hs, zs, priors, None)
+
+    @torch.no_grad()
+    def imagine_policy(
+        self,
+        policy: Callable[[torch.Tensor], torch.Tensor],
+        state: tuple[torch.Tensor, torch.Tensor],
+        horizon: int,
+    ) -> dict[str, torch.Tensor]:
+        """Roll forward on the prior with `policy` choosing each action (M4).
+
+        `policy` maps the current `(N, LATENT_DIM)` latent to `(N,)` action
+        indices. Returns `latent` `(N, horizon + 1, LATENT_DIM)` -- index 0 the
+        start state, index t the state after the t-th action -- and `action`
+        `(N, horizon)`. No graph is built: the world model is frozen in M4, and
+        the actor's log-probabilities are recomputed by the trainer on these
+        detached latents. `imagine` is untouched: M3's diagnostics depend on it.
+        """
+        h, z = state
+        latents, actions = [torch.cat([h, z], dim=-1)], []
+        for _ in range(horizon):
+            action = policy(latents[-1]).long()
+            h = self._step(h, z, self._onehot_actions(action))
+            z = self._sample(self.prior_net(h))
+            latents.append(torch.cat([h, z], dim=-1))
+            actions.append(action)
+        return {"latent": torch.stack(latents, dim=1), "action": torch.stack(actions, dim=1)}
 
     def _pack(self, hs, zs, priors, posts) -> dict[str, torch.Tensor]:
         cats, classes = self.cfg.z_cats, self.cfg.z_classes

@@ -657,3 +657,28 @@ def test_kl_loss_mask_ignores_padded_steps():
     a, _ = kl_loss(post, prior, mask=mask)
     b, _ = kl_loss(garbage_post, prior, mask=mask)
     torch.testing.assert_close(a, b)
+
+
+def test_imagine_policy_with_fixed_actions_matches_imagine(rssm):
+    """A policy that replays a fixed action sequence consumes no RNG, so the
+    latents must equal `imagine` on the same actions from the same seed."""
+    n, horizon = 4, 6
+    torch.manual_seed(0)
+    start = (torch.randn(n, 512), torch.zeros(n, 1024))
+    plan = torch.randint(0, 6, (n, horizon))
+    steps = iter(range(horizon))
+    policy = lambda latent: plan[:, next(steps)]
+    torch.manual_seed(7)
+    out = rssm.imagine_policy(policy, start, horizon)
+    torch.manual_seed(7)
+    ref = rssm.imagine(plan, start)
+    assert out["latent"].shape == (n, horizon + 1, LATENT_DIM)
+    torch.testing.assert_close(out["latent"][:, 1:], ref["latent"])
+    torch.testing.assert_close(out["latent"][:, 0], torch.cat(start, dim=-1))
+    assert torch.equal(out["action"], plan)
+
+
+def test_imagine_policy_builds_no_graph(rssm):
+    start = (torch.randn(2, 512), torch.zeros(2, 1024))
+    out = rssm.imagine_policy(lambda latent: torch.zeros(2, dtype=torch.long), start, 3)
+    assert not out["latent"].requires_grad

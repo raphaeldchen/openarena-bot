@@ -1,8 +1,10 @@
-"""Prediction heads over the RSSM latent (milestone M3).
+"""Prediction heads over the RSSM latent (milestone M3), and the actor-critic
+(milestone M4).
 
-Three heads share the latent: the embedding predictor supplies the world
-model's main reconstruction signal, and the reward and continue heads supply
-what M4's actor-critic will bootstrap from.
+Three world-model heads share the latent: the embedding predictor supplies the
+world model's main reconstruction signal, and the reward and continue heads
+supply what M4's actor-critic will bootstrap from. The module also holds M4's
+`Actor` and `Critic`, which the governing spec §4 places alongside them.
 
 Arm-invariant, like the RSSM: these consume the latent, which derives from the
 2048-d embedding M2 equalises across arms.
@@ -51,3 +53,30 @@ class WorldModelHeads(nn.Module):
             "reward": self.reward(latent).squeeze(-1),
             "continue_logit": self.continue_(latent).squeeze(-1),
         }
+
+
+class Actor(nn.Module):
+    """Policy over the latent: logits of a categorical over the scenario's actions (M4)."""
+
+    def __init__(self, n_actions: int, hidden: int = 512, seed: int = 0) -> None:
+        super().__init__()
+        with seeded_init(seed, "actor"):
+            self.net = _mlp(LATENT_DIM, hidden, n_actions)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.net(latent)
+
+    def dist(self, latent: torch.Tensor) -> torch.distributions.Categorical:
+        return torch.distributions.Categorical(logits=self.forward(latent))
+
+
+class Critic(nn.Module):
+    """Value of the latent (M4). The slow target is a deep copy kept by the trainer."""
+
+    def __init__(self, hidden: int = 512, seed: int = 0) -> None:
+        super().__init__()
+        with seeded_init(seed, "critic"):
+            self.net = _mlp(LATENT_DIM, hidden, 1)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.net(latent).squeeze(-1)
