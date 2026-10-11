@@ -125,3 +125,39 @@ def test_pixel_ae_checkpoint_reaches_the_extractor(monkeypatch, tmp_path):
     ckpt = tmp_path / "autoencoder_cnn.pt"
     eval_live._encoder_fn(model, torch.device("cpu"), stub=False, pixel_ae_checkpoint=ckpt)
     assert seen == {"backbone": "pixel_ae", "checkpoint": ckpt}
+
+
+def test_pixel_ae_without_a_checkpoint_is_refused(monkeypatch):
+    """No silent fallback to FeatureExtractor's my_way_home autoencoder."""
+    import torch
+    from mbfps.data import features
+    from mbfps.training.world_model import WorldModel
+    from mbfps.utils.config import get_config
+
+    sys.path.insert(0, str(SCRIPT.parent))
+    import eval_live
+
+    class Fake:
+        def __init__(self, backbone, device, checkpoint=None):
+            raise AssertionError("must not construct an extractor")
+
+    monkeypatch.setattr(features, "FeatureExtractor", Fake)
+    model = WorldModel(get_config("pixel_ae", device="cpu", n_actions=4))
+    with pytest.raises(ValueError, match="--pixel-ae-checkpoint"):
+        eval_live._encoder_fn(model, torch.device("cpu"), stub=False, pixel_ae_checkpoint=None)
+
+
+@pytest.mark.parametrize("which", ["random", "untrained", ("rungs", "sample"), ("rungs", "argmax")])
+def test_read_refuses_unpaired_seeds(tmp_path, which):
+    from mbfps.eval.study import load_record, write_record
+    _write_live(tmp_path, -170.0, 80.0)
+    path = tmp_path / "live_frozen_ssl_seed0.json"
+    record = load_record(path)
+    record.pop("nonfinite", None)  # write_record re-derives it
+    lst = record[which] if isinstance(which, str) else record["rungs"]["10000"][which[1]]
+    lst[0], lst[1] = lst[1], lst[0]
+    write_record(path, record)
+    code, log = _run(SCRIPT, "--phase", "read", "--out", tmp_path, "--agent-dir", tmp_path,
+                     "--arm", "frozen_ssl", "--seed", 0, "--final-step", 10000)
+    assert code == 73, log
+    assert "SEED_MISMATCH" in log

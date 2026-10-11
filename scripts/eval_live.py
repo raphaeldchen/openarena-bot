@@ -13,6 +13,7 @@ Exit codes (read):
   71  CONTROL_BROKEN    the untrained actor passes the same gate
   72  ISOLATION_BROKEN  the training record's isolation_ok is not true
   11  MISSING           a record the read needs is absent
+  73  SEED_MISMATCH     an episode list is not over the record's seeds, in order
 """
 
 import argparse
@@ -35,6 +36,7 @@ from mbfps.utils.device import get_device
 
 EXIT_OK, EXIT_MISSING = 0, 11
 EXIT_AGENT_NOT_BETTER, EXIT_CONTROL_BROKEN, EXIT_ISOLATION_BROKEN = 70, 71, 72
+EXIT_SEED_MISMATCH = 73
 SCENARIO = "basic"
 
 
@@ -49,6 +51,11 @@ def _encoder_fn(model, device, stub: bool, pixel_ae_checkpoint: Path | None = No
     if backbone is None:
         return lambda frames: frames
     from mbfps.data.geometry import BACKBONE_GEOMETRY
+    if backbone == "pixel_ae" and not stub and pixel_ae_checkpoint is None:
+        raise ValueError(
+            "pixel_ae live evaluation needs --pixel-ae-checkpoint: without it "
+            "FeatureExtractor falls back to the my_way_home autoencoder, and the agent "
+            "would act on features from a different encoder than its cache was written with")
     if stub:
         shape = BACKBONE_GEOMETRY[backbone]
         return lambda frames: np.zeros((len(frames), *shape), dtype=np.float16)
@@ -98,6 +105,8 @@ def measure(args) -> int:
         env.close()
     seconds = time.perf_counter() - start
     record.update({"world_model": str(args.world_model), "agent_dir": str(args.agent_dir),
+                   "pixel_ae_checkpoint": (str(args.pixel_ae_checkpoint)
+                                           if args.pixel_ae_checkpoint else None),
                    "git_sha": git_sha(), "seconds": seconds,
                    "seconds_per_episode": seconds / max(n_episodes, 1)})
     write_record(live_path(args.out, arm, seed), record)
@@ -123,6 +132,15 @@ def read(args) -> int:
     if key not in record["rungs"]:
         print(f"MISSING: rung {key} not in {sorted(record['rungs'])}")
         return EXIT_MISSING
+    lists = {"random": record["random"], "untrained": record["untrained"]}
+    for step, modes in record["rungs"].items():
+        for mode, episodes in modes.items():
+            lists[f"rung {step} {mode}"] = episodes
+    bad = [name for name, episodes in lists.items()
+           if [e["seed"] for e in episodes] != record["seeds"]]
+    if bad:
+        print(f"SEED_MISMATCH: episode seeds differ from the record's seeds in {bad}")
+        return EXIT_SEED_MISMATCH
     rand = [e["return"] for e in record["random"]]
     control = paired_gate([e["return"] for e in record["untrained"]], rand)
     final = record["rungs"][key]
