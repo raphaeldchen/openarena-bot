@@ -22,6 +22,7 @@ from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.models.encoders import build_encoder, encoder_backbone, encoder_input_kind
 from mbfps.models.heads import WorldModelHeads, continue_target
 from mbfps.models.rssm import KL_FREE_BITS, RSSM, RSSMConfig, kl_loss
+from mbfps.models.transforms import reward_target
 from mbfps.utils.config import Config
 from mbfps.utils.device import get_device
 from mbfps.utils.seeding import seed_everything
@@ -38,6 +39,7 @@ class WorldModel(nn.Module):
         self.rssm = RSSM(
             RSSMConfig(
                 embed_dim=cfg.encoder.embed_dim,
+                n_actions=cfg.train.n_actions,
                 sample_temperature=cfg.train.sample_temperature,
             ),
             seed=cfg.train.seed,
@@ -70,13 +72,30 @@ class WorldModel(nn.Module):
         out = self.rssm.observe(embeddings, batch["actions"])
         predictions = self.heads(out["latent"])
 
-        embedding_loss = F.mse_loss(predictions["embedding"], embeddings.detach())
-        reward_loss = F.mse_loss(predictions["reward"], batch["rewards"])
-        continue_loss = F.binary_cross_entropy_with_logits(
-            predictions["continue_logit"],
-            continue_target(batch["terminated"], batch["truncated"]),
-        )
-        kl, kl_parts = kl_loss(out["post_logits"], out["prior_logits"])
+        mask = batch.get("mask")
+        target_reward = reward_target(batch["rewards"], self.cfg.train.reward_transform)
+        target_continue = continue_target(batch["terminated"], batch["truncated"])
+        if mask is None:
+            embedding_loss = F.mse_loss(predictions["embedding"], embeddings.detach())
+            reward_loss = F.mse_loss(predictions["reward"], target_reward)
+            continue_loss = F.binary_cross_entropy_with_logits(
+                predictions["continue_logit"], target_continue
+            )
+        else:
+            # M4 §4.2: every term is a mean over REAL transitions only.
+            weight = mask.to(embeddings.dtype)
+            count = weight.sum()
+            embedding_loss = (
+                (predictions["embedding"] - embeddings.detach()).pow(2).mean(-1) * weight
+            ).sum() / count
+            reward_loss = ((predictions["reward"] - target_reward).pow(2) * weight).sum() / count
+            continue_loss = (
+                F.binary_cross_entropy_with_logits(
+                    predictions["continue_logit"], target_continue, reduction="none"
+                )
+                * weight
+            ).sum() / count
+        kl, kl_parts = kl_loss(out["post_logits"], out["prior_logits"], mask=mask)
 
         loss = embedding_loss + reward_loss + continue_loss + kl
         parts = {
@@ -117,12 +136,41 @@ def _save_checkpoint(model: nn.Module, cfg: Config, directory: Path, step: int |
         "seed": cfg.train.seed,
         "sample_temperature": float(cfg.train.sample_temperature),
         "state_dict": model.state_dict(),
+        "n_actions": int(cfg.train.n_actions),
+        "reward_transform": str(cfg.train.reward_transform),
+        "pad_short": bool(cfg.train.pad_short),
     }
     if step is not None:
         payload["step"] = int(step)
     path = directory / f"world_model_{cfg.arm}_seed{cfg.train.seed}.pt"
     torch.save(payload, path)
     return path
+
+
+def load_world_model(path: Path, device: torch.device) -> "WorldModel":
+    """Rebuild a world model from its checkpoint, in eval mode.
+
+    The configuration comes from the PAYLOAD, never from a caller's
+    assumption: an M3 checkpoint has no `n_actions`, `reward_transform` or
+    `pad_short`, and loads as 6 actions, `identity`, unpadded -- what it was
+    trained with. That is what lets M4 §4.6's control read an M3 model through
+    M4 code."""
+    from mbfps.utils.config import get_config
+
+    payload = torch.load(path, map_location=device, weights_only=True)
+    cfg = get_config(
+        payload["arm"],
+        seed=int(payload["seed"]),
+        device=device.type,
+        sample_temperature=float(payload.get("sample_temperature", 1.0)),
+        n_actions=int(payload.get("n_actions", 6)),
+        reward_transform=str(payload.get("reward_transform", "identity")),
+        pad_short=bool(payload.get("pad_short", False)),
+    )
+    model = WorldModel(cfg).to(device)
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model
 
 
 def train_world_model(
@@ -178,6 +226,7 @@ def train_world_model(
         load_features=model.input_kind == "features",
         feature_backbone=backbone or "dinov2",
         paths=train_paths,
+        pad_short=cfg.train.pad_short,
     )
 
     losses: list[float] = []

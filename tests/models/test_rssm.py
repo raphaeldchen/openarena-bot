@@ -639,3 +639,21 @@ def test_a_configured_temperature_drives_both_paths(rssm):
     modes = out["post_logits"].argmax(-1)
     drawn = out["z"].view(b, t, 32, 32).argmax(-1)
     assert torch.equal(modes, drawn), "a configured tau=0 posterior must draw its own mode"
+
+
+def test_kl_loss_mask_all_true_matches_unmasked():
+    post, prior = torch.randn(B, T, 32, 32), torch.randn(B, T, 32, 32)
+    unmasked, _ = kl_loss(post, prior)
+    masked, _ = kl_loss(post, prior, mask=torch.ones(B, T, dtype=torch.bool))
+    torch.testing.assert_close(masked, unmasked)
+
+
+def test_kl_loss_mask_ignores_padded_steps():
+    post, prior = torch.randn(B, T, 32, 32), torch.randn(B, T, 32, 32)
+    mask = torch.zeros(B, T, dtype=torch.bool)
+    mask[:, :3] = True
+    garbage_post = post.clone()
+    garbage_post[:, 3:] = 1e3 * torch.randn(B, T - 3, 32, 32)
+    a, _ = kl_loss(post, prior, mask=mask)
+    b, _ = kl_loss(garbage_post, prior, mask=mask)
+    torch.testing.assert_close(a, b)

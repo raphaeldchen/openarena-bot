@@ -751,7 +751,8 @@ def test_checkpoint_steps_default_leaves_the_final_save_and_the_history_as_they_
     history = train_world_model(tiny(seed=3), buffer, out_dir=out)
     assert sorted(p.name for p in out.iterdir()) == ["world_model_cnn_seed3.pt"]
     payload = torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)
-    assert set(payload) == {"arm", "seed", "state_dict", "sample_temperature"}
+    assert set(payload) == {"arm", "seed", "state_dict", "sample_temperature",
+                            "n_actions", "reward_transform", "pad_short"}
     assert history["checkpoint_seconds"] == {}
 
 
@@ -765,14 +766,16 @@ def test_checkpoint_steps_write_labelled_rungs_in_the_studys_layout(buffer, tmp_
     )
     for step in (2, 4):
         payload = torch.load(out / f"step{step}" / "world_model_cnn_seed3.pt", weights_only=True)
-        assert set(payload) == {"arm", "seed", "step", "state_dict", "sample_temperature"}
+        assert set(payload) == {"arm", "seed", "step", "state_dict", "sample_temperature",
+                                "n_actions", "reward_transform", "pad_short"}
         assert (payload["arm"], payload["seed"], payload["step"]) == ("cnn", 3, step)
         assert any(k.startswith("rssm.") for k in payload["state_dict"])
     assert sorted(history["checkpoint_seconds"]) == [2, 4]
     assert 0.0 < history["checkpoint_seconds"][2] <= history["checkpoint_seconds"][4] <= history["seconds"]
     # The final save is still written beside the rungs, unchanged.
     assert set(torch.load(out / "world_model_cnn_seed3.pt", weights_only=True)) == {
-        "arm", "seed", "state_dict", "sample_temperature"
+        "arm", "seed", "state_dict", "sample_temperature",
+        "n_actions", "reward_transform", "pad_short",
     }
 
 
@@ -1120,3 +1123,108 @@ def test_the_payload_carries_the_temperature_the_model_was_trained_at(tmp_path, 
         get_config("cnn", steps=2, seq_len=4, seed=3, device="cpu"), buffer, out_dir=warm
     )
     assert torch.load(warm / "world_model_cnn_seed3.pt", weights_only=True)["sample_temperature"] == 1.0
+
+
+from mbfps.data.loader import SequenceLoader  # noqa: E402
+from mbfps.models.transforms import symlog  # noqa: E402
+from mbfps.training.world_model import load_world_model  # noqa: E402
+from mbfps.utils.device import to_device  # noqa: E402
+
+
+def _m4_cfg(**overrides):
+    base = dict(steps=2, seq_len=16, batch_size=4, device="cpu", n_actions=6,
+                pad_short=True, reward_transform="symlog")
+    base.update(overrides)
+    return get_config("cnn", **base)
+
+
+def test_padded_loss_equals_unpadded_loss(tmp_path):
+    """A 6-step episode padded to 16 must score exactly what the same 6 steps
+    score unpadded: the pad contributes nothing to any term."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=6, fill=1))
+    seed_everything(0)
+    model = WorldModel(_m4_cfg())
+    padded = SequenceLoader(buf, batch_size=1, seq_len=16, seed=0, pad_short=True).sample()
+    exact = SequenceLoader(buf, batch_size=1, seq_len=6, seed=0, pad_short=True).sample()
+    assert padded["mask"].sum() == 6 and exact["mask"].all()
+    torch.manual_seed(1)
+    loss_padded, parts_padded = model(to_device(padded, torch.device("cpu")))
+    torch.manual_seed(1)
+    loss_exact, parts_exact = model(to_device(exact, torch.device("cpu")))
+    torch.testing.assert_close(loss_padded, loss_exact, rtol=1e-5, atol=1e-6)
+    for key in ("embedding", "reward", "continue"):
+        assert parts_padded[key] == pytest.approx(parts_exact[key], rel=1e-5, abs=1e-7)
+
+
+def test_padded_positions_get_no_gradient(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=6, fill=1))
+    model = WorldModel(_m4_cfg())
+    batch = to_device(
+        SequenceLoader(buf, batch_size=1, seq_len=16, seed=0, pad_short=True).sample(),
+        torch.device("cpu"),
+    )
+    torch.manual_seed(2)
+    loss_clean, parts_clean = model(batch)
+    batch["rewards"][0, 6:] = 1e6          # garbage in the pad
+    batch["terminated"][0, 6:] = True
+    torch.manual_seed(2)
+    loss_dirty, parts_dirty = model(batch)
+    torch.testing.assert_close(loss_dirty, loss_clean)
+    assert parts_dirty["reward"] == parts_clean["reward"]
+    assert parts_dirty["continue"] == parts_clean["continue"]
+
+
+def test_reward_head_trains_on_symlog(tmp_path):
+    """With reward_transform='symlog' the reward term is the MSE against
+    symlog(r), not r: a head output of symlog(r) scores zero."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    ep = make_episode(t=20, fill=1)
+    ep.rewards[:] = 97.0
+    buf.add(ep)
+    model = WorldModel(_m4_cfg())
+    with torch.no_grad():
+        model.heads.reward[-1].weight.zero_()
+        model.heads.reward[-1].bias.fill_(float(symlog(torch.tensor(97.0))))
+    batch = to_device(SequenceLoader(buf, 1, 16, seed=0, pad_short=True).sample(),
+                      torch.device("cpu"))
+    _, parts = model(batch)
+    assert parts["reward"] == pytest.approx(0.0, abs=1e-10)
+
+
+def test_n_actions_sizes_the_rssm():
+    assert WorldModel(_m4_cfg(n_actions=4)).rssm.cfg.n_actions == 4
+
+
+def test_m4_payload_records_its_fields(tmp_path, buffer):
+    cfg = _m4_cfg(n_actions=6)
+    train_world_model(cfg, buffer, out_dir=tmp_path / "run")
+    payload = torch.load(tmp_path / "run" / "world_model_cnn_seed0.pt", weights_only=True)
+    assert payload["n_actions"] == 6
+    assert payload["reward_transform"] == "symlog"
+    assert payload["pad_short"] is True
+
+
+def test_load_world_model_round_trips(tmp_path, buffer):
+    cfg = _m4_cfg()
+    train_world_model(cfg, buffer, out_dir=tmp_path / "run")
+    model = load_world_model(tmp_path / "run" / "world_model_cnn_seed0.pt", torch.device("cpu"))
+    assert not model.training
+    assert model.cfg.train.reward_transform == "symlog"
+    assert model.cfg.train.pad_short is True
+
+
+def test_m3_payload_loads_with_defaults(tmp_path, buffer):
+    """An M3 checkpoint has none of the M4 keys: it must load as 6 actions,
+    identity, unpadded -- the configuration it was trained with (spec §4.6)."""
+    cfg = get_config("cnn", steps=2, seq_len=16, batch_size=4, device="cpu")
+    train_world_model(cfg, buffer, out_dir=tmp_path / "run")
+    path = tmp_path / "run" / "world_model_cnn_seed0.pt"
+    payload = torch.load(path, weights_only=True)
+    for key in ("n_actions", "reward_transform", "pad_short"):
+        payload.pop(key)
+    torch.save(payload, path)
+    model = load_world_model(path, torch.device("cpu"))
+    assert (model.cfg.train.n_actions, model.cfg.train.reward_transform,
+            model.cfg.train.pad_short) == (6, "identity", False)

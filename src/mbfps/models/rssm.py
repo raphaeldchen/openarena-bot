@@ -204,12 +204,22 @@ class RSSM(nn.Module):
         return out
 
 
-def _categorical_kl(logits_q: torch.Tensor, logits_p: torch.Tensor) -> torch.Tensor:
-    """KL(q || p) summed over the 32 categorical groups, averaged over B and T."""
+def _categorical_kl(
+    logits_q: torch.Tensor, logits_p: torch.Tensor, mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """KL(q || p) summed over the 32 categorical groups, averaged over B and T.
+
+    With `mask` (M4), the average is over the masked-in (B, T) positions only,
+    so padding contributes nothing. With every position masked in this is the
+    unmasked mean up to float rounding; with `mask=None` it is that mean
+    exactly, which is what every M3 caller gets."""
     log_q = F.log_softmax(logits_q, dim=-1)
     log_p = F.log_softmax(logits_p, dim=-1)
-    per_group = (log_q.exp() * (log_q - log_p)).sum(-1)
-    return per_group.sum(-1).mean()
+    per_step = (log_q.exp() * (log_q - log_p)).sum(-1).sum(-1)
+    if mask is None:
+        return per_step.mean()
+    weight = mask.to(per_step.dtype)
+    return (per_step * weight).sum() / weight.sum()
 
 
 KL_FREE_BITS = 0.20
@@ -240,6 +250,7 @@ def kl_loss(
     free_bits: float = KL_FREE_BITS,
     dyn_scale: float = 0.5,
     rep_scale: float = 0.1,
+    mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """KL with DreamerV3 balancing and free bits.
 
@@ -267,8 +278,8 @@ def kl_loss(
     silently invalidates the 0.20 calibration; a per-element clamp needs its
     own free-bits value re-measured from scratch, not 0.20 carried over.
     """
-    dyn = _categorical_kl(post_logits.detach(), prior_logits)
-    rep = _categorical_kl(post_logits, prior_logits.detach())
+    dyn = _categorical_kl(post_logits.detach(), prior_logits, mask)
+    rep = _categorical_kl(post_logits, prior_logits.detach(), mask)
     floor = torch.tensor(free_bits, dtype=dyn.dtype, device=dyn.device)
     loss = dyn_scale * torch.maximum(dyn, floor) + rep_scale * torch.maximum(rep, floor)
     return loss, {"dyn": float(dyn.detach()), "rep": float(rep.detach())}
