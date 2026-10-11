@@ -48,6 +48,11 @@ class RandomPolicy:
         self._rng = np.random.default_rng(self._seed)
 
 
+_DEFAULT_SWEEP_LEN = 100
+"""The shipped sweep length. On `basic` (episodes <= 75 steps) it never
+reverses, so M4 collects `basic` with 10 (spec §3)."""
+
+
 class ScriptedPolicy:
     """Committed movement with a periodic sweep, adapted to available buttons.
 
@@ -69,11 +74,16 @@ class ScriptedPolicy:
 
     _ADVANCE_PROB = 0.5
     _SWEEP_PROB = 0.75
-    _SWEEP_LEN = 100
+    _SWEEP_LEN = _DEFAULT_SWEEP_LEN
 
-    def __init__(self, button_names: Sequence[str], seed: int = 0) -> None:
+    def __init__(
+        self, button_names: Sequence[str], seed: int = 0, sweep_len: int = _DEFAULT_SWEEP_LEN
+    ) -> None:
+        if sweep_len < 1:
+            raise ValueError(f"sweep_len must be >= 1, got {sweep_len}")
         self.name = "scripted"
         self._seed = seed
+        self._sweep_len = int(sweep_len)
         self._n = len(button_names) + 1  # +1 for the no-op
 
         self._advance = self._index_of(button_names, "MOVE_FORWARD")
@@ -107,7 +117,7 @@ class ScriptedPolicy:
         if self._advance is not None and self._rng.random() < self._ADVANCE_PROB:
             return self._advance
         if self._sweep is not None and self._rng.random() < self._SWEEP_PROB:
-            sweeping_left = (self._t // self._SWEEP_LEN) % 2 == 0
+            sweeping_left = (self._t // self._sweep_len) % 2 == 0
             return self._sweep[0] if sweeping_left else self._sweep[1]
         if self._attack is not None and self._rng.random() < 0.5:
             return self._attack

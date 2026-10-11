@@ -151,3 +151,40 @@ def test_scripted_policy_works_without_an_attack_button(obs):
     assert actions.count(forward) / len(actions) > 0.4
     assert HOME.index("TURN_LEFT") + 1 in set(actions)
     assert HOME.index("TURN_RIGHT") + 1 in set(actions)
+
+
+def test_sweep_len_default_reproduces_the_shipped_stream(obs):
+    """sweep_len=100 is the shipped _SWEEP_LEN; the action stream must not move."""
+    shipped = _run(ScriptedPolicy(HOME, seed=3), obs, n=500)
+    explicit = _run(ScriptedPolicy(HOME, seed=3, sweep_len=100), obs, n=500)
+    assert shipped == explicit
+
+
+def test_sweep_len_10_reverses_every_10_steps_on_basic(obs):
+    """On `basic` (no MOVE_FORWARD, no TURN_*) the sweep strafes. With
+    sweep_len=10 the strafe direction flips at t = 10, 20, ... -- the shipped
+    100 never flips inside a 75-step episode.
+
+    Counted, not asserted per step: 1 step in 8 falls through to a uniform
+    random action, which can be either strafe in either phase. The sweep's own
+    choice must dominate each phase."""
+    policy = ScriptedPolicy(BASIC, seed=0, sweep_len=10)
+    left, right = 1, 2  # MOVE_LEFT, MOVE_RIGHT action indices
+    counts = {0: {left: 0, right: 0}, 1: {left: 0, right: 0}}
+    for t in range(1, 401):          # `act` increments t before reading it
+        a = policy.act(obs)
+        if a in (left, right):
+            counts[(t // 10) % 2][a] += 1
+    assert counts[0][left] > 4 * counts[0][right]
+    assert counts[1][right] > 4 * counts[1][left]
+
+
+def test_shipped_sweep_never_reverses_inside_a_basic_episode(obs):
+    policy = ScriptedPolicy(BASIC, seed=0)
+    actions = [policy.act(obs) for _ in range(75)]
+    assert actions.count(1) > 4 * actions.count(2)
+
+
+def test_sweep_len_must_be_positive():
+    with pytest.raises(ValueError, match="sweep_len"):
+        ScriptedPolicy(BASIC, seed=0, sweep_len=0)
