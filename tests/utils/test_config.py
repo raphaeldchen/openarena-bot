@@ -172,3 +172,28 @@ def test_the_sample_temperature_is_a_train_config_field_at_the_shipped_default()
     assert TrainConfig().sample_temperature == SAMPLE_TEMPERATURE == 1.0
     assert get_config("pixel_ae").train.sample_temperature == 1.0
     assert get_config("pixel_ae", sample_temperature=0.5).train.sample_temperature == 0.5
+
+
+# --- M4: action count, padding and reward transform ------------------------
+# Defaults are M3's values, so every M3 config, checkpoint and test is
+# unchanged. The M4 values reach the model through the same override path.
+
+
+def test_m4_fields_default_to_m3_behaviour():
+    train = TrainConfig()
+    assert (train.n_actions, train.pad_short, train.reward_transform) == (6, False, "identity")
+
+
+def test_m4_fields_override_through_get_config():
+    cfg = get_config("frozen_ssl", n_actions=4, pad_short=True, reward_transform="symlog")
+    assert (cfg.train.n_actions, cfg.train.pad_short, cfg.train.reward_transform) == (4, True, "symlog")
+
+
+def test_unknown_reward_transform_is_refused_at_construction():
+    with pytest.raises(ValueError, match="reward_transform"):
+        get_config("frozen_ssl", reward_transform="log")
+
+
+def test_n_actions_must_be_positive():
+    with pytest.raises(ValueError, match="n_actions"):
+        get_config("frozen_ssl", n_actions=0)
