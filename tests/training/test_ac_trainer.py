@@ -127,3 +127,29 @@ def test_script_writes_record_and_checkpoints(world, tmp_path):
     assert record["isolation_ok"] is True and record["updates"] == 2
     assert (out / "actor_critic_cnn_seed0_step1.pt").is_file()
     assert (out / "actor_critic_cnn_seed0_step2.pt").is_file()
+
+
+def _count_empty_cache(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append(1))
+    return calls
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_mps_cache_released_every_update(world, tmp_path, monkeypatch):
+    """N (masked-in start states) changes every update, so MPS never reuses blocks:
+    driver memory grew ~60 MB/update to OOM near update 350. Release it each update."""
+    buf, _ = world
+    model = load_world_model(tmp_path / "wm" / "world_model_cnn_seed0.pt", torch.device("mps"))
+    calls = _count_empty_cache(monkeypatch)
+    cfg = ACConfig(updates=3, checkpoint_every=3, batch_size=4, seq_len=16, device="mps")
+    train_actor_critic(model, buf, cfg, out_dir=None, log_every=0)
+    assert len(calls) == 3
+
+
+def test_cpu_never_touches_mps_cache(world, monkeypatch):
+    buf, model = world
+    calls = _count_empty_cache(monkeypatch)
+    cfg = ACConfig(updates=2, checkpoint_every=2, batch_size=4, seq_len=16, device="cpu")
+    train_actor_critic(model, buf, cfg, out_dir=None, log_every=0)
+    assert calls == []

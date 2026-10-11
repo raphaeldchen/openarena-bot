@@ -213,6 +213,12 @@ def train_actor_critic(world_model, buffer: ReplayBuffer, cfg: ACConfig,
         if log_every and update % log_every == 0:
             print(f"[ac {arm}] update {update}/{cfg.updates} actor={history['actor_loss'][-1]:+.4f} "
                   f"critic={history['critic_loss'][-1]:.4f} G0={history['imagined_return'][-1]:+.2f}")
+        if device.type == "mps":
+            # N (masked-in start states) differs every update, so every update
+            # allocates tensors of new shapes and the MPS caching allocator never
+            # reuses its blocks. Driver memory grew ~60 MB/update and hit OOM near
+            # update 350; releasing the cache each update holds it flat (~1 GB).
+            torch.mps.empty_cache()
 
     seconds = time.perf_counter() - start
     history.update({"arm": arm, "seed": cfg.seed, "updates": cfg.updates,
