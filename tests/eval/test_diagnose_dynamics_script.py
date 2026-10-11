@@ -729,6 +729,32 @@ def test_every_exit_status_is_distinct_and_none_of_them_is_argparses_own():
         clash = own & set(statuses(other).values())
         assert not clash, f"motion_headroom collides with {other} on {clash}"
 
+    ceiling = statuses("probe_ceiling")
+    reused_by_ceiling = dict(reused)
+    shared_with_trust = {
+        name: value for name, value in ceiling.items() if value in set(trust.values()) - {0}
+    }
+    assert shared_with_trust == reused_by_ceiling, (
+        f"probe_ceiling shares {shared_with_trust} with trust_horizon; only "
+        f"{reused_by_ceiling} is shared on purpose"
+    )
+    assert len(set(ceiling.values())) == len(ceiling), ceiling
+    assert 1 not in ceiling.values() and 2 not in ceiling.values()
+    assert ceiling["EXIT_HARNESS_DISAGREES"] == 49
+    assert ceiling["EXIT_NO_MAJORITY"] == 50
+    own = set(ceiling.values()) - set(reused_by_ceiling.values()) - {0}
+    assert own == {49, 50}
+    # 47 and 48 are M3n's, so 49 and 50 are the next two free numbers: asked of the tool
+    # that held the highest, so a later renumbering of either cannot pass.
+    assert own == {max(set(headroom.values()) - {0}) + 1, max(set(headroom.values()) - {0}) + 2}
+    assert own.isdisjoint({43, 44, 45, 46, 47, 48})
+    for other in ("run_study", "report_study", "pool_dynamics", "diagnose_dynamics", "split_gap",
+                  "checkpoint_ladder", "stage_decomposition", "sharper_latent", "latent_motion",
+                  "latent_retention", "latent_width", "latent_capacity", "prediction_burden",
+                  "motion_headroom", "trust_horizon"):
+        clash = own & set(statuses(other).values())
+        assert not clash, f"probe_ceiling collides with {other} on {clash}"
+
 
 def test_a_protocol_divergence_and_a_record_mismatch_report_different_statuses(
     monkeypatch, tmp_path, capsys

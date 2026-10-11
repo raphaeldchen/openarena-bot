@@ -320,6 +320,95 @@ def test_the_sweep_reports_the_window_count_it_actually_scored(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The readout is whatever `apply_readout` reads, not only the shipped linear dict.
+# ---------------------------------------------------------------------------
+
+
+def _linear_kernel_readout(probe: dict) -> dict:
+    """`probe` re-expressed in `fit_kernel_probe`'s dict form, on its LINEAR kernel.
+
+    With the identity as the anchors the kernel matrix of a query is the
+    standardised query itself, so the prediction is `xs @ alpha + centre`: the
+    shipped probe's own `xs @ w[:-1] + w[-1]`, computed by a different route.
+    The two are therefore equal up to rounding, which is an expectation that
+    never passes through the code under test. It carries no `w`, so
+    `probe.apply_probe` cannot read it.
+    """
+    width = probe["mean"].shape[0]
+    return {
+        "kind": "rbf", "kernel": "linear", "mean": probe["mean"], "scale": probe["scale"],
+        "anchors": np.eye(width), "alpha": probe["w"][:-1], "centre": probe["w"][-1],
+        "gamma": None, "bandwidth": float("inf"), "jitter": 1.0, "r2": 0.0,
+    }
+
+
+def test_the_sweep_reads_an_rbf_kind_readout_at_every_probe_call_site(tmp_path):
+    """`_diagnose` reads the embedding probe in four places: the model's own
+    imagination, the floor, persistence, and each re-grounding rung. All four
+    must go through `apply_readout`, or an RBF readout reaches M3n's sweep only
+    partway and fails -- or, worse, is read by the linear path -- at whichever
+    site was missed.
+
+    THE REAL STOCHASTIC RIG, because on the oracle rig a perfect predictor
+    scores ~0 under any probe and a site that read the wrong one would not move
+    a number. Both sweeps run at the same seed, so they sample the same
+    latents and differ only in how the probe is read.
+
+    THE MUTATION THIS EXISTS FOR: any one of the four `apply_readout` calls
+    reverted to `apply_probe`, which raises `KeyError: 'w'` on the readout.
+    """
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    readout = _linear_kernel_readout(probe)
+    width = probe["mean"].shape[0]
+    with pytest.raises(KeyError):
+        apply_probe(readout, np.zeros((1, width)))           # the fixture is not readable by apply_probe
+
+    ks = (1, 3, HORIZON)
+    shipped = sweep(model, [path], probe, ks=ks, seed=2)
+    routed = sweep(model, [path], readout, ks=ks, seed=2)
+
+    assert shipped.windows_total == routed.windows_total >= 1
+    assert shipped.reference.floor_position.min() > 0.0      # a curve with something to disagree about
+    for name in ("rssm_position", "floor_position", "persistence_position"):
+        np.testing.assert_allclose(
+            getattr(routed.reference, name), getattr(shipped.reference, name),
+            rtol=1e-9, atol=1e-9, err_msg=name,
+        )
+    np.testing.assert_allclose(
+        routed.window_floor_position, shipped.window_floor_position, rtol=1e-9, atol=1e-9,
+    )
+    for k in ks:
+        for name in ("window_position", "window_hold_position"):
+            np.testing.assert_allclose(
+                getattr(routed, name)[k], getattr(shipped, name)[k],
+                rtol=1e-9, atol=1e-9, err_msg=f"{name}[{k}]",
+            )
+
+
+def test_an_rbf_kernel_readout_changes_what_the_sweep_reads(tmp_path):
+    """The previous test shows the readout is READ; this shows it is read as the
+    kernel it is. A Gaussian-kernel readout on random anchors must move every
+    curve off the linear probe's, or `apply_readout` would be answering the
+    linear question whatever it was handed."""
+    path = write(tmp_path, synthetic_episode())
+    model, probe = real_model_and_probe()
+    width = probe["mean"].shape[0]
+    rng = np.random.default_rng(5)
+    nonlinear = {
+        "kind": "rbf", "kernel": "rbf", "mean": probe["mean"], "scale": probe["scale"],
+        "anchors": rng.normal(size=(8, width)), "alpha": 40.0 * rng.normal(size=(8, 4)),
+        "centre": np.zeros(4), "gamma": 1.0 / (2.0 * width), "bandwidth": 1.0,
+        "jitter": 1.0, "r2": 0.0,
+    }
+    shipped = sweep(model, [path], probe, ks=(1, HORIZON), seed=2)
+    moved = sweep(model, [path], nonlinear, ks=(1, HORIZON), seed=2)
+    assert np.isfinite(moved.window_position[1]).all()
+    assert not np.allclose(moved.reference.floor_position, shipped.reference.floor_position)
+    assert not np.allclose(moved.window_position[1], shipped.window_position[1])
+
+
+# ---------------------------------------------------------------------------
 # Self-check 1: k == horizon reproduces the open-loop rollout.
 # ---------------------------------------------------------------------------
 
@@ -2262,7 +2351,8 @@ def test_the_embedding_distance_is_computed_on_rows_the_embedding_head_emitted(
     on the raw latent is caught by rows the head never produced. The call
     count is typed first: two sequence rungs, six held actions and the noise
     reference against the real imagination, plus the contrast's held pair,
-    per window over two windows. And `apply_probe` is called exactly as often
+    per window over two windows. And `apply_readout` (M3o Task 7: the name every
+    probe read in `_diagnose` goes through) is called exactly as often
     as before -- the noise reference is NOT probed; it is an embedding-space
     ruler only.
     """
@@ -2281,14 +2371,14 @@ def test_the_embedding_distance_is_computed_on_rows_the_embedding_head_emitted(
     distances: list[tuple[np.ndarray, np.ndarray]] = []
     real_distance = diagnostics_module._embedding_distance
     probed: list[int] = []
-    real_apply = diagnostics_module.apply_probe
+    real_apply = diagnostics_module.apply_readout
     monkeypatch.setattr(model.heads, "forward", spy_heads)
     monkeypatch.setattr(
         diagnostics_module, "_embedding_distance",
         lambda a, b: distances.append((np.asarray(a), np.asarray(b))) or real_distance(a, b),
     )
     monkeypatch.setattr(
-        diagnostics_module, "apply_probe",
+        diagnostics_module, "apply_readout",
         lambda p, rows: probed.append(1) or real_apply(p, rows),
     )
     result = ladder(model, [path], probe)
@@ -2538,11 +2628,11 @@ def test_every_arm_is_probed_by_the_same_probe_through_the_embedding_head(
         return out
 
     probed: list[tuple[int, np.ndarray]] = []
-    real_apply = diagnostics_module.apply_probe
+    real_apply = diagnostics_module.apply_readout
     monkeypatch.setattr(model.heads, "forward", spy_heads)
     monkeypatch.setattr(
         diagnostics_module,
-        "apply_probe",
+        "apply_readout",
         lambda p, latents: probed.append((id(p), np.asarray(latents)))
         or real_apply(p, latents),
     )

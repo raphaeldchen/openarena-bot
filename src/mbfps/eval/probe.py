@@ -19,6 +19,7 @@ Two properties of `my_way_home`, measured rather than assumed:
 Positions are Doom map units, not metres.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -56,14 +57,109 @@ RIDGES: tuple[float, ...] = (1e-1, 1e1, 1e3, 1e5, 1e7)
 """Candidate strengths. The measured optimum here is 1e3-1e5, not 1."""
 
 
+def _solve_ladder(x: np.ndarray, y: np.ndarray, ridges: Sequence[float]) -> list[np.ndarray]:
+    """Ridge weights with an UNREGULARISED intercept, one set per entry of
+    `ridges`, solved in the smaller space and from ONE Gram matrix.
+
+    Two algebraically identical forms:
+
+        primal (D x D):  w = (X'X + lambda I_D)^-1 X'y
+        dual   (n x n):  w = X'(XX' + lambda I_n)^-1 y
+
+    The primal is natural at latent scale, where D is 1536-2048 and D^2 is
+    33 MB. It is unusable on raw frames: at D = 37632 the `np.eye` alone is
+    11.3 GB, and `fit_probe` solves once per rung of `RIDGES`.
+
+    The dual's cost is n^2, so neither form is universally right and the
+    branch is on `min(n, D)`. Verified against the primal across the whole
+    ladder on 40 rows of 300 features: 1.5e-10 at ridge 1e-1 falling to
+    1.4e-14 at 1e7 for centred features, and 2.7e-07 at 1e-1 for features with
+    a mean of 5. Agreement is worst at the smallest ridge, where the Gram is
+    worst conditioned.
+
+    THAT SHAPE CANNOT OCCUR IN PRODUCTION, so here is the behaviour at the ones that
+    do. An embedding is D = 2048 and `n` is the fit split's rows (9,044 at stride 1;
+    3,016 at the recorded run's `--frames 4000`). There `d < n` and the PRIMAL path
+    runs, and it is BITWISE the implementation it replaced (`np.array_equal` against
+    the old `design.T @ design + ridge * eye` solve, at every rung of `RIDGES`): at
+    n = 9044, 7236 and 2049 on synthetic features, and at n = 3016 and 2049 on the
+    real encoder embeddings of each arm (seed 0). The branch is STRICT, `d < n`, so
+    `n == D` is already dual, and the dual is reached only when `n <= D`: a run with
+    few enough episodes, or a small enough `--frames`, to leave fewer than 2049 fit
+    rows would cross into it. Measured there, at n = D = 2048 and n = 2047 on those
+    real embeddings (standardised, as `fit_probe` hands them): the dual differs from
+    the primal by at most 4.4e-08 in any weight at ridge 1e-1, 1.5e-10 at 1e1 and
+    1.3e-12 at 1e3, and by at most 3.8e-07 map units in a prediction on the selection
+    split. M3o's embedding-width fits are all primal (n = 3016 > 2048), where the
+    synthetic n = 2000, D = 2048 draws behind `ceiling.CEILING_RIDGES`' figures are
+    dual (n < D). The dual is what M3o's raw-pixel (D = 37632) and sequence
+    (D = 10240) readouts run on at every n this project uses (n <= 9,044), and the
+    raw-pixel one has no primal to compare with, which is why the branch exists.
+
+    THE GRAM DEPENDS ON `x` ALONE, NOT ON THE RIDGE, so it is built once and
+    only its diagonal is rewritten between rungs. Each rung is written from a
+    pristine copy of that diagonal rather than added to the last rung's, so no
+    rung can inherit another's penalty. The primal path is bitwise the form it
+    replaces: the ridge is added to the first D diagonal entries only, so the
+    intercept's entry is the untouched Gram value, exactly the `+ 0.0` the old
+    `penalty` matrix gave it. Existing callers' numbers do not move.
+
+    THE INTERCEPT IS NEVER REGULARISED, in either form, and the dual CENTRES
+    `x` ITSELF rather than assuming a centred caller. `fit_probe` does pass
+    standardised features, so assuming it would work in production -- and be
+    wrong by hundreds of map units (485.2 at ridge 1e-1, on features with a
+    mean of 5) for anyone calling `_solve` directly with raw features,
+    silently, since both forms return a plausible array. Ridge with a free
+    intercept is exactly: centre both, solve without an intercept, then recover
+    it as `y.mean(0) - x.mean(0) @ w`.
+
+    THE DUAL WORKS IN FLOAT64 WHATEVER IT IS HANDED, and accepts a 1-D `y`,
+    returning `(D + 1,)` as the primal does. `fit_probe` coerces to float64
+    before it gets here, so neither is reachable from it; a direct caller with
+    float32 features would otherwise get a float32 Gram, and weights that are
+    the right shape and dtype and wrong by 1.8e-4 at ridge 1e-1 and 1.6e-5 at
+    1e3, on 40 rows of 300 features with a mean of 5.
+    """
+    n, d = x.shape
+    solved = []
+    if d < n:
+        design = np.concatenate([x, np.ones((n, 1))], axis=1)
+        gram = design.T @ design
+        moment = design.T @ y
+        diagonal = np.einsum("ii->i", gram)          # a writable view; no np.eye
+        pristine = diagonal[:d].copy()
+        for ridge in ridges:
+            diagonal[:d] = pristine + ridge          # the intercept entry is untouched
+            solved.append(np.linalg.solve(gram, moment))
+        return solved
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    vector = y.ndim == 1
+    if vector:
+        y = y[:, None]
+    x_centre, y_centre = x.mean(0), y.mean(0)
+    # `yc` is numerical hygiene, not part of the answer: the columns of `xc`
+    # sum to zero, so `xc.T @ solve(gram, y)` is the same weights without it.
+    xc, yc = x - x_centre, y - y_centre
+    gram = xc @ xc.T
+    diagonal = np.einsum("ii->i", gram)
+    pristine = diagonal.copy()
+    for ridge in ridges:
+        diagonal[:] = pristine + ridge
+        weights = xc.T @ np.linalg.solve(gram, yc)
+        intercept = (y_centre - x_centre @ weights)[None, :]
+        w = np.concatenate([weights, intercept], axis=0)
+        solved.append(w[:, 0] if vector else w)
+    return solved
+
+
 def _solve(x: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
-    design = np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
-    penalty = ridge * np.eye(design.shape[1])
-    penalty[-1, -1] = 0.0  # never regularise the intercept
-    return np.linalg.solve(design.T @ design + penalty, design.T @ y)
+    """One ridge's weights; see `_solve_ladder` for how they are computed."""
+    return _solve_ladder(x, y, (ridge,))[0]
 
 
-def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) -> dict:
+def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None,
+              ridges: Sequence[float] = RIDGES) -> dict:
     """Standardise the inputs, then SELECT the ridge on held-out data.
 
     Returns a dict carrying the weights and the standardisation, because both
@@ -76,6 +172,21 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) 
     are order 1 -- and measured, that one default cost held-out R^2 0.16 against
     a ceiling of 0.42. Without validation data the fallback is 1e3, the middle
     of the measured optimum, not 1.
+
+    `ridges` is the grid SELECTION searches, defaulting to the shipped `RIDGES`
+    so no existing caller moves. It exists because `RIDGES` steps by 100x and
+    the optimum is interior: measured, the shipped grid selects 1e3 where the
+    best ridge is 177.8 and gives up 0.09-0.11 of scored R^2 for it (n=300,
+    D=150), and +0.011 to +0.021 at n=2000, D=1024-2048 (means over 6 draws;
+    the ranges are in `ceiling.CEILING_RIDGES`'s docstring). That grid is the
+    finer one, and it CONTAINS `RIDGES` bitwise, so passing it adds rungs and
+    moves no existing number. `RIDGES` stays the default because thirteen
+    milestones of recorded numbers came through it.
+
+    SELECTION NEEDS AT LEAST ONE RUNG: an empty `ridges` with held-out data
+    raises `ValueError` rather than failing later on a `None`. A call that does
+    not select (an explicit `ridge=`, or no held-out data) never reads `ridges`,
+    so an empty grid is not an error there.
     """
     x = np.asarray(latents, dtype=np.float64)
     y = np.asarray(targets, dtype=np.float64)
@@ -86,10 +197,15 @@ def fit_probe(latents, targets, val_latents=None, val_targets=None, ridge=None) 
     if val_latents is None:
         return {"w": _solve(xs, y, 1e3), "mean": mean, "scale": scale, "ridge": 1e3}
 
+    if len(ridges) == 0:
+        raise ValueError(
+            "fit_probe: `ridges` is empty, so there is no ridge to select among"
+        )
     xv = (np.asarray(val_latents, dtype=np.float64) - mean) / scale
     best = None
-    for ridge in RIDGES:
-        w = _solve(xs, y, ridge)
+    # One Gram for the whole ladder: it depends on `xs`, not on the ridge, and
+    # recomputing it per rung was five matmuls where one will do.
+    for ridge, w in zip(ridges, _solve_ladder(xs, y, ridges)):
         pred = np.concatenate([xv, np.ones((xv.shape[0], 1))], axis=1) @ w
         score = _mean_r2(pred, val_targets)
         if best is None or score > best[0]:
