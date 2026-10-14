@@ -180,6 +180,15 @@ class SequenceLoader:
         if self.load_features:
             self._features.append(features)
 
+    @property
+    def n_episodes(self) -> int:
+        return len(self._paths)
+
+    @property
+    def rng(self) -> np.random.Generator:
+        """The window-sampling generator (M5a saves and restores its state)."""
+        return self._rng
+
     def episode_path(self, index: int) -> Path:
         """File backing the episode a batch's `episode_index` refers to.
 

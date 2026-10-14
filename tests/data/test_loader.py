@@ -676,3 +676,8 @@ def test_add_checks_feature_geometry(tmp_path):
     loader = SequenceLoader(buf, 4, 8, seed=0, load_features=True, paths=[])
     with pytest.raises(ValueError):
         loader.add(path)
+
+
+def test_loader_exposes_episode_count_and_rng(buffer):
+    loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    assert loader.n_episodes == 4 and loader.rng is loader._rng

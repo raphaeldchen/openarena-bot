@@ -82,3 +82,25 @@ def test_run_episodes_with_random_policy_on_real_basic():
         env.close()
     assert len(eps) == 3 and all(1 <= e["length"] <= 75 for e in eps)
     assert all(e["imagined_return"] is None for e in eps)
+
+
+def test_act_from_features_matches_act():
+    model, agent = _agent()
+    frame = np.zeros((112, 112, 3), dtype=np.uint8)
+    agent.reset(seed=3)
+    a = [agent.act(frame) for _ in range(4)]
+    agent.reset(seed=3)
+    b = [agent.act_from_features(frame) for _ in range(4)]   # cnn kind: features are pixels
+    assert a == b
+
+
+def test_agent_state_round_trips():
+    model, agent = _agent()
+    frame = np.zeros((112, 112, 3), dtype=np.uint8)
+    agent.reset(seed=1)
+    agent.act(frame)
+    s = agent.get_state()
+    agent.act(frame)
+    agent.set_state(s)
+    assert agent.get_state()["last_action"] == s["last_action"]
+    assert torch.equal(agent.get_state()["h"], s["h"])
