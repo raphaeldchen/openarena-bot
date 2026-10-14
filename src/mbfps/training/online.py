@@ -33,6 +33,11 @@ class OnlineConfig:
                 or self.prefill % self.act_steps or self.budget % self.eval_every:
             raise ValueError("prefill, eval_every and budget must align with act_steps "
                              "and budget with eval_every, so every checkpoint is reached exactly")
+        if self.prefill >= self.eval_every or self.prefill >= self.budget:
+            raise ValueError("prefill must be below eval_every and below budget: the step-0 "
+                             "evaluation happens right after the prefill, so it must precede "
+                             "the first checkpoint (else it is mislabelled step 0 and the "
+                             "eval_every checkpoint is never evaluated)")
 
 
 def checkpoint_steps(cfg: OnlineConfig) -> list[int]:

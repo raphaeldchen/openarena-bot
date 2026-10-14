@@ -3,7 +3,7 @@ import pytest
 from mbfps.eval.efficiency import auc, pairwise_wins, run_problems, steps_to_threshold, verdict
 from mbfps.training.online import OnlineConfig
 
-CFG = OnlineConfig(budget=30, prefill=10, act_steps=10, eval_every=10, eval_seeds=(1, 2))
+CFG = OnlineConfig(budget=30, prefill=5, act_steps=5, eval_every=10, eval_seeds=(1, 2))
 
 
 def _rec(arm="dreamer", curve=(-160.0, 10.0, 60.0, 70.0), step0=-170.0, random=-165.0,

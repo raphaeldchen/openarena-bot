@@ -206,3 +206,17 @@ def test_delete_keeps_a_non_finite_value_in_the_record(tmp_path):
     delete_replay_features(tmp_path, TINY)
     out = load_record(tmp_path / "record.json")
     assert np.isnan(out["evals"][0]["diagnostics"]["probe"])
+
+
+@pytest.mark.parametrize("kw", [
+    dict(budget=3000, prefill=1000, act_steps=100, eval_every=1000),
+    dict(budget=1000, prefill=1000, act_steps=100, eval_every=1000),
+])
+def test_prefill_must_precede_the_first_checkpoint(kw):
+    with pytest.raises(ValueError, match="step-0"):
+        OnlineConfig(**kw)
+
+
+def test_default_and_tiny_configs_construct():
+    assert OnlineConfig().prefill < OnlineConfig().eval_every
+    assert TINY.prefill < TINY.eval_every
