@@ -78,7 +78,7 @@ def test_eval_policies_put_the_gated_mode_first(tmp_path):
     assert list(d.eval_policies())[0] == d.gated_mode == "sample"
     assert list(q.eval_policies())[0] == q.gated_mode == "greedy"
     assert set(d.eval_policies()) == {"sample", "argmax"}
-    assert set(q.eval_policies()) == {"greedy", "eps0.05"}
+    assert set(q.eval_policies()) == {"greedy", "eps0_05"}
 
 
 def test_dqn_behaviour_policy_follows_the_schedule(tmp_path):

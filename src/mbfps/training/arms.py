@@ -164,7 +164,7 @@ class DQNArm:
         k = self.cfg.frame_stack
         return {"greedy": EpsilonGreedyQPolicy(self.q, self.encode, self.device, lambda: 0.0,
                                                frame_stack=k, name="dqn_greedy"),
-                "eps0.05": EpsilonGreedyQPolicy(self.q, self.encode, self.device, lambda: 0.05,
+                "eps0_05": EpsilonGreedyQPolicy(self.q, self.encode, self.device, lambda: 0.05,
                                                 frame_stack=k, name="dqn_eps")}
 
     def diagnostics(self) -> dict:
