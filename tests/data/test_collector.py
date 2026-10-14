@@ -286,3 +286,10 @@ def test_malformed_obs_is_not_reported_as_an_engine_crash():
         c.collect_episode(seed=0)
     assert c.crash_count == 0
     c.close()
+
+
+def test_privileged_row_is_module_level():
+    from mbfps.data.collector import privileged_row
+    row = privileged_row({"a": 1.0, "b": 2.0}, ("a", "b"), previous=None)
+    assert row.tolist() == [1.0, 2.0]
+    assert privileged_row(None, ("a", "b"), previous=row).tolist() == [1.0, 2.0]
