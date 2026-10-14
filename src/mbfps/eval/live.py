@@ -90,6 +90,22 @@ def run_episodes(env, policy, seeds) -> list[dict]:
     return episodes
 
 
+def seed_mismatches(record: dict, steps=None) -> list[str]:
+    """Names of the episode lists whose per-episode seeds differ from `record["seeds"]`.
+
+    The paired gate subtracts the random policy's return from the agent's seed by seed;
+    a list in a different order (or over different seeds) pairs the wrong episodes.
+    Checks `random`, `untrained`, and `sample`/`argmax` of each rung in `steps` (default
+    every rung the record holds).
+    """
+    lists = {"random": record["random"], "untrained": record["untrained"]}
+    for step in (record["rungs"] if steps is None else steps):
+        for mode, episodes in record["rungs"][step].items():
+            lists[f"rung {step} {mode}"] = episodes
+    return [name for name, episodes in lists.items()
+            if [e["seed"] for e in episodes] != record["seeds"]]
+
+
 def paired_gate(agent_returns, random_returns, resamples: int = RESAMPLES, seed: int = 0) -> dict:
     """§5.5: the mean per-seed difference, bootstrapped over seeds."""
     d = np.asarray(agent_returns, dtype=np.float64) - np.asarray(random_returns, dtype=np.float64)

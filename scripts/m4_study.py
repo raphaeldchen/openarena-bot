@@ -6,7 +6,13 @@ run    one arm at a time, so its feature cache can be cleared before the next
 read   every cell's entry and live readings, and the §6.2 cross-arm reading:
        arm X ranks above arm Y only if every seed of X beats every seed of Y.
 
-Exit codes (read): 0 all nine cells present and read; 80 MISSING_CELLS.
+Exit codes (read): 0 all nine cells present and valid; 80 MISSING_CELLS; 81 INVALID_CELLS.
+A cell is invalid when its live record lacks the final rung, when its episode seeds are
+not `live["seeds"]` in order (random, untrained, and the final rung's sample and argmax),
+when its training record's `isolation_ok` is not True (spec §5.5), or when its untrained
+control passes the paired gate (spec §5.6: the evaluation is broken). Invalid cells are
+listed on an INVALID_CELLS line and the §6.2 cross-arm reading is withheld. Missing cells
+(80) take precedence: with both, the exit code is 80 and only MISSING_CELLS is printed.
 """
 
 import argparse
@@ -24,7 +30,7 @@ FINAL_STEP = 10_000
 PIXEL_AE_BASIC = Path("runs/m2_basic/autoencoder_cnn.pt")
 """The autoencoder Stage C trains on `basic` and writes the pixel_ae cache with.
 Live evaluation must encode with the same one (Task 12's --pixel-ae-checkpoint)."""
-EXIT_OK, EXIT_MISSING_CELLS = 0, 80
+EXIT_OK, EXIT_MISSING_CELLS, EXIT_INVALID_CELLS = 0, 80, 81
 
 
 def separation(scores: dict) -> dict:
@@ -89,10 +95,10 @@ def run(args) -> int:
 
 def read(args) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from mbfps.eval.live import paired_gate
+    from mbfps.eval.live import paired_gate, seed_mismatches
     from mbfps.eval.study import load_record
 
-    missing, scores, lines = [], {arm: [] for arm in ARMS}, ["M4 Stage C -- 3 arms x 3 seeds"]
+    missing, invalid, scores, lines = [], [], {arm: [] for arm in ARMS}, ["M4 Stage C -- 3 arms x 3 seeds"]
     for arm in ARMS:
         for seed in SEEDS:
             p = _paths(args.runs, arm, seed)
@@ -101,21 +107,39 @@ def read(args) -> int:
                 missing.append(f"{arm}/seed{seed}: {absent}")
                 continue
             entry, live, train = load_record(p["entry"]), load_record(p["live"]), load_record(p["train"])
+            cell = f"{arm}/seed{seed}"
+            if str(FINAL_STEP) not in live["rungs"]:
+                invalid.append(f"{cell}: no rung {FINAL_STEP} in {sorted(live['rungs'], key=int)}")
+                lines.append(f"  {arm:<11s} s{seed}  INVALID: no rung {FINAL_STEP}")
+                continue
             final = live["rungs"][str(FINAL_STEP)]["sample"]
             rand = [e["return"] for e in live["random"]]
             gate = paired_gate([e["return"] for e in final], rand)
             control = paired_gate([e["return"] for e in live["untrained"]], rand)
             score = float(np.mean([e["return"] for e in final]))
-            scores[arm].append(score)
             iv = entry["imagined"]
+            reasons = []
+            if (bad := seed_mismatches(live, steps=[str(FINAL_STEP)])):
+                reasons.append(f"episode seeds differ from the record's seeds in {bad}")
+            if train.get("isolation_ok") is not True:
+                reasons.append(f"isolation_ok is {train.get('isolation_ok')}")
+            if control["passed"]:
+                reasons.append("untrained control passes the gate")
+            if reasons:
+                invalid.append(f"{cell}: " + ", ".join(reasons))
+            else:
+                scores[arm].append(score)
             lines.append(
                 f"  {arm:<11s} s{seed}  score {score:+8.2f}  gate {gate['point']:+7.2f} "
                 f"[{gate['ci_low']:+7.2f},{gate['ci_high']:+7.2f}] {'PASS' if gate['passed'] else 'fail'}"
                 f"  control {'BROKEN' if control['passed'] else 'ok'}"
                 f"  isolation {train.get('isolation_ok')}"
-                f"  entry {entry['verdict']} (R {iv['return']['ci_low']:+.3f}, C {iv['continue']['ci_low']:+.3f})")
+                f"  entry {entry['verdict']} (R {iv['return']['ci_low']:+.3f}, C {iv['continue']['ci_low']:+.3f})"
+                + (f"  INVALID: {'; '.join(reasons)}" if reasons else ""))
     if missing:
         lines.append("MISSING_CELLS: " + "; ".join(missing))
+    elif invalid:
+        lines.append("INVALID_CELLS: " + "; ".join(invalid))
     else:
         lines.append("cross-arm reading (9 of 9 pairwise wins to rank):")
         for (a, b), verdict in separation(scores).items():
@@ -125,7 +149,7 @@ def read(args) -> int:
     text = "\n".join(lines) + "\n"
     (out / "study.txt").write_text(text)
     print(text, end="")
-    return EXIT_MISSING_CELLS if missing else EXIT_OK
+    return EXIT_MISSING_CELLS if missing else EXIT_INVALID_CELLS if invalid else EXIT_OK
 
 
 def main(argv=None) -> int:

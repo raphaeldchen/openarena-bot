@@ -26,7 +26,7 @@ import torch
 
 from mbfps.data.policies import RandomPolicy
 from mbfps.envs.registry import make_env
-from mbfps.eval.live import EVAL_SEEDS, AgentPolicy, paired_gate, run_episodes
+from mbfps.eval.live import EVAL_SEEDS, AgentPolicy, paired_gate, run_episodes, seed_mismatches
 from mbfps.eval.study import git_sha, load_record, write_record
 from mbfps.models.encoders import encoder_backbone
 from mbfps.models.heads import Actor, Critic
@@ -132,12 +132,7 @@ def read(args) -> int:
     if key not in record["rungs"]:
         print(f"MISSING: rung {key} not in {sorted(record['rungs'])}")
         return EXIT_MISSING
-    lists = {"random": record["random"], "untrained": record["untrained"]}
-    for step, modes in record["rungs"].items():
-        for mode, episodes in modes.items():
-            lists[f"rung {step} {mode}"] = episodes
-    bad = [name for name, episodes in lists.items()
-           if [e["seed"] for e in episodes] != record["seeds"]]
+    bad = seed_mismatches(record)
     if bad:
         print(f"SEED_MISMATCH: episode seeds differ from the record's seeds in {bad}")
         return EXIT_SEED_MISMATCH
