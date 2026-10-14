@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -6,7 +9,12 @@ from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.episode import Episode
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.models.rssm import KL_FREE_BITS
-from mbfps.training.world_model import WorldModel, history_at, train_world_model
+from mbfps.training.world_model import (
+    WorldModel,
+    history_at,
+    train_world_model,
+    world_model_step,
+)
 from mbfps.utils.config import ARMS, get_config
 from mbfps.utils.seeding import seed_everything
 
@@ -1228,3 +1236,24 @@ def test_m3_payload_loads_with_defaults(tmp_path, buffer):
     model = load_world_model(path, torch.device("cpu"))
     assert (model.cfg.train.n_actions, model.cfg.train.reward_transform,
             model.cfg.train.pad_short) == (6, "identity", False)
+
+
+WM_GOLDEN = Path(__file__).parent / "fixtures" / "wm_golden_m3.json"
+
+
+def test_train_world_model_reproduces_golden_losses(buffer):
+    h = train_world_model(get_config("cnn", steps=4, seq_len=16, batch_size=4, device="cpu"),
+                          buffer, out_dir=None, log_every=0)
+    assert h["loss"] == json.loads(WM_GOLDEN.read_text())["loss"]
+
+
+def test_world_model_step_updates_and_clears_grads(buffer):
+    seed_everything(0)
+    model = WorldModel(get_config("cnn", seq_len=16, batch_size=4, device="cpu"))
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+    before = [p.detach().clone() for p in model.parameters()]
+    batch = to_device(SequenceLoader(buffer, 4, 16, seed=0).sample(), torch.device("cpu"))
+    loss, parts = world_model_step(model, opt, batch)
+    assert isinstance(loss, float) and "embedding" in parts
+    assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters()))
+    assert all(p.grad is None for p in model.parameters())
