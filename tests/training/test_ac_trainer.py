@@ -153,3 +153,24 @@ def test_cpu_never_touches_mps_cache(world, monkeypatch):
     cfg = ACConfig(updates=2, checkpoint_every=2, batch_size=4, seq_len=16, device="cpu")
     train_actor_critic(model, buf, cfg, out_dir=None, log_every=0)
     assert calls == []
+
+
+def test_amendment_flags_default_off():
+    cfg = ACConfig()
+    assert cfg.bound_reward_readout is False and cfg.drop_terminal_starts is False
+
+
+def test_drop_terminal_removes_terminated_keeps_truncated(world):
+    buf, model = world
+    batch = SequenceLoader(buf, batch_size=4, seq_len=16, seed=0, pad_short=True,
+                           load_obs=True).sample()
+    batch["mask"][:] = True
+    batch["terminated"][:] = False
+    batch["truncated"][:] = False
+    batch["terminated"][0, 3] = True
+    batch["truncated"][1, 5] = True
+    dev = to_device(batch, torch.device("cpu"))
+    h_all, _ = start_states(model, dev)
+    h_drop, _ = start_states(model, dev, drop_terminal=True)
+    assert h_all.shape[0] == 4 * 16
+    assert h_drop.shape[0] == 4 * 16 - 1          # only the terminated one

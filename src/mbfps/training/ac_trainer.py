@@ -47,6 +47,12 @@ class ACConfig:
     seed: int = 0
     device: str = "mps"
     grad_clip: float = 100.0
+    bound_reward_readout: bool = False
+    """M5a §4.3: clip the reward head to the observed reward range before the
+    inverse transform. Off reproduces M4."""
+    drop_terminal_starts: bool = False
+    """M5a §4.3: never start imagination at a terminated transition. Off
+    reproduces M4."""
 
     def __post_init__(self) -> None:
         if self.checkpoint_every < 1 or self.updates % self.checkpoint_every:
@@ -105,10 +111,17 @@ def freeze(world_model: nn.Module) -> None:
 
 
 @torch.no_grad()
-def start_states(world_model, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Posterior `(h, z)` at every masked-in position of `batch`."""
+def start_states(
+    world_model, batch: dict, drop_terminal: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Posterior `(h, z)` at every masked-in position of `batch`.
+
+    `drop_terminal` (M5a §4.3) also excludes positions whose transition
+    terminated the episode; truncated (time-limit) positions are kept."""
     out = world_model.rssm.observe(world_model.embed(batch), batch["actions"])
     mask = batch["mask"].bool()
+    if drop_terminal:
+        mask = mask & ~batch["terminated"].bool()
     return out["h"][mask], out["z"][mask]
 
 
