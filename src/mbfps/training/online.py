@@ -230,15 +230,18 @@ def delete_replay_features(out_dir: Path, cfg: OnlineConfig) -> int:
     problems = verify_record(record, cfg)
     if problems:
         raise ValueError("refusing to delete replay features: " + "; ".join(problems))
-    victims = sorted((out_dir / "replay").glob("*.features*.npy"))
+    features = sorted((out_dir / "replay").glob("*.features*.npy"))
     state = out_dir / "state.pt"
-    if state.exists():
-        victims.append(state)
-    for path in victims:
-        path.unlink()
-    record["replay_features_deleted"] = True
+    victims = ([state] if state.exists() else []) + features
+    # Flag the record first: a crash after this leaves a flagged run that can be
+    # deleted again (idempotent), never a deleted run whose record says otherwise.
     # load_record restores the NaN/inf floats but leaves the map that recorded
     # them in the dict; write_record rebuilds that map and refuses a stale one.
+    record["replay_features_deleted"] = True
     record.pop(NONFINITE_KEY, None)
     write_record(record_path, record)
+    # state.pt goes first, so a crash between the unlinks leaves no resume state
+    # pointing at features that are gone.
+    for path in victims:
+        path.unlink()
     return len(victims)

@@ -53,3 +53,25 @@ def test_isolation_required_for_dreamer_only():
 def test_steps_to_threshold():
     assert steps_to_threshold(_rec(), CFG) == 20
     assert steps_to_threshold(_rec(curve=(-160, 1, 2, 3)), CFG) is None
+
+
+def test_gated_mode_is_pinned_to_the_arm():
+    bad = _rec(arm="dqn")
+    bad["gated_mode"] = "eps0_05"
+    for e in bad["evals"]:
+        e["modes"]["eps0_05"] = e["modes"]["greedy"]
+    assert any("gated mode" in p for p in run_problems(bad, CFG))
+    swapped = _rec()
+    swapped["gated_mode"] = "greedy"
+    for e in swapped["evals"]:
+        e["modes"]["greedy"] = e["modes"]["sample"]
+    assert any("gated mode" in p for p in run_problems(swapped, CFG))
+    unknown = _rec()
+    unknown["arm"] = "ppo"
+    assert any("arm" in p for p in run_problems(unknown, CFG))
+
+
+def test_run_identity_is_checked_when_given():
+    assert run_problems(_rec(), CFG, arm="dreamer", seed=0) == []
+    assert any("seed" in p for p in run_problems(_rec(), CFG, arm="dreamer", seed=3))
+    assert any("arm" in p for p in run_problems(_rec(), CFG, arm="dqn", seed=0))

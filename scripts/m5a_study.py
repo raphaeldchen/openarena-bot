@@ -16,7 +16,7 @@ import numpy as np
 from mbfps.eval.efficiency import (ARMS, SEEDS, auc, gated_returns, pairwise_wins,
                                    run_problems, steps_to_threshold, verdict)
 from mbfps.eval.study import load_record
-from mbfps.training.online import OnlineConfig, checkpoint_steps
+from mbfps.training.online import OnlineConfig, checkpoint_steps, verify_record
 
 ROOT = Path(__file__).resolve().parent
 EXIT_OK, EXIT_MISSING_RUNS, EXIT_INVALID_RUNS = 0, 90, 91
@@ -26,11 +26,21 @@ def _record_path(runs: Path, arm: str, seed: int) -> Path:
     return runs / f"{arm}_seed{seed}" / "record.json"
 
 
+def _done(path: Path) -> bool:
+    """A verified record whose resume state is gone is finished: train_online
+    refuses to start over it, so it must never be relaunched. A verified
+    record whose state.pt remains is relaunched, to resume and delete."""
+    if not path.exists():
+        return False
+    return not verify_record(load_record(path), OnlineConfig()) \
+        and not (path.parent / "state.pt").exists()
+
+
 def run(args) -> int:
     for seed in args.seeds:
         for arm in args.arms:
             path = _record_path(args.runs, arm, seed)
-            if path.exists() and load_record(path).get("replay_features_deleted"):
+            if _done(path):
                 print(f"skip (done): {arm} seed {seed}")
                 continue
             cmd = [sys.executable, str(ROOT / "train_online.py"), "--arm", arm,
@@ -56,7 +66,7 @@ def read(args) -> int:
             if rec.get("complete") is not True:
                 missing.append(f"{arm}_seed{seed} (incomplete)")
                 continue
-            problems = run_problems(rec, cfg)
+            problems = run_problems(rec, cfg, arm, seed)
             if problems:
                 invalid.append(f"{arm}_seed{seed}: " + "; ".join(problems))
             else:

@@ -1,5 +1,6 @@
 import json
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -170,6 +171,26 @@ def test_delete_removes_features_and_state_only(tmp_path):
     assert not (tmp_path / "state.pt").exists()
     assert len(list((tmp_path / "replay").glob("ep_*.npz"))) == n_npz
     assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
+
+
+def test_delete_flags_the_record_and_drops_state_before_any_feature(tmp_path, monkeypatch):
+    _run(tmp_path)
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *a, **k):
+        if ".features" in self.name:
+            raise OSError("simulated crash")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    with pytest.raises(OSError, match="simulated"):
+        delete_replay_features(tmp_path, TINY)
+    monkeypatch.undo()
+    assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
+    assert not (tmp_path / "state.pt").exists()
+    assert list((tmp_path / "replay").glob("*.features*.npy"))
+    delete_replay_features(tmp_path, TINY)            # idempotent: finishes the job
+    assert not list((tmp_path / "replay").glob("*.features*.npy"))
 
 
 def test_verify_flags_a_reordered_eval(tmp_path):

@@ -9,6 +9,7 @@ ARMS: tuple[str, ...] = ("dreamer", "dqn")
 SEEDS: tuple[int, ...] = (0, 1, 2, 3, 4)
 WIN_BAR: float = 21.0
 THRESHOLD: float = 50.0
+GATED_MODES = {"dreamer": "sample", "dqn": "greedy"}   # pre-registered (§7.1)
 VERDICTS = ("DREAMER_MORE_EFFICIENT", "DQN_MORE_EFFICIENT", "NOT_SEPARATED")
 
 
@@ -39,9 +40,23 @@ def verdict(dreamer_aucs, dqn_aucs) -> str:
     return "NOT_SEPARATED"
 
 
-def run_problems(record: dict, cfg: OnlineConfig) -> list[str]:
-    """§7.3: everything that makes a run invalid; [] if it is valid."""
-    problems = verify_record(record, cfg)
+def run_problems(record: dict, cfg: OnlineConfig, arm: str | None = None,
+                 seed: int | None = None) -> list[str]:
+    """§7.3: everything that makes a run invalid; [] if it is valid.
+
+    `arm` and `seed` are the identity the record was read from; a record that
+    claims another is invalid."""
+    problems = []
+    if arm is not None and record.get("arm") != arm:
+        problems.append(f"record arm {record.get('arm')!r} != {arm!r}")
+    if seed is not None and record.get("seed") != seed:
+        problems.append(f"record seed {record.get('seed')!r} != {seed!r}")
+    if record.get("arm") not in GATED_MODES:
+        problems.append(f"unknown arm {record.get('arm')!r}")
+    elif record.get("gated_mode") != GATED_MODES[record["arm"]]:
+        problems.append(f"gated mode {record.get('gated_mode')!r} != "
+                        f"{GATED_MODES[record['arm']]!r} for {record['arm']}")
+    problems += verify_record(record, cfg)
     if problems:
         return problems
     random_returns = [float(e["return"]) for e in record["random"]]
