@@ -5,7 +5,7 @@ bit-identical to an uninterrupted run (§3.4)."""
 
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +14,7 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.policies import RandomPolicy
 from mbfps.eval.live import EVAL_SEEDS, run_episodes
-from mbfps.eval.study import NONFINITE_KEY, git_sha, load_record, write_record
+from mbfps.eval.study import git_sha, write_record
 from mbfps.training.arms import DQNArm, DreamerArm
 from mbfps.training.online_rollout import OnlineRollout
 
@@ -63,6 +63,27 @@ def _set_rng_state(state: dict, device) -> None:
         torch.mps.set_rng_state(state["mps"])
 
 
+def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict) -> dict:
+    """What identifies a run. A dataclass kwarg (DQNConfig) is stored by value."""
+    kwargs = {k: asdict(v) if is_dataclass(v) else v for k, v in arm_kwargs.items()}
+    return {"arm": arm_name, "seed": seed, "cfg": asdict(cfg), "arm_kwargs": kwargs}
+
+
+def _prune_replay(root: Path, keep: set[str]) -> None:
+    """Delete every episode file (and its feature caches) whose stem is not in `keep`.
+
+    Episodes written after the last checkpoint by a process that then died are
+    orphans: the saved state never counted them, so a resume would otherwise
+    re-add them at the next checkpoint and diverge from an uninterrupted run.
+    Run this before the ReplayBuffer is built so its index counter restarts
+    where the uninterrupted run's was.
+    """
+    for pattern in ("ep_*.npz", "ep_*.features*.npy"):
+        for path in root.glob(pattern):
+            if path.name.split(".")[0] not in keep:
+                path.unlink(missing_ok=True)
+
+
 def _evaluate(arm, env, seeds) -> dict:
     return {mode: run_episodes(env, policy, seeds) for mode, policy in arm.eval_policies().items()}
 
@@ -79,8 +100,26 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         raise RuntimeError(f"{out_dir} already holds record.json but no state.pt: the run "
                            "is finished and its resumable state was removed; refusing to "
                            "start a fresh run on top of its replay")
-    replay = ReplayBuffer(out_dir / "replay", capacity_transitions=10**9)
-    arm = _make_arm(arm_name, seed, device, encode, replay, arm_kwargs or {})
+    arm_kwargs = arm_kwargs or {}
+    meta = _meta(arm_name, seed, cfg, arm_kwargs)
+    saved = None
+    if state_path.exists():
+        # weights_only=False: the state holds NumPy RNG states and frame stacks,
+        # which the restricted unpickler refuses. The file is written only by
+        # `_checkpoint` below, into this run's own directory, and never shipped.
+        saved = torch.load(state_path, weights_only=False)
+        if saved["meta"] != meta:
+            raise RuntimeError(f"{out_dir} holds a run that differs from this call: saved "
+                               f"{saved['meta']}, called with {meta}")
+    replay_dir = out_dir / "replay"
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    # state.pt is the source of truth. Anything in replay/ it does not list was
+    # written by a process that died after the last checkpoint (or during the
+    # prefill, when there is no state yet); drop it before the buffer counts it.
+    _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
+                  if saved else set())
+    replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
+    arm = _make_arm(arm_name, seed, device, encode, replay, arm_kwargs)
     train_env, eval_env = env_factory(), env_factory()
     rollout = OnlineRollout(train_env, encode, replay, run_seed=seed,
                             on_episode=arm.add_episode, policy_name=arm.name)
@@ -88,22 +127,16 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
     timing = {"act": 0.0, "train": 0.0, "eval": 0.0}
     seeds = list(cfg.eval_seeds)
 
-    if state_path.exists():
-        # weights_only=False: the state holds NumPy RNG states and frame stacks,
-        # which the restricted unpickler refuses. The file is written only by
-        # `_checkpoint` below, into this run's own directory, and never shipped.
-        saved = torch.load(state_path, weights_only=False)
+    if saved is not None:
         for path in saved["replay_paths"]:
-            arm.add_episode(Path(path))
+            arm.add_episode(replay_dir / Path(path).name)
         arm.load_state_dict(saved["arm"])
         rollout.restore(saved["rollout"], policy)
         if saved["policy"] is not None:
             policy.set_state(saved["policy"])
         _set_rng_state(saved["rng"], device)
-        record = load_record(record_path)
-        record.pop(NONFINITE_KEY, None)    # write_record re-derives it and refuses a stale one
-        update_rounds = record["update_rounds"]
-        timing = record["timing"]
+        record, update_rounds, timing = saved["record"], saved["update_rounds"], saved["timing"]
+        write_record(record_path, record)   # record.json is a derived copy; resync it
     else:
         prefill_policy = RandomPolicy(4, seed=seed)
         rollout.policy_name = "random"
@@ -122,7 +155,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
                                 "diagnostics": arm.diagnostics(), "update_rounds": 0})
         timing["eval"] += time.perf_counter() - t0
         _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, device,
-                    state_path, record_path)
+                    state_path, record_path, meta)
 
     while rollout.budget_step < cfg.budget:
         if stop_after_step is not None and rollout.budget_step >= stop_after_step:
@@ -147,12 +180,12 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
             timing["eval"] += time.perf_counter() - t0
             record["complete"] = rollout.budget_step == cfg.budget
             _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, device,
-                        state_path, record_path)
+                        state_path, record_path, meta)
     return record
 
 
 def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, device,
-                state_path: Path, record_path: Path) -> None:
+                state_path: Path, record_path: Path, meta: dict) -> None:
     record.update({"budget_steps": rollout.budget_step, "update_rounds": update_rounds,
                    "isolation_ok": arm.isolation_ok, "timing": dict(timing),
                    "seconds": sum(timing.values()), "git_sha": git_sha()})
@@ -160,6 +193,7 @@ def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, dev
     torch.save({"arm": arm.state_dict(), "rollout": rollout.state(),
                 "policy": policy.get_state() if rollout.in_progress else None,
                 "replay_paths": [str(p) for p in replay.episode_paths()],
-                "rng": _rng_state(device)}, tmp)
+                "rng": _rng_state(device), "meta": meta, "record": record,
+                "update_rounds": update_rounds, "timing": dict(timing)}, tmp)
     tmp.replace(state_path)
     write_record(record_path, record)

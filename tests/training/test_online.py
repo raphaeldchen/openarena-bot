@@ -1,4 +1,5 @@
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -47,16 +48,83 @@ def test_prefill_cuts_at_exactly_the_prefill_step(tmp_path):
     assert load_episode(first_arm).policy_name == "dreamer"
 
 
-def test_resume_is_bit_identical(tmp_path):
-    full = _run(tmp_path / "full")
-    part = _run(tmp_path / "resumed", stop=20)
+def _strip(r):
+    return json.dumps({k: v for k, v in r.items() if k not in ("seconds", "timing", "git_sha")},
+                      sort_keys=True)
+
+
+def _kw(arm):
+    return {"cfg": DQNConfig(batch_size=8)} if arm == "dqn" else None
+
+
+def _replay(d):
+    return sorted(p.name for p in (d / "replay").iterdir())
+
+
+def _stored(d):
+    return sum(load_episode(p).length for p in (d / "replay").glob("ep_*.npz"))
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_resume_is_bit_identical(tmp_path, arm):
+    full = _run(tmp_path / "full", arm, kw=_kw(arm))
+    part = _run(tmp_path / "resumed", arm, stop=20, kw=_kw(arm))
     assert part["complete"] is False
-    resumed = _run(tmp_path / "resumed")
-    strip = lambda r: {k: v for k, v in r.items() if k not in ("seconds", "timing", "git_sha")}
-    assert json.dumps(strip(full), sort_keys=True) == json.dumps(strip(resumed), sort_keys=True)
-    a = torch.load(tmp_path / "full" / "state.pt", weights_only=False)["arm"]["world_model"]
-    b = torch.load(tmp_path / "resumed" / "state.pt", weights_only=False)["arm"]["world_model"]
+    resumed = _run(tmp_path / "resumed", arm, kw=_kw(arm))
+    assert _strip(full) == _strip(resumed)
+    a = torch.load(tmp_path / "full" / "state.pt", weights_only=False)["arm"]["world_model" if arm == "dreamer" else "q"]
+    b = torch.load(tmp_path / "resumed" / "state.pt", weights_only=False)["arm"]["world_model" if arm == "dreamer" else "q"]
     assert all(torch.equal(a[k], b[k]) for k in a)
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_resume_after_a_crash_between_checkpoints(tmp_path, arm):
+    full = _run(tmp_path / "full", arm, kw=_kw(arm))
+    d = tmp_path / "crash"
+    _run(d, arm, stop=20, kw=_kw(arm))
+    shutil.copy(d / "state.pt", tmp_path / "state20.pt")
+    shutil.copy(d / "record.json", tmp_path / "record20.json")
+    _run(d, arm, stop=40, kw=_kw(arm))              # the process that then dies
+    shutil.copy(tmp_path / "state20.pt", d / "state.pt")
+    shutil.copy(tmp_path / "record20.json", d / "record.json")
+    _run(d, arm, stop=40, kw=_kw(arm))
+    resumed = _run(d, arm, kw=_kw(arm))
+    assert _strip(full) == _strip(resumed)
+    assert _stored(d) == 60
+    assert _replay(d) == _replay(tmp_path / "full")
+
+
+def test_crash_during_prefill_leaves_no_trace(tmp_path):
+    full = _run(tmp_path / "full")
+    d = tmp_path / "crash"
+    shutil.copytree(tmp_path / "full" / "replay", d / "replay")   # partial replay, no state.pt
+    (d / "replay" / "ep_000000_len00010.features_dummy.npy").write_bytes(b"x")
+    resumed = _run(d)
+    assert _strip(full) == _strip(resumed)
+    assert _stored(d) == 60
+    assert _replay(d) == _replay(tmp_path / "full")
+
+
+def test_state_is_the_source_of_truth_over_record_json(tmp_path):
+    _run(tmp_path, stop=20)
+    (tmp_path / "record.json").write_text("{}")      # out of step with state.pt
+    full = _run(tmp_path / "ref")
+    assert _strip(_run(tmp_path)) == _strip(full)
+    assert load_record(tmp_path / "record.json")["complete"] is True
+
+
+@pytest.mark.parametrize("change", [{"seed": 1}, {"cfg": OnlineConfig(
+    budget=60, prefill=10, act_steps=10, rounds_per_act=2, eval_every=30,
+    eval_seeds=TINY.eval_seeds)}, {"arm_kwargs": {"batch_size": 4, "seq_len": 8}}])
+def test_resume_refuses_a_different_run(tmp_path, change):
+    _run(tmp_path, stop=20)
+    call = dict(arm_name="dreamer", seed=0, out_dir=tmp_path, env_factory=FakeEnv,
+                encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=DREAMER_KW)
+    call.update(change)
+    n = _replay(tmp_path)
+    with pytest.raises(RuntimeError, match="differs"):
+        train_online(**call)
+    assert _replay(tmp_path) == n
 
 
 def test_evaluation_steps_never_enter_the_replay(tmp_path):
