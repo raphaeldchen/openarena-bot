@@ -3712,3 +3712,283 @@ What the sign does and does not mean. §5.5 names a large **positive** gap as th
 - The gate shows the agent's mean return exceeds a uniform-random policy's on `basic`. It does not show the agent is a strong policy: no scripted or other non-random baseline was evaluated here, and the return difference is largely random's truncated episodes (see "Per-seed facts").
 - Whether the flat learning curve reflects a quickly saturated task, a ceiling set by the environment, or the learning rate was not tested; no ablation was run.
 - No claim is made about the world model's accuracy from the imagined-vs-real gap.
+
+## Stage C results
+
+Run on 2026-10-11 to 2026-10-13: the 3 x 3 study of spec §6, arms `frozen_ssl`, `pixel_ae`, `random_vit` x seeds 0, 1, 2, scenario `basic`, 4 actions, symlog reward head, the fixed dataset `data/basic` (1,200 episodes, Stage A). Branch `claude/project-recap-ba6e4a`. Paths are worktree-relative; `runs` and `data` are symlinks into the main checkout (ledger ruling R2). The ledger is `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/progress.md` (lines beginning `Task 15:`); run logs are in `.superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/` and `runs/`. Python below means `PYTHONPATH=src /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python` (ruling R1); `python3` with no `PYTHONPATH` is used only where a command needs no repository import. Everything was executed by the controller (ruling R5).
+
+### Verdict
+
+**Stage C gate (§6.3) met; the §6.2 reading is `NOT_SEPARATED` for all three pairs. Exit code 0.** All nine cells are present, once each (`ls runs/m4c_entry runs/m4c_world/*.pt runs/m4c_agent` list nine entry records, nine world models, nine agent directories); every cell's live gate, untrained control, `isolation_ok` and entry readings are reported below; the cross-arm reading is printed. Every cell passes the §5.5 live gate (`ci_low` > 0), every control fails it as §5.6 requires, every cell has `isolation_ok` True, and every cell has entry verdict `ENTRY_PASS`.
+
+```
+frozen_ssl vs pixel_ae: NOT_SEPARATED
+frozen_ssl vs random_vit: NOT_SEPARATED
+pixel_ae vs random_vit: NOT_SEPARATED
+```
+
+- Record: `runs/m4c_study/read.log` (identical to `runs/m4c_study/study.txt`); the exit code is the ledger line `Task 15: step 6: read exit 0`.
+- Re-derive, into a scratch directory so the records are not rewritten (the read writes `study.txt` under its `--runs` directory):
+
+```bash
+D=$(mktemp -d); mkdir -p "$D/m4c_entry" "$D/m4c_agent"; cp runs/m4c_entry/*.json "$D/m4c_entry/"
+for d in runs/m4c_agent/*; do mkdir -p "$D/m4c_agent/$(basename $d)"; cp $d/*.json "$D/m4c_agent/$(basename $d)/"; done
+python scripts/m4_study.py --phase read --runs "$D" > "$D/second.txt"; echo $?
+diff runs/m4c_study/read.log "$D/second.txt" && echo byte-identical
+```
+
+At write time this printed exit `0` and `byte-identical`. The read is a pure function of the 9 entry, 9 train and 9 live JSONs; it does not re-run the live episodes.
+
+**`NOT_SEPARATED` is a result, not a failure** (§6.3: "Stage C does **not** require any arm to pass Stage B or to separate"; §6.2 calls it "a legitimate, reportable result"). What it licenses: on `basic`, with 3 seeds per arm, 100 evaluation seeds, and the score defined as mean live return at update 10,000, **no arm ranks above another** under the pre-registered 9-of-9 rule. What it does not license: it does not establish that the arms are equal or equivalent. No equivalence test or margin was pre-registered or run; the rule can only detect complete separation, and the absence of complete separation at 3 vs 3 is what is reported. The pairwise win counts below are descriptive and carry no p-value.
+
+### Commits, suite, and what ran where
+
+| item | value | source |
+|---|---|---|
+| suite | 3113 passed, 0 failed, 2582.48 s (0:43:02), at `2535828` | `tail -1 .superpowers/sdd/2026-10-10-mb-fps-m4-actor-critic/runlogs/m4b_suite.log` prints `3113 passed in 2582.48s (0:43:02)`; the commit is from the ledger (`Task 13: step 1`) and ruling R9 |
+| covering tests for the MPS fix | `tests/training/test_ac_trainer.py` + `tests/models`, 124 passed, at `0a9506d` | ruling R9 (ledger only; not in a run log) |
+| commit the 36 Stage C records carry | `e235d07` | `python3 -c "import json,glob;print({json.load(open(f))['git_sha'][:7] for f in glob.glob('runs/m4c_world/train_*.json')+glob.glob('runs/m4c_entry/entry_*.json')+glob.glob('runs/m4c_agent/*/*.json')})"` prints `{'e235d07'}` (9 world + 9 entry + 18 agent records; `nonfinite` is `{}` in all 36) |
+| code identity with `0a9506d` | `src/`, `scripts/` and `tests/` byte-identical | `git diff --stat 0a9506d HEAD -- src scripts` prints nothing (exit 0); so does `git diff --stat 0a9506d e235d07 -- src scripts tests` |
+
+R9's chain: the suite ran green at `2535828` (which already contains `scripts/m4_study.py`, the Stage C driver, and its test `tests/eval/test_m4_study_script.py`; `git show --stat 2535828`); `0a9506d` added only the MPS cache release in `ac_trainer.py` and its test, covered by the 124 tests; the Stage C runs executed at `e235d07`, whose `src/`, `scripts/` and `tests/` equal `0a9506d`'s. Commits `fd19eb5` and `e235d07` changed only this plan file (`git diff --stat 0a9506d HEAD` lists one file, the plan). The full suite was **not** re-run at `0a9506d` or `e235d07` for Stage C (ledger `Task 15: step 1`: "suite per R9"). The records carry `e235d07`, not `0a9506d`, because that was HEAD when the arms ran; the trees are the same. As in Stage B, a regression that the 124 covering tests do not cover is excluded by the Stage C runs completing, not by the suite.
+
+No run failed: `grep -c 'FAILED\|Traceback\|Error' runs/m4c_frozen_ssl.log runs/m4c_random_vit.log runs/m4c_pixel_ae.log` prints `0` for each, and `grep -c 'skip (exists)'` prints `0` for each (no cell was skipped as already present). Each arm log holds 12 `run:` lines (3 seeds x world model, entry check, actor-critic, live). The `pixel_ae` log's three live commands carry `--pixel-ae-checkpoint runs/m2_basic/autoencoder_cnn.pt` (`grep '^run:' runs/m4c_pixel_ae.log | grep -c -- '--pixel-ae-checkpoint runs/m2_basic/autoencoder_cnn.pt'` prints `3`), and the three live records say so (`live_pixel_ae_seed{0,1,2}.json['pixel_ae_checkpoint']` is that path; for the other six cells it is `None`).
+
+### Stage A's cell was retrained, not reused
+
+The pre-registered reuse check (plan Task 15 Step 2, spec §6.1) compares the code Stage A's world model was trained at against HEAD:
+
+```bash
+SHA=$(python3 -c "import json;print(json.load(open('runs/m4a_world/train_frozen_ssl_seed0.json'))['git_sha'])")   # d674ab7306689fc580e90cf58e9b88bc3e0913c9
+git diff --quiet "$SHA" HEAD -- src/mbfps/models src/mbfps/training/world_model.py src/mbfps/data src/mbfps/utils && echo UNCHANGED || echo CHANGED
+git diff --stat "$SHA" HEAD -- src/mbfps/models src/mbfps/training/world_model.py src/mbfps/data src/mbfps/utils
+```
+
+It prints **`CHANGED`** (ledger `Task 15: step 2`), with
+
+```
+ src/mbfps/models/heads.py | 37 +++++++++++++++++++++++++++++++++----
+ src/mbfps/models/rssm.py  | 27 +++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 4 deletions(-)
+```
+
+The ledger attributes these to Task 9's `Actor`/`Critic`/`imagine_policy` additions. Under the pre-registered rule the cell was therefore **retrained with the other eight, not copied**: `runs/m4c_world/world_model_frozen_ssl_seed0.pt` carries `git_sha` `e235d07` and its own `seconds` (6,017.18; Stage A's was 12,820.69 and was inflated by a concurrent test suite, see Stage A). Stage A's files in `runs/m4a_world/` were not touched.
+
+**Does the retrained cell reproduce Stage B's? Yes, exactly, on every record compared.** Stage B's live record is `runs/m4b_agent/live_frozen_ssl_seed0.json` (code `0a9506d`); Stage C's is `runs/m4c_agent/frozen_ssl_seed0/live_frozen_ssl_seed0.json` (code `e235d07`, same tree). The two world models were trained separately (Stage A's, Stage C's) and the two actor-critic runs were separate 10,000-update runs.
+
+```python
+import json, numpy as np, torch
+A = json.load(open("runs/m4b_agent/live_frozen_ssl_seed0.json")); B = json.load(open("runs/m4c_agent/frozen_ssl_seed0/live_frozen_ssl_seed0.json"))
+key = lambda l: [(e["seed"], e["return"], e["length"], e["killed"], e["truncated"], e["imagined_return"]) for e in l]
+print(A["seeds"] == B["seeds"], key(A["random"]) == key(B["random"]), key(A["untrained"]) == key(B["untrained"]))
+print(all(key(A["rungs"][s][m]) == key(B["rungs"][s][m]) for s in A["rungs"] for m in ("sample", "argmax")))
+ta = json.load(open("runs/m4b_agent/train_frozen_ssl_seed0.json")); tb = json.load(open("runs/m4c_agent/frozen_ssl_seed0/train_frozen_ssl_seed0.json"))
+print({k: ta[k] == tb[k] for k in ("actor_loss", "critic_loss", "scale", "imagined_return", "entropy")})
+wa = torch.load("runs/m4a_world/world_model_frozen_ssl_seed0.pt", map_location="cpu", weights_only=True)["state_dict"]
+wb = torch.load("runs/m4c_world/world_model_frozen_ssl_seed0.pt", map_location="cpu", weights_only=True)["state_dict"]
+print(len(wa), set(wa) == set(wb), all(torch.equal(wa[k], wb[k]) for k in wa))
+ea = json.load(open("runs/m4a_entry/entry_frozen_ssl_seed0.json")); ec = json.load(open("runs/m4c_entry/entry_frozen_ssl_seed0.json"))
+print({k: ea[k] == ec[k] for k in ("imagined", "posterior", "counts", "c_R", "c_C", "position_gap_closed_h15", "verdict")})
+```
+
+At write time this printed `True True True`; `True`; all five training series `True` (each 10,000 entries); `36 True True`; all seven entry fields `True`. In words:
+
+- **Matches:** the 100 evaluation seeds; all 1,200 episode records in the random list, the untrained list and the ten rung-mode lists (seed by seed: `return`, `length`, `killed`, `truncated` and `imagined_return`, with a maximum absolute `imagined_return` difference of 0.0); the 10,000-entry `actor_loss`, `critic_loss`, `scale`, `imagined_return` and `entropy` series of the training record; all 36 tensors of the world model's `state_dict`; and the entry record's `imagined`, `posterior`, `counts`, `c_R`, `c_C`, `position_gap_closed_h15` and `verdict`. Seed-0 gate point +227.39 and every rung's mean are therefore Stage B's, to the printed precision.
+- **Differs:** `git_sha` (`d674ab7`/`0a9506d`/`03be77b` against `e235d07`) and `seconds` only: world 12,820.69 against 6,017.18; actor-critic 3,967.13 (Stage B) against 3,743.40; live 338.28 against 362.96.
+- **What this shows:** on this machine, retraining with the Task 9 code in place reproduces Stage A's world model and Stage B's agent bit for bit, so reusing Stage A's cell would have given the same cell. It does not show that training is deterministic in general (one cell, one device, one pair of runs), and it says nothing about the other eight cells, which have no earlier counterpart.
+
+### Prerequisites and ruling R10
+
+| step | record | value |
+|---|---|---|
+| `random_vit` cache | `runlogs/m4c_cache_rv.log` | `features_cached=1200 elapsed_s=140`, 395 frames/s, mps |
+| `pixel_ae` autoencoder on `basic` | `runs/m2_basic.log`, `runs/m2_basic/history_cnn.json` | 20,000 steps, `--seq-len 1` (command in the plan, Step 5), 2,861.74 s (`seconds`), mean of first 20 losses 0.08894, of last 20 0.00072 (`python3 -c "import json,statistics as s;l=json.load(open('runs/m2_basic/history_cnn.json'))['loss'];print(len(l),round(s.mean(l[:20]),5),round(s.mean(l[-20:]),5))"` prints `20000 0.08894 0.00072`) |
+| `pixel_ae` cache | `runlogs/m4c_cache_pa.log` | `features_cached=1200 elapsed_s=18`, 3,022 frames/s, mps |
+
+**R10: the dinov2 cache was kept, not cleared.** Plan Step 3 says to run `cache_features.py --backbone dinov2 --clear` after the `frozen_ssl` arm "to free the cache". The controller did not (ruling R10): 20 GB was free, a second ~2.7 GB ViT cache fit with margin, and nothing was deleted that was not needed; R10 says the Step 4 check of at least 5 GB free would be made first. Evidence at write time: `ls data/basic | sed 's/ep_.*_len[0-9]*\.//' | sort | uniq -c` prints 1200 each of `features.npy` (dinov2), `features_pixel_ae.npy`, `features_random_vit.npy` and `npz`; the dinov2 files are 2.53 GiB in total and their modification times run 2026-10-10 23:10:21 to 2026-10-11 00:08:28, i.e. Stage A's write, untouched; the `random_vit` files date 2026-10-12 02:30:10 to 02:32:30 (2.53 GiB) and the `pixel_ae` files 2026-10-12 20:38:09 to 20:38:27 (0.21 GiB). `df -h .` prints 15 GiB available at write time. The risk R10 named, disk running short during the `random_vit` cache, did not occur (1,200 episodes cached, exit 0: ledger `Task 15: step 4`). Each arm's cache was written once, on mps, as §6.1 requires, and the three arms read different suffix files, so keeping the dinov2 files cannot have changed any other arm's inputs. The cost is 2.53 GiB left on disk.
+
+### The nine cells
+
+Records: entry `runs/m4c_entry/entry_<arm>_seed<n>.json`; agent `runs/m4c_agent/<arm>_seed<n>/train_<arm>_seed<n>.json` and `live_<arm>_seed<n>.json`; world model `runs/m4c_world/train_<arm>_seed<n>.json`. Each live record holds 100 evaluation episodes on seeds 1,000,000 to 1,000,099, the same seeds and the same `random` list (identical returns) in all nine files. The score is the mean `return` of the 100 episodes at update 10,000, sample mode. The gate and control columns are `paired_gate` against `random` (mean of the per-seed difference, 95% percentile interval from 2,000 resamples at a fixed seed; `src/mbfps/eval/live.py`). Entry intervals are 95% percentile intervals from 2,000 episode-clustered resamples of the 240 held-out episodes, imagined horizon 15 (spec §4.5); `ENTRY_PASS` requires `ci_low` > 0 for both. All nine records carry the same `counts` (240 episodes, 10,220 starts, 131,553 slots, 144 kills, 144 terminations) and `c_R` = -44.510, `c_C` = 0.9885. Re-derive (this script prints the table below row by row; its last block prints the §6.2 comparisons):
+
+```python
+import json, itertools, numpy as np
+from mbfps.eval.live import paired_gate
+ARMS = ("frozen_ssl", "pixel_ae", "random_vit"); S = {}
+for arm in ARMS:
+    for s in range(3):
+        d = f"runs/m4c_agent/{arm}_seed{s}"
+        L = json.load(open(f"{d}/live_{arm}_seed{s}.json")); T = json.load(open(f"{d}/train_{arm}_seed{s}.json"))
+        E = json.load(open(f"runs/m4c_entry/entry_{arm}_seed{s}.json")); i = E["imagined"]
+        r = [e["return"] for e in L["random"]]; a = [e["return"] for e in L["rungs"]["10000"]["sample"]]
+        g = paired_gate(a, r); c = paired_gate([e["return"] for e in L["untrained"]], r); S[(arm, s)] = np.mean(a)
+        print(arm, s, E["verdict"], i["return"]["point"], i["return"]["ci_low"], i["return"]["ci_high"],
+              i["continue"]["point"], i["continue"]["ci_low"], i["continue"]["ci_high"], np.mean(a),
+              g["point"], g["ci_low"], g["ci_high"], g["passed"], c["point"], c["ci_low"], c["ci_high"], c["passed"],
+              T["isolation_ok"], T["nonfinite"], L["nonfinite"], E["nonfinite"])
+for x, y in itertools.combinations(ARMS, 2):
+    xs, ys = [S[(x, s)] for s in range(3)], [S[(y, s)] for s in range(3)]
+    print(x, y, [(i, j, "X" if xs[i] > ys[j] else "Y") for i in range(3) for j in range(3)])
+```
+
+| cell | entry verdict | Reading R, `R2_return` imagined: point [95%] | Reading C, `brier_skill` imagined: point [95%] | score | gate: point [95%] | control: point [95%] | isolation_ok |
+|---|---|---|---|---|---|---|---|
+| frozen_ssl s0 | ENTRY_PASS | +0.4334 [+0.4007, +0.4680] | +0.1190 [+0.0836, +0.1555] | +63.18 | +227.39 [+191.86, +262.69] | +4.35 [-41.91, +50.70] | True |
+| frozen_ssl s1 | ENTRY_PASS | +0.7315 [+0.6674, +0.7890] | +0.5116 [+0.3721, +0.6255] | +76.18 | +240.39 [+204.23, +276.14] | -5.59 [-50.80, +40.60] | True |
+| frozen_ssl s2 | ENTRY_PASS | +0.7413 [+0.6908, +0.7909] | +0.4595 [+0.3225, +0.5776] | +78.45 | +242.66 [+206.54, +278.19] | -4.66 [-53.06, +43.25] | True |
+| pixel_ae s0 | ENTRY_PASS | +0.7192 [+0.6432, +0.7856] | +0.4676 [+0.3055, +0.6042] | +67.73 | +231.94 [+195.08, +267.38] | +8.79 [-35.30, +52.85] | True |
+| pixel_ae s1 | ENTRY_PASS | +0.7157 [+0.6170, +0.7945] | +0.4788 [+0.3203, +0.6204] | +64.96 | +229.17 [+193.92, +263.56] | -8.12 [-54.76, +38.36] | True |
+| pixel_ae s2 | ENTRY_PASS | +0.7165 [+0.6500, +0.7774] | +0.4637 [+0.3144, +0.5873] | +62.26 | +226.47 [+190.45, +261.35] | -3.65 [-52.35, +45.08] | True |
+| random_vit s0 | ENTRY_PASS | +0.6978 [+0.6261, +0.7630] | +0.2800 [+0.0544, +0.4583] | **-94.98** | +69.23 [+29.94, +106.85] | +7.53 [-37.42, +53.53] | True |
+| random_vit s1 | ENTRY_PASS | +0.7208 [+0.6608, +0.7718] | +0.4323 [+0.2816, +0.5532] | +73.93 | +238.14 [+201.40, +274.24] | -9.19 [-55.73, +37.29] | True |
+| random_vit s2 | ENTRY_PASS | +0.6751 [+0.5930, +0.7479] | +0.3133 [+0.1193, +0.4774] | +76.34 | +240.55 [+205.13, +276.33] | +5.85 [-40.72, +53.58] | True |
+
+The `read.log` columns "R" and "C" are the two `ci_low` values above (rounded to three places, e.g. `R +0.401, C +0.084` for `frozen_ssl` s0). `nonfinite` is `{}` in all 36 records. In every row the gate's `ci_low` is above zero (smallest: +29.94, `random_vit` s0) and the control's `ci_low` is below zero (largest: -35.30, `pixel_ae` s0). Each control interval reaches +37 to +54 at its upper end, so each is a failure to find an effect, not a measurement that the untrained actor equals random (the Stage B reading of its own control carries over). `frozen_ssl` s0's gate, control and every number in its row are the Stage B values (see above). The gate's baseline is the same `random` list in every cell (mean -164.21, 57 of 100 episodes ending in a kill), so the gate says each agent beat uniform random; it does not rank the arms.
+
+**Per arm, the three scores (§6.2's input):**
+
+| arm | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| `frozen_ssl` | +63.18 | +76.18 | +78.45 |
+| `pixel_ae` | +67.73 | +64.96 | +62.26 |
+| `random_vit` | -94.98 | +73.93 | +76.34 |
+
+Learning curve, sample-mode mean return at each rung, with the 10,000-update kill rate, median length, argmax score and imagined-vs-real gap (reported, not gated; same definitions as Stage B; gap = mean `imagined_return` minus mean `return` of the sample-mode list). Re-derive:
+
+```python
+import json, numpy as np
+for arm in ("frozen_ssl", "pixel_ae", "random_vit"):
+    for s in range(3):
+        L = json.load(open(f"runs/m4c_agent/{arm}_seed{s}/live_{arm}_seed{s}.json"))
+        sm = {st: L["rungs"][st]["sample"] for st in L["rungs"]}; f = sm["10000"]
+        print(arm, s, [np.mean([e["return"] for e in sm[st]]) for st in sm], np.mean([e["killed"] for e in f]),
+              np.median([e["length"] for e in f]), np.mean([e["return"] for e in L["rungs"]["10000"]["argmax"]]),
+              np.mean([e["imagined_return"] for e in f]) - np.mean([e["return"] for e in f]), np.mean([e["imagined_return"] for e in f]))
+```
+
+The table:
+
+| cell | 2,000 | 4,000 | 6,000 | 8,000 | 10,000 | kill rate | median length | argmax at 10,000 | gap at 10,000 (imagined) |
+|---|---|---|---|---|---|---|---|---|---|
+| frozen_ssl s0 | +65.06 | +61.96 | +62.36 | +63.62 | +63.18 | 1.00 | 9 | +65.26 | -24.85 (+38.33) |
+| frozen_ssl s1 | +73.35 | +75.55 | +76.14 | +76.15 | +76.18 | 1.00 | 7 | +75.94 | -0.05 (+76.13) |
+| frozen_ssl s2 | +74.83 | +77.44 | +77.77 | +77.96 | +78.45 | 1.00 | 6 | +78.56 | +0.69 (+79.14) |
+| pixel_ae s0 | +72.38 | +68.00 | +63.62 | +65.50 | +67.73 | 1.00 | 6 | +63.40 | +6.62 (+74.35) |
+| pixel_ae s1 | +66.24 | +60.21 | +67.95 | +69.84 | +64.96 | 0.99 | 7 | +55.77 | +9.08 (+74.04) |
+| pixel_ae s2 | +67.01 | +70.27 | +67.42 | +63.40 | +62.26 | 1.00 | 7 | +54.59 | +11.16 (+73.42) |
+| random_vit s0 | +70.71 | +72.80 | +43.35 | -100.36 | -94.98 | 0.81 | 37 | -106.32 | **+980.56** (+885.58) |
+| random_vit s1 | +73.39 | +73.61 | +74.68 | +75.21 | +73.93 | 1.00 | 7 | +73.57 | -1.73 (+72.20) |
+| random_vit s2 | +71.09 | +73.05 | +74.98 | +75.33 | +76.34 | 1.00 | 7 | +77.34 | -1.29 (+75.05) |
+
+(The `random` list kills on 57 of 100 episodes with median length 59 in all nine files.) Eight of the nine curves have a sample-mode mean between +60.21 and +78.45 at every rung from 2,000 on; the ninth is `random_vit` s0 (next section). Five cells (`frozen_ssl` s0, s1, s2; `random_vit` s1, s2) have an argmax score within 2.1 of their sample score at 10,000 (differences +2.08, -0.24, +0.11, -0.36, +1.00); the three `pixel_ae` cells have an argmax score below their sample score by 4.33, 9.19 and 7.67, and `random_vit` s0 by 11.34 (no interval computed, not gated, no explanation tested). The `frozen_ssl` s0 gap (-24.85) differs in size from the other `frozen_ssl` seeds (-0.05, +0.69); that, like the signs elsewhere, is reported, not gated, and subject to the like-for-like caveat Stage B gives for the gap.
+
+### The §6.2 reading, pair by pair
+
+§6.2, in the spec's words: "**Arm X ranks above arm Y** only if every seed of X scores above every seed of Y: 9 of 9 pairwise wins." "Any other pattern reads **`NOT_SEPARATED`** for that pair, which is a legitimate, reportable result." A "win" below is a cell-to-cell comparison of the score (mean live return at update 10,000). The code (`separation` in `scripts/m4_study.py`) also reads `BELOW` when every seed of Y beats every seed of X; no pair shows that either (the smallest win count for either side is 2).
+
+| pair | reading | wins X : Y of 9 | the comparisons that broke 9 of 9 for X above Y |
+|---|---|---|---|
+| `frozen_ssl` vs `pixel_ae` | **NOT_SEPARATED** | 7 : 2 | `frozen_ssl` s0 (+63.18) is below `pixel_ae` s0 (+67.73) and below `pixel_ae` s1 (+64.96). It is above `pixel_ae` s2 (+62.26) by 0.92. |
+| `frozen_ssl` vs `random_vit` | **NOT_SEPARATED** | 6 : 3 | `frozen_ssl` s0 (+63.18) is below `random_vit` s1 (+73.93) and below `random_vit` s2 (+76.34); `frozen_ssl` s1 (+76.18) is below `random_vit` s2 (+76.34) by 0.16. `random_vit` s0 (-94.98) is below all three `frozen_ssl` seeds. |
+| `pixel_ae` vs `random_vit` | **NOT_SEPARATED** | 3 : 6 | every `pixel_ae` seed (+67.73, +64.96, +62.26) is below `random_vit` s1 (+73.93) and below `random_vit` s2 (+76.34): six comparisons. The three `pixel_ae` wins are all against `random_vit` s0 (-94.98). |
+
+Facts about the table that the records support. In the first pair, the two comparisons that break the rule both involve `frozen_ssl` s0; the other seven comparisons, including all six involving `frozen_ssl` s1 and s2, are `frozen_ssl` wins. In the second pair, three of the six `frozen_ssl` wins are against `random_vit` s0, the degraded cell; the three comparisons that break the rule are `frozen_ssl` s0 against `random_vit` s1 and s2, and `frozen_ssl` s1 against `random_vit` s2 (a margin of 0.16). In the third pair, `random_vit` s0 is the only `random_vit` seed that `pixel_ae` beats, so the pair's reading depends on `random_vit` s0 in the sense that without it every comparison would go `random_vit`'s way (6 of 6); that arithmetic is a description of the records, **not a reading**: §6.2 fixes three seeds per arm, and dropping a cell after seeing it is not a pre-registered reading and is not licensed here. The within-arm score ranges (maximum minus minimum) are 15.27 (`frozen_ssl`), 5.47 (`pixel_ae`) and 171.32 (`random_vit`, set by seed 0).
+
+Re-derive: the second print in the script above lists all 27 comparisons as `(i, j, X|Y)` (X = first-named arm's seed `i` score above second-named arm's seed `j` score, Y = the reverse); `grep -A3 'cross-arm' runs/m4c_study/read.log` prints the three readings.
+
+### `random_vit` seed 0 (score -94.98, gate still PASS)
+
+This cell is reported as the records show it. Its score of -94.98 is 157.24 below the next-lowest cell (`pixel_ae` s2, +62.26); the gate is +69.23 [+29.94, +106.85], so it still passes (`ci_low` > 0), because the gate's baseline is `random`'s mean of -164.21 (Stage B notes that random's long truncated episodes set much of that low mean). Re-derive:
+
+```python
+import json, numpy as np
+from mbfps.eval.live import paired_gate
+L = json.load(open("runs/m4c_agent/random_vit_seed0/live_random_vit_seed0.json")); r = [e["return"] for e in L["random"]]
+for st in L["rungs"]:
+    for m in ("sample", "argmax"):
+        l = L["rungs"][st][m]; a = [e["return"] for e in l]; g = paired_gate(a, r); im = np.mean([e["imagined_return"] for e in l])
+        print(st, m, np.mean(a), np.std(a), np.mean([e["killed"] for e in l]), np.median([e["length"] for e in l]),
+              max(e["length"] for e in l), g["point"], g["ci_low"], g["ci_high"], im, im - np.mean(a))
+l = L["rungs"]["10000"]["sample"]; a = np.array([e["return"] for e in l]); le = np.array([e["length"] for e in l]); k = np.array([e["killed"] for e in l])
+print(k.sum(), (~k).sum(), sorted(set(a[~k])), a[k].mean(), np.median(le[k]), (a > np.array(r)).sum(), (a < np.array(r)).sum())
+T = json.load(open("runs/m4c_agent/random_vit_seed0/train_random_vit_seed0.json")); sc, g0 = np.array(T["scale"]), np.array(T["imagined_return"])
+print(np.argmax(sc > 150) + 1, np.argmax(g0 > 150) + 1, np.argmax(g0 > 300) + 1, sc.max(), g0.max())
+for lo in range(0, 10000, 500): print(lo + 1, np.median(sc[lo:lo+500]), np.median(T["critic_loss"][lo:lo+500]), np.median(g0[lo:lo+500]), np.median(T["entropy"][lo:lo+500]))
+```
+
+**Live record, rung by rung** (`live_random_vit_seed0.json`; sample mode unless stated; `random` for reference: mean -164.21, kill rate 0.57, median length 59):
+
+| update | mean return | kill rate | median length | max length | gate: point [95%] | mean imagined `G0` | imagined minus real |
+|---|---|---|---|---|---|---|---|
+| 2,000 | +70.71 | 1.00 | 8 | 33 | +234.92 [+197.91, +270.83] | +65.75 | -4.96 |
+| 4,000 | +72.80 | 1.00 | 7 | 46 | +237.01 [+200.84, +272.88] | +68.25 | -4.55 |
+| 6,000 | +43.35 | 1.00 | 11 | 49 | +207.56 [+173.73, +240.91] | +78.55 | +35.20 |
+| 8,000 | -100.36 | 0.81 | 42.5 | 75 | +63.85 [+27.36, +100.05] | +505.02 | +605.38 |
+| **10,000 (the gate)** | **-94.98** | 0.81 | 37 | 75 | **+69.23 [+29.94, +106.85]** | +885.58 | +980.56 |
+| 10,000, argmax | -106.32 | 0.78 | 42 | 75 | +57.89 [+21.34, +95.46] | | |
+
+Argmax-mode means at 2,000 to 8,000: +74.13, +75.48, +50.79, -99.75 (kill rates 1.00, 1.00, 1.00, 0.81). The study reads update 10,000 only (§6.2); the 2,000 and 4,000 rungs (+70.71, +72.80) are in the record and were not used to pick a checkpoint.
+
+- **Episodes at the gate (10,000, sample):** 81 killed, 19 truncated at the 75-step cap (all 19 have `killed` False). The 19 truncated episodes return -335, -330, -310, -305 or -300 (14 of them exactly -300). The 81 killed episodes have mean return -45.84 and median length 33 (the other eight cells' medians are 6 to 9 over all 100 episodes). Against `random` on the same seed the agent is higher on 54 seeds, lower on 46, equal on none (`frozen_ssl` s0 in Stage B and here: higher on 90, lower on 7, equal on 3). The sample-mode and argmax-mode returns coincide on 20 of 100 episodes.
+- **Entry readings** (table above and `entry_random_vit_seed0.json`): `ENTRY_PASS`; Reading R +0.6978 [+0.6261, +0.7630]; Reading C +0.2800 [+0.0544, +0.4583]. Reading C's `ci_low` (+0.0544) is the smallest of the nine cells; its point (+0.2800) is the second smallest, after `frozen_ssl` s0's +0.1190, which scored +63.18 with a stable curve. The posterior references are in the range of the other cells (R +0.9308 against +0.7162 to +0.9493; C +0.8646 against +0.6816 to +0.9258), and `position_gap_closed_h15` is +0.9882, the largest of the nine (+0.7961 to +0.9375 in the other eight). Its world-model `kl_dyn_max` is 3.528, below `random_vit` s1's 4.524 and s2's 9.772. So the entry record sets this cell apart only on Reading C's lower bound (smallest of nine) and on the position ratio (largest of nine), and gates nothing about either.
+- **Training record** (`train_random_vit_seed0.json`, 10,000 per-update values for each series; `scale` is the recorded return-scale series and `imagined_return` the per-update start-state lambda-return `G0` of that batch; windows are medians over 500 updates):
+
+| updates | `scale` | critic loss | `G0` | entropy |
+|---|---|---|---|---|
+| 4,001-4,500 | 102.0 | 12.4 | +65.1 | 0.242 |
+| 5,001-5,500 | 145.6 | 1,422.2 | +68.2 | 0.166 |
+| 6,001-6,500 | 239.8 | 7,471.3 | +97.2 | 0.083 |
+| 7,001-7,500 | 418.5 | 11,413.9 | +278.8 | 0.048 |
+| 8,001-8,500 | 394.6 | 6,772.2 | +493.4 | 0.033 |
+| 9,501-10,000 | 381.9 | 4,703.8 | +773.9 | 0.030 |
+
+`scale` first exceeds 150 at update 5,281; `G0` first exceeds +150 at update 6,176 and +300 at update 6,997; the run's maxima are `scale` 459.2 and `G0` +888.6 (at update 10,000). The largest real return in any of the 90 rung lists (9 cells x 5 rungs x 2 modes) is +95 and the largest reward in the dataset is 99 with a kill ending the episode (Stage A), so the `G0` values above +100 in this record, and the live mean imagined return of +885.58, are above any return the environment gave in these records. In the other eight cells the maximum `scale` is 103.3 to 133.0 and the maximum `G0` is +44.5 to +80.3 (`max(T['scale'])`, `max(T['imagined_return'])` per cell). The critic loss has single-update spikes well before the live degradation (maximum per-update value 15,200 in updates 1,501-2,000 and 36,161 in 2,001-2,500, while the window medians there are 16.6 and 15.1), so a large single-update critic loss is not by itself a marker of the later change. The other eight cells' per-update critic-loss maxima are 525.6 to 1,268.6; this cell's is 148,042.3.
+- **Imagined against real.** The sign and size of the gap move from -4.96 (2,000) to +980.56 (10,000), against -24.85 to +11.16 at 10,000 in the other eight cells. §5.5 names "a large positive gap" as "the signature of an actor exploiting the model's errors"; this cell shows a large positive gap, and its live return fell over the same updates. Per episode at 10,000 the imagined return ranges 633.17 to 1,056.84 (median 901.79) and correlates +0.37 with the real return.
+
+**What the records do not show.** They do not say why this cell degraded: no ablation, no rerun of seed 0, no policy diagnostic at the checkpoints (action frequencies, state visitation), and no comparison of the world model's imagined rollouts against real ones for this cell beyond the entry check were run. The gap is not like-for-like with the real return (Stage B: discounted, critic-bootstrapped, 15-step horizon against an undiscounted episode sum, and sample-mode imagination for both modes), so its size is not a measure of model error. The co-occurrence of the rising imagined return, the rising `scale`, and the falling real return after update ~5,000 is what the records show; the exploitation reading is §5.5's description of that pattern, not a result of this run. One seed of three degraded in one arm; the records do not separate an effect of the arm from an effect of the seed (the agent seed and the world-model seed are the same number in each cell).
+
+### Wall clock per arm
+
+Two numbers per arm, because the machine slept during the run. **Recorded** is the sum of the `seconds` fields (world model, entry check, actor-critic training, live evaluation) of the nine records; in the cells where checkpoint times show no gap it matches the elapsed time between file times (e.g. `random_vit` s0 training: 3,524.48 recorded, 3,526 between the entry record and the training record), and where they show a gap it is smaller than that span by about the gap, so it is read as compute time with sleep excluded (consistent with a clock that does not advance during sleep; the world-model, actor-critic, entry-check, live-evaluation and autoencoder code all time with `time.perf_counter`). **Elapsed** is file modification time to file modification time (`stat`), so it includes any sleep. Re-derive:
+
+```python
+import json, os
+for arm in ("frozen_ssl", "random_vit", "pixel_ae"):
+    tot = {"world": 0, "entry": 0, "train": 0, "live": 0}
+    for s in range(3):
+        d = f"runs/m4c_agent/{arm}_seed{s}"
+        tot["world"] += json.load(open(f"runs/m4c_world/train_{arm}_seed{s}.json"))["seconds"]
+        tot["entry"] += json.load(open(f"runs/m4c_entry/entry_{arm}_seed{s}.json"))["seconds"]
+        tot["train"] += json.load(open(f"{d}/train_{arm}_seed{s}.json"))["seconds"]
+        tot["live"] += json.load(open(f"{d}/live_{arm}_seed{s}.json"))["seconds"]
+    print(arm, {k: round(v) for k, v in tot.items()}, round(sum(tot.values())), os.stat(f"{d}/live_{arm}_seed2.json").st_mtime)
+```
+
+| arm | world models (3) | entry checks (3) | actor-critic (3 x 10,000 updates) | live evaluation (3 x 1,200 episodes) | recorded total | prerequisite | elapsed |
+|---|---|---|---|---|---|---|---|
+| `frozen_ssl` | 18,628 s | 107 s | 12,547 s | 1,001 s | 32,283 s (8.97 h) | none (dinov2 cache from Stage A) | at least 40,878 s (11.35 h), 2026-10-11 15:08:19 to 2026-10-12 02:29:36 |
+| `random_vit` | 18,549 s | 104 s | 11,679 s | 1,272 s | 31,604 s (8.78 h) | cache 140 s | 62,245 s (17.29 h), 2026-10-12 02:32:30 to 19:49:55 |
+| `pixel_ae` | 15,643 s | 111 s | 11,412 s | 387 s | 27,553 s (7.65 h) | autoencoder 2,861.74 s + cache 18 s | 74,968 s (20.82 h), 2026-10-12 20:38:27 to 2026-10-13 17:27:55; 77,855 s (21.63 h) counting from the autoencoder's start, 19:50:20 |
+
+The start of `frozen_ssl` is not recorded (no log has timestamps): it is the seed-0 world model's file time minus its recorded `seconds` (the world-model file is written when training ends), so it is a lower bound on the arm's elapsed time. The `random_vit` and `pixel_ae` starts are the modification times of their cache logs, the step before each arm; the `pixel_ae` autoencoder's start (its log's file time minus its `seconds`) is 25 s after `random_vit`'s last file, so the arms ran back to back. Per cell (recorded seconds): world model `frozen_ssl` 6,017 / 6,063 / 6,548, `random_vit` 5,520 / 7,163 / 5,866, `pixel_ae` 5,087 / 5,228 / 5,328; actor-critic 3,743 / 4,755 / 4,048, 3,524 / 4,136 / 4,018 and 3,809 / 4,032 / 3,570; live 363 / 323 / 315, 669 / 338 / 265 and 125 / 130 / 132 (seeds 0 / 1 / 2). Live evaluation of `pixel_ae` takes about a fifth to a half of the others' time per cell; the records do not say why.
+
+**Machine-sleep gaps.** Checkpoint files are written every 2,000 updates, so their modification times show where a training run stalled (`stat -f '%Sm %N' -t '%m-%d %H:%M:%S' runs/m4c_agent/<arm>_seed<n>/actor_critic_*.pt`). Of the 45 intervals (5 per cell; the first is measured from the entry record), 39 are 668 to 1,160 s; the six that are not:
+
+| cell | interval | file times | gap |
+|---|---|---|---|
+| `frozen_ssl` s0 | step 8,000 to 10,000 | 10-11 17:36:09 to 18:18:15 | 2,526 s (typical 697 to 713 s) |
+| `frozen_ssl` s2 | step 2,000 to 4,000 | 10-12 01:14:39 to 01:46:22 | 1,903 s (typical 751 to 933 s) |
+| `random_vit` s2 | step 4,000 to 6,000 | 10-12 17:51:07 to 19:15:54 | 5,087 s, 84.8 min (typical 680 to 796 s); the ledger's "one apparent machine sleep" |
+| `pixel_ae` s2 | entry record to step 2,000 | 10-13 16:14:22 to 16:38:10 | 1,428 s (typical 677 to 769 s) |
+| `pixel_ae` s1 | entry record to step 2,000 | 10-13 01:43:15 to 09:04:38 | 26,483 s |
+| `pixel_ae` s1 | step 2,000 to 4,000 | 10-13 09:04:38 to 12:54:04 | 13,766 s; together about 11 h, the ledger's "09:04 -> 12:54" |
+
+Training records agree: `pixel_ae` s1's `seconds` is 4,032 for a span of 42,268 s from entry record to training record. A longer gap in a stage with no intermediate file cannot be placed inside the stage: taking each stage's mtime span minus its recorded `seconds` (previous file's time to this file's time), the spans exceed their recorded seconds by more than 600 s in `frozen_ssl` s0 training (1,601 s), s0 live (840 s), s1 world (4,407 s), s1 live (670 s), s2 training (1,066 s); `random_vit` s1 world (25,225 s, 7.0 h, between seed 0's live record at 10-12 05:15:04 and seed 1's world model at 14:14:52), s2 world (613 s), s2 training (4,407 s); `pixel_ae` s0 world (1,753 s), s1 world (2,203 s), s1 training (38,236 s), s2 world (4,503 s), s2 training (709 s). These excesses are consistent with sleep but the records do not distinguish sleep from other stalls or from process start-up (the `pixel_ae` s0 world figure includes the time from the cache log's file time to the world-model start). Elapsed minus recorded is 8,595 s for `frozen_ssl`, 30,641 s for `random_vit` and 47,415 s for `pixel_ae`. The wall-clock ordering of the arms (11.4, 17.3, 20.8 h elapsed) is therefore mostly the sleep, not the compute: by recorded seconds the arms are 8.97, 8.78 and 7.65 h. Whether `pixel_ae`'s lower recorded total (smaller autoencoder features, 0.21 GiB cache against 2.53 GiB) is the cause was not tested.
+
+### Not established by this run
+
+- **Which arm is better.** `NOT_SEPARATED` for all three pairs; no ranking. It is also not evidence of equality: three seeds per arm, a 9-of-9 rule, no equivalence margin. The descriptive win counts (7:2, 6:3, 3:6) license no ordering.
+- **Why `random_vit` s0 degraded**, or whether `random_vit` as an arm is prone to it. One seed of three. Its score is the one that makes `random_vit` NOT_SEPARATED from `pixel_ae` in the direction it is; the other two `random_vit` seeds score +73.93 and +76.34. No diagnosis beyond the records quoted above.
+- **That the score is a measure of policy quality beyond `basic`.** All cells pass the gate against uniform random; no scripted or other non-random baseline was evaluated (as in Stage B). The score is a mean over 100 fixed evaluation seeds (1,000,000 to 1,000,099); the gate intervals resample those seeds and do not cover variation of the training seed, which the three-seed rule is the only handle on.
+- **The learning curve between 0 and 2,000 updates**, and any claim from rungs other than 10,000 (read by §6.2 only at 10,000); the argmax scores and imagined-vs-real gaps are reported, not gated, and not like-for-like.
+- **Spec §10, restated.** M4 does not answer whether the world model tracks a shifting, policy-induced distribution (the dataset is fixed; that is M5); whether the `my_way_home` world models support control (M4 uses them only as §4.6's known-negative control); the M3 exit gate (unmoved and still failing; M4 neither re-reads it nor depends on it); whether the arm ranking transfers to harder scenarios or the online loop (§6.2's reading is about `basic`, a fixed dataset, and 10,000 updates; here it is no ranking at all); or model-free comparison at equal environment steps (M5, governing spec §6).
