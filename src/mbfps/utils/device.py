@@ -35,13 +35,14 @@ def get_device(prefer: str = "mps") -> torch.device:
     return torch.device("cpu")
 
 
-_TRAINING_KEYS = ("obs", "features", "actions", "rewards", "terminated", "truncated")
+_TRAINING_KEYS = ("obs", "features", "actions", "rewards", "terminated", "truncated", "mask")
 """Keys allowed onto the compute device.
 
 A whitelist, deliberately. `privileged` is absent and must stay absent: it is
 evaluation-only, and keeping it off the device makes that a structural property
 rather than a rule someone has to remember. `episode_index` and `window_start`
-are bookkeeping and stay on the host.
+are bookkeeping and stay on the host. `mask` (M4) marks real transitions in a
+padded window.
 """
 
 

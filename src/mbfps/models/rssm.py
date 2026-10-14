@@ -14,6 +14,7 @@ This module is arm-invariant: it consumes the 2048-d embedding that M2
 equalises across arms, so `encoders.py` remains the only module that differs.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -189,6 +190,32 @@ class RSSM(nn.Module):
             hs.append(h); zs.append(z); priors.append(prior_logits)
         return self._pack(hs, zs, priors, None)
 
+    @torch.no_grad()
+    def imagine_policy(
+        self,
+        policy: Callable[[torch.Tensor], torch.Tensor],
+        state: tuple[torch.Tensor, torch.Tensor],
+        horizon: int,
+    ) -> dict[str, torch.Tensor]:
+        """Roll forward on the prior with `policy` choosing each action (M4).
+
+        `policy` maps the current `(N, LATENT_DIM)` latent to `(N,)` action
+        indices. Returns `latent` `(N, horizon + 1, LATENT_DIM)` -- index 0 the
+        start state, index t the state after the t-th action -- and `action`
+        `(N, horizon)`. No graph is built: the world model is frozen in M4, and
+        the actor's log-probabilities are recomputed by the trainer on these
+        detached latents. `imagine` is untouched: M3's diagnostics depend on it.
+        """
+        h, z = state
+        latents, actions = [torch.cat([h, z], dim=-1)], []
+        for _ in range(horizon):
+            action = policy(latents[-1]).long()
+            h = self._step(h, z, self._onehot_actions(action))
+            z = self._sample(self.prior_net(h))
+            latents.append(torch.cat([h, z], dim=-1))
+            actions.append(action)
+        return {"latent": torch.stack(latents, dim=1), "action": torch.stack(actions, dim=1)}
+
     def _pack(self, hs, zs, priors, posts) -> dict[str, torch.Tensor]:
         cats, classes = self.cfg.z_cats, self.cfg.z_classes
         h = torch.stack(hs, dim=1)
@@ -204,12 +231,22 @@ class RSSM(nn.Module):
         return out
 
 
-def _categorical_kl(logits_q: torch.Tensor, logits_p: torch.Tensor) -> torch.Tensor:
-    """KL(q || p) summed over the 32 categorical groups, averaged over B and T."""
+def _categorical_kl(
+    logits_q: torch.Tensor, logits_p: torch.Tensor, mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """KL(q || p) summed over the 32 categorical groups, averaged over B and T.
+
+    With `mask` (M4), the average is over the masked-in (B, T) positions only,
+    so padding contributes nothing. With every position masked in this is the
+    unmasked mean up to float rounding; with `mask=None` it is that mean
+    exactly, which is what every M3 caller gets."""
     log_q = F.log_softmax(logits_q, dim=-1)
     log_p = F.log_softmax(logits_p, dim=-1)
-    per_group = (log_q.exp() * (log_q - log_p)).sum(-1)
-    return per_group.sum(-1).mean()
+    per_step = (log_q.exp() * (log_q - log_p)).sum(-1).sum(-1)
+    if mask is None:
+        return per_step.mean()
+    weight = mask.to(per_step.dtype)
+    return (per_step * weight).sum() / weight.sum()
 
 
 KL_FREE_BITS = 0.20
@@ -240,6 +277,7 @@ def kl_loss(
     free_bits: float = KL_FREE_BITS,
     dyn_scale: float = 0.5,
     rep_scale: float = 0.1,
+    mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """KL with DreamerV3 balancing and free bits.
 
@@ -267,8 +305,8 @@ def kl_loss(
     silently invalidates the 0.20 calibration; a per-element clamp needs its
     own free-bits value re-measured from scratch, not 0.20 carried over.
     """
-    dyn = _categorical_kl(post_logits.detach(), prior_logits)
-    rep = _categorical_kl(post_logits, prior_logits.detach())
+    dyn = _categorical_kl(post_logits.detach(), prior_logits, mask)
+    rep = _categorical_kl(post_logits, prior_logits.detach(), mask)
     floor = torch.tensor(free_bits, dtype=dyn.dtype, device=dyn.device)
     loss = dyn_scale * torch.maximum(dyn, floor) + rep_scale * torch.maximum(rep, floor)
     return loss, {"dyn": float(dyn.detach()), "rep": float(rep.detach())}

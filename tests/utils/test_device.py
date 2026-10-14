@@ -54,3 +54,12 @@ def test_moved_arrays_become_tensors_on_the_requested_device():
 def test_non_array_values_are_dropped_even_on_whitelisted_keys():
     """A batch key can carry a list or a scalar; only arrays are converted."""
     assert to_device({"obs": [1, 2, 3], "rewards": 0.5}, torch.device("cpu")) == {}
+
+
+def test_mask_is_moved_to_the_device():
+    import numpy as np
+    import torch
+    from mbfps.utils.device import to_device
+
+    moved = to_device({"mask": np.ones((2, 3), dtype=bool)}, torch.device("cpu"))
+    assert moved["mask"].dtype == torch.bool

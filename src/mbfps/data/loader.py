@@ -100,6 +100,7 @@ class SequenceLoader:
         load_features: bool = False,
         feature_backbone: str = _DEFAULT_BACKBONE,
         paths: list[Path] | None = None,
+        pad_short: bool = False,
     ) -> None:
         self.buffer = buffer
         self.batch_size = batch_size
@@ -107,6 +108,7 @@ class SequenceLoader:
         self.load_obs = load_obs
         self.load_features = load_features
         self.feature_backbone = feature_backbone
+        self.pad_short = pad_short
         self._rng = np.random.default_rng(seed)
 
         # Keep paths and episodes index-aligned by construction rather than by
@@ -171,7 +173,12 @@ class SequenceLoader:
         return self._paths[index]
 
     def _usable(self) -> list[int]:
-        return [i for i, ep in enumerate(self._episodes) if ep.length >= self.seq_len]
+        """Episodes a window can be drawn from. With `pad_short` every non-empty
+        episode is eligible and a short one is padded (M4 spec §4.2): `basic`'s
+        kill episodes have a median length of 20, so a 64-step floor would
+        discard most of the reward events the world model has to learn."""
+        floor = 1 if self.pad_short else self.seq_len
+        return [i for i, ep in enumerate(self._episodes) if ep.length >= floor]
 
     def sample(self, include_privileged: bool = False) -> dict[str, Any]:
         """Sample one batch.
@@ -187,31 +194,35 @@ class SequenceLoader:
         usable = self._usable()
         if not usable:
             raise ValueError(
-                f"no episodes long enough for seq_len={self.seq_len}; "
+                f"no episodes long enough for seq_len={self.seq_len} "
+                f"(pad_short={self.pad_short}); "
                 f"buffer holds {len(self._episodes)} episodes"
             )
 
         obs, actions, rewards = [], [], []
         terminated, truncated, privileged, features = [], [], [], []
-        indices, starts = [], []
+        indices, starts, masks = [], [], []
 
         for _ in range(self.batch_size):
             idx = int(self._rng.choice(usable))
             ep = self._episodes[idx]
-            start = int(self._rng.integers(0, ep.length - self.seq_len + 1))
-            end = start + self.seq_len
-            actions.append(ep.actions[start:end])
-            rewards.append(ep.rewards[start:end])
-            terminated.append(ep.terminated[start:end])
-            truncated.append(ep.truncated[start:end])
+            start = int(self._rng.integers(0, max(ep.length - self.seq_len, 0) + 1))
+            end = min(start + self.seq_len, ep.length)
+            real = end - start
+            pad = self.seq_len - real
+            actions.append(_pad(ep.actions[start:end], pad))
+            rewards.append(_pad(ep.rewards[start:end], pad))
+            terminated.append(_pad(ep.terminated[start:end], pad))
+            truncated.append(_pad(ep.truncated[start:end], pad))
+            masks.append(np.arange(self.seq_len) < real)
             indices.append(idx)
             starts.append(start)
             if self.load_obs:
-                obs.append(ep.obs[start : end + 1])
+                obs.append(_pad(ep.obs[start : end + 1], pad))
             if self.load_features:
-                features.append(np.asarray(self._features[idx][start : end + 1]))
+                features.append(_pad(np.asarray(self._features[idx][start : end + 1]), pad))
             if include_privileged:
-                privileged.append(ep.privileged[start : end + 1])
+                privileged.append(_pad(ep.privileged[start : end + 1], pad))
 
         batch: dict[str, Any] = {
             "actions": np.stack(actions).astype(np.int32),
@@ -227,7 +238,17 @@ class SequenceLoader:
             batch["features"] = np.stack(features)
         if include_privileged:
             batch["privileged"] = np.stack(privileged).astype(np.float32)
+        if self.pad_short:
+            batch["mask"] = np.stack(masks)
         return batch
+
+
+def _pad(rows: np.ndarray, pad: int) -> np.ndarray:
+    """`rows` followed by `pad` zero rows of the same trailing shape and dtype."""
+    if pad == 0:
+        return rows
+    filler = np.zeros((pad, *rows.shape[1:]), dtype=rows.dtype)
+    return np.concatenate([rows, filler], axis=0)
 
 
 class _EpisodeMeta:

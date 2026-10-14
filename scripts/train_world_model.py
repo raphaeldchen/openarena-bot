@@ -18,6 +18,11 @@ def main() -> None:
     parser.add_argument("--device", default="mps")
     parser.add_argument("--data", type=Path, default=Path("data/my_way_home"))
     parser.add_argument("--out", type=Path, default=Path("runs/m3"))
+    parser.add_argument("--n-actions", type=int, default=6)
+    parser.add_argument("--pad-short", action="store_true")
+    parser.add_argument("--reward-transform", choices=("identity", "symlog"), default="identity")
+    parser.add_argument("--record", type=Path, default=None,
+                        help="write a JSON summary of the run here (M4)")
     args = parser.parse_args()
 
     cfg = get_config(
@@ -27,6 +32,9 @@ def main() -> None:
         batch_size=args.batch_size,
         seed=args.seed,
         device=args.device,
+        n_actions=args.n_actions,
+        pad_short=args.pad_short,
+        reward_transform=args.reward_transform,
     )
     buffer = ReplayBuffer(args.data, capacity_transitions=10**9)
     history = train_world_model(cfg, buffer, out_dir=args.out)
@@ -42,6 +50,17 @@ def main() -> None:
     # every arm so two arms' rates can be compared before their errors are.
     print(f"kl_dyn_max={history['kl_dyn_max']:.5f}")
     print(f"kl_rate_above_free_bits={history['kl_rate_above_free_bits']:.4f}")
+    if args.record is not None:
+        from mbfps.eval.study import git_sha, write_record
+
+        write_record(args.record, {
+            "arm": cfg.arm, "seed": cfg.train.seed, "steps": history["steps"],
+            "seconds": history["seconds"], "data": str(args.data),
+            "kl_dyn_max": history["kl_dyn_max"],
+            "kl_rate_above_free_bits": history["kl_rate_above_free_bits"],
+            "n_actions": cfg.train.n_actions, "pad_short": cfg.train.pad_short,
+            "reward_transform": cfg.train.reward_transform, "git_sha": git_sha(),
+        })
 
 
 if __name__ == "__main__":

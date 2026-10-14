@@ -77,6 +77,25 @@ class TrainConfig:
     seed: int = 0
     device: str = "mps"
     sample_temperature: float = SAMPLE_TEMPERATURE
+    n_actions: int = 6
+    """Width of the RSSM's one-hot action input. 6 is `my_way_home` and every
+    M3 checkpoint; `basic` is 4 (M4 spec §3)."""
+    pad_short: bool = False
+    """Sample episodes shorter than `seq_len`, padded and masked (M4 spec §4.2).
+    False is M3's loader exactly."""
+    reward_transform: str = "identity"
+    """`identity` (M3) or `symlog` (M4 spec §4.3)."""
+
+    def __post_init__(self) -> None:
+        from mbfps.models.transforms import REWARD_TRANSFORMS
+
+        if self.reward_transform not in REWARD_TRANSFORMS:
+            raise ValueError(
+                f"unknown reward_transform {self.reward_transform!r}; "
+                f"available: {list(REWARD_TRANSFORMS)}"
+            )
+        if self.n_actions < 1:
+            raise ValueError(f"n_actions must be >= 1, got {self.n_actions}")
 
 
 @dataclass(frozen=True)

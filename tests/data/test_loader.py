@@ -589,3 +589,67 @@ def test_obs_window_values_match_the_sampled_offset(varied_buffer):
         np.testing.assert_array_equal(batch["obs"][i], expected)
         # The timestep marker must actually advance, or the check is vacuous.
         assert len(np.unique(batch["obs"][i][:, 0, 0, 0])) > 1
+
+
+@pytest.fixture
+def mixed_buffer(tmp_path):
+    """Two long episodes (80) and one short one (6) whose last step terminates."""
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    buf.add(make_episode(t=80, fill=1))
+    buf.add(make_episode(t=80, fill=2))
+    short = make_episode(t=6, fill=3)
+    short.rewards[:] = 1.0
+    short.terminated[-1] = True
+    buf.add(short)
+    return buf
+
+
+def test_default_loader_never_samples_a_short_episode(mixed_buffer):
+    loader = SequenceLoader(mixed_buffer, batch_size=32, seq_len=16, seed=0)
+    batch = loader.sample()
+    assert "mask" not in batch
+    assert not np.any(batch["obs"][:, 0, 0, 0, 0] == 3)
+
+
+def test_pad_short_samples_a_short_episode(mixed_buffer):
+    loader = SequenceLoader(mixed_buffer, batch_size=32, seq_len=16, seed=0, pad_short=True)
+    batch = loader.sample()
+    short_rows = np.flatnonzero(batch["obs"][:, 0, 0, 0, 0] == 3)
+    assert short_rows.size > 0
+
+
+def test_short_episode_terminal_step_is_masked_in(mixed_buffer):
+    loader = SequenceLoader(mixed_buffer, batch_size=32, seq_len=16, seed=0, pad_short=True)
+    batch = loader.sample()
+    row = int(np.flatnonzero(batch["obs"][:, 0, 0, 0, 0] == 3)[0])
+    assert batch["mask"][row].tolist() == [True] * 6 + [False] * 10
+    assert batch["terminated"][row, 5]
+    assert not batch["terminated"][row, 6:].any()
+    assert np.all(batch["rewards"][row, :6] == 1.0)
+    assert np.all(batch["rewards"][row, 6:] == 0.0)
+    assert batch["window_start"][row] == 0
+    # obs carries T+1 rows: 7 real frames, then zero padding.
+    assert np.all(batch["obs"][row, :7] == 3)
+    assert np.all(batch["obs"][row, 7:] == 0)
+
+
+def test_pad_short_masks_long_windows_all_true(mixed_buffer):
+    loader = SequenceLoader(mixed_buffer, batch_size=32, seq_len=16, seed=0, pad_short=True)
+    batch = loader.sample()
+    long_rows = np.flatnonzero(batch["obs"][:, 0, 0, 0, 0] != 3)
+    assert batch["mask"][long_rows].all()
+
+
+def test_pad_short_pads_features_with_zeros(mixed_buffer):
+    rng = np.random.default_rng(0)
+    for path in mixed_buffer.episode_paths():
+        n = len(np.load(path)["actions"]) + 1
+        np.save(path.with_suffix(feature_suffix("dinov2")),
+                (rng.random((n, 64, 384)) + 1.0).astype(np.float16))
+    loader = SequenceLoader(mixed_buffer, batch_size=32, seq_len=16, seed=0,
+                            pad_short=True, load_obs=True, load_features=True)
+    batch = loader.sample()
+    row = int(np.flatnonzero(batch["obs"][:, 0, 0, 0, 0] == 3)[0])
+    assert batch["features"].shape[1] == 17
+    assert np.all(batch["features"][row, :7] > 0)
+    assert np.all(batch["features"][row, 7:] == 0)

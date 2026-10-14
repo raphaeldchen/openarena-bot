@@ -35,6 +35,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--frame-skip", type=int, default=4)
+    parser.add_argument(
+        "--sweep-len", type=int, default=100,
+        help="ScriptedPolicy sweep length; basic is collected with 10 (M4 spec §3)",
+    )
+    parser.add_argument(
+        "--policies", default="random,scripted",
+        help="comma-separated policies, alternated in this order per episode",
+    )
     parser.add_argument("--max-steps", type=int, default=1000)
     # A real episode is ~19.8 MB resident once loaded by SequenceLoader (526
     # frames of 112x112x3 uint8). At the default below (60,000 transitions,
@@ -45,6 +53,13 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    known = ("random", "scripted")
+    order = [name.strip() for name in args.policies.split(",") if name.strip()]
+    unknown = sorted(set(order) - set(known))
+    if not order or unknown:
+        # Checked before any env is built: a Collector opens its env on construction.
+        raise SystemExit(f"--policies must name some of {list(known)}; got {args.policies!r}")
 
     seed_everything(args.seed)
     out = args.out or Path("data") / args.scenario
@@ -64,13 +79,15 @@ def main() -> None:
             env_factory, RandomPolicy(n_actions, seed=args.seed), args.max_steps
         ),
         "scripted": Collector(
-            env_factory, ScriptedPolicy(button_names, seed=args.seed), args.max_steps
+            env_factory,
+            ScriptedPolicy(button_names, seed=args.seed, sweep_len=args.sweep_len),
+            args.max_steps,
         ),
     }
 
     start, kept = time.perf_counter(), 0
     for i in range(args.episodes):
-        name = "random" if i % 2 == 0 else "scripted"
+        name = order[i % len(order)]
         episode = collectors[name].collect_episode(seed=args.seed + i)
         if episode is not None:
             buffer.add(episode)
