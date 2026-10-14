@@ -125,6 +125,14 @@ class OnlineRollout:
             return
         self._start(policy)
         assert self._ep["seed"] == saved["seed"], (self._ep["seed"], saved["seed"])
-        for action in saved["actions"]:
+        for i, action in enumerate(saved["actions"]):
             obs, reward, terminated, truncated, _ = self.env.step(int(action))
+            if terminated or truncated:
+                # The recorded episode was still in progress after this action,
+                # so a replay that ends it means the engine diverged.
+                seed = saved["seed"]
+                self._ep = None
+                raise RuntimeError(
+                    f"replay of episode seed {seed} ended at step {i}, but it was "
+                    f"recorded as still in progress after {len(saved['actions'])} actions")
             self._record(action, obs, reward, terminated, truncated)

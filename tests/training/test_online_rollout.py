@@ -76,6 +76,18 @@ def test_close_budget_stores_the_tail_truncated(tmp_path):
     assert not r.in_progress and r.budget_step == 5
 
 
+def _assert_same_episode(a, b):
+    """The restored in-progress episode must equal the uninterrupted one."""
+    assert a.budget_step == b.budget_step
+    assert a.episodes_done == b.episodes_done
+    assert a.current_length == b.current_length > 0
+    for key in ("obs", "features", "privileged"):
+        assert len(a._ep[key]) == len(b._ep[key]), key
+        assert all(np.array_equal(x, y) for x, y in zip(a._ep[key], b._ep[key])), key
+    assert a._ep["actions"] == b._ep["actions"]
+    assert a._ep["rewards"] == b._ep["rewards"]
+
+
 def test_restore_replays_the_engine_to_the_same_point(tmp_path):
     seen_a, seen_b = [], []
     a = _rollout(tmp_path / "a", seen_a)
@@ -86,6 +98,8 @@ def test_restore_replays_the_engine_to_the_same_point(tmp_path):
     b = _rollout(tmp_path / "b", seen_b)
     pb = RandomPolicy(4, seed=0)
     b.restore(state, pb)
+    assert a.in_progress and b.in_progress
+    _assert_same_episode(a, b)
     pb._rng.bit_generator.state = pa._rng.bit_generator.state
     for _ in range(20):
         a.step(pa)
@@ -102,3 +116,35 @@ def test_act_with_prefers_features():
     class Q:
         def act(self, obs): return 1
     assert act_with(P(), None, None) == 3 and act_with(Q(), None, None) == 1
+
+
+def test_equality_check_fails_for_a_restore_that_skips_the_replay(tmp_path):
+    a = _rollout(tmp_path / "a", [])
+    pa = RandomPolicy(4, seed=0)
+    for _ in range(7):
+        a.step(pa)
+    assert a.in_progress
+    state = a.state()
+    b = _rollout(tmp_path / "b", [])
+    b.budget_step, b.episodes_done = state["budget_step"], state["episodes_done"]
+    b._start(RandomPolicy(4, seed=0))  # a restore that never replays the actions
+    with pytest.raises(AssertionError):
+        _assert_same_episode(a, b)
+
+
+def test_restore_raises_when_the_replay_ends_the_episode(tmp_path):
+    class Diverging(FakeEnv):
+        def step(self, action):
+            obs, reward, _, _, info = super().step(action)
+            return obs, reward, True, False, info
+
+    a = _rollout(tmp_path / "a", [])
+    pa = _NoShoot()
+    for _ in range(3):
+        a.step(pa)
+    assert a.in_progress
+    state = a.state()
+    replay = ReplayBuffer(tmp_path / "b" / "replay", capacity_transitions=10**9)
+    b = OnlineRollout(Diverging(), fake_encode, replay, run_seed=1, on_episode=lambda p: None)
+    with pytest.raises(RuntimeError, match=str(state["episode"]["seed"])):
+        b.restore(state, _NoShoot())
