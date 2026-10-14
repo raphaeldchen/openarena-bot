@@ -14,7 +14,7 @@ import torch
 from mbfps.data.buffer import ReplayBuffer
 from mbfps.data.policies import RandomPolicy
 from mbfps.eval.live import EVAL_SEEDS, run_episodes
-from mbfps.eval.study import git_sha, write_record
+from mbfps.eval.study import NONFINITE_KEY, git_sha, load_record, write_record
 from mbfps.training.arms import DQNArm, DreamerArm
 from mbfps.training.online_rollout import OnlineRollout
 
@@ -197,3 +197,48 @@ def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, dev
                 "update_rounds": update_rounds, "timing": dict(timing)}, tmp)
     tmp.replace(state_path)
     write_record(record_path, record)
+
+
+def verify_record(record: dict, cfg: OnlineConfig) -> list[str]:
+    """Why a run's record is not complete and well-formed (§3.4, §7.3); [] if it is."""
+    problems = []
+    seeds = list(cfg.eval_seeds)
+    if record.get("complete") is not True:
+        problems.append("record is not complete")
+    if record.get("budget_steps") != cfg.budget:
+        problems.append(f"budget_steps {record.get('budget_steps')} != {cfg.budget}")
+    steps = [e["step"] for e in record.get("evals", [])]
+    if steps != checkpoint_steps(cfg):
+        problems.append(f"eval steps {steps} != {checkpoint_steps(cfg)}")
+    if [e["seed"] for e in record.get("random", [])] != seeds:
+        problems.append("random baseline seeds differ from the evaluation seeds")
+    for e in record.get("evals", []):
+        if record.get("gated_mode") not in e["modes"]:
+            problems.append(f"step {e['step']}: gated mode missing")
+        for mode, episodes in e["modes"].items():
+            if [x["seed"] for x in episodes] != seeds:
+                problems.append(f"step {e['step']} {mode}: seeds differ from the evaluation seeds")
+    return problems
+
+
+def delete_replay_features(out_dir: Path, cfg: OnlineConfig) -> int:
+    """§9: delete a finished run's feature caches and resumable state, only
+    after its record verifies. Episode files and the record are kept."""
+    out_dir = Path(out_dir)
+    record_path = out_dir / "record.json"
+    record = load_record(record_path)
+    problems = verify_record(record, cfg)
+    if problems:
+        raise ValueError("refusing to delete replay features: " + "; ".join(problems))
+    victims = sorted((out_dir / "replay").glob("*.features*.npy"))
+    state = out_dir / "state.pt"
+    if state.exists():
+        victims.append(state)
+    for path in victims:
+        path.unlink()
+    record["replay_features_deleted"] = True
+    # load_record restores the NaN/inf floats but leaves the map that recorded
+    # them in the dict; write_record rebuilds that map and refuses a stale one.
+    record.pop(NONFINITE_KEY, None)
+    write_record(record_path, record)
+    return len(victims)

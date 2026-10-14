@@ -6,9 +6,10 @@ import pytest
 import torch
 
 from mbfps.data.episode import load_episode
-from mbfps.eval.study import load_record
+from mbfps.eval.study import load_record, write_record
 from mbfps.training.dqn import DQNConfig
-from mbfps.training.online import OnlineConfig, train_online
+from mbfps.training.online import (OnlineConfig, delete_replay_features, train_online,
+                                   verify_record)
 from tests.training.fake_env import FakeEnv, fake_encode
 
 CPU = torch.device("cpu")
@@ -145,3 +146,42 @@ def test_finished_run_without_state_refuses_to_restart(tmp_path):
     with pytest.raises(RuntimeError, match=str(tmp_path)):
         _run(tmp_path)
     assert len(list((tmp_path / "replay").iterdir())) == n_files
+
+
+def test_verify_accepts_a_complete_run(tmp_path):
+    rec = _run(tmp_path)
+    assert verify_record(rec, TINY) == []
+
+
+def test_delete_refuses_incomplete_record(tmp_path):
+    _run(tmp_path, stop=20)
+    with pytest.raises(ValueError, match="complete"):
+        delete_replay_features(tmp_path, TINY)
+    assert list((tmp_path / "replay").glob("*.features*.npy"))
+    assert (tmp_path / "state.pt").exists()
+
+
+def test_delete_removes_features_and_state_only(tmp_path):
+    _run(tmp_path)
+    n_npz = len(list((tmp_path / "replay").glob("ep_*.npz")))
+    deleted = delete_replay_features(tmp_path, TINY)
+    assert deleted == n_npz + 1                       # every feature file, plus state.pt
+    assert not list((tmp_path / "replay").glob("*.features*.npy"))
+    assert not (tmp_path / "state.pt").exists()
+    assert len(list((tmp_path / "replay").glob("ep_*.npz"))) == n_npz
+    assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
+
+
+def test_verify_flags_a_reordered_eval(tmp_path):
+    rec = _run(tmp_path)
+    rec["evals"][1]["modes"]["sample"] = rec["evals"][1]["modes"]["sample"][::-1]
+    assert any("seeds" in p for p in verify_record(rec, TINY))
+
+
+def test_delete_keeps_a_non_finite_value_in_the_record(tmp_path):
+    rec = _run(tmp_path)
+    rec["evals"][0]["diagnostics"]["probe"] = float("nan")
+    write_record(tmp_path / "record.json", rec)
+    delete_replay_features(tmp_path, TINY)
+    out = load_record(tmp_path / "record.json")
+    assert np.isnan(out["evals"][0]["diagnostics"]["probe"])
