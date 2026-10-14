@@ -3487,6 +3487,37 @@ def stats(ps, policy=None):
 
 Every terminated episode holds exactly one kill (kills equal terminations in every row). The held-out split is `episode_split(paths, val_fraction=0.2, seed=0)`: 240 held-out and 960 training episodes. The held-out totals (240 episodes, 144 kills, 144 terminations) match the entry record: `python3 -c "import json;print(json.load(open('runs/m4a_entry/entry_frozen_ssl_seed0.json'))['counts'])"` prints `{'episodes': 240, 'starts': 10220, 'slots': 131553, 'kills': 144, 'terminations': 144}`. The 10,220 starts equal the held-out transitions minus one per episode (10,460 - 240), which follows from the spec's `i < T - 1` start rule.
 
+### Sampling weight (spec §4.2; recorded, not corrected)
+
+`SequenceLoader(pad_short=True)` draws `idx = int(self._rng.choice(usable))` with `usable = _usable()`, which with `pad_short` is every episode of length at least 1 (`src/mbfps/data/loader.py`, `_usable` and `sample`). Each training-split episode is therefore drawn with equal probability whatever its length, and a drawn episode contributes `min(length, 64)` real (masked-in) transitions. A 19-step kill episode is drawn as often as a 75-step one. This was a pre-registered design choice (spec §4.2: "recorded in the plan's results rather than corrected silently"), and it was not corrected. Spec §11 Q2 names it as the first thing to examine if Stage A's posterior reference had failed Reading R. The posterior reference did not fail (above), so it was never examined: no run here compares it with length-weighted sampling.
+
+Measured on the 960 training episodes (`episode_split(paths, val_fraction=VAL_FRACTION, seed=0)`, train side). A "kill episode" is one with `terminated.any()`; the expected shares use `min(length, 64)` per episode at equal draw probability, `seq_len` 64. Script, run as `PYTHONPATH=src /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python`:
+
+```python
+from pathlib import Path
+import numpy as np
+from mbfps.data.split import episode_split, VAL_FRACTION
+paths = sorted(Path("data/basic").glob("ep_*_len*.npz"))
+train, _ = episode_split(paths, val_fraction=VAL_FRACTION, seed=0)
+d = [np.load(p) for p in train]
+L = np.array([len(x["actions"]) for x in d]); T = np.array([int(x["terminated"].sum()) for x in d])
+K = T > 0; w = np.minimum(L, 64) / len(L)                       # expected real transitions per draw
+cover = np.where(L >= 64, 1.0 / np.maximum(L - 63, 1), 1.0)     # P(window holds the terminal step)
+print(K.mean(), L[K].sum() / L.sum(), w[K].sum() / w.sum(), (cover * T).sum() / len(L) / w.sum(), T.sum() / L.sum())
+```
+
+| quantity | value |
+|---|---|
+| training episodes / transitions | 960 / 43,506 |
+| kill episodes | 565 (0.5885 of episodes) |
+| median length, kill / non-kill episodes | 19 / 75 |
+| share of training transitions in kill episodes | 0.3191 |
+| share of sampled real transitions in kill episodes (expected, per-episode-uniform, `seq_len` 64) | 0.3516 |
+| terminating transitions, share of sampled real transitions (expected) | 0.01394 |
+| terminating transitions, per-transition base rate (565 / 43,506) | 0.01299 |
+
+Per-episode-uniform sampling raises the kill episodes' share of the transitions the world model sees from 0.319 (the share a draw uniform over transitions would give) to 0.352, and the terminating-transition rate from 0.01299 to 0.01394 (a factor of 1.07). Kill episodes are 0.589 of episodes, and they are short (median 19), so they supply 0.352 of the real transitions per draw. The expected number of real transitions per draw is 40.6 of 64 slots. These are expectations from episode lengths, not counts from a training log.
+
 ### World model
 
 Record `runs/m4a_world/train_frozen_ssl_seed0.json`, log `runs/m4a_world/train.log` (`python3 -c "import json;d=json.load(open('runs/m4a_world/train_frozen_ssl_seed0.json'));print({k:d[k] for k in ('steps','seconds','kl_rate_above_free_bits','kl_dyn_max','n_actions','pad_short','reward_transform')})"`):
