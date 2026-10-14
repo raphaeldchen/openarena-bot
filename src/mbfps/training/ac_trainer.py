@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -25,9 +26,14 @@ from mbfps.data.loader import SequenceLoader
 from mbfps.data.split import VAL_FRACTION, episode_split
 from mbfps.models.encoders import encoder_backbone
 from mbfps.models.heads import Actor, Critic
-from mbfps.models.transforms import read_reward
+from mbfps.models.transforms import read_reward, reward_target
 from mbfps.utils.device import to_device
 from mbfps.utils.seeding import seed_everything
+
+
+def reward_target_value(reward: float, transform: str) -> float:
+    """A reward bound in the head's output space (M5a §4.3)."""
+    return float(reward_target(torch.tensor(float(reward)), transform))
 
 
 @dataclass(frozen=True)
@@ -148,20 +154,103 @@ def load_actor(path: Path, device: torch.device) -> Actor:
     return actor.eval()
 
 
+class ActorCriticLearner:
+    """One DreamerV3 actor-critic update on a world model's imagination (M4
+    §5.3), reusable by the fixed-dataset trainer (M4) and the online loop (M5a).
+
+    The world model is read under `no_grad` only: no gradient from this step
+    can reach it, whether or not its parameters require grad."""
+
+    def __init__(self, n_actions: int, cfg: ACConfig, device: torch.device) -> None:
+        self.cfg = cfg
+        self.actor = Actor(n_actions, seed=cfg.seed).to(device)
+        self.critic = Critic(seed=cfg.seed).to(device)
+        self.critic_slow = copy.deepcopy(self.critic).requires_grad_(False)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
+        self.scale = ReturnScale(cfg.scale_decay)
+
+    def step(self, world_model, batch: dict,
+             reward_bounds: tuple[float, float] | None = None) -> dict[str, float]:
+        cfg = self.cfg
+        transform = world_model.cfg.train.reward_transform
+        h, z = start_states(world_model, batch, drop_terminal=cfg.drop_terminal_starts)
+        n_real = float(batch["mask"].bool().sum())
+        bounds = reward_bounds if cfg.bound_reward_readout else None
+        sample_actor = lambda latent: self.actor.dist(latent).sample()
+        with torch.no_grad():
+            traj = world_model.rssm.imagine_policy(sample_actor, (h, z), cfg.horizon)
+            heads = world_model.heads(traj["latent"][:, 1:])
+            clipped_share = 0.0
+            if bounds is not None:
+                lo, hi = (reward_target_value(b, transform) for b in bounds)
+                raw = heads["reward"]
+                clipped_share = float(((raw < lo) | (raw > hi)).float().mean())
+            rewards = read_reward(heads["reward"], transform, bounds=bounds)
+            cont = torch.sigmoid(heads["continue_logit"])
+            values_slow = self.critic_slow(traj["latent"])
+            returns = lambda_returns(rewards, cfg.gamma * cont, values_slow, cfg.lam)
+            weights = continue_weights(cont)
+        latents = traj["latent"][:, :-1]
+
+        values = self.critic(latents)
+        critic_loss = (0.5 * weights * (values - returns).pow(2)).mean()
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.grad_clip)
+        self.critic_opt.step()
+        _ema(self.critic_slow, self.critic, cfg.critic_ema)
+
+        s = self.scale.update(returns)
+        dist = self.actor.dist(latents)
+        advantage = ((returns - values.detach()) / s).detach()
+        entropy = dist.entropy()
+        actor_loss = (weights * (-advantage * dist.log_prob(traj["action"])
+                                 - cfg.entropy * entropy)).mean()
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.grad_clip)
+        self.actor_opt.step()
+
+        out = {"actor_loss": float(actor_loss.detach()),
+               "critic_loss": float(critic_loss.detach()),
+               "scale": s,
+               "imagined_return": float(returns[:, 0].mean()),
+               "entropy": float(entropy.mean().detach()),
+               "n_starts": float(h.shape[0]),
+               "n_dropped": n_real - float(h.shape[0]),
+               "clipped_share": clipped_share}
+        if h.device.type == "mps":
+            # N (start states) differs every update, so every update allocates
+            # tensors of new shapes and the MPS caching allocator never reuses
+            # its blocks. Driver memory grew ~60 MB/update and hit OOM near
+            # update 350 (M4); releasing the cache each update holds it flat.
+            torch.mps.empty_cache()
+        return out
+
+    def state_dict(self) -> dict:
+        return {"actor": self.actor.state_dict(), "critic": self.critic.state_dict(),
+                "critic_slow": self.critic_slow.state_dict(),
+                "actor_opt": self.actor_opt.state_dict(),
+                "critic_opt": self.critic_opt.state_dict(),
+                "scale": {"low": self.scale.low, "high": self.scale.high}}
+
+    def load_state_dict(self, sd: dict) -> None:
+        self.actor.load_state_dict(sd["actor"])
+        self.critic.load_state_dict(sd["critic"])
+        self.critic_slow.load_state_dict(sd["critic_slow"])
+        self.actor_opt.load_state_dict(sd["actor_opt"])
+        self.critic_opt.load_state_dict(sd["critic_opt"])
+        self.scale.low, self.scale.high = sd["scale"]["low"], sd["scale"]["high"]
+
+
 def train_actor_critic(world_model, buffer: ReplayBuffer, cfg: ACConfig,
                        out_dir: Path | None, log_every: int = 100) -> dict[str, Any]:
     seed_everything(cfg.seed)
     device = next(world_model.parameters()).device
     freeze(world_model)
     arm, n_actions = world_model.cfg.arm, world_model.cfg.train.n_actions
-    transform = world_model.cfg.train.reward_transform
-
-    actor = Actor(n_actions, seed=cfg.seed).to(device)
-    critic = Critic(seed=cfg.seed).to(device)
-    critic_slow = copy.deepcopy(critic).requires_grad_(False)
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
-    critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
-    scale = ReturnScale(cfg.scale_decay)
+    learner = ActorCriticLearner(n_actions, cfg, device)
 
     train_paths, _ = episode_split(buffer.episode_paths(), val_fraction=VAL_FRACTION, seed=0)
     kind = world_model.input_kind
@@ -171,7 +260,10 @@ def train_actor_critic(world_model, buffer: ReplayBuffer, cfg: ACConfig,
         feature_backbone=encoder_backbone(world_model.cfg.encoder) or "dinov2",
         paths=train_paths, pad_short=True,
     )
-    sample_actor = lambda latent: actor.dist(latent).sample()
+    bounds = None
+    if cfg.bound_reward_readout:
+        rewards = np.concatenate([np.load(p)["rewards"] for p in train_paths])
+        bounds = (float(rewards.min()), float(rewards.max()))
 
     history: dict[str, Any] = {"actor_loss": [], "critic_loss": [], "scale": [],
                                "imagined_return": [], "entropy": [], "checkpoints": []}
@@ -179,59 +271,20 @@ def train_actor_critic(world_model, buffer: ReplayBuffer, cfg: ACConfig,
     start = time.perf_counter()
     for update in range(1, cfg.updates + 1):
         batch = to_device(loader.sample(), device)
-        h, z = start_states(world_model, batch)
-        with torch.no_grad():
-            traj = world_model.rssm.imagine_policy(sample_actor, (h, z), cfg.horizon)
-            heads = world_model.heads(traj["latent"][:, 1:])
-            rewards = read_reward(heads["reward"], transform)
-            cont = torch.sigmoid(heads["continue_logit"])
-            values_slow = critic_slow(traj["latent"])
-            returns = lambda_returns(rewards, cfg.gamma * cont, values_slow, cfg.lam)
-            weights = continue_weights(cont)
-        latents = traj["latent"][:, :-1]
-
-        values = critic(latents)
-        critic_loss = (0.5 * weights * (values - returns).pow(2)).mean()
-        critic_opt.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(critic.parameters(), cfg.grad_clip)
-        critic_opt.step()
-        _ema(critic_slow, critic, cfg.critic_ema)
-
-        s = scale.update(returns)
-        dist = actor.dist(latents)
-        advantage = ((returns - values.detach()) / s).detach()
-        entropy = dist.entropy()
-        actor_loss = (weights * (-advantage * dist.log_prob(traj["action"])
-                                 - cfg.entropy * entropy)).mean()
-        actor_opt.zero_grad()
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(actor.parameters(), cfg.grad_clip)
-        actor_opt.step()
-
+        out = learner.step(world_model, batch, reward_bounds=bounds)
         if update == 1:
             isolation_ok = all(p.grad is None for p in world_model.parameters())
             if not isolation_ok:
                 raise RuntimeError("a world-model parameter received a gradient (spec §5.2)")
-
-        history["actor_loss"].append(float(actor_loss.detach()))
-        history["critic_loss"].append(float(critic_loss.detach()))
-        history["scale"].append(s)
-        history["imagined_return"].append(float(returns[:, 0].mean()))
-        history["entropy"].append(float(entropy.mean().detach()))
+        for key in ("actor_loss", "critic_loss", "scale", "imagined_return", "entropy"):
+            history[key].append(out[key])
         if out_dir is not None and update % cfg.checkpoint_every == 0:
             path = _save(Path(out_dir), arm, cfg.seed, update, n_actions,
-                         actor, critic, critic_slow)
+                         learner.actor, learner.critic, learner.critic_slow)
             history["checkpoints"].append(str(path))
         if log_every and update % log_every == 0:
             print(f"[ac {arm}] update {update}/{cfg.updates} actor={history['actor_loss'][-1]:+.4f} "
                   f"critic={history['critic_loss'][-1]:.4f} G0={history['imagined_return'][-1]:+.2f}")
-        if device.type == "mps":
-            # N (masked-in start states) differs every update, so every update
-            # allocates tensors of new shapes and the MPS caching allocator never
-            # reuses its blocks. Driver memory grew ~60 MB/update and hit OOM near
-            # update 350; releasing the cache each update holds it flat (~1 GB).
-            torch.mps.empty_cache()
 
     seconds = time.perf_counter() - start
     history.update({"arm": arm, "seed": cfg.seed, "updates": cfg.updates,
