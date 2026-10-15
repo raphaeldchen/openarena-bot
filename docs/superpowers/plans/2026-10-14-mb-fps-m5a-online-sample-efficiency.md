@@ -2624,3 +2624,39 @@ Then re-run the read into a scratch copy of the ten `record.json` files and conf
 - [ ] **Step 5: Write `## M5a results` and commit**
 
 Every number from a named record with the command that derives it, as in M4's results sections: the suite chain; each run's AUC, curve, steps-to-+50, final return, update rounds, wall clock (act/train/eval); every step-0 control; Dreamer's isolation and imagined-vs-real gap across checkpoints; the reported-only modes; the 25 pairwise comparisons; the verdict, exit code and what §7.2 licenses in the spec's words; the §10 limits; and that the feature caches were deleted after verification (§9). Commit only the plan file: `results: M5a -- <the finding, no more>`.
+
+---
+
+## Smoke results
+
+**Suite.** At `dd1bb2a`: 3814 passed, 0 failed, 1464.63 s. The one later code commit, `ba0f977`, adds only `OnlineConfig` validation; at `ba0f977` every test that touches `OnlineConfig`, `train_online` or `m5a_study` was re-run: 43 passed, 37.4 s.
+
+**Attempt 1 (budget 3000, prefill 1000, eval_every 1000), refused.** Both arms trained and evaluated, but the eval steps came out [0, 2000, 3000]. When `prefill == eval_every`, the step-0 evaluation sits at budget step 1000, so checkpoint 1000 is never evaluated. `verify_record` refused both runs and correctly left their feature caches in place. The fix is `ba0f977`: `OnlineConfig` now raises if `prefill >= eval_every` or `prefill >= budget`. Production uses prefill 5000 and eval_every 10000, so it was never affected.
+
+**Attempt 2 (budget 3000, prefill 500, eval_every 1000, at `ba0f977`).** Both runs exited 0 and printed `complete`:
+- eval steps [0, 1000, 2000, 3000];
+- 500 update rounds;
+- `nonfinite` {};
+- feature caches and `state.pt` deleted after verification (70 files each);
+- Dreamer `isolation_ok` True.
+
+| | train s/round | act ms/step | eval s/checkpoint | projected 100k run |
+|---|---|---|---|---|
+| Dreamer | 339.4 / 500 = 0.679 | 54.8 / 3000 = 18.3 | 1093.8 / 4 = 273 | 12,896 + 1,826 + 3,008 s = **4.93 h** |
+| DQN | 23.2 / 500 = 0.046 | 35.8 / 3000 = 11.9 | 703.1 / 4 = 176 | 882 + 1,192 + 1,934 s = **1.11 h** |
+
+Ten runs: 5 × (4.93 + 1.11) = **30.2 h**. This is under the 40 h stop and above the spec's ~25 h estimate. Evaluation is about 40% of the total, and its cost is highest while policies are poor, because random-like episodes run to the timeout.
+
+Gated returns at steps 0 / 1000 / 2000 / 3000 (random −164.2):
+- Dreamer `sample`: −171.3 / −170.2 / −158.8 / −166.0.
+- DQN `greedy`: −300.5 / −165.3 / −218.7 / −226.9.
+
+Three thousand steps measure nothing about efficiency. They only show that the loop runs and that both step-0 controls sit at or below random. The reported-only modes are Dreamer `argmax`, which is −300 (timeout) until −236 at step 3000, and DQN `eps0_05`, which is −289 to −127. Neither looks wrong for untrained policies.
+
+**Real-stack crash-resume.** This closes Task 8's deferred minor.
+- A Dreamer seed-0 run with the attempt-2 configuration was stopped at budget step 1500 via `train_online(..., stop_after_step=1500)`. No checkpoint is written at the stop, so this simulates a crash after checkpoint 1000.
+- It was then resumed by `scripts/train_online.py` to 3000.
+- Its `evals`, `random`, `update_rounds`, `budget_steps`, `isolation_ok` and `complete` are **identical** to the uninterrupted attempt-2 record.
+- So on ViZDoom and DINOv2 on MPS, a resume still reproduces the run exactly: orphan pruning, re-encoding the replayed episode, and restoring the recurrent policy state.
+
+**Nothing else looked wrong.** `runs/m5a_smoke*` are scratch. Copies of the smoke records are in the SDD workspace's `runlogs/`.
