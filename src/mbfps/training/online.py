@@ -53,25 +53,39 @@ def _make_arm(name: str, seed: int, device, encode, replay, kwargs):
 
 
 def _rng_state(device) -> dict:
+    """Every generator a resume must restore. A device type this does not know
+    raises: a silently unsaved generator would break the bit-identical resume (§3.4)."""
+    if device.type not in ("cpu", "mps", "cuda"):
+        raise ValueError(f"cannot save the RNG state of a {device.type!r} device")
     out = {"python": random.getstate(), "numpy": np.random.get_state(),
            "torch": torch.get_rng_state()}
     if device.type == "mps":
         out["mps"] = torch.mps.get_rng_state()
+    elif device.type == "cuda":
+        out["cuda"] = torch.cuda.get_rng_state_all()
     return out
 
 
 def _set_rng_state(state: dict, device) -> None:
+    if device.type not in ("cpu", "mps", "cuda"):
+        raise ValueError(f"cannot restore the RNG state of a {device.type!r} device")
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
     if device.type == "mps":
         torch.mps.set_rng_state(state["mps"])
+    elif device.type == "cuda":
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict) -> dict:
-    """What identifies a run. A dataclass kwarg (DQNConfig) is stored by value."""
+def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict, device) -> dict:
+    """What identifies a run. A dataclass kwarg (DQNConfig) is stored by value.
+
+    The commit and the device type are part of it: a resume on other code or on
+    another device is not the run that was started, and is refused."""
     kwargs = {k: asdict(v) if is_dataclass(v) else v for k, v in arm_kwargs.items()}
-    return {"arm": arm_name, "seed": seed, "cfg": asdict(cfg), "arm_kwargs": kwargs}
+    return {"arm": arm_name, "seed": seed, "cfg": asdict(cfg), "arm_kwargs": kwargs,
+            "git_sha": git_sha(), "device": device.type}
 
 
 def _prune_replay(root: Path, keep: set[str]) -> None:
@@ -106,7 +120,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
                            "is finished and its resumable state was removed; refusing to "
                            "start a fresh run on top of its replay")
     arm_kwargs = arm_kwargs or {}
-    meta = _meta(arm_name, seed, cfg, arm_kwargs)
+    meta = _meta(arm_name, seed, cfg, arm_kwargs, device)
     saved = None
     if state_path.exists():
         # weights_only=False: the state holds NumPy RNG states and frame stacks,
@@ -152,7 +166,8 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         rollout.policy_name = arm.name
         timing["act"] += time.perf_counter() - t0
         record = {"arm": arm.name, "seed": seed, "gated_mode": arm.gated_mode, "seeds": seeds,
-                  "config": asdict(cfg), "evals": [], "complete": False,
+                  "config": asdict(cfg), "git_sha": meta["git_sha"], "evals": [],
+                  "complete": False,
                   "random": run_episodes(eval_env, RandomPolicy(4, seed=0), seeds)}
         update_rounds = 0
         t0 = time.perf_counter()
@@ -193,7 +208,7 @@ def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, dev
                 state_path: Path, record_path: Path, meta: dict) -> None:
     record.update({"budget_steps": rollout.budget_step, "update_rounds": update_rounds,
                    "isolation_ok": arm.isolation_ok, "timing": dict(timing),
-                   "seconds": sum(timing.values()), "git_sha": git_sha()})
+                   "seconds": sum(timing.values())})
     tmp = state_path.with_suffix(".tmp")
     torch.save({"arm": arm.state_dict(), "rollout": rollout.state(),
                 "policy": policy.get_state() if rollout.in_progress else None,

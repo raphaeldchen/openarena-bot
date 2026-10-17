@@ -9,6 +9,7 @@ import torch
 from mbfps.data.episode import load_episode
 from mbfps.eval.study import load_record, write_record
 from mbfps.training.dqn import DQNConfig
+from mbfps.training import online
 from mbfps.training.online import (OnlineConfig, delete_replay_features, train_online,
                                    verify_record)
 from tests.training.fake_env import FakeEnv, fake_encode
@@ -127,6 +128,72 @@ def test_resume_refuses_a_different_run(tmp_path, change):
     with pytest.raises(RuntimeError, match="differs"):
         train_online(**call)
     assert _replay(tmp_path) == n
+
+
+def _call(tmp_path, **change):
+    call = dict(arm_name="dreamer", seed=0, out_dir=tmp_path, env_factory=FakeEnv,
+                encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=DREAMER_KW)
+    call.update(change)
+    return call
+
+
+def test_resume_refuses_a_different_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-b")
+    n = _replay(tmp_path)
+    with pytest.raises(RuntimeError, match="differs"):
+        train_online(**_call(tmp_path))
+    assert _replay(tmp_path) == n
+
+
+def test_resume_at_the_same_commit_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    assert _run(tmp_path)["complete"] is True
+
+
+def test_resume_refuses_a_different_device_type(tmp_path):
+    _run(tmp_path, stop=20)
+    n = _replay(tmp_path)
+    with pytest.raises(RuntimeError, match="differs"):
+        train_online(**_call(tmp_path, device=torch.device("mps")))
+    assert _replay(tmp_path) == n
+
+
+def test_meta_pins_the_commit_and_the_device_type(monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    meta = online._meta("dreamer", 0, TINY, {}, CPU)
+    assert meta["git_sha"] == "commit-a" and meta["device"] == "cpu"
+    assert online._meta("dreamer", 0, TINY, {}, torch.device("cuda"))["device"] == "cuda"
+
+
+def test_record_git_sha_is_set_once_and_never_overwritten(tmp_path, monkeypatch):
+    shas = iter(f"sha{i}" for i in range(100))
+    monkeypatch.setattr(online, "git_sha", lambda: next(shas))
+    rec = _run(tmp_path)
+    assert len(rec["evals"]) == 4                       # four checkpoints were written
+    assert rec["git_sha"] == "sha0"                     # the one _meta read, not a later HEAD
+    assert load_record(tmp_path / "record.json")["git_sha"] == "sha0"
+
+
+def test_unknown_device_type_is_refused():
+    meta = torch.device("meta")
+    with pytest.raises(ValueError, match="meta"):
+        online._rng_state(meta)
+    with pytest.raises(ValueError, match="meta"):
+        online._set_rng_state({"python": None}, meta)
+
+
+def test_cuda_rng_is_saved_and_restored(monkeypatch):
+    cuda = torch.device("cuda")
+    seen = {}
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: ["gpu0", "gpu1"])
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", lambda s: seen.setdefault("set", s))
+    state = online._rng_state(cuda)
+    assert state["cuda"] == ["gpu0", "gpu1"]
+    online._set_rng_state(state, cuda)
+    assert seen["set"] == ["gpu0", "gpu1"]
 
 
 def test_evaluation_steps_never_enter_the_replay(tmp_path):
