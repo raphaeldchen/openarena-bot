@@ -2660,3 +2660,352 @@ Three thousand steps measure nothing about efficiency. They only show that the l
 - So on ViZDoom and DINOv2 on MPS, a resume still reproduces the run exactly: orphan pruning, re-encoding the replayed episode, and restoring the recurrent policy state.
 
 **Nothing else looked wrong.** `runs/m5a_smoke*` are scratch. Copies of the smoke records are in the SDD workspace's `runlogs/`.
+
+---
+
+## M5a results
+
+Run on 2026-10-14 to 2026-10-16: five seeds (0-4) of two arms, online Dreamer (`frozen_ssl` world model, actor sampling) and Double DQN (greedy), scenario `basic`, 100,000 environment steps per run (5,000 random prefill steps included), one update round per 5 steps after the prefill, evaluation on seeds 1,000,000-1,000,099 at steps 0, 10,000, ..., 100,000. Branch `feat/m5a-online-loop`. Paths are worktree-relative; `runs` is a symlink into the main checkout. The ledger is `.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-efficiency/progress.md` (lines beginning `Task 11:` and `Task 12:`); run and read logs are `runs/m5a_run.log`, `runs/m5a/read.log` and `runs/m5a/study.txt`, with copies in that directory's `runlogs/`. Python below means `PYTHONPATH=src:. /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python`. The ten runs and the read were executed by the controller; this section was written afterwards from the ten `runs/m5a/<arm>_seed<n>/record.json` files and the logs, and every number below was re-derived from those records by the snippets shown (the numbers in `study.txt` agree with them wherever both print the same quantity).
+
+All snippets in this section share this prelude, run from the worktree root (pure reads; nothing is written):
+
+```python
+import json, itertools, numpy as np
+from mbfps.eval.efficiency import auc, gated_returns, pairwise_wins, run_problems, steps_to_threshold, verdict
+from mbfps.eval.live import paired_gate
+from mbfps.training.online import OnlineConfig, checkpoint_steps
+cfg = OnlineConfig(); CK = checkpoint_steps(cfg)
+R = {(a, s): json.load(open(f"runs/m5a/{a}_seed{s}/record.json")) for a in ("dreamer", "dqn") for s in range(5)}
+ev = lambda r, st: next(e for e in r["evals"] if e["step"] == st)
+mean = lambda r, st, mode=None: float(np.mean([e["return"] for e in ev(r, st)["modes"][mode or r["gated_mode"]]]))
+```
+
+### Verdict
+
+**The §7.2 reading is `DQN_MORE_EFFICIENT`. Dreamer's AUC is higher in 1 of the 25 pairs; DQN's is higher in 24. Exit code 0.** All ten runs are present, complete and valid under §7.3, so the reading is printed.
+
+```
+Dreamer AUCs: +13.22, -17.25, +36.83, -13.23, +24.60
+DQN AUCs:     +33.86, +46.52, +49.70, +51.23, +43.88
+Dreamer wins 1 of 25 (bar 21; ties count 1/2)
+median AUC difference (Dreamer - DQN): -33.31
+VERDICT: DQN_MORE_EFFICIENT
+```
+
+- Record: `runs/m5a/read.log` (byte-identical to `runs/m5a/study.txt`: `cmp runs/m5a/study.txt runs/m5a/read.log` prints nothing). The exit code is the ledger line `Task 12: step 4: read exit 0`. `shasum -a 256 runs/m5a/study.txt` prints `4cb14b0657bdd83b1d64170be9ccd6f16860ab500be59fbfdb6f87d11c62251e`.
+- Re-derive, into a scratch directory, because the read writes `study.txt` under its `--runs` directory:
+
+```bash
+D=$(mktemp -d); for d in runs/m5a/*_seed*; do mkdir -p "$D/$(basename $d)"; cp $d/record.json "$D/$(basename $d)/"; done
+Python scripts/m5a_study.py --phase read --runs "$D" > "$D/second.txt"; echo $?
+cmp runs/m5a/study.txt "$D/study.txt" && cmp runs/m5a/read.log "$D/second.txt" && echo byte-identical
+```
+
+  At write time this printed exit `0` and `byte-identical`, and the `sha256` above. The read is a pure function of the ten records; it does not run any episode.
+- The "median AUC difference" is the difference of the two arm medians (13.22 - 46.52 = -33.31 before rounding the inputs); the median of the 25 pairwise differences is also -33.31 (-33.306 in both cases).
+
+**What §7.2 licenses.** The spec's rule for this verdict is "`DQN_MORE_EFFICIENT` | DQN's AUC higher in at least 21 of 25 pairs (Mann-Whitney U <= 4)", with one-sided exact p "12/252 = 0.048" and "The two-sided false-positive rate is 24/252 ~ 0.095." The bar was met with margin: 24 of 25 is U = 1, which has 2 of the 252 equally likely rankings at or below it (the snippet under "The 25 pairs" enumerates them; this exact p of 2/252 = 0.0079 is arithmetic on the observed U, not part of the pre-registered reading, which is the 21-of-25 bar). So, in the spec's terms (§1: "at equal environment steps, does an online Dreamer agent learn `basic` faster than a model-free agent reading the same representation?"): on `basic`, with five seeds per arm, 100,000 environment steps, one update per 5 steps, and AUC defined as the mean over the ten checkpoints 10k...100k of the mean gated return over 100 evaluation episodes, the DQN arm is the more sample-efficient one by the pre-registered rule. That is the whole licence.
+
+**What it does not license** (spec §10, restated): it is one scenario (`basic`), one train ratio (1 update per 5 steps), one budget (100,000 steps) and one model-free baseline (Double DQN on the same frozen DINOv2 features), all fixed in advance; it says nothing about harder scenarios or the encoder comparison (M5b), nothing about raw-pixel model-free agents, and nothing about transfer to other ratios, budgets or algorithms. It measures environment-sample efficiency, not compute efficiency: Dreamer spent about 3x DQN's wall-clock per run (see "Compute"), and the verdict is silent on which is cheaper for a given return. It does not say why Dreamer was slower to learn; the diagnostics below describe what the records show during that phase and do not establish a cause. It also does not say the arms differ at the end of training: both reach about +77 to +80 (see "The learning curves").
+
+### Commits, suite, and what ran where
+
+| item | value | source |
+|---|---|---|
+| suite | 3814 passed, 0 failed, 1464.63 s (0:24:24), at `dd1bb2a` | `tail -1 .superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-efficiency/runlogs/m5a_suite.log` prints `3814 passed in 1464.63s (0:24:24)`; the commit is from the ledger (`Task 11: step 1`) |
+| later code commit `ba0f977` | adds only `OnlineConfig` validation (`prefill >= eval_every` or `>= budget` refused) | `git diff --stat dd1bb2a ba0f977 -- src scripts tests` lists `src/mbfps/training/online.py` (5 lines), `tests/eval/test_efficiency.py` (2) and `tests/training/test_online.py` (14) |
+| covering tests at `ba0f977` | every test touching `OnlineConfig`, `train_online` or `m5a_study`: 43 passed, 37.4 s | ledger `Task 11: Ruling (Task 12 step 1)` (ledger only; no full-suite re-run at `ba0f977`, a ruling recorded there) |
+| run commit `c38a33a` | docs-only on top of `ba0f977` | `git diff --stat ba0f977 c38a33a -- src scripts tests` prints nothing (exit 0); `git diff --stat ba0f977 c38a33a` lists only this plan file (36 insertions) |
+| commit the ten records carry | `c38a33a` | snippet A below |
+
+The chain is: the full suite was green at `dd1bb2a`; `ba0f977` changed only the `OnlineConfig` constructor checks and its tests, which were re-run; `c38a33a` changed no source, script or test. The suite was not re-run on `c38a33a` itself.
+
+**Snippet A (validity and identity).**
+
+```python
+print({r["git_sha"][:7] for r in R.values()}, {r["complete"] for r in R.values()}, {r["budget_steps"] for r in R.values()},
+      {r["update_rounds"] for r in R.values()}, [r["nonfinite"] for r in R.values()])
+print(sum(bool(run_problems(r, cfg, *k)) for k, r in R.items()), [R[("dreamer", s)]["isolation_ok"] for s in range(5)],
+      {r["replay_features_deleted"] for r in R.values()})
+```
+
+At write time this printed `{'c38a33a'} {True} {100000} {19000} [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]` and `0 [True, True, True, True, True] {True}`. In words: all ten records carry `c38a33a`, are `complete`, spent exactly 100,000 budget steps and 19,000 update rounds (95,000 post-prefill steps / 5), and have an empty `nonfinite`; `run_problems` (the same validity function the read uses: §7.3 plus `verify_record`) returns `[]` for all ten; Dreamer's `isolation_ok` is True in all five seeds (no actor-critic step ever put a gradient on a world-model parameter); `replay_features_deleted` is True in all ten.
+
+**What ran.** The study was launched on 2026-10-14 at about 20:10 (-0500; `c38a33a` is dated 20:10:46) under `caffeinate -i` with `Python scripts/m5a_study.py --phase run > runs/m5a_run.log 2>&1`, and finished on 2026-10-16 at about 21:20 (the last `complete:` line is in `runs/m5a_run.log`, which was last written 21:23). It ran as one process, in the order dreamer s0, dqn s0, dreamer s1, dqn s1, ... dqn s4; `grep -c 'skip (done)\|FAILED\|Traceback\|resum' runs/m5a_run.log` prints `0` and there are ten `complete:` lines, so no run failed, was skipped or needed a resume. The run exit was 0 (ledger `Task 12: step 3`). The wall-clock span is about 49 hours; the sum of the ten runs' own `seconds` is 33.83 hours (snippet H). The difference is the laptop sleeping (lid or battery): each run's `seconds` and `timing` are `time.perf_counter` sums and exclude periods the machine was asleep. This section says nothing further about the cause of any timing figure.
+
+### The ten runs
+
+Records: `runs/m5a/<arm>_seed<n>/record.json` (Dreamer gated mode `sample`, DQN `greedy`). AUC is `mbfps.eval.efficiency.auc`; steps-to-+50 is `steps_to_threshold` (first checkpoint whose mean gated return is at least +50; no persistence is required); the return at 100k is the mean over the 100 evaluation episodes; seconds are the record's `seconds` and `timing` (act, train, eval).
+
+**Snippet B (per run).**
+
+```python
+for (a, s), r in R.items():
+    print(a, s, f"{auc(r, cfg):+.2f}", steps_to_threshold(r, cfg) or ">100k", f"{mean(r, 100000):+.2f}", r["update_rounds"],
+          round(r["seconds"]), *(round(r["timing"][k]) for k in ("act", "train", "eval")),
+          " ".join(f"{mean(r, c):+.1f}" for c in CK))
+```
+
+| arm | seed | AUC | steps to +50 | return at 100k | update rounds | seconds | act | train | eval |
+|---|---|---|---|---|---|---|---|---|---|
+| dreamer | 0 | +13.22 | 40000 | +77.37 | 19,000 | 15,793 | 2,638 | 12,001 | 1,154 |
+| dreamer | 1 | -17.25 | 50000 | +77.39 | 19,000 | 15,953 | 2,468 | 11,977 | 1,507 |
+| dreamer | 2 | +36.83 | 40000 | +77.22 | 19,000 | 17,220 | 2,835 | 13,412 | 973 |
+| dreamer | 3 | -13.23 | 40000 | +78.08 | 19,000 | 21,927 | 3,265 | 17,379 | 1,283 |
+| dreamer | 4 | +24.60 | 40000 | +76.54 | 19,000 | 20,362 | 2,907 | 16,416 | 1,038 |
+| dqn | 0 | +33.86 | 40000 | +79.44 | 19,000 | 5,136 | 2,164 | 2,091 | 882 |
+| dqn | 1 | +46.52 | 30000 | +79.76 | 19,000 | 5,229 | 2,146 | 2,445 | 638 |
+| dqn | 2 | +49.70 | 20000 | +79.04 | 19,000 | 6,228 | 3,012 | 2,565 | 651 |
+| dqn | 3 | +51.23 | 20000 | +79.74 | 19,000 | 6,344 | 3,056 | 2,506 | 782 |
+| dqn | 4 | +43.88 | 40000 | +79.46 | 19,000 | 7,600 | 3,056 | 3,766 | 778 |
+
+No run failed to reach +50 within the budget (no `>100k`). Steps-to-+50: Dreamer 40k in four seeds and 50k in seed 1; DQN 20k (seeds 2, 3), 30k (seed 1) and 40k (seeds 0, 4). The statistic is a first crossing on a 10k grid: DQN seed 2 is at +64.2 at 20k and +43.7 at 30k, and Dreamer seed 2 is at +49.6 at 30k, just under the bar, and +74.9 at 40k.
+
+Per-run curves (mean gated return over the 100 evaluation episodes at each checkpoint; the same snippet, last column group):
+
+| arm | seed | 0k | 10k | 20k | 30k | 40k | 50k | 60k | 70k | 80k | 90k | 100k |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| dreamer | 0 | -171.3 | -93.9 | -223.0 | -90.1 | +72.1 | +77.2 | +77.7 | +78.1 | +78.4 | +78.2 | +77.4 |
+| dreamer | 1 | -167.0 | -96.4 | -160.2 | -224.8 | -149.0 | +75.1 | +76.0 | +76.2 | +75.5 | +77.7 | +77.4 |
+| dreamer | 2 | -164.8 | -83.1 | -135.8 | +49.6 | +74.9 | +77.4 | +77.4 | +76.9 | +76.7 | +77.1 | +77.2 |
+| dreamer | 3 | -176.5 | -270.4 | -270.6 | -119.0 | +68.1 | +74.6 | +75.7 | +74.7 | +78.4 | +78.0 | +78.1 |
+| dreamer | 4 | -165.8 | -92.5 | -120.5 | -53.6 | +50.0 | +75.8 | +77.2 | +77.4 | +78.1 | +77.6 | +76.5 |
+| dqn | 0 | -300.5 | -167.5 | -67.2 | +32.9 | +74.8 | +77.2 | +75.3 | +75.7 | +78.6 | +79.4 | +79.4 |
+| dqn | 1 | -273.4 | -137.9 | +2.2 | +69.2 | +70.0 | +72.7 | +74.7 | +77.4 | +78.6 | +78.6 | +79.8 |
+| dqn | 2 | -206.4 | -150.1 | +64.2 | +43.7 | +70.7 | +74.8 | +76.5 | +78.7 | +80.0 | +79.6 | +79.0 |
+| dqn | 3 | -300.0 | -149.6 | +63.5 | +56.6 | +73.7 | +74.4 | +77.9 | +77.6 | +79.1 | +79.3 | +79.7 |
+| dqn | 4 | -313.0 | -107.4 | -3.5 | +18.3 | +69.4 | +72.3 | +76.8 | +75.7 | +79.1 | +78.6 | +79.5 |
+
+These are the same values as the `curve(0..100k)` lines of `runs/m5a/study.txt`.
+
+### The learning curves (§7.4)
+
+Mean and range across the five seeds of the gated-mode return at every checkpoint (snippet D):
+
+```python
+for c in CK:
+    print(c, *(f"{np.mean(m):+.1f} [{min(m):+.1f}, {max(m):+.1f}]" for m in ([mean(R[(a, s)], c) for s in range(5)] for a in ("dreamer", "dqn"))))
+print("early 10-40k", *(round(np.mean([[mean(R[(a, s)], c) for c in CK[1:5]] for s in range(5)]), 1) for a in ("dreamer", "dqn")),
+      "late 50-100k", *(round(np.mean([[mean(R[(a, s)], c) for c in CK[5:]] for s in range(5)]), 1) for a in ("dreamer", "dqn")))
+```
+
+| step | Dreamer mean | Dreamer range | DQN mean | DQN range |
+|---|---|---|---|---|
+| 0k | -169.1 | -176.5 to -164.8 | -278.7 | -313.0 to -206.4 |
+| 10k | -127.2 | -270.4 to -83.1 | -142.5 | -167.5 to -107.4 |
+| 20k | -182.0 | -270.6 to -120.5 | +11.9 | -67.2 to +64.2 |
+| 30k | -87.6 | -224.8 to +49.6 | +44.1 | +18.3 to +69.2 |
+| 40k | +23.2 | -149.0 to +74.9 | +71.7 | +69.4 to +74.8 |
+| 50k | +76.0 | +74.6 to +77.4 | +74.3 | +72.3 to +77.2 |
+| 60k | +76.8 | +75.7 to +77.7 | +76.2 | +74.7 to +77.9 |
+| 70k | +76.6 | +74.7 to +78.1 | +77.0 | +75.7 to +78.7 |
+| 80k | +77.4 | +75.5 to +78.4 | +79.1 | +78.6 to +80.0 |
+| 90k | +77.7 | +77.1 to +78.2 | +79.1 | +78.6 to +79.6 |
+| 100k | +77.3 | +76.5 to +78.1 | +79.5 | +79.0 to +79.8 |
+
+Step 0 is not part of the AUC. What the table shows, descriptively:
+
+- **Where the AUC difference comes from.** Over checkpoints 10k-40k the arms' mean gated returns average -93.4 (Dreamer) and -3.7 (DQN); over 50k-100k they average +77.0 and +77.5. The AUC gap (Dreamer mean AUC +8.83, DQN +45.04) is made in the first 40k steps. At 50k and 60k Dreamer's seed-mean is slightly above DQN's (+76.0 against +74.3; +76.8 against +76.2), and at 70k they are +76.6 against +77.0.
+- **Both arms plateau at about +77 to +80.** From 50k, every run of both arms holds between +72.3 and +80.0. At 80k, 90k and 100k the two arms' per-seed ranges do not overlap, DQN's being higher (at 100k, Dreamer +76.5 to +78.1, DQN +79.0 to +79.8, a mean difference of 2.2). This is an observation about the last three checkpoints, not part of the pre-registered reading. At 100k both arms' evaluation episodes are all kills (kill rate 1.0) with mean length 6.3 (Dreamer) and 5.9 (DQN) steps.
+- **DQN's curve is closer to monotone.** After 20k its largest single fall is DQN seed 2 from +64.2 to +43.7. Dreamer is not monotone before 50k: in four seeds the mean return falls between two consecutive checkpoints by 28 to 129 points (seed 0 from -93.9 to -223.0; seed 1 from -96.4 to -160.2 and then to -224.8; seed 2 from -83.1 to -135.8; seed 4 from -92.5 to -120.5) and in seed 3 by 0.2 (-270.4 to -270.6). All five are above +74 at 50k (seed 1, the last to recover, is at -149.0 at 40k and +75.1 at 50k).
+
+### Step-0 controls (§6, §7.3)
+
+Both arms are evaluated at budget step 0, after the prefill and before any update; each arm's step-0 policy through M4's seed-paired gate against the random policy on the same 100 seeds must **fail** it (the gate passes only if the paired-difference interval's `ci_low` is above 0). `random` is measured once; it is identical in all ten records.
+
+```python
+rnd = [e["return"] for e in R[("dreamer", 0)]["random"]]
+print("random mean", round(np.mean(rnd), 2), "len", round(np.mean([e["length"] for e in R[("dreamer", 0)]["random"]]), 1),
+      "kill", np.mean([e["killed"] for e in R[("dreamer", 0)]["random"]]), "identical in all ten:", len({tuple(e["return"] for e in r["random"]) for r in R.values()}) == 1)
+for k, r in R.items():
+    g = paired_gate(gated_returns(r, 0), [e["return"] for e in r["random"]])
+    print(k, round(mean(r, 0), 2), {a: b for a, b in g.items()})
+```
+
+Random baseline: mean return -164.21, mean length 47.1, kill rate 0.57; identical in all ten records (`True`).
+
+| run | step-0 mean return | point | ci_low | ci_high | passed |
+|---|---|---|---|---|---|
+| dreamer s0 | -171.34 | -7.13 | -49.48 | +35.56 | False |
+| dreamer s1 | -167.02 | -2.81 | -45.12 | +41.80 | False |
+| dreamer s2 | -164.81 | -0.60 | -44.60 | +45.07 | False |
+| dreamer s3 | -176.47 | -12.26 | -54.04 | +32.39 | False |
+| dreamer s4 | -165.77 | -1.56 | -45.43 | +43.52 | False |
+| dqn s0 | -300.50 | -136.29 | -172.91 | -98.84 | False |
+| dqn s1 | -273.44 | -109.23 | -148.41 | -70.52 | False |
+| dqn s2 | -206.45 | -42.24 | -95.87 | +7.78 | False |
+| dqn s3 | -300.00 | -135.79 | -172.40 | -98.59 | False |
+| dqn s4 | -313.00 | -148.79 | -186.06 | -113.83 | False |
+
+All ten fail the gate, as §6 requires (`passed` is False in every row; `run_problems` raises the step-0 problem otherwise and returns `[]` for all ten). They fail in different ways: Dreamer's untrained actor is indistinguishable from random (every interval straddles 0), while DQN's untrained greedy policy is worse than random (four of the five intervals lie entirely below 0); its step-0 episodes time out in 70% to 100% of cases (mean length 55.9 to 75.0, against random's 47.1; `truncated` and `length` of `evals[0]["modes"]["greedy"]`).
+
+### The 25 pairs (§7.2)
+
+Dreamer seed rows against DQN seed columns; each cell is the AUC difference (Dreamer - DQN), and the winner is the arm with the higher AUC. There are no ties.
+
+```python
+d = [auc(R[("dreamer", s)], cfg) for s in range(5)]; q = [auc(R[("dqn", s)], cfg) for s in range(5)]
+for i, x in enumerate(d): print(i, " ".join(f"{x - y:+.2f}" for y in q))
+print(pairwise_wins(d, q), pairwise_wins(q, d), verdict(d, q), np.median(d) - np.median(q), np.median([x - y for x in d for y in q]))
+U = [sum(a > b for a, b in itertools.product(c, set(range(10)) - set(c))) for c in itertools.combinations(range(10), 5)]
+print("exact one-sided p, DQN-wins>=24 (U<=1):", sum(u <= 1 for u in U), "/", len(U), "; U<=4:", sum(u <= 4 for u in U), "/", len(U))
+```
+
+| Dreamer \ DQN | s0 (+33.86) | s1 (+46.52) | s2 (+49.70) | s3 (+51.23) | s4 (+43.88) |
+|---|---|---|---|---|---|
+| s0 (+13.22) | DQN (-20.64) | DQN (-33.31) | DQN (-36.48) | DQN (-38.01) | DQN (-30.66) |
+| s1 (-17.25) | DQN (-51.11) | DQN (-63.78) | DQN (-66.95) | DQN (-68.48) | DQN (-61.13) |
+| s2 (+36.83) | **Dreamer (+2.97)** | DQN (-9.69) | DQN (-12.87) | DQN (-14.39) | DQN (-7.05) |
+| s3 (-13.23) | DQN (-47.09) | DQN (-59.75) | DQN (-62.93) | DQN (-64.46) | DQN (-57.11) |
+| s4 (+24.60) | DQN (-9.26) | DQN (-21.93) | DQN (-25.10) | DQN (-26.63) | DQN (-19.28) |
+
+The snippet prints `1.0 24.0 DQN_MORE_EFFICIENT -33.306 -33.306` and `exact one-sided p, DQN-wins>=24 (U<=1): 2 / 252 ; U<=4: 12 / 252` (the 12/252 is the spec's table entry for the 21-of-25 bar, reproduced). The single Dreamer win is seed 2 over DQN seed 0, by 2.97 AUC points. Dreamer's best AUC (+36.83, seed 2) is below DQN's median (+49.70) and below four of the five DQN AUCs; Dreamer seeds 1 and 3 have negative AUCs. The two Dreamer seeds with negative AUC are two of the three that fall below random (see "Dreamer diagnostics").
+
+### The reported-only modes (§6, §7.4)
+
+Dreamer `argmax` and DQN `eps0_05` (epsilon 0.05) are recorded at every checkpoint on the same 100 seeds; they are not part of the reading. Seed-means (snippet F):
+
+```python
+for c in CK:
+    print(c, *(f"{np.mean([mean(R[(a, s)], c, m) for s in range(5)]):+.1f}" for a, m in (("dreamer", "sample"), ("dreamer", "argmax"), ("dqn", "greedy"), ("dqn", "eps0_05"))))
+A = {(a, m): [np.mean([mean(R[(a, s)], c, m) for c in CK[1:]]) for s in range(5)] for a, m in (("dreamer", "sample"), ("dreamer", "argmax"), ("dqn", "greedy"), ("dqn", "eps0_05"))}
+print({k: round(np.mean(v), 2) for k, v in A.items()}, pairwise_wins(A[("dreamer", "argmax")], A[("dqn", "eps0_05")]))
+```
+
+| step | Dreamer `sample` (gated) | Dreamer `argmax` | DQN `greedy` (gated) | DQN `eps0_05` |
+|---|---|---|---|---|
+| 0k | -169.1 | -268.5 | -278.7 | -261.3 |
+| 10k | -127.2 | -149.8 | -142.5 | -111.2 |
+| 20k | -182.0 | -190.9 | +11.9 | +19.2 |
+| 30k | -87.6 | -90.4 | +44.1 | +44.4 |
+| 40k | +23.2 | +18.0 | +71.7 | +70.5 |
+| 50k | +76.0 | +76.4 | +74.3 | +72.3 |
+| 60k | +76.8 | +77.2 | +76.2 | +74.5 |
+| 70k | +76.6 | +77.8 | +77.0 | +74.3 |
+| 80k | +77.4 | +77.2 | +79.1 | +76.8 |
+| 90k | +77.7 | +77.6 | +79.1 | +77.0 |
+| 100k | +77.3 | +77.5 | +79.5 | +77.3 |
+
+Mean AUC by mode: Dreamer `sample` +8.83, Dreamer `argmax` +5.06; DQN `greedy` +45.04, DQN `eps0_05` +47.51. Applying the same 25-pair comparison to the reported-only modes (descriptive only; it is not a pre-registered reading) gives 0.0 Dreamer wins of 25 for Dreamer `argmax` against DQN `eps0_05`: Dreamer's best `argmax` AUC (+34.43) is below DQN's lowest `eps0_05` AUC (+38.77). So the ordering does not depend on which evaluation mode is used for either arm. After 50k, Dreamer's `argmax` and `sample` seed-means differ by at most 1.2, and DQN's `eps0_05` seed-mean is 1.7 to 2.7 below its greedy seed-mean. The training epsilon recorded in the DQN diagnostics is 0.81 at 10k and 0.05 at 50k and 100k in all five seeds, so from 50k the `eps0_05` evaluation mode matches the behaviour policy's floor.
+
+### Dreamer diagnostics (§4.4, reported not gated)
+
+Source: `evals[i]["diagnostics"]` (training diagnostics: means over the update rounds since the previous checkpoint) and `evals[i]["modes"]["sample"][j]["imagined_return"]` (evaluation: the imagined lambda-return at each evaluation episode's first filtered state, read with `critic_slow`, `gamma`, `lam` and the unbounded reward readout; `mbfps.eval.live.AgentPolicy._imagined_return`). The imagined-vs-real gap at episode start (§4.4) is the evaluation imagined return minus the episode's real return, averaged over the 100 evaluation episodes. It is the spec's diagnostic, not a calibrated error: the imagined value is a discounted lambda-return over a 15-step horizon, bootstrapped by the slow critic, and the real return is an undiscounted episode sum.
+
+**Snippet G.**
+
+```python
+D = [R[("dreamer", s)] for s in range(5)]
+imag = lambda r, c: float(np.mean([e["imagined_return"] for e in ev(r, c)["modes"]["sample"]]))
+rows = [(s, c, mean(D[s], c, "sample"), imag(D[s], c)) for s in range(5) for c in CK[1:]]
+print("real < random:", [(s, c, round(re, 1)) for s, c, re, im in rows if re < np.mean(rnd)])
+print("gap > +100:", [(s, c, round(re), round(im), round(im - re)) for s, c, re, im in rows if im - re > 100])
+print("gap < -100:", [(s, c, round(re), round(im), round(im - re)) for s, c, re, im in rows if im - re < -100])
+late = [im - re for s, c, re, im in rows if c >= 60000]
+print("60k+ gap: mean", round(np.mean(late), 2), "mean abs", round(np.mean(np.abs(late)), 2), "range", round(min(late), 1), round(max(late), 1), len(late))
+for s, c in ((0, 20000), (1, 30000), (3, 10000), (3, 20000), (1, 20000), (4, 20000)):
+    m = ev(D[s], c)["modes"]["sample"]
+    print(s, c, "len", round(np.mean([x["length"] for x in m]), 1), "kill", np.mean([x["killed"] for x in m]), "truncated", np.mean([x["truncated"] for x in m]))
+print("random truncated", np.mean([e["truncated"] for e in R[("dreamer", 0)]["random"]]))
+dg = lambda s, c, k: ev(D[s], c)["diagnostics"][k]
+for k in ("imagined_return", "clipped_share", "n_dropped", "n_starts", "entropy", "scale", "critic_loss", "wm_reward"):
+    print(k, *(f"{np.mean([dg(s, c, k) for s in range(5)]):.4g}" for c in CK[1:]))
+```
+
+Imagined return at episode start, real return, and the gap (imagined - real), per seed and checkpoint:
+
+| seed | | 0k | 10k | 20k | 30k | 40k | 50k | 60k | 70k | 80k | 90k | 100k |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | real | -171.3 | -93.9 | -223.0 | -90.1 | +72.1 | +77.2 | +77.7 | +78.1 | +78.4 | +78.2 | +77.4 |
+| 0 | imagined | +0.1 | -116.7 | -77.7 | -154.3 | +43.0 | +76.5 | +81.8 | +78.3 | +78.1 | +79.7 | +76.9 |
+| 0 | gap | +171.4 | -22.8 | +145.3 | -64.2 | -29.1 | -0.7 | +4.1 | +0.2 | -0.2 | +1.6 | -0.5 |
+| 1 | real | -167.0 | -96.4 | -160.2 | -224.8 | -149.0 | +75.1 | +76.0 | +76.2 | +75.5 | +77.7 | +77.4 |
+| 1 | imagined | +0.0 | -132.3 | -367.7 | -75.7 | -163.6 | +73.6 | +72.5 | +79.1 | +74.7 | +79.0 | +85.4 |
+| 1 | gap | +167.0 | -35.9 | -207.5 | +149.2 | -14.6 | -1.5 | -3.5 | +3.0 | -0.8 | +1.3 | +8.0 |
+| 2 | real | -164.8 | -83.1 | -135.8 | +49.6 | +74.9 | +77.4 | +77.4 | +76.9 | +76.7 | +77.1 | +77.2 |
+| 2 | imagined | -0.1 | -112.9 | -92.1 | +3.7 | +64.8 | +78.7 | +79.5 | +75.4 | +81.3 | +74.9 | +82.0 |
+| 2 | gap | +164.7 | -29.8 | +43.7 | -46.0 | -10.1 | +1.3 | +2.1 | -1.5 | +4.6 | -2.2 | +4.8 |
+| 3 | real | -176.5 | -270.4 | -270.6 | -119.0 | +68.1 | +74.6 | +75.7 | +74.7 | +78.4 | +78.0 | +78.1 |
+| 3 | imagined | -0.0 | -163.8 | -120.1 | -117.8 | +36.6 | +71.2 | +79.5 | +71.1 | +75.9 | +76.5 | +76.7 |
+| 3 | gap | +176.4 | +106.5 | +150.5 | +1.2 | -31.5 | -3.4 | +3.8 | -3.6 | -2.5 | -1.6 | -1.4 |
+| 4 | real | -165.8 | -92.5 | -120.5 | -53.6 | +50.0 | +75.8 | +77.2 | +77.4 | +78.1 | +77.6 | +76.5 |
+| 4 | imagined | -0.0 | -144.4 | -392.2 | -62.4 | +23.7 | +64.7 | +79.1 | +77.5 | +82.5 | +73.9 | +83.5 |
+| 4 | gap | +165.8 | -51.8 | -271.7 | -8.7 | -26.3 | -11.1 | +1.9 | +0.2 | +4.4 | -3.8 | +7.0 |
+
+Training diagnostics (seed-mean over the five Dreamer seeds of the checkpoint's window mean):
+
+| step | imagined_return | clipped_share | dropped share of start states | entropy | return scale | critic_loss | wm_reward |
+|---|---|---|---|---|---|---|---|
+| 10k | -93.78 | 0.0026 | 1.3% | 1.102 | 91.4 | 292 | 0.403 |
+| 20k | -398.8 | 0.0051 | 1.3% | 0.232 | 547.6 | 1,714 | 0.0737 |
+| 30k | -403.6 | 0.0299 | 1.3% | 0.323 | 790.4 | 3,871 | 0.0206 |
+| 40k | -125.3 | 0.0388 | 1.8% | 0.234 | 380.5 | 1,091 | 0.0136 |
+| 50k | +37.74 | 0.0572 | 3.8% | 0.105 | 126.5 | 192 | 0.0125 |
+| 60k | +66.06 | 0.0736 | 6.0% | 0.081 | 91.8 | 21.7 | 0.00977 |
+| 70k | +70.46 | 0.0737 | 7.6% | 0.067 | 89.7 | 13.9 | 0.00886 |
+| 80k | +73.31 | 0.0726 | 8.8% | 0.064 | 86.5 | 11.0 | 0.00876 |
+| 90k | +75.68 | 0.0739 | 9.7% | 0.065 | 86.5 | 9.10 | 0.00823 |
+| 100k | +77.00 | 0.0708 | 10.3% | 0.075 | 77.4 | 8.08 | 0.00662 |
+
+(The table's columns follow `CK[1:]`; the dropped share is `n_dropped / (n_dropped + n_starts)` per seed, then averaged; `clipped_share` is the share of imagined reward readouts outside the bound, per §4.3.) At step 0 (before any update) the diagnostics hold only `reward_bounds`, `replay_transitions` (5,000) and `replay_episodes` (101 to 118 across seeds, per `evals[0]`).
+
+What the diagnostics show:
+
+- **Isolation held.** `isolation_ok` is True in all five Dreamer runs (snippet A).
+- **Reward bounds.** `reward_bounds` is [-9.0, 99.0] at every checkpoint, including step 0, in all five seeds (`{tuple(ev(r, c)["diagnostics"]["reward_bounds"]) for r in D for c in CK}` is `{(-9.0, 99.0)}`), so both a missed shot and a kill were in the prefill replay and the bound never widened afterwards.
+- **Clipping.** `clipped_share` rises from 0.26% (10k) to about 7% from 60k; the largest value in any seed at any checkpoint is 0.0867. The bound is active throughout and never dominant. The dropped share of start states (terminal starts, §4.3) is 1.3% through 30k (about the 1.4% the spec cites for M4) and rises to 10.3% at 100k, as episodes shorten to about 6 steps and every one ends in a kill.
+- **Imagined against real, after the transient.** From 60k to 100k (25 seed-checkpoints) the gap has mean +1.0, mean absolute value 2.7, range -3.8 to +8.0; at 50k it is -11.1 to +1.3. Imagination and reality agree to within a few points once the policy is at its plateau. There is no sign of the exploitation signature (§4.4: imagined return far above the real one) in the plateau phase.
+- **Imagined against real, during the dips.** This is the observation worth recording. Four seed-checkpoints have a real mean return below random (-164.21): seed 0 at 20k (-223.0), seed 1 at 30k (-224.8), seed 3 at 10k (-270.4) and seed 3 at 20k (-270.6) (the `real < random` line of snippet G). Three of the five seeds (0, 1, 3) have at least one; seeds 2 and 4 never fall below random after step 0 (their minima are -135.8 and -120.5). The same four seed-checkpoints are exactly the four whose gap exceeds +100 (imagined return at episode start minus real: +145, +149, +107, +150, with imagined returns of -78, -76, -164 and -120): the world model's start-of-episode estimate was 107 to 150 points above what the policy then earned. At those four checkpoints the evaluation episodes also show lower kill rates (0.21, 0.36, 0.08 and 0.31, against 0.57 for random) and longer episodes with more time-outs (truncated share 0.79, 0.64, 0.92 and 0.69, against 0.43 for random).
+- **But the gap is not always positive when the policy is poor.** Two other checkpoints have a gap below -100, in the other direction: seed 1 at 20k (imagined -368, real -160, gap -208) and seed 4 at 20k (imagined -392, real -120, gap -272). So a large gap of either sign occurs at 20k, and a policy near or somewhat better than random can have a very pessimistic imagined value. Also, the training-window `imagined_return` (the lambda-return at the first imagined step over start states drawn from the replay, bounded readout) is strongly negative over 20k-40k in every seed (seed-means -399, -404, -125), far below the real evaluation returns of the same checkpoints (-182.0, -87.6, +23.2), while the return scale `scale` and `critic_loss` peak at 20k-30k (seed-mean scale 548 and 790, against 91 at 10k and 77-92 from 60k; critic loss 1,714 and 3,871). Since the reward readout is bounded below by -9, 15 imagined steps contribute at least -135 undiscounted; training-window returns near -400 therefore come from the slow critic's bootstrap values (an inference from the bound, not a separate measurement).
+- **What this does and does not show.** The records show that in every Dreamer seed that fell below random, the fall coincides with an evaluation-time imagined return over 100 points above the real return, the pattern M4 §5.5 names as an exploitation signature. They do not show that the policy was exploiting model error: the pattern is also what a value estimate that has not yet caught up with a changing policy would produce, two other checkpoints show a large gap of the opposite sign, the training-window imagined returns are the opposite sign to the evaluation-time ones, and the evaluation-time quantity is a single-state estimate averaged over 100 episodes. **Hypothesis only, not tested here:** that the actor drifted into regions where the world model's reward or continue head over-predicted return and was corrected as the replay grew. It is untestable from what survives: no replay, world model or actor from any checkpoint was retained (state.pt, feature caches and episode frames were deleted after each record verified; see "Disk and retention"), and the plan named no run to keep before the study began (spec §11.1, open question 1). The records alone cannot tell this apart from the alternatives.
+
+### Compute (§7.4)
+
+M5a equalises environment steps (100,000) and gradient steps, not wall-clock time. Every run took 19,000 update rounds. A Dreamer round is one world-model step plus one actor-critic step (so 19,000 of each); a DQN round is one Q-network step (19,000 in total).
+
+**Snippet H.**
+
+```python
+sec = {a: [R[(a, s)]["seconds"] for s in range(5)] for a in ("dreamer", "dqn")}
+tim = {a: {k: np.mean([R[(a, s)]["timing"][k] for s in range(5)]) for k in ("act", "train", "eval")} for a in ("dreamer", "dqn")}
+print({a: (round(np.mean(v)), round(min(v)), round(max(v)), round(sum(v) / 3600, 2)) for a, v in sec.items()})
+print("ratio", round(np.mean(sec["dreamer"]) / np.mean(sec["dqn"]), 2), "median ratio", round(np.median(sec["dreamer"]) / np.median(sec["dqn"]), 2),
+      [round(x / y, 2) for x, y in zip(sec["dreamer"], sec["dqn"])], "total h", round((sum(sec["dreamer"]) + sum(sec["dqn"])) / 3600, 2))
+print({a: {k: round(v) for k, v in t.items()} for a, t in tim.items()}, {k: round(tim["dreamer"][k] / tim["dqn"][k], 2) for k in tim["dreamer"]})
+print("train s/round", {a: round(tim[a]["train"] / 19000, 3) for a in tim}, "eval s/ckpt", {a: round(tim[a]["eval"] / 11) for a in tim},
+      "eval share", {a: round(tim[a]["eval"] / np.mean(sec[a]), 3) for a in tim})
+```
+
+| | Dreamer | DQN | ratio |
+|---|---|---|---|
+| seconds per run, mean (range) | 18,251 (15,793 to 21,927) | 6,107 (5,136 to 7,600) | 2.99 (median-to-median 2.76) |
+| hours, five runs | 25.35 | 8.48 | |
+| act, mean seconds | 2,823 | 2,687 | 1.05 |
+| train, mean seconds | 14,237 | 2,674 | 5.32 |
+| eval, mean seconds | 1,191 | 746 | 1.60 |
+| train seconds per update round | 0.749 | 0.141 | |
+| eval seconds per evaluation (11 per run) | 108 | 68 | |
+| eval share of a run | 6.5% | 12.2% | |
+
+Per seed (Dreamer / DQN) the ratio is 3.07, 3.05, 2.76, 3.46, 2.68. Dreamer used about three times DQN's per-run time; its update phase alone is 5.3x DQN's. The ten runs sum to 33.83 hours (Dreamer 25.35, DQN 8.48). Against the Task 11 smoke projection (`Task 11: step 3`: Dreamer 4.93 h, DQN 1.11 h per run, 30.2 h for ten), the measured mean runs are 5.07 h (Dreamer) and 1.70 h (DQN); the total is 3.6 h above the projection and under the 40 h stop, and above the spec's ~25 h estimate. The measured DQN train time per round (0.141 s) is three times the smoke figure (0.046 s) and Dreamer's (0.749 s) is 10% above it (0.679 s); the evaluation share of a run (6.5% and 12.2%) is below the smoke projection's ~40%, which the smoke results themselves attributed to random-like policies running to time-out. The records do not explain these differences and this section does not.
+
+Dreamer seeds 3 and 4 measured slower than the others: 21,927 s and 20,362 s, against 15,793 s, 15,953 s and 17,220 s for seeds 0-2, with the difference in the `train` component (17,379 s and 16,416 s, against 11,977 s to 13,412 s). This is reported without explanation. It does not enter the reading, which is on returns and not on time; using seeds 0-2 only, the ratio is 2.95 (Dreamer mean 16,322 s against DQN 5,531 s), so the 2.99 headline is not an artefact of the two slower seeds. Per-run `seconds` and `timing` are `time.perf_counter` sums and exclude periods the machine was asleep.
+
+### Disk and retention (§9, §11.1)
+
+**Decided before any run (Task 12, Step 2):** no run's replay is retained. Disk at the start was 14 GiB free (`Task 12: step 2`), above the 8 GB bar. Each run's feature caches (`*.features.npy`) and `state.pt` were deleted by `scripts/train_online.py` only after `verify_record` passed on the run's record; the record then carries `replay_features_deleted` True (snippet A: True in all ten).
+
+**Deviation from the §9 text, a gap in the spec and not a change of reading.** On 2026-10-15 at about 16:40 the disk reached 5.8 GiB free (`Task 12: user decision`). Spec §9 estimated disk as "~4.9 GB of features per run" and counted only the feature caches. It did not count the roughly 2 GB of episode frame files (`replay/*.npz`) each run keeps, and the plan's Global Constraints said "episode `.npz` files and records are kept". With ten of them, the study would have run out of disk during DQN seed 2. The user chose to delete each run's episode frames after its record verifies. This was done by an ops watcher outside the study code, `runlogs/frame_reaper.py` (log `runlogs/frame_reaper.log`), so the code did not change and all ten runs keep one `git_sha`. The watcher deletes a run's frames only when `verify_record` passes, `replay_features_deleted` is True, `state.pt` is gone and no feature file remains; it never touches `record.json`. The log has ten lines, one per run, each `verified; deleted 9,673 to 11,538 episode frame files (1.95 to 1.98 GiB); leftovers []`; dreamer s0, s1 and dqn s0, s1 were reaped in the first pass on 2026-10-15 at 16:29-16:30 and the last, dqn s4, on 2026-10-16 at 21:24. Evidence: `ls runs/m5a/*/` lists exactly one file, `record.json`, in each of the ten run directories, and `du -sh runs/m5a` prints `4.7M`; `df -h .` showed 15 GiB free at write time.
+
+**Consequence.** Nothing but the ten records, the read outputs and the logs survives from the study: no replay, no world-model or policy checkpoints. Every number in this section comes from the records, which carry every evaluation episode (return, length, kill, truncation, imagined return) at every checkpoint, so nothing reported here is lost. Anything that needs the replay or a checkpoint, such as examining the below-random Dreamer checkpoints, needs a rerun.
+
+### Limits (§10)
+
+Restated from the spec, and what this reading does not answer:
+
+- **One scenario, one ratio, one budget, one baseline.** `basic` only, one update round per 5 environment steps, 100,000 steps per run, Double DQN as the only model-free comparator, all fixed in advance. `defend_the_center`, `deadly_corridor` and the encoder comparison are M5b.
+- **Environment-step efficiency, not compute efficiency.** Equal environment steps and equal gradient steps; Dreamer's wall-clock was about 3x DQN's and its update phase 5.3x (above).
+- **Five seeds per arm.** The reading is the pre-registered 21-of-25 bar; 24 of 25 clears it, but five seeds per arm cannot support a claim about the spread of either arm's behaviour beyond what the table shows.
+- **Shared representation by design.** Both arms read frozen DINOv2 features through the same trainable `BottleneckEncoder` class, so nothing here speaks to raw-pixel model-free performance.
+- **Unexplained by the records:** why Dreamer's curve is slower to rise and has deep transient dips; why its seeds 3 and 4 measured slower; why the smoke compute projection was off. The diagnostics above are descriptions, and the one hypothesis is labelled as such.
+- **M3's tools** (`eval/study.py`'s routing through `load_world_model` / `read_reward`) remain a follow-up; M5a never called it.
