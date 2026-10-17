@@ -17,11 +17,11 @@
 - Training-episode seeds: `2_000_000 + 100_000 * run_seed + k` for the run's k-th episode (disjoint from evaluation seeds).
 - Dreamer: `frozen_ssl` world model, `n_actions=4`, `pad_short=True`, `reward_transform="symlog"`, Adam 1e-4, clip 100, batch 16 × 64; actor-critic exactly M4's `ACConfig` defaults with `bound_reward_readout=True`, `drop_terminal_starts=True`.
 - DQN: Double DQN, n-step **3**, γ **0.99**, target hard copy every **2,000** updates, Huber δ 1, Adam **1e-4**, clip **10**, batch **256** transitions, reward scale **0.01**, frame stack **4**, ε linear **1.0 → 0.05** over budget steps 0–50,000 then **0.05**; MLP 2 × 512 SiLU.
-- Gated evaluation modes: Dreamer **`sample`**, DQN **`greedy`** (ε = 0). Reported-only: Dreamer `argmax`, DQN `eps0.05`.
+- Gated evaluation modes: Dreamer **`sample`**, DQN **`greedy`** (ε = 0). Reported-only: Dreamer `argmax`, DQN `eps0.05` (implemented as `eps0_05`; strict JSON keys, ruling in Task 8).
 - Reading: AUC = mean over the 10 checkpoints 10k…100k of the mean gated return; 25 pairs; ties count ½; **≥ 21** wins → a `*_MORE_EFFICIENT` verdict; else `NOT_SEPARATED`.
 - `read` exits **0** (reading printed), **90** `MISSING_RUNS`, **91** `INVALID_RUNS`; missing beats invalid.
 - Amendment flags default **off**; M4's code paths and recorded results must stay bit-for-bit reproducible.
-- Each run's replay feature caches (`*.features.npy`) are **deleted after the run's record is verified complete**; episode `.npz` files and records are kept. Never touch `runs/m4*`, `runs/m3*`, `data/`.
+- Each run's replay feature caches (`*.features.npy`) are **deleted after the run's record is verified complete**; episode `.npz` files and records are kept (M5a: frames were deleted after verification by an ops watcher with user approval, see M5a results). Never touch `runs/m4*`, `runs/m3*`, `data/`.
 - Run outputs go to `runs/m5a/<arm>_seed<n>/` (`runs` is a symlink into the main checkout).
 - Run long commands with a redirect and read `$?`, never through a pipe.
 - Commit trailers: the Co-Authored-By line the committing agent's environment specifies.
@@ -2665,7 +2665,7 @@ Three thousand steps measure nothing about efficiency. They only show that the l
 
 ## M5a results
 
-Run on 2026-10-14 to 2026-10-16: five seeds (0-4) of two arms, online Dreamer (`frozen_ssl` world model, actor sampling) and Double DQN (greedy), scenario `basic`, 100,000 environment steps per run (5,000 random prefill steps included), one update round per 5 steps after the prefill, evaluation on seeds 1,000,000-1,000,099 at steps 0, 10,000, ..., 100,000. Branch `feat/m5a-online-loop`. Paths are worktree-relative; `runs` is a symlink into the main checkout. The ledger is `.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-efficiency/progress.md` (lines beginning `Task 11:` and `Task 12:`); run and read logs are `runs/m5a_run.log`, `runs/m5a/read.log` and `runs/m5a/study.txt`, with copies in that directory's `runlogs/`. Python below means `PYTHONPATH=src:. /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python`. The ten runs and the read were executed by the controller; this section was written afterwards from the ten `runs/m5a/<arm>_seed<n>/record.json` files and the logs, and every number below was re-derived from those records by the snippets shown (the numbers in `study.txt` agree with them wherever both print the same quantity).
+Run on 2026-10-14 to 2026-10-16: five seeds (0-4) of two arms, online Dreamer (`frozen_ssl` world model, actor sampling) and Double DQN (greedy), scenario `basic`, 100,000 environment steps per run (5,000 random prefill steps included), one update round per 5 steps after the prefill, evaluation on seeds 1,000,000-1,000,099 at steps 0, 10,000, ..., 100,000. Branch `feat/m5a-online-loop`. Paths are worktree-relative; `runs` is a symlink into the main checkout. The ledger is `.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-efficiency/progress.md` (lines beginning `Task 11:` and `Task 12:`); the run log, read log, read output and frame-reaper script and log are committed in `docs/superpowers/evidence/m5a/` (`m5a_run.log`, `read.log`, `study.txt`, `frame_reaper.py`, `frame_reaper.log`), copied unchanged from the originals (`runs/m5a_run.log`, `runs/m5a/read.log`, `runs/m5a/study.txt`, the SDD workspace's `runlogs/`) except that `m5a_run.log` has the HuggingFace Hub warning and weight-loading progress-bar lines removed (`grep -v`), so its sha256 (`898aec909cff3efc32b1bca4c332410985f19ba95a446c96d419f8fad51ed2f1`) differs from the original's (`7051989c0a39fe6ac7e83164b65309ad8c8b1ef2d8b8510fbdd52dcdc29a9407`); the ledger, `m5a_suite.log` and the smoke-record copies remain only in the untracked SDD workspace (`.superpowers/` is gitignored). The `record.json` files stay under `runs/m5a/`. Python below means `PYTHONPATH=src:. /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python`. The ten runs and the read were executed by the controller; this section was written afterwards from the ten `runs/m5a/<arm>_seed<n>/record.json` files and the logs, and every number below was re-derived from those records by the snippets shown (the numbers in `study.txt` agree with them wherever both print the same quantity).
 
 All snippets in this section share this prelude, run from the worktree root (pure reads; nothing is written):
 
@@ -2692,13 +2692,13 @@ median AUC difference (Dreamer - DQN): -33.31
 VERDICT: DQN_MORE_EFFICIENT
 ```
 
-- Record: `runs/m5a/read.log` (byte-identical to `runs/m5a/study.txt`: `cmp runs/m5a/study.txt runs/m5a/read.log` prints nothing). The exit code is the ledger line `Task 12: step 4: read exit 0`. `shasum -a 256 runs/m5a/study.txt` prints `4cb14b0657bdd83b1d64170be9ccd6f16860ab500be59fbfdb6f87d11c62251e`.
+- Record: `docs/superpowers/evidence/m5a/read.log` (byte-identical to `docs/superpowers/evidence/m5a/study.txt`: `cmp docs/superpowers/evidence/m5a/study.txt docs/superpowers/evidence/m5a/read.log` prints nothing; both are byte-identical to the originals `runs/m5a/study.txt` and `runs/m5a/read.log`). The exit code is the ledger line `Task 12: step 4: read exit 0`. `shasum -a 256 docs/superpowers/evidence/m5a/study.txt` prints `4cb14b0657bdd83b1d64170be9ccd6f16860ab500be59fbfdb6f87d11c62251e`.
 - Re-derive, into a scratch directory, because the read writes `study.txt` under its `--runs` directory:
 
 ```bash
 D=$(mktemp -d); for d in runs/m5a/*_seed*; do mkdir -p "$D/$(basename $d)"; cp $d/record.json "$D/$(basename $d)/"; done
 Python scripts/m5a_study.py --phase read --runs "$D" > "$D/second.txt"; echo $?
-cmp runs/m5a/study.txt "$D/study.txt" && cmp runs/m5a/read.log "$D/second.txt" && echo byte-identical
+cmp docs/superpowers/evidence/m5a/study.txt "$D/study.txt" && cmp docs/superpowers/evidence/m5a/read.log "$D/second.txt" && echo byte-identical
 ```
 
   At write time this printed exit `0` and `byte-identical`, and the `sha256` above. The read is a pure function of the ten records; it does not run any episode.
@@ -2720,6 +2720,8 @@ cmp runs/m5a/study.txt "$D/study.txt" && cmp runs/m5a/read.log "$D/second.txt" &
 
 The chain is: the full suite was green at `dd1bb2a`; `ba0f977` changed only the `OnlineConfig` constructor checks and its tests, which were re-run; `c38a33a` changed no source, script or test. The suite was not re-run on `c38a33a` itself.
 
+**After the records.** The final review's fix commit changed `src/mbfps/training/online.py` (and `tests/training/test_online.py`) after the ten records were made: a resume's identity now includes the commit and the device type, a record's `git_sha` is set once at its creation instead of at every checkpoint, and the CUDA RNG state is saved. None of this touches training, evaluation or reading arithmetic, and the ten records are unchanged (no run resumed and HEAD did not move). `tests/training` (148 passed), `tests/eval/test_efficiency.py` and `tests/eval/test_m5a_study_script.py` were re-run on that commit.
+
 **Snippet A (validity and identity).**
 
 ```python
@@ -2731,7 +2733,7 @@ print(sum(bool(run_problems(r, cfg, *k)) for k, r in R.items()), [R[("dreamer", 
 
 At write time this printed `{'c38a33a'} {True} {100000} {19000} [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]` and `0 [True, True, True, True, True] {True}`. In words: all ten records carry `c38a33a`, are `complete`, spent exactly 100,000 budget steps and 19,000 update rounds (95,000 post-prefill steps / 5), and have an empty `nonfinite`; `run_problems` (the same validity function the read uses: §7.3 plus `verify_record`) returns `[]` for all ten; Dreamer's `isolation_ok` is True in all five seeds (no actor-critic step ever put a gradient on a world-model parameter); `replay_features_deleted` is True in all ten.
 
-**What ran.** The study was launched on 2026-10-14 at about 20:10 (-0500; `c38a33a` is dated 20:10:46) under `caffeinate -i` with `Python scripts/m5a_study.py --phase run > runs/m5a_run.log 2>&1`, and finished on 2026-10-16 at about 21:20 (the last `complete:` line is in `runs/m5a_run.log`, which was last written 21:23). It ran as one process, in the order dreamer s0, dqn s0, dreamer s1, dqn s1, ... dqn s4; `grep -c 'skip (done)\|FAILED\|Traceback\|resum' runs/m5a_run.log` prints `0` and there are ten `complete:` lines, so no run failed, was skipped or needed a resume. The run exit was 0 (ledger `Task 12: step 3`). The wall-clock span is about 49 hours; the sum of the ten runs' own `seconds` is 33.83 hours (snippet H). The difference is the laptop sleeping (lid or battery): each run's `seconds` and `timing` are `time.perf_counter` sums and exclude periods the machine was asleep. This section says nothing further about the cause of any timing figure.
+**What ran.** The study was launched on 2026-10-14 at about 20:10 (-0500; `c38a33a` is dated 20:10:46) under `caffeinate -i` with `Python scripts/m5a_study.py --phase run > runs/m5a_run.log 2>&1`, and finished on 2026-10-16 at about 21:20 (the last `complete:` line is in `docs/superpowers/evidence/m5a/m5a_run.log`, whose original `runs/m5a_run.log` was last written 21:23). It ran as one process, in the order dreamer s0, dqn s0, dreamer s1, dqn s1, ... dqn s4; `grep -c 'skip (done)\|FAILED\|Traceback\|resum' docs/superpowers/evidence/m5a/m5a_run.log` prints `0` and there are ten `complete:` lines, so no run failed, was skipped or needed a resume. The run exit was 0 (ledger `Task 12: step 3`). The wall-clock span is about 49 hours; the sum of the ten runs' own `seconds` is 33.83 hours (snippet H). The difference is the laptop sleeping (lid or battery): each run's `seconds` and `timing` are `time.perf_counter` sums and exclude periods the machine was asleep. This section says nothing further about the cause of any timing figure.
 
 ### The ten runs
 
@@ -2776,7 +2778,7 @@ Per-run curves (mean gated return over the 100 evaluation episodes at each check
 | dqn | 3 | -300.0 | -149.6 | +63.5 | +56.6 | +73.7 | +74.4 | +77.9 | +77.6 | +79.1 | +79.3 | +79.7 |
 | dqn | 4 | -313.0 | -107.4 | -3.5 | +18.3 | +69.4 | +72.3 | +76.8 | +75.7 | +79.1 | +78.6 | +79.5 |
 
-These are the same values as the `curve(0..100k)` lines of `runs/m5a/study.txt`.
+These are the same values as the `curve(0..100k)` lines of `docs/superpowers/evidence/m5a/study.txt`.
 
 ### The learning curves (§7.4)
 
@@ -2987,15 +2989,50 @@ print("train s/round", {a: round(tim[a]["train"] / 19000, 3) for a in tim}, "eva
 | eval seconds per evaluation (11 per run) | 108 | 68 | |
 | eval share of a run | 6.5% | 12.2% | |
 
-Per seed (Dreamer / DQN) the ratio is 3.07, 3.05, 2.76, 3.46, 2.68. Dreamer used about three times DQN's per-run time; its update phase alone is 5.3x DQN's. The ten runs sum to 33.83 hours (Dreamer 25.35, DQN 8.48). Against the Task 11 smoke projection (`Task 11: step 3`: Dreamer 4.93 h, DQN 1.11 h per run, 30.2 h for ten), the measured mean runs are 5.07 h (Dreamer) and 1.70 h (DQN); the total is 3.6 h above the projection and under the 40 h stop, and above the spec's ~25 h estimate. The measured DQN train time per round (0.141 s) is three times the smoke figure (0.046 s) and Dreamer's (0.749 s) is 10% above it (0.679 s); the evaluation share of a run (6.5% and 12.2%) is below the smoke projection's ~40%, which the smoke results themselves attributed to random-like policies running to time-out. The records do not explain these differences and this section does not.
+Per seed (Dreamer / DQN) the ratio is 3.07, 3.05, 2.76, 3.46, 2.68. Dreamer used about three times DQN's per-run time; its update phase alone is 5.3x DQN's. The ten runs sum to 33.83 hours (Dreamer 25.35, DQN 8.48). Against the Task 11 smoke projection (`Task 11: step 3`: Dreamer 4.93 h, DQN 1.11 h per run, 30.2 h for ten), the measured mean runs are 5.07 h (Dreamer) and 1.70 h (DQN); the total is 3.6 h above the projection and under the 40 h stop, and above the spec's ~25 h estimate. The measured DQN train time per round (0.141 s) is three times the smoke figure (0.046 s) and Dreamer's (0.749 s) is 10% above it (0.679 s); the evaluation share of a run (6.5% and 12.2%) is below the smoke projection's ~40%, which the smoke results themselves attributed to random-like policies running to time-out. The records do not explain these differences and this section does not. (Added after the final review, which is the only place an explanation was offered: its finding M6 names a plausible but untested contributor to the rise in DQN's train time, a per-sample cost that grows with the replay size, in `TransitionSampler.sample` at `src/mbfps/training/dqn.py:108-121` and `SequenceLoader.sample` at `src/mbfps/data/loader.py:207-231`. No run or measurement here tests it; see Follow-ups before M5b.)
 
 Dreamer seeds 3 and 4 measured slower than the others: 21,927 s and 20,362 s, against 15,793 s, 15,953 s and 17,220 s for seeds 0-2, with the difference in the `train` component (17,379 s and 16,416 s, against 11,977 s to 13,412 s). This is reported without explanation. It does not enter the reading, which is on returns and not on time; using seeds 0-2 only, the ratio is 2.95 (Dreamer mean 16,322 s against DQN 5,531 s), so the 2.99 headline is not an artefact of the two slower seeds. Per-run `seconds` and `timing` are `time.perf_counter` sums and exclude periods the machine was asleep.
+
+**Amount of data replayed per update (spec §3.2).** §3.2 says the arms replay different amounts per update (Dreamer 16 × 64 = 1,024 timesteps, DQN 256 transitions) and that "the results report both". The Dreamer figure that counts is not the padded 1,024. `diagnostics["n_starts"] + diagnostics["n_dropped"]` is the number of real (mask-true) timesteps in the batch the round used: `ActorCriticLearner.step` sets `n_real = batch["mask"].sum()`, `n_starts` is the number of start states kept and `n_dropped = n_real - n_starts` (`src/mbfps/training/ac_trainer.py:178` and `:220-221`), and the diagnostics are means over the update rounds since the previous checkpoint. The DQN records carry no such field because the batch is always 256 transitions (`DQNConfig.batch_size`, `src/mbfps/training/dqn.py:29`).
+
+**Snippet I.**
+
+```python
+D = [R[("dreamer", s)] for s in range(5)]
+real = lambda s, c: ev(D[s], c)["diagnostics"]["n_starts"] + ev(D[s], c)["diagnostics"]["n_dropped"]
+for s in range(5):
+    print(s, *(f"{real(s, c):.0f}" for c in CK[1:]))
+print("mean", *(f"{np.mean([real(s, c) for s in range(5)]):.0f}" for c in CK[1:]))
+print("seeds below 256:", {c: sum(real(s, c) < 256 for s in range(5)) for c in CK[1:]})
+print("max over seeds, 70k..100k:", round(max(real(s, c) for s in range(5) for c in CK if c >= 70000)))
+```
+
+Real (unpadded) timesteps per Dreamer update round, window mean at each checkpoint, per seed:
+
+| seed | 10k | 20k | 30k | 40k | 50k | 60k | 70k | 80k | 90k | 100k |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 612 | 610 | 620 | 532 | 305 | 219 | 183 | 162 | 151 | 142 |
+| 1 | 647 | 666 | 663 | 652 | 519 | 303 | 231 | 194 | 173 | 163 |
+| 2 | 647 | 595 | 601 | 414 | 244 | 193 | 167 | 151 | 142 | 137 |
+| 3 | 693 | 678 | 651 | 559 | 340 | 238 | 198 | 173 | 158 | 150 |
+| 4 | 664 | 652 | 642 | 595 | 397 | 262 | 205 | 182 | 165 | 155 |
+| **mean** | 652 | 640 | 635 | 550 | 361 | 243 | 197 | 172 | 158 | 150 |
+| seeds below 256 | 0 | 0 | 0 | 0 | 1 | 3 | 5 | 5 | 5 | 5 |
+
+| per update | amount |
+|---|---|
+| Dreamer, padded batch (16 × 64) | 1,024 timesteps |
+| Dreamer, real timesteps, 10k window | 612 to 693 (mean 652) |
+| Dreamer, real timesteps, 100k window | 137 to 163 (mean 150) |
+| DQN | 256 transitions, constant |
+
+Dreamer replays 1,024 timesteps per update only if padding counts. Counting real timesteps, it replays 2.4 to 2.7 times DQN's 256 in the first window and fewer than DQN from 70k on: at 70k, 80k, 90k and 100k every Dreamer seed is below 256 (the largest value in any seed from 70k on is 231), and at 60k three of five seeds are. The likely cause (the final review's reading; not tested here) is in the data and not in the loop: uniform episode sampling over a replay that fills with roughly 6-step kill episodes (see the dropped-share discussion in the diagnostics above) leaves most of each 64-step window as padding. The verdict is unaffected, since it is read on returns at equal environment steps and equal update rounds; this table only qualifies the §3.2 framing that Dreamer always replays about four times as much data per gradient step. It is a count of timesteps in the batch; it does not weight them by how informative they are, and this section does not claim either arm learned more per replayed sample.
 
 ### Disk and retention (§9, §11.1)
 
 **Decided before any run (Task 12, Step 2):** no run's replay is retained. Disk at the start was 14 GiB free (`Task 12: step 2`), above the 8 GB bar. Each run's feature caches (`*.features.npy`) and `state.pt` were deleted by `scripts/train_online.py` only after `verify_record` passed on the run's record; the record then carries `replay_features_deleted` True (snippet A: True in all ten).
 
-**Deviation from the §9 text, a gap in the spec and not a change of reading.** On 2026-10-15 the disk reached 5.8 GiB free and the user decided at about 16:28 (the controller's ruling; the ledger line `Task 12: user decision` says "16:4x", which the controller has corrected, and the watcher's first deletion is logged at 16:29). Spec §9 estimated disk as "~4.9 GB of features per run" and counted only the feature caches. It did not count the roughly 2 GB of episode frame files (`replay/*.npz`) each run keeps, and the plan's Global Constraints said "episode `.npz` files and records are kept". With ten of them, the study would have run out of disk during DQN seed 2. The user chose to delete each run's episode frames after its record verifies. This was done by an ops watcher outside the study code, `runlogs/frame_reaper.py` (log `runlogs/frame_reaper.log`), so the code did not change and all ten runs keep one `git_sha`. The watcher deletes a run's frames only when `verify_record` passes, `replay_features_deleted` is True, `state.pt` is gone and no feature file remains; it never touches `record.json`. The log has ten run lines, one per run (plus a closing `all ten runs reaped; exiting` line at 2026-10-16 21:26), each `verified; deleted 9,673 to 11,538 episode frame files (1.95 to 1.98 GiB); leftovers []`; dreamer s0, s1 and dqn s0, s1 were reaped in the first pass on 2026-10-15 at 16:29-16:30 and the last, dqn s4, on 2026-10-16 at 21:24. Evidence: `ls runs/m5a/*/` lists exactly one file, `record.json`, in each of the ten run directories, and `du -sh runs/m5a` prints `4.7M`; the disk had 15 GiB free after the last run (`df` at 2026-10-16 21:26, per the controller).
+**Deviation from the §9 text, a gap in the spec and not a change of reading.** On 2026-10-15 the disk reached 5.8 GiB free and the user decided at about 16:28 (the controller's ruling; the ledger line `Task 12: user decision` says "16:4x", which the controller has corrected, and the watcher's first deletion is logged at 16:29). Spec §9 estimated disk as "~4.9 GB of features per run" and counted only the feature caches. It did not count the roughly 2 GB of episode frame files (`replay/*.npz`) each run keeps, and the plan's Global Constraints said "episode `.npz` files and records are kept". With ten of them, the study would have run out of disk during DQN seed 2. The user chose to delete each run's episode frames after its record verifies. This was done by an ops watcher outside the study code, `docs/superpowers/evidence/m5a/frame_reaper.py` (log `docs/superpowers/evidence/m5a/frame_reaper.log`), so the code did not change and all ten runs keep one `git_sha`. The watcher deletes a run's frames only when `verify_record` passes, `replay_features_deleted` is True, `state.pt` is gone and no feature file remains; it never touches `record.json`. The log has ten run lines, one per run (plus a closing `all ten runs reaped; exiting` line at 2026-10-16 21:26), each `verified; deleted 9,673 to 11,538 episode frame files (1.95 to 1.98 GiB); leftovers []`; dreamer s0, s1 and dqn s0, s1 were reaped in the first pass on 2026-10-15 at 16:29-16:30 and the last, dqn s4, on 2026-10-16 at 21:24. Evidence: `ls runs/m5a/*/` lists exactly one file, `record.json`, in each of the ten run directories, and `du -sh runs/m5a` prints `4.7M`; the disk had 15 GiB free after the last run (`df` at 2026-10-16 21:26, per the controller).
 
 **Consequence.** Nothing but the ten records, the read outputs and the logs survives from the study: no replay, no world-model or policy checkpoints. Every number in this section comes from the records, which carry every evaluation episode (return, length, kill, truncation, imagined return) at every checkpoint, so nothing reported here is lost. Anything that needs the replay or a checkpoint, such as examining the below-random Dreamer checkpoints, needs a rerun.
 
@@ -3009,3 +3046,17 @@ Restated from spec §10 (the first four bullets below; the last two are this sec
 - **M3's tools** (`eval/study.py`'s routing through `load_world_model` / `read_reward`) remain a follow-up; M5a never called it.
 - **Addition (not in §10): five seeds per arm.** The reading is the pre-registered 21-of-25 bar; 24 of 25 clears it, but five seeds per arm cannot support a claim about the spread of either arm's behaviour beyond what the table shows.
 - **Addition (not in §10): unexplained by the records:** why Dreamer's curve is slower to rise and has deep transient dips; why its seeds 3 and 4 measured slower; why the smoke compute projection was off. The diagnostics above are descriptions, and the one hypothesis is labelled as such.
+
+### Follow-ups before M5b
+
+From the final review (`.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-efficiency/final-review.md`, untracked) and its deferred-minor triage. None changes a recorded number. Line numbers are at the commit that added this list.
+
+- **M3.** `verify_record` (`src/mbfps/training/online.py:222`) and `run_problems` (`src/mbfps/eval/efficiency.py:43-67`) do not check `record["config"] == asdict(cfg)` or `update_rounds == (budget - prefill) / act_steps * rounds_per_act`, and the record does not carry `arm_kwargs` (written only to `state.pt`, `online.py:168-171` and `_checkpoint`), so a finished record cannot show which DQN settings it ran with. Write `arm_kwargs` into the record, check both in `verify_record`, add a test.
+- **M4.** A fresh start prunes every `ep_*` file under `<out>/replay` without proof that it owns them (`src/mbfps/training/online.py:91-100` and the call at `:138`). Write a marker holding `meta` before the first episode; prune only when it is absent or matches, otherwise refuse a non-empty `replay/`.
+- **M5.** A NaN AUC gives `NOT_SEPARATED` and exit 0 instead of 91 (`src/mbfps/eval/efficiency.py:24-40` and `run_problems`), and a malformed eval entry raises `KeyError` so the read exits 1 instead of 91 (`scripts/m5a_study.py:69`). Add an `np.isfinite(auc)` check to `run_problems` and catch `KeyError`/`StopIteration` there.
+- **M6.** Per-sample cost grows with the replay size: `SequenceLoader._usable()` is rebuilt over every episode and `rng.choice` is called on that list (`src/mbfps/data/loader.py:199-205`, `:218`, `:231`); `TransitionSampler.sample` calls `np.searchsorted` on a Python list once per transition (`src/mbfps/training/dqn.py:112-121`; `_ends` is a list, `:85`). Keep `_ends` as a NumPy array and cache the usable list, keeping `rng.choice` over an equal-valued array so the draws and future numbers are unchanged. A plausible, untested contributor to DQN's train time rising from 0.046 s to 0.141 s per round.
+- **M7.** `AgentPolicy.reset` reseeds the global torch generator at every training-episode start and every eval-policy construction (`src/mbfps/eval/live.py:42`), coupling Dreamer's training noise to acting and evaluation. Document it in the M5b spec, or give the policy its own `torch.Generator` (that changes future numbers, so it belongs in M5b).
+- **Must land before M5b: `QNetwork` hard-codes the encoder.** `EncoderConfig(kind="frozen_ssl")` at `src/mbfps/training/dqn.py:54`; needed before M5b's encoder comparison.
+- **Must land before M5b: the random action hard-codes 4 actions.** `self._rng.integers(0, 4)` at `src/mbfps/training/dqn.py:174`; needed before any scenario with another action count.
+- **Must land before M5b: the chain test cannot tell Double DQN from vanilla.** `test_double_dqn_learns_a_chain` (`tests/training/test_dqn.py:88`) covers only n=1 and passes for either; spec §5.4 asks the known-answer test to check both.
+- **Fold frame deletion into code.** Extend `delete_replay_features` (`src/mbfps/training/online.py:244`) to: verify the record, flag it (`replay_features_deleted`, plus a new `replay_frames_deleted`), then delete `state.pt`, the features, then the episode frames, leaving `replay/` empty; with tests, a corrected docstring ("Episode files and the record are kept" is now false for M5a), and an update to spec §9's disk arithmetic (about 2 GB of frames per run). This replaces the untracked-then-committed ops script `docs/superpowers/evidence/m5a/frame_reaper.py` with tested code.
