@@ -1,0 +1,496 @@
+{
+ "transition_sampler": [
+  "bc0dd14e0e419a8fcc88ee1e8b4a0d855c63ffdc4d293845e5441b49f4a0d54d",
+  "4b1267b3f74d771e447a0bcb2a59d6f4dfb310bfba3c003d5a690f0267bd1494",
+  "9e0a4af8e79acdd0b1a57c486d3ba3ddcb29d3318a66f50bdd2bb25e6263448f",
+  "92b352eac8dc423b861cdf61bafae3d03781915cac86a79b3d9ee0a52b870978",
+  "33c0cb7881bc5de9b529f8177ab378316b3222d40e8d22277ba0c35c41b07fda",
+  "f472295f1eea32b86398439286ded758867539dec8cf5a9ca708ca98da4841ef",
+  "667b48831c1dfd524f4341237a2fd8349f0a9c06d75eff36f47c3af5f91fc334",
+  "4d5bd45bf6326144f0f581fd922b7af77a89ade3e609fdfd2d8f009be0bb65aa",
+  "6fc977dca8e6b87ebb1ef562a287291d2aad00d106985c0ff0ed61a8e14b23bd",
+  "4a707ac24e221a4e8e8b389a670576c0b9284c99f609452771a3c9c07eae42bb",
+  "07d0e4694568d95d63a348931631155075768440cf6fbbd73d6e11512ef96e89",
+  "96ced240bfc724632bf2fe418aed95d83cb76bec3a81b9093d104ee84605a288",
+  "83dfd5df77637ce7010cf2f6f806aa97b6a0efb39db7d3c220e3f0af35046b27",
+  "940f41b538669f63d04b3420f4bb5575d8b7558dc929cf423e2bba97d4f3aa9f",
+  "9d77186b4acdbb7d18d08821c823caed2b665b847d1c8819a524d34e74be52c7",
+  "703e0e0b70373267e32cd2a05fa07c0bf508b9e509e893c25d66d2e246855525",
+  "6e0763d6b424f0b7cae87e3e2b0f9a9ca2a9753a3383e41c678e5b8ccb3f79f2",
+  "ecd1b1c6da40aaacb752fcb0825c1737730b53f83596dec1bbe68c1ace241ca8",
+  "f8c06a60d469276c75258ec72a96c92abe7def54fef4254e57c8c4082ea86b69",
+  "e9e9c7296b96a49bf389f1d9a9da4a923ce17108bbf2da5164282cf39ea5006c",
+  "fa59423d2f730b951219f3efc7a48db811ed8f38d8cc0a76e71009aa990700da",
+  "a25887f41da6d33012a858637bbaa0f60da99fa52775637eba9437e326c12f1f",
+  "674e1d08f09949ccf7157351322ed450535628fd1002bfd930156d2db8265069",
+  "41ee4fccabaaf2e8a8b4bb83f33cf96af5822ef691b0b248317ffc8bfad1b123",
+  "abd1f2b081f2eeaea43600c2e01bcd98e9f2f1395f00ba14a8e486c5db05f8ca",
+  "54a1794217db333a6c5b63227689fe203b36161a9843f68da63221de9ba238a0",
+  "bd032955a194a93d424b370a0605ae071f245c91a13fe2d2853d7a5942c2952a",
+  "d4b073282d9c3f1156d0c73f9123e9907b325aa7ea2da021ef3e56f1e18b3b03",
+  "54b76b6472b1f6aaea6f5612368ae32f73a185b4ad6092ba585e4c00a551431d",
+  "3f0b59a17347360efaec3675c96cfabe3d11eb76cab3b953b9ed2ec5cbbe2876"
+ ],
+ "sequence_loader": [
+  {
+   "episode_index": [
+    2,
+    0,
+    1,
+    1,
+    2,
+    0,
+    1,
+    0
+   ],
+   "window_start": [
+    12,
+    17,
+    6,
+    3,
+    0,
+    8,
+    4,
+    0
+   ],
+   "sha": "098d9e4f5aeab2b5da712aca26a9b45ebf67b30787669458fe14ccc902935245"
+  },
+  {
+   "episode_index": [
+    0,
+    0,
+    1,
+    4,
+    1,
+    2,
+    5,
+    5
+   ],
+   "window_start": [
+    1,
+    21,
+    7,
+    0,
+    3,
+    4,
+    1,
+    8
+   ],
+   "sha": "18e49a1361e29d80218075b590db6c797349f0ec9c840e15f51192113a2d0604"
+  },
+  {
+   "episode_index": [
+    7,
+    3,
+    5,
+    5,
+    5,
+    8,
+    8,
+    3
+   ],
+   "window_start": [
+    1,
+    0,
+    5,
+    7,
+    0,
+    10,
+    4,
+    0
+   ],
+   "sha": "df54ae073b2765469e7ae5a263f3c378776305c77634d21b1c4156cac86fc700"
+  },
+  {
+   "episode_index": [
+    10,
+    0,
+    8,
+    10,
+    2,
+    10,
+    10,
+    0
+   ],
+   "window_start": [
+    2,
+    8,
+    2,
+    4,
+    8,
+    12,
+    4,
+    17
+   ],
+   "sha": "7772b2cf41c1ade2be88f998c0be88aa4f8c087898349e0676591ca0ae27b174"
+  },
+  {
+   "episode_index": [
+    10,
+    0,
+    7,
+    6,
+    13,
+    3,
+    7,
+    4
+   ],
+   "window_start": [
+    10,
+    0,
+    4,
+    0,
+    0,
+    0,
+    4,
+    0
+   ],
+   "sha": "888f8643945a2ac6a7e3ffb7fb8fc16c5eb09e4f9694176ffc90e10856c7a425"
+  },
+  {
+   "episode_index": [
+    14,
+    2,
+    2,
+    5,
+    10,
+    3,
+    14,
+    14
+   ],
+   "window_start": [
+    0,
+    5,
+    2,
+    7,
+    6,
+    0,
+    0,
+    0
+   ],
+   "sha": "45914e326f8dcfce749af662e22081f9b6470704d174c96895a4bb85903ba525"
+  },
+  {
+   "episode_index": [
+    4,
+    1,
+    3,
+    16,
+    10,
+    10,
+    4,
+    16
+   ],
+   "window_start": [
+    0,
+    3,
+    0,
+    10,
+    4,
+    13,
+    0,
+    0
+   ],
+   "sha": "3a5789072e626b8cfda770bc50a0a323cec490979c993591a12ef85e3fe73c5a"
+  },
+  {
+   "episode_index": [
+    7,
+    20,
+    2,
+    20,
+    10,
+    23,
+    22,
+    9
+   ],
+   "window_start": [
+    13,
+    0,
+    13,
+    0,
+    5,
+    0,
+    13,
+    2
+   ],
+   "sha": "6b48488ffe145d7d95d5306a1d95a2fd22359650779c9deaeb3c062eb2199202"
+  },
+  {
+   "episode_index": [
+    25,
+    7,
+    18,
+    6,
+    8,
+    5,
+    25,
+    18
+   ],
+   "window_start": [
+    0,
+    7,
+    0,
+    0,
+    13,
+    7,
+    0,
+    0
+   ],
+   "sha": "37d5048df4bab5e896791fa6b6bc476805a7900d44142edbac7bbbc2a6883ddd"
+  },
+  {
+   "episode_index": [
+    19,
+    13,
+    29,
+    10,
+    19,
+    3,
+    4,
+    20
+   ],
+   "window_start": [
+    0,
+    0,
+    2,
+    8,
+    0,
+    0,
+    0,
+    0
+   ],
+   "sha": "a03f8dfeac232a1b21e227eb748052f58dc5814cae9a1acaa74aabd3303ed562"
+  },
+  {
+   "episode_index": [
+    27,
+    30,
+    10,
+    1,
+    6,
+    12,
+    26,
+    12
+   ],
+   "window_start": [
+    10,
+    4,
+    11,
+    2,
+    0,
+    2,
+    19,
+    0
+   ],
+   "sha": "4a54e12fcf3c641145b2347f28f88d3878a867acd0da56258aec27a75236ce20"
+  },
+  {
+   "episode_index": [
+    25,
+    3,
+    22,
+    33,
+    35,
+    22,
+    13,
+    29
+   ],
+   "window_start": [
+    0,
+    0,
+    3,
+    14,
+    0,
+    14,
+    0,
+    1
+   ],
+   "sha": "3f897823284b3a63e796b7665f7b30919f23097c854db7202e2df1615a589008"
+  },
+  {
+   "episode_index": [
+    5,
+    27,
+    33,
+    15,
+    21,
+    25,
+    18,
+    23
+   ],
+   "window_start": [
+    3,
+    7,
+    20,
+    4,
+    0,
+    0,
+    0,
+    0
+   ],
+   "sha": "8d150ff71ed6488dd58f90bb96b4023a78403626f8bf0aabbbbc2b69dda6829d"
+  },
+  {
+   "episode_index": [
+    40,
+    30,
+    17,
+    6,
+    0,
+    17,
+    26,
+    39
+   ],
+   "window_start": [
+    0,
+    4,
+    7,
+    0,
+    17,
+    6,
+    12,
+    12
+   ],
+   "sha": "3e2325a4b6dd201e4de0d01f3bec2c69570b8f4cbaec4583c1007bc211aa94d1"
+  },
+  {
+   "episode_index": [
+    41,
+    14,
+    14,
+    44,
+    8,
+    37,
+    7,
+    18
+   ],
+   "window_start": [
+    13,
+    0,
+    0,
+    1,
+    14,
+    0,
+    9,
+    0
+   ],
+   "sha": "67312a1e3ac5b3c63ae96a4c44395367b229224f5d66713dde40c1b4daa50306"
+  },
+  {
+   "episode_index": [
+    16,
+    9,
+    39,
+    27,
+    15,
+    47,
+    12,
+    23
+   ],
+   "window_start": [
+    1,
+    10,
+    17,
+    2,
+    5,
+    0,
+    8,
+    0
+   ],
+   "sha": "d77f3b8de08b46413dac57cdb4b109241765501924f7dbd45dbc432042b03c09"
+  },
+  {
+   "episode_index": [
+    25,
+    28,
+    5,
+    44,
+    14,
+    22,
+    15,
+    37
+   ],
+   "window_start": [
+    0,
+    6,
+    10,
+    1,
+    0,
+    8,
+    0,
+    0
+   ],
+   "sha": "7e22651a221ac4b810ca4c8b26a4d5ea7c19edbd1ef64bf26caa4ee333258164"
+  },
+  {
+   "episode_index": [
+    41,
+    34,
+    12,
+    25,
+    48,
+    25,
+    18,
+    24
+   ],
+   "window_start": [
+    4,
+    6,
+    14,
+    0,
+    4,
+    0,
+    0,
+    0
+   ],
+   "sha": "e1439f94675362662f3277195a641b7f3a7f4bb53486390fc3e8e36a2745f295"
+  },
+  {
+   "episode_index": [
+    38,
+    19,
+    48,
+    19,
+    2,
+    30,
+    52,
+    33
+   ],
+   "window_start": [
+    0,
+    0,
+    4,
+    0,
+    12,
+    5,
+    0,
+    21
+   ],
+   "sha": "d6758fd3942104295ce8bf924f13d931a9a6d0f97140f8a17df4b195dc652c64"
+  },
+  {
+   "episode_index": [
+    44,
+    30,
+    41,
+    41,
+    0,
+    2,
+    8,
+    12
+   ],
+   "window_start": [
+    1,
+    2,
+    18,
+    9,
+    16,
+    12,
+    5,
+    8
+   ],
+   "sha": "8bcd21d98c068aa4d3cc784d6cab61a4c325d245c9ae187e9b8f4317430cc897"
+  }
+ ]
+}
