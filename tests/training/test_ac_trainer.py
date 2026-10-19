@@ -1,4 +1,6 @@
 import copy
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,7 +11,7 @@ from mbfps.data.episode import Episode
 from mbfps.data.loader import SequenceLoader
 from mbfps.envs.protocol import OBS_SHAPE
 from mbfps.training.ac_trainer import (
-    ACConfig, ReturnScale, continue_weights, freeze, lambda_returns, start_states,
+    ACConfig, ActorCriticLearner, ReturnScale, continue_weights, freeze, lambda_returns, start_states,
     train_actor_critic,
 )
 from mbfps.training.world_model import WorldModel, load_world_model, train_world_model
@@ -153,3 +155,70 @@ def test_cpu_never_touches_mps_cache(world, monkeypatch):
     cfg = ACConfig(updates=2, checkpoint_every=2, batch_size=4, seq_len=16, device="cpu")
     train_actor_critic(model, buf, cfg, out_dir=None, log_every=0)
     assert calls == []
+
+
+def test_amendment_flags_default_off():
+    cfg = ACConfig()
+    assert cfg.bound_reward_readout is False and cfg.drop_terminal_starts is False
+
+
+def test_drop_terminal_removes_terminated_keeps_truncated(world):
+    buf, model = world
+    batch = SequenceLoader(buf, batch_size=4, seq_len=16, seed=0, pad_short=True,
+                           load_obs=True).sample()
+    batch["mask"][:] = True
+    batch["terminated"][:] = False
+    batch["truncated"][:] = False
+    batch["terminated"][0, 3] = True
+    batch["truncated"][1, 5] = True
+    dev = to_device(batch, torch.device("cpu"))
+    h_all, _ = start_states(model, dev)
+    h_drop, _ = start_states(model, dev, drop_terminal=True)
+    assert h_all.shape[0] == 4 * 16
+    assert h_drop.shape[0] == 4 * 16 - 1          # only the terminated one
+
+
+GOLDEN = Path(__file__).parent / "fixtures" / "ac_golden_m4.json"
+
+
+def test_m4_trainer_reproduces_golden_series(world):
+    """The refactor must not move M4: with the flags off, the series the M4
+    code produced before the refactor is reproduced exactly."""
+    buf, model = world
+    h = train_actor_critic(model, buf, ACConfig(updates=4, checkpoint_every=4, batch_size=4,
+                                                seq_len=16, device="cpu"),
+                           out_dir=None, log_every=0)
+    golden = json.loads(GOLDEN.read_text())
+    for key, values in golden.items():
+        assert h[key] == values, key
+
+
+def test_learner_step_returns_metrics_and_leaves_world_model_untouched(world):
+    buf, model = world
+    for p in model.parameters():
+        p.grad = None
+    learner = ActorCriticLearner(4, ACConfig(batch_size=4, seq_len=16, device="cpu",
+                                             drop_terminal_starts=True,
+                                             bound_reward_readout=True),
+                                 torch.device("cpu"))
+    batch = to_device(SequenceLoader(buf, 4, 16, seed=0, pad_short=True, load_obs=True).sample(),
+                      torch.device("cpu"))
+    out = learner.step(model, batch, reward_bounds=(-9.0, 99.0))
+    for key in ("actor_loss", "critic_loss", "scale", "imagined_return", "entropy",
+                "n_starts", "n_dropped", "clipped_share"):
+        assert isinstance(out[key], float), key
+    assert out["n_starts"] + out["n_dropped"] == float(batch["mask"].sum())
+    assert all(p.grad is None for p in model.parameters())
+
+
+def test_learner_state_dict_round_trips(world):
+    _, model = world
+    a = ActorCriticLearner(4, ACConfig(device="cpu"), torch.device("cpu"))
+    a.scale.low, a.scale.high = -3.0, 7.0
+    b = ActorCriticLearner(4, ACConfig(seed=9, device="cpu"), torch.device("cpu"))
+    b.load_state_dict(a.state_dict())
+    for x, y in zip(a.actor.parameters(), b.actor.parameters()):
+        assert torch.equal(x, y)
+    for x, y in zip(a.critic_slow.parameters(), b.critic_slow.parameters()):
+        assert torch.equal(x, y)
+    assert (b.scale.low, b.scale.high) == (-3.0, 7.0)

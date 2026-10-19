@@ -36,7 +36,17 @@ def reward_target(rewards: torch.Tensor, transform: str) -> torch.Tensor:
     return symlog(rewards) if transform == "symlog" else rewards
 
 
-def read_reward(head_output: torch.Tensor, transform: str) -> torch.Tensor:
-    """The reward head's output in reward units."""
+def read_reward(
+    head_output: torch.Tensor, transform: str, bounds: tuple[float, float] | None = None
+) -> torch.Tensor:
+    """The reward head's output in reward units.
+
+    `bounds` (M5a §4.3): `(r_min, r_max)` in reward units. The head's output is
+    clipped to `[reward_target(r_min), reward_target(r_max)]` BEFORE the inverse
+    transform, so an off-distribution head output cannot extrapolate through
+    `symexp`. None leaves the readout exactly as M4 had it."""
     _require_known(transform)
+    if bounds is not None:
+        lo, hi = (reward_target(torch.tensor(float(b)), transform).item() for b in bounds)
+        head_output = head_output.clamp(min=lo, max=hi)
     return symexp(head_output) if transform == "symlog" else head_output

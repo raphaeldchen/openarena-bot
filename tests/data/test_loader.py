@@ -653,3 +653,31 @@ def test_pad_short_pads_features_with_zeros(mixed_buffer):
     assert batch["features"].shape[1] == 17
     assert np.all(batch["features"][row, :7] > 0)
     assert np.all(batch["features"][row, 7:] == 0)
+
+
+def test_add_makes_a_new_episode_sampleable(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    first = buf.add(make_episode(t=20, fill=1))
+    loader = SequenceLoader(buf, batch_size=16, seq_len=8, seed=0, paths=[first])
+    assert set(np.unique(loader.sample()["obs"])) == {1}
+    second = buf.add(make_episode(t=20, fill=2))
+    loader.add(second)
+    seen = set()
+    for _ in range(10):
+        seen |= set(np.unique(loader.sample()["obs"]).tolist())
+    assert seen == {1, 2}
+    assert loader.episode_path(1) == second
+
+
+def test_add_checks_feature_geometry(tmp_path):
+    buf = ReplayBuffer(tmp_path, capacity_transitions=10_000)
+    path = buf.add(make_episode(t=10, fill=1))
+    np.save(path.with_suffix(feature_suffix("dinov2")), np.zeros((11, 64, 32), np.float16))
+    loader = SequenceLoader(buf, 4, 8, seed=0, load_features=True, paths=[])
+    with pytest.raises(ValueError):
+        loader.add(path)
+
+
+def test_loader_exposes_episode_count_and_rng(buffer):
+    loader = SequenceLoader(buffer, batch_size=2, seq_len=16, seed=0)
+    assert loader.n_episodes == 4 and loader.rng is loader._rng

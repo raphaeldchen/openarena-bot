@@ -26,6 +26,30 @@ class DataIntegrityError(Exception):
     """
 
 
+def privileged_row(
+    state: dict[str, float] | None,
+    keys: tuple[str, ...],
+    previous: np.ndarray | None,
+) -> np.ndarray:
+    """One privileged row, carrying the last value forward when unavailable.
+
+    The engine reports no state on the terminal frame, so the final row
+    repeats the last live reading. Zeros would be a plausible-looking lie:
+    position 0,0,0 is a real coordinate, and the M3 latent probe would fit
+    against it.
+    """
+    if state:
+        missing = [k for k in keys if k not in state]
+        if missing:
+            raise DataIntegrityError(
+                f"privileged state lost keys mid-episode: {missing}"
+            )
+        return np.asarray([state[k] for k in keys], dtype=np.float32)
+    if previous is not None:
+        return previous.copy()
+    return np.zeros(len(keys), dtype=np.float32)
+
+
 class Collector:
     """Collects episodes, restarting the engine when it crashes."""
 
@@ -122,29 +146,7 @@ class Collector:
                 f"collected episode failed validation: {exc}"
             ) from exc
 
-    @staticmethod
-    def _row(
-        state: dict[str, float] | None,
-        keys: tuple[str, ...],
-        previous: np.ndarray | None,
-    ) -> np.ndarray:
-        """One privileged row, carrying the last value forward when unavailable.
-
-        The engine reports no state on the terminal frame, so the final row
-        repeats the last live reading. Zeros would be a plausible-looking lie:
-        position 0,0,0 is a real coordinate, and the M3 latent probe would fit
-        against it.
-        """
-        if state:
-            missing = [k for k in keys if k not in state]
-            if missing:
-                raise DataIntegrityError(
-                    f"privileged state lost keys mid-episode: {missing}"
-                )
-            return np.asarray([state[k] for k in keys], dtype=np.float32)
-        if previous is not None:
-            return previous.copy()
-        return np.zeros(len(keys), dtype=np.float32)
+    _row = staticmethod(privileged_row)
 
     def _restart(self) -> None:
         try:

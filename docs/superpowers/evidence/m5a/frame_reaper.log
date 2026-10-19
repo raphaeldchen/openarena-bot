@@ -1,0 +1,11 @@
+2026-10-15 16:29 dreamer seed 0: verified; deleted 11016 episode frame files (1.97 GiB); leftovers []
+2026-10-15 16:30 dreamer seed 1: verified; deleted 9673 episode frame files (1.95 GiB); leftovers []
+2026-10-15 16:30 dqn seed 0: verified; deleted 10996 episode frame files (1.97 GiB); leftovers []
+2026-10-15 16:30 dqn seed 1: verified; deleted 10872 episode frame files (1.97 GiB); leftovers []
+2026-10-15 23:52 dreamer seed 2: verified; deleted 11538 episode frame files (1.98 GiB); leftovers []
+2026-10-16 01:36 dqn seed 2: verified; deleted 11039 episode frame files (1.97 GiB); leftovers []
+2026-10-16 07:42 dreamer seed 3: verified; deleted 10606 episode frame files (1.96 GiB); leftovers []
+2026-10-16 09:28 dqn seed 3: verified; deleted 11077 episode frame files (1.97 GiB); leftovers []
+2026-10-16 18:34 dreamer seed 4: verified; deleted 10114 episode frame files (1.96 GiB); leftovers []
+2026-10-16 21:24 dqn seed 4: verified; deleted 10853 episode frame files (1.97 GiB); leftovers []
+2026-10-16 21:26 all ten runs reaped; exiting

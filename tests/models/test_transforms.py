@@ -41,3 +41,22 @@ def test_reward_target_matches_read_reward():
     r = torch.tensor([-9.0, -4.0, 97.0])
     for transform in REWARD_TRANSFORMS:
         torch.testing.assert_close(read_reward(reward_target(r, transform), transform), r)
+
+
+def test_read_reward_bounds_clip_in_target_space():
+    """Bounds are reward units; the clip happens on the head's output, in the
+    transform's space, so symexp never sees a value beyond symlog(r_max)."""
+    head = torch.tensor([symlog(torch.tensor(500.0)).item(), 0.0, -50.0])
+    out = read_reward(head, "symlog", bounds=(-9.0, 99.0))
+    torch.testing.assert_close(out, torch.tensor([99.0, 0.0, -9.0]), rtol=1e-5, atol=1e-4)
+
+
+def test_read_reward_bounds_are_identity_inside():
+    head = symlog(torch.tensor([-4.0, 50.0]))
+    torch.testing.assert_close(read_reward(head, "symlog", bounds=(-9.0, 99.0)),
+                               torch.tensor([-4.0, 50.0]), rtol=1e-5, atol=1e-4)
+
+
+def test_read_reward_without_bounds_is_unchanged():
+    head = torch.tensor([7.0])
+    assert torch.equal(read_reward(head, "symlog"), symexp(head))

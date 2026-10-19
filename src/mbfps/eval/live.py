@@ -45,9 +45,15 @@ class AgentPolicy:
         self._first = True
         self.imagined_start_return = None
 
-    @torch.no_grad()
     def act(self, obs: np.ndarray) -> int:
-        inputs = torch.as_tensor(self.encode(obs[None])).to(self.device)
+        return self.act_from_features(self.encode(obs[None])[0])
+
+    @torch.no_grad()
+    def act_from_features(self, features: np.ndarray) -> int:
+        """`act` for a frame whose backbone features are already computed
+        (M5a: the online loop encodes each frame once, for the replay and the
+        policy). Identical arithmetic to M4's `act`."""
+        inputs = torch.as_tensor(np.asarray(features)[None]).to(self.device)
         embedding = self.world_model.encoder(inputs)[:, None]           # (1, 1, E)
         action_in = torch.tensor([[self._last_action]], device=self.device)
         out = self.world_model.rssm.observe(embedding, action_in, state=self._state)
@@ -60,6 +66,17 @@ class AgentPolicy:
         action = int(dist.sample() if self.mode == "sample" else dist.probs.argmax(-1))
         self._last_action = action
         return action
+
+    def get_state(self) -> dict:
+        return {"h": self._state[0].detach().cpu(), "z": self._state[1].detach().cpu(),
+                "last_action": self._last_action, "first": self._first,
+                "imagined_start_return": self.imagined_start_return}
+
+    def set_state(self, state: dict) -> None:
+        self._state = (state["h"].to(self.device), state["z"].to(self.device))
+        self._last_action = int(state["last_action"])
+        self._first = bool(state["first"])
+        self.imagined_start_return = state["imagined_start_return"]
 
     def _imagined_return(self) -> float:
         wm = self.world_model

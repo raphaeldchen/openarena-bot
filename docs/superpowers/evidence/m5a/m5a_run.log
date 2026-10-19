@@ -1,0 +1,30 @@
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dreamer --seed 0 --out runs/m5a/dreamer_seed0
+complete: dreamer seed 0, 19000 update rounds, 15793 s
+deleted 11017 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dqn --seed 0 --out runs/m5a/dqn_seed0
+complete: dqn seed 0, 19000 update rounds, 5136 s
+deleted 10997 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dreamer --seed 1 --out runs/m5a/dreamer_seed1
+complete: dreamer seed 1, 19000 update rounds, 15953 s
+deleted 9674 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dqn --seed 1 --out runs/m5a/dqn_seed1
+complete: dqn seed 1, 19000 update rounds, 5229 s
+deleted 10873 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dreamer --seed 2 --out runs/m5a/dreamer_seed2
+complete: dreamer seed 2, 19000 update rounds, 17220 s
+deleted 11539 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dqn --seed 2 --out runs/m5a/dqn_seed2
+complete: dqn seed 2, 19000 update rounds, 6228 s
+deleted 11040 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dreamer --seed 3 --out runs/m5a/dreamer_seed3
+complete: dreamer seed 3, 19000 update rounds, 21927 s
+deleted 10607 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dqn --seed 3 --out runs/m5a/dqn_seed3
+complete: dqn seed 3, 19000 update rounds, 6344 s
+deleted 11078 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dreamer --seed 4 --out runs/m5a/dreamer_seed4
+complete: dreamer seed 4, 19000 update rounds, 20362 s
+deleted 10115 feature/state files after verification
+run: /Users/raphaelchen/Desktop/csgo-bot/.venv/bin/python /Users/raphaelchen/Desktop/csgo-bot/.claude/worktrees/project-recap-ba6e4a/scripts/train_online.py --arm dqn --seed 4 --out runs/m5a/dqn_seed4
+complete: dqn seed 4, 19000 update rounds, 7600 s
+deleted 10854 feature/state files after verification

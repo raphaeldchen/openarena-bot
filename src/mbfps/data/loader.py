@@ -129,24 +129,11 @@ class SequenceLoader:
                     f"unknown feature backbone {feature_backbone!r}; "
                     f"available: {list(BACKBONE_GEOMETRY)}"
                 )
-            expected = BACKBONE_GEOMETRY[feature_backbone]
-            suffix = feature_suffix(feature_backbone)
+            # Every file, from its header: a mixed directory (an interrupted
+            # `--clear`, a partial re-cache) must fail here, at construction,
+            # and name the first file that disagrees.
             for path in self._paths:
-                feature_path = path.with_suffix(suffix)
-                if not feature_path.is_file():
-                    raise FileNotFoundError(
-                        f"no cached features for {path.name}; expected "
-                        f"{feature_path.name}. Run scripts/cache_features.py "
-                        f"--backbone {feature_backbone} first."
-                    )
-                features = np.load(feature_path, mmap_mode="r")
-                # Every file, from its header: a mixed directory (an
-                # interrupted `--clear`, a partial re-cache) must fail here,
-                # at construction, and name the first file that disagrees.
-                _check_feature_geometry(
-                    features, feature_backbone, expected, feature_path
-                )
-                self._features.append(features)
+                self._features.append(self._load_features_for(path))
 
         if load_obs:
             total = sum(ep.obs.nbytes for ep in self._episodes)
@@ -164,6 +151,43 @@ class SequenceLoader:
         if self.load_obs:
             return load_episode(path)
         return _EpisodeMeta.from_npz(path)
+
+    def _load_features_for(self, path: Path) -> np.ndarray:
+        """Memmap one episode's cached features, checking their geometry."""
+        feature_path = path.with_suffix(feature_suffix(self.feature_backbone))
+        if not feature_path.is_file():
+            raise FileNotFoundError(
+                f"no cached features for {path.name}; expected "
+                f"{feature_path.name}. Run scripts/cache_features.py "
+                f"--backbone {self.feature_backbone} first."
+            )
+        features = np.load(feature_path, mmap_mode="r")
+        _check_feature_geometry(
+            features, self.feature_backbone,
+            BACKBONE_GEOMETRY[self.feature_backbone], feature_path,
+        )
+        return features
+
+    def add(self, path: Path) -> None:
+        """Append one episode (M5a: the online replay grows during a run).
+        The directory is never re-scanned; the new episode becomes eligible
+        for the next `sample()`."""
+        path = Path(path)
+        episode = self._read(path)
+        features = self._load_features_for(path) if self.load_features else None
+        self._paths.append(path)
+        self._episodes.append(episode)
+        if self.load_features:
+            self._features.append(features)
+
+    @property
+    def n_episodes(self) -> int:
+        return len(self._paths)
+
+    @property
+    def rng(self) -> np.random.Generator:
+        """The window-sampling generator (M5a saves and restores its state)."""
+        return self._rng
 
     def episode_path(self, index: int) -> Path:
         """File backing the episode a batch's `episode_index` refers to.

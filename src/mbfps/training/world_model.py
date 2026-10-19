@@ -173,6 +173,20 @@ def load_world_model(path: Path, device: torch.device) -> "WorldModel":
     return model
 
 
+def world_model_step(model, optimiser, batch: dict[str, Any],
+                     grad_clip: float = 100.0) -> tuple[float, dict[str, float]]:
+    """One world-model update (M3/M4 losses, masked when the batch carries a
+    mask). Gradients are released after the step, so a following actor-critic
+    step can verify it left every world-model `.grad` as None (M5a §3.5)."""
+    loss, parts = model(batch)
+    optimiser.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimiser.step()
+    optimiser.zero_grad(set_to_none=True)
+    return float(loss.detach()), parts
+
+
 def train_world_model(
     cfg: Config,
     buffer: ReplayBuffer,
@@ -234,12 +248,8 @@ def train_world_model(
     checkpoint_seconds: dict[int, float] = {}
     start = time.perf_counter()
     for step in range(cfg.train.steps):
-        loss, parts = model(to_device(loader.sample(), device))
-        optimiser.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 100.0)
-        optimiser.step()
-        losses.append(float(loss.detach()))
+        loss_value, parts = world_model_step(model, optimiser, to_device(loader.sample(), device))
+        losses.append(loss_value)
         history_parts.append(parts)
         if (step + 1) in rungs:
             checkpoint_seconds[step + 1] = time.perf_counter() - start
