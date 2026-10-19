@@ -1,0 +1,674 @@
+{
+ "dqn": {
+  "arm": "dqn",
+  "budget_steps": 60,
+  "complete": true,
+  "config": {
+   "act_steps": 10,
+   "budget": 60,
+   "eval_every": 20,
+   "eval_seeds": [
+    1000000,
+    1000001,
+    1000002
+   ],
+   "prefill": 10,
+   "rounds_per_act": 2
+  },
+  "evals": [
+   {
+    "diagnostics": {
+     "epsilon": 0.99981,
+     "replay_transitions": 10,
+     "updates": 0
+    },
+    "modes": {
+     "eps0_05": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "greedy": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 0,
+    "update_rounds": 0
+   },
+   {
+    "diagnostics": {
+     "epsilon": 0.99962,
+     "loss": 0.1392449326813221,
+     "q_mean": 0.007201609201729298,
+     "replay_transitions": 10,
+     "updates": 2
+    },
+    "modes": {
+     "eps0_05": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": true,
+       "length": 9,
+       "return": 30.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "greedy": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 20,
+    "update_rounds": 2
+   },
+   {
+    "diagnostics": {
+     "epsilon": 0.99924,
+     "loss": 0.0428644735366106,
+     "q_mean": 0.024332988541573286,
+     "replay_transitions": 34,
+     "updates": 6
+    },
+    "modes": {
+     "eps0_05": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": true,
+       "length": 9,
+       "return": 30.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "greedy": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 40,
+    "update_rounds": 6
+   },
+   {
+    "diagnostics": {
+     "epsilon": 0.99886,
+     "loss": 0.027510513784363866,
+     "q_mean": 0.009424316231161356,
+     "replay_transitions": 60,
+     "updates": 10
+    },
+    "modes": {
+     "eps0_05": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": true,
+       "length": 9,
+       "return": 30.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "greedy": [
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": null,
+       "killed": false,
+       "length": 12,
+       "return": -108.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 60,
+    "update_rounds": 10
+   }
+  ],
+  "gated_mode": "greedy",
+  "isolation_ok": null,
+  "random": [
+   {
+    "imagined_return": null,
+    "killed": false,
+    "length": 12,
+    "return": -53.0,
+    "seed": 1000000,
+    "truncated": true
+   },
+   {
+    "imagined_return": null,
+    "killed": true,
+    "length": 4,
+    "return": 85.0,
+    "seed": 1000001,
+    "truncated": false
+   },
+   {
+    "imagined_return": null,
+    "killed": false,
+    "length": 12,
+    "return": -78.0,
+    "seed": 1000002,
+    "truncated": true
+   }
+  ],
+  "seed": 0,
+  "seeds": [
+   1000000,
+   1000001,
+   1000002
+  ],
+  "update_rounds": 10
+ },
+ "dreamer": {
+  "arm": "dreamer",
+  "budget_steps": 60,
+  "complete": true,
+  "config": {
+   "act_steps": 10,
+   "budget": 60,
+   "eval_every": 20,
+   "eval_seeds": [
+    1000000,
+    1000001,
+    1000002
+   ],
+   "prefill": 10,
+   "rounds_per_act": 2
+  },
+  "evals": [
+   {
+    "diagnostics": {
+     "replay_episodes": 2,
+     "replay_transitions": 10,
+     "reward_bounds": [
+      -4.0,
+      97.0
+     ]
+    },
+    "modes": {
+     "argmax": [
+      {
+       "imagined_return": 0.10536198318004608,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.10915784537792206,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.11195391416549683,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "sample": [
+      {
+       "imagined_return": 0.09864767640829086,
+       "killed": false,
+       "length": 12,
+       "return": -68.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.09529666602611542,
+       "killed": true,
+       "length": 3,
+       "return": 89.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": 0.10236458480358124,
+       "killed": false,
+       "length": 12,
+       "return": -63.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 0,
+    "update_rounds": 0
+   },
+   {
+    "diagnostics": {
+     "actor_loss": 0.01289076916873455,
+     "clipped_share": 0.0,
+     "critic_loss": 0.0003334063076181337,
+     "entropy": 1.3858267664909363,
+     "imagined_return": 0.08569180220365524,
+     "n_dropped": 0.5,
+     "n_starts": 7.5,
+     "replay_episodes": 2,
+     "replay_transitions": 10,
+     "reward_bounds": [
+      -4.0,
+      97.0
+     ],
+     "scale": 1.0,
+     "wm_continue": 0.6750911474227905,
+     "wm_embedding": 0.008438728749752045,
+     "wm_kl_dyn": 0.021833309903740883,
+     "wm_kl_rep": 0.021833309903740883,
+     "wm_loss": 4.448460102081299,
+     "wm_reward": 3.644930362701416
+    },
+    "modes": {
+     "argmax": [
+      {
+       "imagined_return": 0.08523136377334595,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.08577930182218552,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.08827809244394302,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "sample": [
+      {
+       "imagined_return": 0.0754912793636322,
+       "killed": false,
+       "length": 12,
+       "return": -68.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.07116712629795074,
+       "killed": true,
+       "length": 3,
+       "return": 89.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": 0.08243071287870407,
+       "killed": false,
+       "length": 12,
+       "return": -63.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 20,
+    "update_rounds": 2
+   },
+   {
+    "diagnostics": {
+     "actor_loss": 0.004435833579918835,
+     "clipped_share": 0.0,
+     "critic_loss": 7.002856204962882e-05,
+     "entropy": 1.3857872486114502,
+     "imagined_return": 0.049371718894690275,
+     "n_dropped": 1.25,
+     "n_starts": 13.5,
+     "replay_episodes": 4,
+     "replay_transitions": 34,
+     "reward_bounds": [
+      -9.0,
+      97.0
+     ],
+     "scale": 1.0,
+     "wm_continue": 0.669117882847786,
+     "wm_embedding": 0.007518571452237666,
+     "wm_kl_dyn": 0.0225231871008873,
+     "wm_kl_rep": 0.0225231871008873,
+     "wm_loss": 5.250022768974304,
+     "wm_reward": 4.45338648557663
+    },
+    "modes": {
+     "argmax": [
+      {
+       "imagined_return": 0.04113662242889404,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.037827376276254654,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.04334249347448349,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "sample": [
+      {
+       "imagined_return": 0.0275786854326725,
+       "killed": false,
+       "length": 12,
+       "return": -68.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": 0.02172783389687538,
+       "killed": true,
+       "length": 3,
+       "return": 89.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": 0.04181574285030365,
+       "killed": false,
+       "length": 12,
+       "return": -63.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 40,
+    "update_rounds": 6
+   },
+   {
+    "diagnostics": {
+     "actor_loss": -0.010023211711086333,
+     "clipped_share": 0.0,
+     "critic_loss": 0.00024622953787911683,
+     "entropy": 1.3857490122318268,
+     "imagined_return": -0.01840169681236148,
+     "n_dropped": 0.25,
+     "n_starts": 15.5,
+     "replay_episodes": 7,
+     "replay_transitions": 60,
+     "reward_bounds": [
+      -9.0,
+      97.0
+     ],
+     "scale": 1.0,
+     "wm_continue": 0.6508679836988449,
+     "wm_embedding": 0.0076654545264318585,
+     "wm_kl_dyn": 0.024946383200585842,
+     "wm_kl_rep": 0.024946383200585842,
+     "wm_loss": 4.451038599014282,
+     "wm_reward": 3.6725054383277893
+    },
+    "modes": {
+     "argmax": [
+      {
+       "imagined_return": -0.02217588759958744,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": -0.028226573020219803,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000001,
+       "truncated": true
+      },
+      {
+       "imagined_return": -0.019928481429815292,
+       "killed": false,
+       "length": 12,
+       "return": -48.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ],
+     "sample": [
+      {
+       "imagined_return": -0.041220419108867645,
+       "killed": false,
+       "length": 12,
+       "return": -68.0,
+       "seed": 1000000,
+       "truncated": true
+      },
+      {
+       "imagined_return": -0.04959080368280411,
+       "killed": true,
+       "length": 3,
+       "return": 89.0,
+       "seed": 1000001,
+       "truncated": false
+      },
+      {
+       "imagined_return": -0.02247288078069687,
+       "killed": false,
+       "length": 12,
+       "return": -63.0,
+       "seed": 1000002,
+       "truncated": true
+      }
+     ]
+    },
+    "step": 60,
+    "update_rounds": 10
+   }
+  ],
+  "gated_mode": "sample",
+  "isolation_ok": true,
+  "random": [
+   {
+    "imagined_return": null,
+    "killed": false,
+    "length": 12,
+    "return": -53.0,
+    "seed": 1000000,
+    "truncated": true
+   },
+   {
+    "imagined_return": null,
+    "killed": true,
+    "length": 4,
+    "return": 85.0,
+    "seed": 1000001,
+    "truncated": false
+   },
+   {
+    "imagined_return": null,
+    "killed": false,
+    "length": 12,
+    "return": -78.0,
+    "seed": 1000002,
+    "truncated": true
+   }
+  ],
+  "seed": 0,
+  "seeds": [
+   1000000,
+   1000001,
+   1000002
+  ],
+  "update_rounds": 10
+ }
+}

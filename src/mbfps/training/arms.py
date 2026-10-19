@@ -1,10 +1,11 @@
 """The two arms of M5a behind one interface (spec §4, §5).
 
-Both read frozen DINOv2 features (the `frozen_ssl` cache suffix) and are built
-from the run seed. `update_round()` is one update round of §3.2; the driver
+Both read one encoder kind's cached frozen-backbone features (`frozen_ssl`,
+i.e. DINOv2, by default, as in M5a) and are built from the run seed. `update_round()` is one update round of §3.2; the driver
 calls it 20 times per 100 budget steps."""
 
 import copy
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
@@ -18,12 +19,17 @@ from mbfps.training.ac_trainer import ACConfig, ActorCriticLearner
 from mbfps.training.dqn import (DQNConfig, EpsilonGreedyQPolicy, QNetwork,
                                 TransitionSampler, dqn_step, epsilon)
 from mbfps.training.world_model import WorldModel, world_model_step
-from mbfps.utils.config import get_config
+from mbfps.models.encoders import encoder_backbone
+from mbfps.utils.config import EncoderConfig, get_config
 from mbfps.utils.device import to_device
 from mbfps.utils.seeding import seed_everything
 
-BACKBONE = "dinov2"
-N_ACTIONS = 4
+def _feature_backbone(encoder: str) -> str:
+    backbone = encoder_backbone(EncoderConfig(kind=encoder))
+    if backbone is None:
+        raise ValueError(f"encoder kind {encoder!r} reads pixels; the online loop feeds "
+                         "cached features only")
+    return backbone
 
 
 class _Means:
@@ -46,25 +52,35 @@ class DreamerArm:
     name, gated_mode = "dreamer", "sample"
 
     def __init__(self, seed: int, device: torch.device, encode, replay: ReplayBuffer,
-                 batch_size: int = 16, seq_len: int = 64) -> None:
+                 batch_size: int = 16, seq_len: int = 64, encoder: str = "frozen_ssl",
+                 n_actions: int = 4) -> None:
+        self.encoder, self.backbone = encoder, _feature_backbone(encoder)
+        self.n_actions = n_actions
         seed_everything(seed)   # the world model is built first after this, as in M3/M4
         self.device, self.encode = device, encode
         self.world_model = WorldModel(get_config(
-            "frozen_ssl", seed=seed, device=device.type, n_actions=N_ACTIONS,
+            encoder, seed=seed, device=device.type, n_actions=n_actions,
             pad_short=True, reward_transform="symlog")).to(device)
         self.wm_opt = torch.optim.Adam(self.world_model.parameters(),
                                        lr=self.world_model.cfg.train.lr)
         self.learner = ActorCriticLearner(
-            N_ACTIONS, ACConfig(seed=seed, device=device.type, batch_size=batch_size,
+            n_actions, ACConfig(seed=seed, device=device.type, batch_size=batch_size,
                                 seq_len=seq_len, bound_reward_readout=True,
                                 drop_terminal_starts=True), device)
         self.loader = SequenceLoader(replay, batch_size=batch_size, seq_len=seq_len, seed=seed,
                                      load_obs=False, load_features=True,
-                                     feature_backbone=BACKBONE, paths=[], pad_short=True)
+                                     feature_backbone=self.backbone, paths=[], pad_short=True)
+        self.batch_size, self.seq_len = batch_size, seq_len
         self.reward_bounds: tuple[float, float] | None = None
         self.isolation_ok: bool | None = None
         self._means = _Means()
         self._replay_transitions = 0
+
+    def settings(self) -> dict:
+        """The settings this arm ran with, defaults included (written to the record)."""
+        return {"encoder": self.encoder, "n_actions": self.n_actions,
+                "batch_size": self.batch_size, "seq_len": self.seq_len,
+                "world_model": asdict(self.world_model.cfg), "ac": asdict(self.learner.cfg)}
 
     def add_episode(self, path: Path) -> None:
         self.loader.add(path)
@@ -128,11 +144,14 @@ class DQNArm:
     name, gated_mode = "dqn", "greedy"
 
     def __init__(self, seed: int, device: torch.device, encode,
-                 cfg: DQNConfig = DQNConfig()) -> None:
+                 cfg: DQNConfig = DQNConfig(), encoder: str = "frozen_ssl",
+                 n_actions: int = 4) -> None:
+        self.encoder, self.backbone = encoder, _feature_backbone(encoder)
+        self.n_actions = n_actions
         seed_everything(seed)
         self.device, self.encode, self.cfg = device, encode, cfg
-        self.q = QNetwork(N_ACTIONS, seed=seed, frame_stack=cfg.frame_stack,
-                          hidden=cfg.hidden).to(device)
+        self.q = QNetwork(n_actions, seed=seed, frame_stack=cfg.frame_stack,
+                          hidden=cfg.hidden, encoder_kind=encoder).to(device)
         self.q_target = copy.deepcopy(self.q).requires_grad_(False)
         self.opt = torch.optim.Adam(self.q.parameters(), lr=cfg.lr)
         self.sampler = TransitionSampler(seed=seed, cfg=cfg)
@@ -141,10 +160,14 @@ class DQNArm:
         self._means = _Means()
         self._budget_step_fn: Callable[[], int] = lambda: 0
 
+    def settings(self) -> dict:
+        """The settings this arm ran with, defaults included (written to the record)."""
+        return {"encoder": self.encoder, "n_actions": self.n_actions, "cfg": asdict(self.cfg)}
+
     def add_episode(self, path: Path) -> None:
         with np.load(path) as d:
             arrays = (d["actions"], d["rewards"], d["terminated"], d["truncated"])
-        features = np.load(path.with_suffix(feature_suffix(BACKBONE)), mmap_mode="r")
+        features = np.load(path.with_suffix(feature_suffix(self.backbone)), mmap_mode="r")
         self.sampler.add(features, *arrays)
 
     def update_round(self) -> dict[str, float]:

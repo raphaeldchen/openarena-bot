@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 import shutil
 from pathlib import Path
 
@@ -229,15 +230,15 @@ def test_delete_refuses_incomplete_record(tmp_path):
     assert (tmp_path / "state.pt").exists()
 
 
-def test_delete_removes_features_and_state_only(tmp_path):
+def test_delete_empties_the_replay_and_flags_both(tmp_path):
     _run(tmp_path)
     n_npz = len(list((tmp_path / "replay").glob("ep_*.npz")))
     deleted = delete_replay_features(tmp_path, TINY)
-    assert deleted == n_npz + 1                       # every feature file, plus state.pt
-    assert not list((tmp_path / "replay").glob("*.features*.npy"))
+    assert deleted == 2 * n_npz + 2              # features, frames, state.pt, the owner marker
+    assert list((tmp_path / "replay").iterdir()) == []
     assert not (tmp_path / "state.pt").exists()
-    assert len(list((tmp_path / "replay").glob("ep_*.npz"))) == n_npz
-    assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
+    rec = load_record(tmp_path / "record.json")
+    assert rec["replay_features_deleted"] is True and rec["replay_frames_deleted"] is True
 
 
 def test_delete_flags_the_record_and_drops_state_before_any_feature(tmp_path, monkeypatch):
@@ -256,8 +257,9 @@ def test_delete_flags_the_record_and_drops_state_before_any_feature(tmp_path, mo
     assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
     assert not (tmp_path / "state.pt").exists()
     assert list((tmp_path / "replay").glob("*.features*.npy"))
+    assert list((tmp_path / "replay").glob("ep_*.npz"))   # frames go last
     delete_replay_features(tmp_path, TINY)            # idempotent: finishes the job
-    assert not list((tmp_path / "replay").glob("*.features*.npy"))
+    assert list((tmp_path / "replay").iterdir()) == []
 
 
 def test_verify_flags_a_reordered_eval(tmp_path):
@@ -287,3 +289,171 @@ def test_prefill_must_precede_the_first_checkpoint(kw):
 def test_default_and_tiny_configs_construct():
     assert OnlineConfig().prefill < OnlineConfig().eval_every
     assert TINY.prefill < TINY.eval_every
+
+
+class _ThreeActionEnv(FakeEnv):
+    """FakeEnv with a 3-action space and its own scenario name (never shoots)."""
+
+    def __init__(self, limit: int = 12) -> None:
+        super().__init__(limit)
+        from gymnasium import spaces
+        self.action_space, self.scenario = spaces.Discrete(3), "fake_three"
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_the_action_count_comes_from_the_environment(tmp_path, arm):
+    rec = train_online(arm, seed=0, out_dir=tmp_path, env_factory=_ThreeActionEnv,
+                       encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=_kw(arm) or DREAMER_KW)
+    acts = np.concatenate([load_episode(p).actions
+                           for p in (tmp_path / "replay").glob("ep_*.npz")])
+    assert acts.max() <= 2
+    assert (rec["scenario"], rec["encoder"], rec["n_actions"]) == ("fake_three", "frozen_ssl", 3)
+
+
+def test_the_record_names_the_m5a_defaults(tmp_path):
+    rec = _run(tmp_path)
+    assert (rec["scenario"], rec["encoder"], rec["n_actions"]) == ("fake_basic", "frozen_ssl", 4)
+
+
+def test_arm_kwargs_may_not_set_the_action_count(tmp_path):
+    with pytest.raises(ValueError, match="n_actions"):
+        _run(tmp_path, "dqn", kw={"n_actions": 3})
+
+
+def test_resume_refuses_a_different_scenario(tmp_path):
+    _run(tmp_path, stop=30)
+    with pytest.raises(RuntimeError, match="differs"):
+        train_online("dreamer", seed=0, out_dir=tmp_path, env_factory=_ThreeActionEnv,
+                     encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=DREAMER_KW)
+
+
+def test_a_fresh_run_marks_the_replay_as_its_own(tmp_path):
+    _run(tmp_path, stop=20)
+    owner = json.loads((tmp_path / "replay" / ".owner.json").read_text())
+    assert (owner["arm"], owner["seed"]) == ("dreamer", 0)
+
+
+def test_a_fresh_start_refuses_a_replay_with_no_owner(tmp_path):
+    _run(tmp_path / "other")
+    d = tmp_path / "d"
+    (d / "replay").mkdir(parents=True)
+    stray = next((tmp_path / "other" / "replay").glob("ep_*.npz"))
+    shutil.copy(stray, d / "replay" / stray.name)
+    with pytest.raises(RuntimeError, match="does not own"):
+        _run(d)
+    assert _replay(d) == [stray.name]
+
+
+def test_a_fresh_start_refuses_another_runs_replay(tmp_path):
+    _run(tmp_path, stop=20)
+    (tmp_path / "state.pt").unlink()
+    (tmp_path / "record.json").unlink()
+    n = _replay(tmp_path)
+    with pytest.raises(RuntimeError, match="does not own"):
+        train_online(**_call(tmp_path, seed=1))
+    assert _replay(tmp_path) == n
+
+
+def test_a_refused_resume_names_the_way_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-b")
+    with pytest.raises(RuntimeError) as err:
+        train_online(**_call(tmp_path))
+    assert "check out commit-a" in str(err.value) and "delete" in str(err.value)
+
+
+def test_an_unsupported_device_is_refused_before_any_work(tmp_path):
+    calls = []
+    with pytest.raises(ValueError, match="meta"):
+        train_online(**_call(tmp_path, device=torch.device("meta"),
+                             env_factory=lambda: calls.append(1) or FakeEnv()))
+    assert calls == [] and not (tmp_path / "replay").exists()
+
+
+def test_the_record_carries_its_arm_kwargs(tmp_path):
+    rec = _run(tmp_path, "dqn", kw={"cfg": DQNConfig(batch_size=8)})
+    assert rec["arm_kwargs"]["cfg"]["batch_size"] == 8
+
+
+@pytest.mark.parametrize("break_it, word", [
+    (lambda r: r["config"].update(prefill=20), "config"),
+    (lambda r: r.update(update_rounds=r["update_rounds"] - 1), "update_rounds"),
+    (lambda r: r.pop("config"), "config"),
+    (lambda r: r["evals"][1].pop("modes"), "malformed"),
+])
+def test_verify_checks_config_rounds_and_shape(tmp_path, break_it, word):
+    rec = json.loads(json.dumps(_run(tmp_path)))
+    assert verify_record(rec, TINY) == []
+    break_it(rec)
+    assert any(word in p for p in verify_record(rec, TINY))
+
+
+def test_the_record_carries_the_arms_effective_settings(tmp_path):
+    dqn = _run(tmp_path / "dqn", "dqn", kw={})
+    assert dqn["arm_settings"] == {"encoder": "frozen_ssl", "n_actions": 4,
+                                   "cfg": json.loads(json.dumps(asdict(DQNConfig())))}
+    dreamer = _run(tmp_path / "dreamer")
+    s = dreamer["arm_settings"]
+    assert (s["encoder"], s["n_actions"], s["batch_size"], s["seq_len"]) == ("frozen_ssl", 4, 2, 8)
+    assert s["ac"]["bound_reward_readout"] is True and s["ac"]["drop_terminal_starts"] is True
+    assert s["world_model"]["arm"] == "frozen_ssl"
+    assert s["world_model"]["train"]["reward_transform"] == "symlog"
+    assert load_record(tmp_path / "dqn" / "record.json")["arm_settings"] == dqn["arm_settings"]
+
+
+def test_a_crashed_prefill_restarts_after_a_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    (tmp_path / "state.pt").unlink()             # as if it died before its first checkpoint
+    (tmp_path / "record.json").unlink()
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-b")
+    assert _run(tmp_path)["complete"] is True
+
+
+def test_a_finished_run_refusal_names_the_way_out(tmp_path):
+    _run(tmp_path)
+    (tmp_path / "state.pt").unlink()
+    with pytest.raises(RuntimeError, match="delete"):
+        _run(tmp_path)
+
+
+def test_a_failed_start_closes_its_environments_and_claims_nothing(tmp_path):
+    closed = []
+
+    class _Env(FakeEnv):
+        def close(self):
+            closed.append(1)
+
+    with pytest.raises(KeyError, match="nope"):
+        train_online(**_call(tmp_path, env_factory=_Env, arm_kwargs={**DREAMER_KW, "encoder": "nope"}))
+    assert closed == [1, 1]
+    assert not (tmp_path / "replay" / ".owner.json").exists()
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_a_random_vit_run_completes_and_deletes(tmp_path, arm):
+    kw = {**(_kw(arm) or DREAMER_KW), "encoder": "random_vit"}
+    rec = _run(tmp_path, arm, kw=kw)
+    assert rec["encoder"] == "random_vit" and verify_record(rec, TINY) == []
+    assert list((tmp_path / "replay").glob("*.features_random_vit.npy"))
+    delete_replay_features(tmp_path, TINY)
+    assert list((tmp_path / "replay").iterdir()) == []
+
+
+def test_a_failing_second_environment_closes_the_first(tmp_path):
+    made, closed = [], []
+
+    class _Env(FakeEnv):
+        def close(self):
+            closed.append(1)
+
+    def factory():
+        if made:
+            raise OSError("no second display")
+        made.append(1)
+        return _Env()
+
+    with pytest.raises(OSError, match="second"):
+        train_online(**_call(tmp_path, env_factory=factory))
+    assert closed == [1]

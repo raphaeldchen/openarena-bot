@@ -3,6 +3,7 @@ is spent, evaluating at step 0 and every 10,000 budget steps. After each
 evaluation the full state is written; a rerun resumes from it and is
 bit-identical to an uninterrupted run (§3.4)."""
 
+import json
 import random
 import time
 from dataclasses import asdict, dataclass, is_dataclass
@@ -52,10 +53,14 @@ def _make_arm(name: str, seed: int, device, encode, replay, kwargs):
     raise ValueError(f"unknown arm {name!r}")
 
 
+DEVICE_TYPES = ("cpu", "mps", "cuda")
+OWNER = ".owner.json"
+
+
 def _rng_state(device) -> dict:
     """Every generator a resume must restore. A device type this does not know
     raises: a silently unsaved generator would break the bit-identical resume (§3.4)."""
-    if device.type not in ("cpu", "mps", "cuda"):
+    if device.type not in DEVICE_TYPES:
         raise ValueError(f"cannot save the RNG state of a {device.type!r} device")
     out = {"python": random.getstate(), "numpy": np.random.get_state(),
            "torch": torch.get_rng_state()}
@@ -67,7 +72,7 @@ def _rng_state(device) -> dict:
 
 
 def _set_rng_state(state: dict, device) -> None:
-    if device.type not in ("cpu", "mps", "cuda"):
+    if device.type not in DEVICE_TYPES:
         raise ValueError(f"cannot restore the RNG state of a {device.type!r} device")
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
@@ -78,14 +83,17 @@ def _set_rng_state(state: dict, device) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict, device) -> dict:
+def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict, device,
+          scenario: str | None = None, n_actions: int | None = None) -> dict:
     """What identifies a run. A dataclass kwarg (DQNConfig) is stored by value.
 
-    The commit and the device type are part of it: a resume on other code or on
-    another device is not the run that was started, and is refused."""
+    The commit, the device type, the scenario and its action count are part of
+    it: a resume on other code, on another device or in another environment is
+    not the run that was started, and is refused."""
     kwargs = {k: asdict(v) if is_dataclass(v) else v for k, v in arm_kwargs.items()}
     return {"arm": arm_name, "seed": seed, "cfg": asdict(cfg), "arm_kwargs": kwargs,
-            "git_sha": git_sha(), "device": device.type}
+            "git_sha": git_sha(), "device": device.type, "scenario": scenario,
+            "n_actions": n_actions}
 
 
 def _prune_replay(root: Path, keep: set[str]) -> None:
@@ -103,6 +111,35 @@ def _prune_replay(root: Path, keep: set[str]) -> None:
                 path.unlink(missing_ok=True)
 
 
+def _owner(meta: dict) -> dict:
+    """Which run a replay belongs to: its identity without the commit and the
+    device, so a run that died in its prefill restarts after a commit (its
+    partial prefill is pruned, as before) while another run's files are never
+    touched."""
+    return _jsonable({k: v for k, v in meta.items() if k not in ("git_sha", "device")})
+
+
+def _check_owner(replay_dir: Path, meta: dict, resuming: bool) -> None:
+    """Refuse a fresh start over episode files some other run wrote: orphan
+    pruning deletes every episode the saved state does not list, so it must
+    only ever see this run's own files. A resume is pinned by state.pt."""
+    owner_path = replay_dir / OWNER
+    if not resuming and any(replay_dir.glob("ep_*")):
+        owner = json.loads(owner_path.read_text()) if owner_path.exists() else None
+        if owner != _owner(meta):
+            raise RuntimeError(
+                f"{replay_dir} holds episode files this run does not own (owner: {owner}); "
+                "move or delete them, or choose another output directory")
+
+
+def _write_owner(replay_dir: Path, meta: dict) -> None:
+    """Mark `replay_dir` as this run's, before its first episode."""
+    owner_path = replay_dir / OWNER
+    tmp = owner_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_owner(meta), sort_keys=True))
+    tmp.replace(owner_path)
+
+
 def _evaluate(arm, env, seeds) -> dict:
     return {mode: run_episodes(env, policy, seeds) for mode, policy in arm.eval_policies().items()}
 
@@ -110,6 +147,11 @@ def _evaluate(arm, env, seeds) -> dict:
 def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, device,
                  cfg: OnlineConfig = OnlineConfig(), arm_kwargs: dict | None = None,
                  stop_after_step: int | None = None) -> dict:
+    if device.type not in DEVICE_TYPES:
+        # Checked before any work: the first checkpoint would otherwise refuse
+        # only after the prefill and the step-0 evaluation.
+        raise ValueError(f"unsupported device type {device.type!r}; expected one of "
+                         f"{DEVICE_TYPES}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path, record_path = out_dir / "state.pt", out_dir / "record.json"
@@ -118,9 +160,23 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         # Starting fresh here would rerun the prefill and append to its replay.
         raise RuntimeError(f"{out_dir} already holds record.json but no state.pt: the run "
                            "is finished and its resumable state was removed; refusing to "
-                           "start a fresh run on top of its replay")
+                           "start a fresh run on top of it. To run it again, delete "
+                           f"{out_dir} (or choose another output directory).")
     arm_kwargs = arm_kwargs or {}
-    meta = _meta(arm_name, seed, cfg, arm_kwargs, device)
+    if "n_actions" in arm_kwargs:
+        raise ValueError("n_actions comes from the environment's action space; do not pass it "
+                         "in arm_kwargs")
+    # The environments are built before the arm: the action count is the
+    # environment's, and the arm's seed_everything resets every global RNG anyway.
+    train_env = env_factory()
+    try:
+        eval_env = env_factory()
+    except BaseException:
+        train_env.close()
+        raise
+    n_actions = int(train_env.action_space.n)
+    meta = _meta(arm_name, seed, cfg, arm_kwargs, device,
+                 scenario=getattr(train_env, "scenario", None), n_actions=n_actions)
     saved = None
     if state_path.exists():
         # weights_only=False: the state holds NumPy RNG states and frame stacks,
@@ -128,19 +184,29 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         # `_checkpoint` below, into this run's own directory, and never shipped.
         saved = torch.load(state_path, weights_only=False)
         if saved["meta"] != meta:
-            raise RuntimeError(f"{out_dir} holds a run that differs from this call: saved "
-                               f"{saved['meta']}, called with {meta}")
+            train_env.close(), eval_env.close()
+            raise RuntimeError(
+                f"{out_dir} holds a run that differs from this call: saved {saved['meta']}, "
+                f"called with {meta}. To finish the saved run, check out "
+                f"{saved['meta'].get('git_sha')} and repeat its exact call (arm, seed, config, "
+                f"arm_kwargs, device, scenario); to start over, delete {out_dir}.")
     replay_dir = out_dir / "replay"
-    replay_dir.mkdir(parents=True, exist_ok=True)
-    # state.pt is the source of truth. Anything in replay/ it does not list was
-    # written by a process that died after the last checkpoint (or during the
-    # prefill, when there is no state yet); drop it before the buffer counts it.
-    _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
-                  if saved else set())
-    replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
-    arm = _make_arm(arm_name, seed, device, encode, replay, arm_kwargs)
-    train_env, eval_env = env_factory(), env_factory()
-    rollout = OnlineRollout(train_env, encode, replay, run_seed=seed,
+    try:
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        _check_owner(replay_dir, meta, resuming=saved is not None)
+        # state.pt is the source of truth. Anything in replay/ it does not list was
+        # written by a process that died after the last checkpoint (or during the
+        # prefill, when there is no state yet); drop it before the buffer counts it.
+        _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
+                      if saved else set())
+        replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
+        arm = _make_arm(arm_name, seed, device, encode, replay,
+                        {**arm_kwargs, "n_actions": n_actions})
+    except BaseException:
+        train_env.close(), eval_env.close()
+        raise
+    _write_owner(replay_dir, meta)
+    rollout = OnlineRollout(train_env, encode, replay, run_seed=seed, backbone=arm.backbone,
                             on_episode=arm.add_episode, policy_name=arm.name)
     policy = arm.behaviour_policy(lambda: rollout.budget_step)
     timing = {"act": 0.0, "train": 0.0, "eval": 0.0}
@@ -157,7 +223,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         record, update_rounds, timing = saved["record"], saved["update_rounds"], saved["timing"]
         write_record(record_path, record)   # record.json is a derived copy; resync it
     else:
-        prefill_policy = RandomPolicy(4, seed=seed)
+        prefill_policy = RandomPolicy(n_actions, seed=seed)
         rollout.policy_name = "random"
         t0 = time.perf_counter()
         while rollout.budget_step < cfg.prefill:
@@ -166,9 +232,11 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         rollout.policy_name = arm.name
         timing["act"] += time.perf_counter() - t0
         record = {"arm": arm.name, "seed": seed, "gated_mode": arm.gated_mode, "seeds": seeds,
-                  "config": asdict(cfg), "git_sha": meta["git_sha"], "evals": [],
-                  "complete": False,
-                  "random": run_episodes(eval_env, RandomPolicy(4, seed=0), seeds)}
+                  "config": asdict(cfg), "git_sha": meta["git_sha"],
+                  "scenario": meta["scenario"], "encoder": arm.encoder, "n_actions": n_actions,
+                  "arm_kwargs": meta["arm_kwargs"], "arm_settings": _jsonable(arm.settings()),
+                  "evals": [], "complete": False,
+                  "random": run_episodes(eval_env, RandomPolicy(n_actions, seed=0), seeds)}
         update_rounds = 0
         t0 = time.perf_counter()
         record["evals"].append({"step": 0, "modes": _evaluate(arm, eval_env, seeds),
@@ -219,9 +287,29 @@ def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, dev
     write_record(record_path, record)
 
 
+_MALFORMED = (KeyError, TypeError, AttributeError, StopIteration)
+
+
+def _jsonable(x):
+    return json.loads(json.dumps(x))
+
+
 def verify_record(record: dict, cfg: OnlineConfig) -> list[str]:
-    """Why a run's record is not complete and well-formed (§3.4, §7.3); [] if it is."""
+    """Why a run's record is not complete and well-formed (§3.4, §7.3); [] if it is.
+    A record missing a field or holding one of the wrong shape is reported, not raised."""
+    try:
+        return _record_problems(record, cfg)
+    except _MALFORMED as exc:
+        return [f"malformed record: {type(exc).__name__}: {exc}"]
+
+
+def _record_problems(record: dict, cfg: OnlineConfig) -> list[str]:
     problems = []
+    if _jsonable(record.get("config")) != _jsonable(asdict(cfg)):
+        problems.append(f"config {record.get('config')} != {asdict(cfg)}")
+    rounds = (cfg.budget - cfg.prefill) // cfg.act_steps * cfg.rounds_per_act
+    if record.get("update_rounds") != rounds:
+        problems.append(f"update_rounds {record.get('update_rounds')} != {rounds}")
     seeds = list(cfg.eval_seeds)
     if record.get("complete") is not True:
         problems.append("record is not complete")
@@ -242,26 +330,33 @@ def verify_record(record: dict, cfg: OnlineConfig) -> list[str]:
 
 
 def delete_replay_features(out_dir: Path, cfg: OnlineConfig) -> int:
-    """§9: delete a finished run's feature caches and resumable state, only
-    after its record verifies. Episode files and the record are kept."""
+    """§9: once a finished run's record verifies, delete everything it no longer
+    needs -- its resumable state, the replay's feature caches, the episode frames
+    and the owner marker -- leaving `replay/` empty and the record as the run's
+    only output. Returns the number of files deleted."""
     out_dir = Path(out_dir)
     record_path = out_dir / "record.json"
     record = load_record(record_path)
     problems = verify_record(record, cfg)
     if problems:
         raise ValueError("refusing to delete replay features: " + "; ".join(problems))
-    features = sorted((out_dir / "replay").glob("*.features*.npy"))
+    replay_dir = out_dir / "replay"
     state = out_dir / "state.pt"
-    victims = ([state] if state.exists() else []) + features
+    owner = replay_dir / OWNER
+    victims = (([state] if state.exists() else [])
+               + sorted(replay_dir.glob("*.features*.npy"))
+               + sorted(replay_dir.glob("ep_*.npz"))
+               + ([owner] if owner.exists() else []))
     # Flag the record first: a crash after this leaves a flagged run that can be
     # deleted again (idempotent), never a deleted run whose record says otherwise.
     # load_record restores the NaN/inf floats but leaves the map that recorded
     # them in the dict; write_record rebuilds that map and refuses a stale one.
     record["replay_features_deleted"] = True
+    record["replay_frames_deleted"] = True
     record.pop(NONFINITE_KEY, None)
     write_record(record_path, record)
     # state.pt goes first, so a crash between the unlinks leaves no resume state
-    # pointing at features that are gone.
+    # pointing at files that are gone; the frames go after their features.
     for path in victims:
         path.unlink()
     return len(victims)

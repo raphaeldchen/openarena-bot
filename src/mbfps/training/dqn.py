@@ -1,8 +1,8 @@
 """The model-free baseline (M5a §5): Double DQN with n-step returns.
 
-Reads the same frozen DINOv2 features as the Dreamer arm, through the same
-`BottleneckEncoder` class at the same seeded initialisation, with a 4-frame
-stack in place of Dreamer's recurrent state. Settings are standard (Rainbow-
+Reads the same frozen-backbone features as the Dreamer arm (DINOv2 in M5a),
+through the same `BottleneckEncoder` class at the same seeded initialisation,
+with a 4-frame stack in place of Dreamer's recurrent state. Settings are standard (Rainbow-
 lite) and were fixed before any run (§5.2)."""
 
 from collections import deque
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mbfps.models.encoders import build_encoder
+from mbfps.models.encoders import build_encoder, encoder_backbone
 from mbfps.utils.config import EncoderConfig
 from mbfps.utils.seeding import fork_seed, seeded_init
 
@@ -49,9 +49,14 @@ def stack_indices(t: int, k: int) -> list[int]:
 class QNetwork(nn.Module):
     """Bottleneck per frame, the k embeddings concatenated, a 2 x 512 SiLU MLP."""
 
-    def __init__(self, n_actions: int, seed: int, frame_stack: int = 4, hidden: int = 512) -> None:
+    def __init__(self, n_actions: int, seed: int, frame_stack: int = 4, hidden: int = 512,
+                 encoder_kind: str = "frozen_ssl") -> None:
         super().__init__()
-        enc_cfg = EncoderConfig(kind="frozen_ssl")
+        enc_cfg = EncoderConfig(kind=encoder_kind)
+        if encoder_backbone(enc_cfg) is None:
+            raise ValueError(f"encoder kind {encoder_kind!r} reads pixels; the online loop "
+                             "feeds cached features only")
+        self.n_actions, self.encoder_kind = n_actions, encoder_kind
         # The world model builds its encoder as the first module after
         # seed_everything(seed); drawing from a fresh generator at `seed`
         # reproduces that initialisation exactly (§5.1).
@@ -83,6 +88,7 @@ class TransitionSampler:
         self.rng = np.random.default_rng(seed)
         self._eps: list[tuple] = []
         self._ends: list[int] = []
+        self._ends_array: np.ndarray | None = None   # `_ends` as an array; rebuilt after an add
 
     @property
     def n_transitions(self) -> int:
@@ -92,6 +98,7 @@ class TransitionSampler:
         self._eps.append((features, np.asarray(actions), np.asarray(rewards, np.float32),
                           np.asarray(terminated, bool), np.asarray(truncated, bool)))
         self._ends.append(self.n_transitions + len(actions))
+        self._ends_array = None
 
     def _target(self, e: int, t: int) -> tuple[float, float, int]:
         _, _, rewards, terminated, _ = self._eps[e]
@@ -110,10 +117,15 @@ class TransitionSampler:
             raise ValueError("no transitions stored")
         k = self.cfg.frame_stack
         idx = self.rng.integers(0, self.n_transitions, batch_size)
+        if self._ends_array is None:
+            self._ends_array = np.asarray(self._ends)
+        # One vectorised search, not one per transition over a Python list: the
+        # list-to-array conversion made sampling grow with the replay (M5a M6).
+        ends = self._ends_array
+        episode = np.searchsorted(ends, idx, side="right")
+        offset = idx - np.where(episode > 0, ends[np.maximum(episode - 1, 0)], 0)
         obs, nxt, act, ret, disc = [], [], [], [], []
-        for i in idx:
-            e = int(np.searchsorted(self._ends, i, side="right"))
-            t = int(i - (self._ends[e - 1] if e else 0))
+        for e, t in zip(episode.tolist(), offset.tolist()):
             feats, actions = self._eps[e][0], self._eps[e][1]
             r, d, n = self._target(e, t)
             obs.append(np.asarray(feats[stack_indices(t, k)]))
@@ -152,7 +164,11 @@ class EpsilonGreedyQPolicy:
     constant. The ε draw uses its own generator, reseeded per episode."""
 
     def __init__(self, q, encode: Callable | None, device: torch.device,
-                 epsilon_fn: Callable[[], float], frame_stack: int = 4, name: str = "dqn") -> None:
+                 epsilon_fn: Callable[[], float], frame_stack: int = 4, name: str = "dqn",
+                 n_actions: int | None = None) -> None:
+        self.n_actions = n_actions if n_actions is not None else getattr(q, "n_actions", None)
+        if self.n_actions is None:
+            raise ValueError("pass n_actions: the network does not say how many actions it has")
         self.q, self.encode, self.device = q, encode, device
         self.epsilon_fn, self.k, self.name = epsilon_fn, frame_stack, name
         self.reset(seed=0)
@@ -171,7 +187,7 @@ class EpsilonGreedyQPolicy:
         else:
             self._stack.append(features)
         explore = self._rng.random() < self.epsilon_fn()
-        random_action = int(self._rng.integers(0, 4))
+        random_action = int(self._rng.integers(0, self.n_actions))
         if explore:
             return random_action
         stack = torch.as_tensor(np.stack(self._stack)[None]).to(self.device)

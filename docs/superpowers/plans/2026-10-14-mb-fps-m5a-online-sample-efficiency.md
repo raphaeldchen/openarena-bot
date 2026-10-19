@@ -3062,3 +3062,19 @@ From the final review (`.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-eff
 - **Fold frame deletion into code.** Extend `delete_replay_features` (`src/mbfps/training/online.py:244`) to: verify the record, flag it (`replay_features_deleted`, plus a new `replay_frames_deleted`), then delete `state.pt`, the features, then the episode frames, leaving `replay/` empty; with tests, a corrected docstring ("Episode files and the record are kept" is now false for M5a), and an update to spec §9's disk arithmetic (about 2 GB of frames per run). This replaces the untracked-then-committed ops script `docs/superpowers/evidence/m5a/frame_reaper.py` with tested code.
 - **N1 (final re-review). A resume now refuses after any commit.** `eaba347` put `git_sha` in the resume identity (`src/mbfps/training/online.py`, `_meta`). So the recovery step of Task 12 Step 3 above ("fix through review if it is code, and re-issue … resumes from its last checkpoint") no longer works once anything is committed after a crash, even a docs-only change. The M5b runbook must say how to recover: check out the saved sha to finish the run, or delete the run directory and restart it. The refusal message should give that hint.
 - **N2 (final re-review). An unsupported device is rejected late.** `_rng_state` raises only at the first checkpoint, after the prefill and the step-0 evaluation. Check `device.type` when `train_online` starts.
+
+**Status (2026-10-18, branch `chore/m5b-prereqs`).** Every item above except M7 is closed:
+- `38bff2d` freezes M5a's default records and sampler draws as fixtures. Every later commit keeps them identical.
+- `e2e055b` closes both encoder and action-count items.
+- `0b5aa81` closes the chain test.
+- `57378ec` closes frame deletion, M4, N1 and N2.
+- `7da766b` closes M3 and M5.
+- `2a8a1d2` closes M6. A 256-transition DQN batch at an M5a run's final replay size drops from 44.7 ms to 0.8 ms.
+
+The ten M5a records still verify under the stricter checks, and re-reading them reproduces the published `study.txt` byte for byte.
+
+M7 is not fixed here. Giving `AgentPolicy` its own generator changes future numbers, so it is a decision for the M5b spec.
+
+**Carried into the M5b spec, from the cleanup branch's review:**
+- **M-g.** The `pixel_ae` backbone checkpoint path is relative to the working directory (`src/mbfps/data/geometry.py:41`). Records name neither the checkpoint nor `random_vit`'s seed. M5b's encoder comparison should pin both and record them.
+- **M-h.** The replay owner marker names a run but does not lock the directory, so two concurrent processes on one output directory could prune each other's episodes. This predates the branch. A lock file or a one-process-per-directory rule belongs in M5b's runbook.
