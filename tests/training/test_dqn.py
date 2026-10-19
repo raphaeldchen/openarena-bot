@@ -200,20 +200,22 @@ def test_dqn_converges_to_known_q_on_a_chain_with_both_endings(n_step):
 
 
 def test_double_dqn_target_uses_the_online_argmax_valued_by_the_target_net():
-    """Online net prefers action 0 at the next state; the target net values
-    action 1 at 5. Double DQN's target is q_target(next)[0] = 0, so the loss is
-    0. Vanilla DQN (max of the target net) would give 4.5; bootstrapping from
-    the online net itself would give 0.5."""
+    """At the next state B the online net prefers action 0 (Q = [1, 0]) and the
+    target net values the actions at [2, 5]. Double DQN's target is
+    q_target(B)[argmax q(B)] = 2, so with Q(A, 0) = 0 the Huber loss is 1.5.
+    Each wrong variant gives another loss: vanilla max of the target net 4.5,
+    bootstrapping from the online net 0.5, the roles swapped (target net
+    selects, online net values) 0."""
     def table(rows):
         net = nn.Sequential(nn.Flatten(), nn.Linear(2, 2, bias=False))
         with torch.no_grad():
             net[1].weight.copy_(torch.tensor(rows, dtype=torch.float32).T)
         return net
     q = table([[0.0, 0.0], [1.0, 0.0]])          # rows: Q(A,.), Q(B,.)
-    q_target = table([[0.0, 0.0], [0.0, 5.0]])
+    q_target = table([[0.0, 0.0], [2.0, 5.0]])
     batch = {"obs": np.array([[[1.0, 0.0]]], np.float32), "next_obs": np.array([[[0.0, 1.0]]], np.float32),
              "action": np.array([0]), "ret": np.array([0.0], np.float32),
              "discount": np.array([1.0], np.float32)}
     out = dqn_step(q, q_target, torch.optim.SGD(q.parameters(), lr=0.0), batch, 1,
                    DQNConfig(target_every=10**9), torch.device("cpu"))
-    assert out["loss"] == pytest.approx(0.0)
+    assert out["loss"] == pytest.approx(1.5)

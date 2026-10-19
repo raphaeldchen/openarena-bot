@@ -5,6 +5,7 @@ i.e. DINOv2, by default, as in M5a) and are built from the run seed. `update_rou
 calls it 20 times per 100 budget steps."""
 
 import copy
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
@@ -69,10 +70,17 @@ class DreamerArm:
         self.loader = SequenceLoader(replay, batch_size=batch_size, seq_len=seq_len, seed=seed,
                                      load_obs=False, load_features=True,
                                      feature_backbone=self.backbone, paths=[], pad_short=True)
+        self.batch_size, self.seq_len = batch_size, seq_len
         self.reward_bounds: tuple[float, float] | None = None
         self.isolation_ok: bool | None = None
         self._means = _Means()
         self._replay_transitions = 0
+
+    def settings(self) -> dict:
+        """The settings this arm ran with, defaults included (written to the record)."""
+        return {"encoder": self.encoder, "n_actions": self.n_actions,
+                "batch_size": self.batch_size, "seq_len": self.seq_len,
+                "ac": asdict(self.learner.cfg)}
 
     def add_episode(self, path: Path) -> None:
         self.loader.add(path)
@@ -151,6 +159,10 @@ class DQNArm:
         self.isolation_ok = None   # not applicable to DQN
         self._means = _Means()
         self._budget_step_fn: Callable[[], int] = lambda: 0
+
+    def settings(self) -> dict:
+        """The settings this arm ran with, defaults included (written to the record)."""
+        return {"encoder": self.encoder, "n_actions": self.n_actions, "cfg": asdict(self.cfg)}
 
     def add_episode(self, path: Path) -> None:
         with np.load(path) as d:

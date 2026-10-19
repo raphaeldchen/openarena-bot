@@ -2,8 +2,9 @@
 features. The defaults are M5a's: `basic` and the `frozen_ssl` (DINOv2) encoder.
 
 Resumes from OUT/state.pt if present. After a complete run, verifies the
-record and deletes the replay's feature caches and resumable state (spec §9)
-unless --keep-features."""
+record and then deletes its resumable state and the whole replay -- feature
+caches and episode frames (spec §9, as amended) -- unless --keep-features,
+which keeps all of it."""
 
 import argparse
 import sys
@@ -28,7 +29,8 @@ def main(argv=None) -> int:
     p.add_argument("--eval-every", type=int, default=10_000)
     p.add_argument("--scenario", default="basic")
     p.add_argument("--encoder", default="frozen_ssl", choices=("frozen_ssl", "pixel_ae", "random_vit"))
-    p.add_argument("--keep-features", action="store_true")
+    p.add_argument("--keep-features", action="store_true",
+                   help="keep state.pt and the replay (features and frames) after verifying")
     args = p.parse_args(argv)
 
     from mbfps.data.features import FeatureExtractor

@@ -92,3 +92,9 @@ def test_a_malformed_eval_is_a_problem_not_a_crash():
     rec = _rec()
     del rec["evals"][1]["modes"]
     assert any("malformed" in p for p in run_problems(rec, CFG))
+
+
+def test_a_malformed_record_past_verification_is_a_problem_not_a_crash():
+    rec = _rec()
+    del rec["random"][0]["return"]               # verify_record reads only the seeds here
+    assert any("malformed" in p for p in run_problems(rec, CFG))

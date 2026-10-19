@@ -111,23 +111,33 @@ def _prune_replay(root: Path, keep: set[str]) -> None:
                 path.unlink(missing_ok=True)
 
 
-def _claim_replay(replay_dir: Path, meta: dict, resuming: bool) -> None:
-    """Mark `replay_dir` as this run's before its first episode, and refuse a
-    fresh start over episode files some other run wrote: orphan pruning deletes
-    every episode the saved state does not list, so it must only ever see this
-    run's own files. A resume is already pinned to its run by state.pt."""
+def _owner(meta: dict) -> dict:
+    """Which run a replay belongs to: its identity without the commit and the
+    device, so a run that died in its prefill restarts after a commit (its
+    partial prefill is pruned, as before) while another run's files are never
+    touched."""
+    return _jsonable({k: v for k, v in meta.items() if k not in ("git_sha", "device")})
+
+
+def _check_owner(replay_dir: Path, meta: dict, resuming: bool) -> None:
+    """Refuse a fresh start over episode files some other run wrote: orphan
+    pruning deletes every episode the saved state does not list, so it must
+    only ever see this run's own files. A resume is pinned by state.pt."""
     owner_path = replay_dir / OWNER
-    mine = json.loads(json.dumps(meta))
     if not resuming and any(replay_dir.glob("ep_*")):
         owner = json.loads(owner_path.read_text()) if owner_path.exists() else None
-        if owner != mine:
+        if owner != _owner(meta):
             raise RuntimeError(
                 f"{replay_dir} holds episode files this run does not own (owner: {owner}); "
-                "move or delete them, or choose another output directory")
-    if not owner_path.exists() or not resuming:
-        tmp = owner_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(mine, sort_keys=True))
-        tmp.replace(owner_path)
+                f"move or delete them, or choose another output directory")
+
+
+def _write_owner(replay_dir: Path, meta: dict) -> None:
+    """Mark `replay_dir` as this run's, before its first episode."""
+    owner_path = replay_dir / OWNER
+    tmp = owner_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_owner(meta), sort_keys=True))
+    tmp.replace(owner_path)
 
 
 def _evaluate(arm, env, seeds) -> dict:
@@ -150,7 +160,8 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         # Starting fresh here would rerun the prefill and append to its replay.
         raise RuntimeError(f"{out_dir} already holds record.json but no state.pt: the run "
                            "is finished and its resumable state was removed; refusing to "
-                           "start a fresh run on top of its replay")
+                           "start a fresh run on top of it. To run it again, delete "
+                           f"{out_dir} (or choose another output directory).")
     arm_kwargs = arm_kwargs or {}
     if "n_actions" in arm_kwargs:
         raise ValueError("n_actions comes from the environment's action space; do not pass it "
@@ -175,15 +186,21 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
                 f"{saved['meta'].get('git_sha')} and repeat its exact call (arm, seed, config, "
                 f"arm_kwargs, device, scenario); to start over, delete {out_dir}.")
     replay_dir = out_dir / "replay"
-    replay_dir.mkdir(parents=True, exist_ok=True)
-    _claim_replay(replay_dir, meta, resuming=saved is not None)
-    # state.pt is the source of truth. Anything in replay/ it does not list was
-    # written by a process that died after the last checkpoint (or during the
-    # prefill, when there is no state yet); drop it before the buffer counts it.
-    _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
-                  if saved else set())
-    replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
-    arm = _make_arm(arm_name, seed, device, encode, replay, {**arm_kwargs, "n_actions": n_actions})
+    try:
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        _check_owner(replay_dir, meta, resuming=saved is not None)
+        # state.pt is the source of truth. Anything in replay/ it does not list was
+        # written by a process that died after the last checkpoint (or during the
+        # prefill, when there is no state yet); drop it before the buffer counts it.
+        _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
+                      if saved else set())
+        replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
+        arm = _make_arm(arm_name, seed, device, encode, replay,
+                        {**arm_kwargs, "n_actions": n_actions})
+    except BaseException:
+        train_env.close(), eval_env.close()
+        raise
+    _write_owner(replay_dir, meta)
     rollout = OnlineRollout(train_env, encode, replay, run_seed=seed, backbone=arm.backbone,
                             on_episode=arm.add_episode, policy_name=arm.name)
     policy = arm.behaviour_policy(lambda: rollout.budget_step)
@@ -212,7 +229,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         record = {"arm": arm.name, "seed": seed, "gated_mode": arm.gated_mode, "seeds": seeds,
                   "config": asdict(cfg), "git_sha": meta["git_sha"],
                   "scenario": meta["scenario"], "encoder": arm.encoder, "n_actions": n_actions,
-                  "arm_kwargs": meta["arm_kwargs"],
+                  "arm_kwargs": meta["arm_kwargs"], "arm_settings": _jsonable(arm.settings()),
                   "evals": [], "complete": False,
                   "random": run_episodes(eval_env, RandomPolicy(n_actions, seed=0), seeds)}
         update_rounds = 0

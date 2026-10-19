@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 import shutil
 from pathlib import Path
 
@@ -386,3 +387,53 @@ def test_verify_checks_config_rounds_and_shape(tmp_path, break_it, word):
     assert verify_record(rec, TINY) == []
     break_it(rec)
     assert any(word in p for p in verify_record(rec, TINY))
+
+
+def test_the_record_carries_the_arms_effective_settings(tmp_path):
+    dqn = _run(tmp_path / "dqn", "dqn", kw={})
+    assert dqn["arm_settings"] == {"encoder": "frozen_ssl", "n_actions": 4,
+                                   "cfg": json.loads(json.dumps(asdict(DQNConfig())))}
+    dreamer = _run(tmp_path / "dreamer")
+    s = dreamer["arm_settings"]
+    assert (s["encoder"], s["n_actions"], s["batch_size"], s["seq_len"]) == ("frozen_ssl", 4, 2, 8)
+    assert s["ac"]["bound_reward_readout"] is True and s["ac"]["drop_terminal_starts"] is True
+    assert load_record(tmp_path / "dqn" / "record.json")["arm_settings"] == dqn["arm_settings"]
+
+
+def test_a_crashed_prefill_restarts_after_a_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    (tmp_path / "state.pt").unlink()             # as if it died before its first checkpoint
+    (tmp_path / "record.json").unlink()
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-b")
+    assert _run(tmp_path)["complete"] is True
+
+
+def test_a_finished_run_refusal_names_the_way_out(tmp_path):
+    _run(tmp_path)
+    (tmp_path / "state.pt").unlink()
+    with pytest.raises(RuntimeError, match="delete"):
+        _run(tmp_path)
+
+
+def test_a_failed_start_closes_its_environments_and_claims_nothing(tmp_path):
+    closed = []
+
+    class _Env(FakeEnv):
+        def close(self):
+            closed.append(1)
+
+    with pytest.raises(KeyError, match="nope"):
+        train_online(**_call(tmp_path, env_factory=_Env, arm_kwargs={**DREAMER_KW, "encoder": "nope"}))
+    assert closed == [1, 1]
+    assert not (tmp_path / "replay" / ".owner.json").exists()
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_a_random_vit_run_completes_and_deletes(tmp_path, arm):
+    kw = {**(_kw(arm) or DREAMER_KW), "encoder": "random_vit"}
+    rec = _run(tmp_path, arm, kw=kw)
+    assert rec["encoder"] == "random_vit" and verify_record(rec, TINY) == []
+    assert list((tmp_path / "replay").glob("*.features_random_vit.npy"))
+    delete_replay_features(tmp_path, TINY)
+    assert list((tmp_path / "replay").iterdir()) == []

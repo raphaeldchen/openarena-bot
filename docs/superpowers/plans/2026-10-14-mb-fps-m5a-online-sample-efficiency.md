@@ -3074,3 +3074,7 @@ From the final review (`.superpowers/sdd/2026-10-14-mb-fps-m5a-online-sample-eff
 The ten M5a records still verify under the stricter checks, and re-reading them reproduces the published `study.txt` byte for byte.
 
 M7 is not fixed here. Giving `AgentPolicy` its own generator changes future numbers, so it is a decision for the M5b spec.
+
+**Carried into the M5b spec, from the cleanup branch's review:**
+- **M-g.** The `pixel_ae` backbone checkpoint path is relative to the working directory (`src/mbfps/data/geometry.py:41`). Records name neither the checkpoint nor `random_vit`'s seed. M5b's encoder comparison should pin both and record them.
+- **M-h.** The replay owner marker names a run but does not lock the directory, so two concurrent processes on one output directory could prune each other's episodes. This predates the branch. A lock file or a one-process-per-directory rule belongs in M5b's runbook.
