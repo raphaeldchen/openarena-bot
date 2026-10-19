@@ -323,6 +323,14 @@ run's records are written and its read-relevant files are verified — the repla
 seed by the determinism in §3.4, and the evaluation records, not the replay, carry every reported number.
 The plan states the exact retention rule; nothing under `runs/m4*` or `data/` is touched.
 
+> **Amendment (2026-10-18, after M5a ran).** The estimate above counts only the features. Each run's
+> replay also holds about 2 GB of episode frames (`replay/*.npz`), which M5a's code kept; mid-study the
+> disk fell to 5.8 GiB and the frames were deleted after verification by an ops watcher, with the
+> author's approval (M5a results). `delete_replay_features` now deletes them itself: after the record
+> verifies it flags `replay_features_deleted` and `replay_frames_deleted`, then removes `state.pt`, the
+> features, the frames and the replay's owner marker. A run's peak is about 7 GB; a finished run keeps
+> only `record.json`.
+
 ---
 
 ## 10. What M5a does not answer

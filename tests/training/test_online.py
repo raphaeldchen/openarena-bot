@@ -229,15 +229,15 @@ def test_delete_refuses_incomplete_record(tmp_path):
     assert (tmp_path / "state.pt").exists()
 
 
-def test_delete_removes_features_and_state_only(tmp_path):
+def test_delete_empties_the_replay_and_flags_both(tmp_path):
     _run(tmp_path)
     n_npz = len(list((tmp_path / "replay").glob("ep_*.npz")))
     deleted = delete_replay_features(tmp_path, TINY)
-    assert deleted == n_npz + 1                       # every feature file, plus state.pt
-    assert not list((tmp_path / "replay").glob("*.features*.npy"))
+    assert deleted == 2 * n_npz + 2              # features, frames, state.pt, the owner marker
+    assert list((tmp_path / "replay").iterdir()) == []
     assert not (tmp_path / "state.pt").exists()
-    assert len(list((tmp_path / "replay").glob("ep_*.npz"))) == n_npz
-    assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
+    rec = load_record(tmp_path / "record.json")
+    assert rec["replay_features_deleted"] is True and rec["replay_frames_deleted"] is True
 
 
 def test_delete_flags_the_record_and_drops_state_before_any_feature(tmp_path, monkeypatch):
@@ -256,8 +256,9 @@ def test_delete_flags_the_record_and_drops_state_before_any_feature(tmp_path, mo
     assert load_record(tmp_path / "record.json")["replay_features_deleted"] is True
     assert not (tmp_path / "state.pt").exists()
     assert list((tmp_path / "replay").glob("*.features*.npy"))
+    assert list((tmp_path / "replay").glob("ep_*.npz"))   # frames go last
     delete_replay_features(tmp_path, TINY)            # idempotent: finishes the job
-    assert not list((tmp_path / "replay").glob("*.features*.npy"))
+    assert list((tmp_path / "replay").iterdir()) == []
 
 
 def test_verify_flags_a_reordered_eval(tmp_path):
@@ -323,3 +324,47 @@ def test_resume_refuses_a_different_scenario(tmp_path):
     with pytest.raises(RuntimeError, match="differs"):
         train_online("dreamer", seed=0, out_dir=tmp_path, env_factory=_ThreeActionEnv,
                      encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=DREAMER_KW)
+
+
+def test_a_fresh_run_marks_the_replay_as_its_own(tmp_path):
+    _run(tmp_path, stop=20)
+    owner = json.loads((tmp_path / "replay" / ".owner.json").read_text())
+    assert (owner["arm"], owner["seed"]) == ("dreamer", 0)
+
+
+def test_a_fresh_start_refuses_a_replay_with_no_owner(tmp_path):
+    _run(tmp_path / "other")
+    d = tmp_path / "d"
+    (d / "replay").mkdir(parents=True)
+    stray = next((tmp_path / "other" / "replay").glob("ep_*.npz"))
+    shutil.copy(stray, d / "replay" / stray.name)
+    with pytest.raises(RuntimeError, match="does not own"):
+        _run(d)
+    assert _replay(d) == [stray.name]
+
+
+def test_a_fresh_start_refuses_another_runs_replay(tmp_path):
+    _run(tmp_path, stop=20)
+    (tmp_path / "state.pt").unlink()
+    (tmp_path / "record.json").unlink()
+    n = _replay(tmp_path)
+    with pytest.raises(RuntimeError, match="does not own"):
+        train_online(**_call(tmp_path, seed=1))
+    assert _replay(tmp_path) == n
+
+
+def test_a_refused_resume_names_the_way_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-a")
+    _run(tmp_path, stop=20)
+    monkeypatch.setattr(online, "git_sha", lambda: "commit-b")
+    with pytest.raises(RuntimeError) as err:
+        train_online(**_call(tmp_path))
+    assert "check out commit-a" in str(err.value) and "delete" in str(err.value)
+
+
+def test_an_unsupported_device_is_refused_before_any_work(tmp_path):
+    calls = []
+    with pytest.raises(ValueError, match="meta"):
+        train_online(**_call(tmp_path, device=torch.device("meta"),
+                             env_factory=lambda: calls.append(1) or FakeEnv()))
+    assert calls == [] and not (tmp_path / "replay").exists()

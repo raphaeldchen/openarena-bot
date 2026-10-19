@@ -47,7 +47,7 @@ def main(argv=None) -> int:
           f"{record['seconds']:.0f} s")
     if not args.keep_features:
         n = delete_replay_features(args.out, cfg)
-        print(f"deleted {n} feature/state files after verification")
+        print(f"deleted {n} files (state, features, frames) after verification")
     return 0
 
 

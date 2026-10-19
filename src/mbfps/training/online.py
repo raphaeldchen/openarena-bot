@@ -3,6 +3,7 @@ is spent, evaluating at step 0 and every 10,000 budget steps. After each
 evaluation the full state is written; a rerun resumes from it and is
 bit-identical to an uninterrupted run (§3.4)."""
 
+import json
 import random
 import time
 from dataclasses import asdict, dataclass, is_dataclass
@@ -52,10 +53,14 @@ def _make_arm(name: str, seed: int, device, encode, replay, kwargs):
     raise ValueError(f"unknown arm {name!r}")
 
 
+DEVICE_TYPES = ("cpu", "mps", "cuda")
+OWNER = ".owner.json"
+
+
 def _rng_state(device) -> dict:
     """Every generator a resume must restore. A device type this does not know
     raises: a silently unsaved generator would break the bit-identical resume (§3.4)."""
-    if device.type not in ("cpu", "mps", "cuda"):
+    if device.type not in DEVICE_TYPES:
         raise ValueError(f"cannot save the RNG state of a {device.type!r} device")
     out = {"python": random.getstate(), "numpy": np.random.get_state(),
            "torch": torch.get_rng_state()}
@@ -67,7 +72,7 @@ def _rng_state(device) -> dict:
 
 
 def _set_rng_state(state: dict, device) -> None:
-    if device.type not in ("cpu", "mps", "cuda"):
+    if device.type not in DEVICE_TYPES:
         raise ValueError(f"cannot restore the RNG state of a {device.type!r} device")
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
@@ -106,6 +111,25 @@ def _prune_replay(root: Path, keep: set[str]) -> None:
                 path.unlink(missing_ok=True)
 
 
+def _claim_replay(replay_dir: Path, meta: dict, resuming: bool) -> None:
+    """Mark `replay_dir` as this run's before its first episode, and refuse a
+    fresh start over episode files some other run wrote: orphan pruning deletes
+    every episode the saved state does not list, so it must only ever see this
+    run's own files. A resume is already pinned to its run by state.pt."""
+    owner_path = replay_dir / OWNER
+    mine = json.loads(json.dumps(meta))
+    if not resuming and any(replay_dir.glob("ep_*")):
+        owner = json.loads(owner_path.read_text()) if owner_path.exists() else None
+        if owner != mine:
+            raise RuntimeError(
+                f"{replay_dir} holds episode files this run does not own (owner: {owner}); "
+                "move or delete them, or choose another output directory")
+    if not owner_path.exists() or not resuming:
+        tmp = owner_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(mine, sort_keys=True))
+        tmp.replace(owner_path)
+
+
 def _evaluate(arm, env, seeds) -> dict:
     return {mode: run_episodes(env, policy, seeds) for mode, policy in arm.eval_policies().items()}
 
@@ -113,6 +137,11 @@ def _evaluate(arm, env, seeds) -> dict:
 def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, device,
                  cfg: OnlineConfig = OnlineConfig(), arm_kwargs: dict | None = None,
                  stop_after_step: int | None = None) -> dict:
+    if device.type not in DEVICE_TYPES:
+        # Checked before any work: the first checkpoint would otherwise refuse
+        # only after the prefill and the step-0 evaluation.
+        raise ValueError(f"unsupported device type {device.type!r}; expected one of "
+                         f"{DEVICE_TYPES}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path, record_path = out_dir / "state.pt", out_dir / "record.json"
@@ -140,10 +169,14 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         saved = torch.load(state_path, weights_only=False)
         if saved["meta"] != meta:
             train_env.close(), eval_env.close()
-            raise RuntimeError(f"{out_dir} holds a run that differs from this call: saved "
-                               f"{saved['meta']}, called with {meta}")
+            raise RuntimeError(
+                f"{out_dir} holds a run that differs from this call: saved {saved['meta']}, "
+                f"called with {meta}. To finish the saved run, check out "
+                f"{saved['meta'].get('git_sha')} and repeat its exact call (arm, seed, config, "
+                f"arm_kwargs, device, scenario); to start over, delete {out_dir}.")
     replay_dir = out_dir / "replay"
     replay_dir.mkdir(parents=True, exist_ok=True)
+    _claim_replay(replay_dir, meta, resuming=saved is not None)
     # state.pt is the source of truth. Anything in replay/ it does not list was
     # written by a process that died after the last checkpoint (or during the
     # prefill, when there is no state yet); drop it before the buffer counts it.
@@ -254,26 +287,33 @@ def verify_record(record: dict, cfg: OnlineConfig) -> list[str]:
 
 
 def delete_replay_features(out_dir: Path, cfg: OnlineConfig) -> int:
-    """§9: delete a finished run's feature caches and resumable state, only
-    after its record verifies. Episode files and the record are kept."""
+    """§9: once a finished run's record verifies, delete everything it no longer
+    needs -- its resumable state, the replay's feature caches, the episode frames
+    and the owner marker -- leaving `replay/` empty and the record as the run's
+    only output. Returns the number of files deleted."""
     out_dir = Path(out_dir)
     record_path = out_dir / "record.json"
     record = load_record(record_path)
     problems = verify_record(record, cfg)
     if problems:
         raise ValueError("refusing to delete replay features: " + "; ".join(problems))
-    features = sorted((out_dir / "replay").glob("*.features*.npy"))
+    replay_dir = out_dir / "replay"
     state = out_dir / "state.pt"
-    victims = ([state] if state.exists() else []) + features
+    owner = replay_dir / OWNER
+    victims = (([state] if state.exists() else [])
+               + sorted(replay_dir.glob("*.features*.npy"))
+               + sorted(replay_dir.glob("ep_*.npz"))
+               + ([owner] if owner.exists() else []))
     # Flag the record first: a crash after this leaves a flagged run that can be
     # deleted again (idempotent), never a deleted run whose record says otherwise.
     # load_record restores the NaN/inf floats but leaves the map that recorded
     # them in the dict; write_record rebuilds that map and refuses a stale one.
     record["replay_features_deleted"] = True
+    record["replay_frames_deleted"] = True
     record.pop(NONFINITE_KEY, None)
     write_record(record_path, record)
     # state.pt goes first, so a crash between the unlinks leaves no resume state
-    # pointing at features that are gone.
+    # pointing at files that are gone; the frames go after their features.
     for path in victims:
         path.unlink()
     return len(victims)
