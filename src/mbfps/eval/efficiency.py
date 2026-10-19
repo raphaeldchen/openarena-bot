@@ -59,9 +59,14 @@ def run_problems(record: dict, cfg: OnlineConfig, arm: str | None = None,
     problems += verify_record(record, cfg)
     if problems:
         return problems
-    random_returns = [float(e["return"]) for e in record["random"]]
-    if paired_gate(gated_returns(record, 0), random_returns)["passed"]:
-        problems.append("step-0 control passes the paired gate against random")
+    try:
+        random_returns = [float(e["return"]) for e in record["random"]]
+        if paired_gate(gated_returns(record, 0), random_returns)["passed"]:
+            problems.append("step-0 control passes the paired gate against random")
+        if not np.isfinite(run_auc := auc(record, cfg)):
+            problems.append(f"AUC is not finite ({run_auc})")
+    except (KeyError, TypeError, ValueError, StopIteration) as exc:
+        problems.append(f"malformed record: {type(exc).__name__}: {exc}")
     if record["arm"] == "dreamer" and record.get("isolation_ok") is not True:
         problems.append("isolation_ok is not true")
     return problems

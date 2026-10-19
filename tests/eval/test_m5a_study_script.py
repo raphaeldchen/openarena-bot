@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 import subprocess
 import sys
 from pathlib import Path
@@ -6,10 +7,12 @@ from pathlib import Path
 import pytest
 
 from mbfps.eval.study import write_record
+from mbfps.training.online import OnlineConfig
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "m5a_study.py"
 SEEDS = list(range(1_000_000, 1_000_100))
 STEPS = list(range(0, 100_001, 10_000))
+M5A_CONFIG = json.loads(json.dumps(asdict(OnlineConfig())))
 
 
 def _write(runs, arm, seed, level, step0=-160.0, isolation=True, budget=100_000, rec_seed=None):
@@ -18,7 +21,7 @@ def _write(runs, arm, seed, level, step0=-160.0, isolation=True, budget=100_000,
     rec = {"arm": arm, "seed": seed if rec_seed is None else rec_seed, "gated_mode": mode, "complete": True,
            "budget_steps": budget, "seeds": SEEDS, "random": eps(-155.0),
            "isolation_ok": isolation if arm == "dreamer" else None,
-           "update_rounds": 19_000, "seconds": 3600.0,
+           "update_rounds": 19_000, "seconds": 3600.0, "config": M5A_CONFIG,
            "evals": [{"step": s, "modes": {mode: eps(step0 if s == 0 else level)}} for s in STEPS]}
     write_record(runs / f"{arm}_seed{seed}" / "record.json", rec)
 
@@ -79,3 +82,16 @@ def test_run_skips_a_verified_run_whose_state_is_gone(tmp_path, monkeypatch):
     assert mod.main(["--phase", "run", "--runs", str(tmp_path), "--arms", "dreamer",
                      "--seeds", "0"]) == 0
     assert len(launched) == 1
+
+
+def test_a_malformed_record_exits_91_not_1(tmp_path):
+    for arm in ("dreamer", "dqn"):
+        for seed in range(5):
+            _write(tmp_path, arm, seed, level=60.0 if arm == "dqn" else 10.0)
+    path = tmp_path / "dqn_seed2" / "record.json"
+    rec = json.loads(path.read_text())
+    del rec["evals"][3]["modes"]
+    path.write_text(json.dumps(rec))
+    code, out = _run("--phase", "read", "--runs", tmp_path)
+    assert code == 91, out
+    assert "dqn_seed2" in out and "malformed" in out

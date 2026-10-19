@@ -212,6 +212,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         record = {"arm": arm.name, "seed": seed, "gated_mode": arm.gated_mode, "seeds": seeds,
                   "config": asdict(cfg), "git_sha": meta["git_sha"],
                   "scenario": meta["scenario"], "encoder": arm.encoder, "n_actions": n_actions,
+                  "arm_kwargs": meta["arm_kwargs"],
                   "evals": [], "complete": False,
                   "random": run_episodes(eval_env, RandomPolicy(n_actions, seed=0), seeds)}
         update_rounds = 0
@@ -264,9 +265,29 @@ def _checkpoint(arm, rollout, policy, replay, record, update_rounds, timing, dev
     write_record(record_path, record)
 
 
+_MALFORMED = (KeyError, TypeError, AttributeError, StopIteration)
+
+
+def _jsonable(x):
+    return json.loads(json.dumps(x))
+
+
 def verify_record(record: dict, cfg: OnlineConfig) -> list[str]:
-    """Why a run's record is not complete and well-formed (§3.4, §7.3); [] if it is."""
+    """Why a run's record is not complete and well-formed (§3.4, §7.3); [] if it is.
+    A record missing a field or holding one of the wrong shape is reported, not raised."""
+    try:
+        return _record_problems(record, cfg)
+    except _MALFORMED as exc:
+        return [f"malformed record: {type(exc).__name__}: {exc}"]
+
+
+def _record_problems(record: dict, cfg: OnlineConfig) -> list[str]:
     problems = []
+    if _jsonable(record.get("config")) != _jsonable(asdict(cfg)):
+        problems.append(f"config {record.get('config')} != {asdict(cfg)}")
+    rounds = (cfg.budget - cfg.prefill) // cfg.act_steps * cfg.rounds_per_act
+    if record.get("update_rounds") != rounds:
+        problems.append(f"update_rounds {record.get('update_rounds')} != {rounds}")
     seeds = list(cfg.eval_seeds)
     if record.get("complete") is not True:
         problems.append("record is not complete")

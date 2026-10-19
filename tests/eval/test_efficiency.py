@@ -1,3 +1,7 @@
+import json
+import math
+from dataclasses import asdict
+
 import pytest
 
 from mbfps.eval.efficiency import auc, pairwise_wins, run_problems, steps_to_threshold, verdict
@@ -14,6 +18,7 @@ def _rec(arm="dreamer", curve=(-160.0, 10.0, 60.0, 70.0), step0=-170.0, random=-
     evals = [{"step": 10 * i, "modes": {mode: eps(step0 if i == 0 else curve[i])}}
              for i in range(4)]
     return {"arm": arm, "seed": 0, "gated_mode": mode, "complete": True, "budget_steps": 30,
+            "config": json.loads(json.dumps(asdict(CFG))), "update_rounds": 5 * CFG.rounds_per_act,
             "random": eps(random), "evals": evals,
             "isolation_ok": isolation if arm == "dreamer" else None}
 
@@ -75,3 +80,15 @@ def test_run_identity_is_checked_when_given():
     assert run_problems(_rec(), CFG, arm="dreamer", seed=0) == []
     assert any("seed" in p for p in run_problems(_rec(), CFG, arm="dreamer", seed=3))
     assert any("arm" in p for p in run_problems(_rec(), CFG, arm="dqn", seed=0))
+
+
+def test_a_non_finite_auc_makes_the_run_invalid():
+    rec = _rec()
+    rec["evals"][2]["modes"]["sample"][0]["return"] = math.nan
+    assert any("AUC" in p for p in run_problems(rec, CFG))
+
+
+def test_a_malformed_eval_is_a_problem_not_a_crash():
+    rec = _rec()
+    del rec["evals"][1]["modes"]
+    assert any("malformed" in p for p in run_problems(rec, CFG))

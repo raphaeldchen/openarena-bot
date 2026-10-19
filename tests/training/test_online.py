@@ -368,3 +368,21 @@ def test_an_unsupported_device_is_refused_before_any_work(tmp_path):
         train_online(**_call(tmp_path, device=torch.device("meta"),
                              env_factory=lambda: calls.append(1) or FakeEnv()))
     assert calls == [] and not (tmp_path / "replay").exists()
+
+
+def test_the_record_carries_its_arm_kwargs(tmp_path):
+    rec = _run(tmp_path, "dqn", kw={"cfg": DQNConfig(batch_size=8)})
+    assert rec["arm_kwargs"]["cfg"]["batch_size"] == 8
+
+
+@pytest.mark.parametrize("break_it, word", [
+    (lambda r: r["config"].update(prefill=20), "config"),
+    (lambda r: r.update(update_rounds=r["update_rounds"] - 1), "update_rounds"),
+    (lambda r: r.pop("config"), "config"),
+    (lambda r: r["evals"][1].pop("modes"), "malformed"),
+])
+def test_verify_checks_config_rounds_and_shape(tmp_path, break_it, word):
+    rec = json.loads(json.dumps(_run(tmp_path)))
+    assert verify_record(rec, TINY) == []
+    break_it(rec)
+    assert any(word in p for p in verify_record(rec, TINY))
