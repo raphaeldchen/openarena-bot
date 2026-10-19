@@ -88,6 +88,7 @@ class TransitionSampler:
         self.rng = np.random.default_rng(seed)
         self._eps: list[tuple] = []
         self._ends: list[int] = []
+        self._ends_array: np.ndarray | None = None   # `_ends` as an array; rebuilt after an add
 
     @property
     def n_transitions(self) -> int:
@@ -97,6 +98,7 @@ class TransitionSampler:
         self._eps.append((features, np.asarray(actions), np.asarray(rewards, np.float32),
                           np.asarray(terminated, bool), np.asarray(truncated, bool)))
         self._ends.append(self.n_transitions + len(actions))
+        self._ends_array = None
 
     def _target(self, e: int, t: int) -> tuple[float, float, int]:
         _, _, rewards, terminated, _ = self._eps[e]
@@ -115,10 +117,15 @@ class TransitionSampler:
             raise ValueError("no transitions stored")
         k = self.cfg.frame_stack
         idx = self.rng.integers(0, self.n_transitions, batch_size)
+        if self._ends_array is None:
+            self._ends_array = np.asarray(self._ends)
+        # One vectorised search, not one per transition over a Python list: the
+        # list-to-array conversion made sampling grow with the replay (M5a M6).
+        ends = self._ends_array
+        episode = np.searchsorted(ends, idx, side="right")
+        offset = idx - np.where(episode > 0, ends[np.maximum(episode - 1, 0)], 0)
         obs, nxt, act, ret, disc = [], [], [], [], []
-        for i in idx:
-            e = int(np.searchsorted(self._ends, i, side="right"))
-            t = int(i - (self._ends[e - 1] if e else 0))
+        for e, t in zip(episode.tolist(), offset.tolist()):
             feats, actions = self._eps[e][0], self._eps[e][1]
             r, d, n = self._target(e, t)
             obs.append(np.asarray(feats[stack_indices(t, k)]))

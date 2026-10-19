@@ -117,6 +117,7 @@ class SequenceLoader:
             list(paths) if paths is not None else buffer.episode_paths()
         )
         self._episodes = [self._read(p) for p in self._paths]
+        self._usable_cache: np.ndarray | None = None
 
         self._features: list[np.ndarray | None] = []
         if load_features:
@@ -177,6 +178,7 @@ class SequenceLoader:
         features = self._load_features_for(path) if self.load_features else None
         self._paths.append(path)
         self._episodes.append(episode)
+        self._usable_cache = None
         if self.load_features:
             self._features.append(features)
 
@@ -196,13 +198,20 @@ class SequenceLoader:
         """
         return self._paths[index]
 
-    def _usable(self) -> list[int]:
+    def _usable(self) -> np.ndarray:
         """Episodes a window can be drawn from. With `pad_short` every non-empty
         episode is eligible and a short one is padded (M4 spec §4.2): `basic`'s
         kill episodes have a median length of 20, so a 64-step floor would
-        discard most of the reward events the world model has to learn."""
-        floor = 1 if self.pad_short else self.seq_len
-        return [i for i, ep in enumerate(self._episodes) if ep.length >= floor]
+        discard most of the reward events the world model has to learn.
+
+        Cached until the next `add`, as an array: rebuilding the list and having
+        `rng.choice` convert it on every draw made sampling grow with the replay
+        (M5a M6). `choice` over an equal-valued array draws the same indices."""
+        if self._usable_cache is None:
+            floor = 1 if self.pad_short else self.seq_len
+            self._usable_cache = np.asarray(
+                [i for i, ep in enumerate(self._episodes) if ep.length >= floor], dtype=np.int64)
+        return self._usable_cache
 
     def sample(self, include_privileged: bool = False) -> dict[str, Any]:
         """Sample one batch.
@@ -216,7 +225,7 @@ class SequenceLoader:
             ValueError: if no episode is at least `seq_len` transitions long.
         """
         usable = self._usable()
-        if not usable:
+        if not len(usable):
             raise ValueError(
                 f"no episodes long enough for seq_len={self.seq_len} "
                 f"(pad_short={self.pad_short}); "
