@@ -85,38 +85,6 @@ def test_reward_scale_applies_to_targets():
     assert float(s.sample(1)["ret"][0]) == pytest.approx(0.97)
 
 
-def test_double_dqn_learns_a_chain():
-    """Known answer (M5a §5.4). States 0,1,2 encoded one-hot; action 1 moves
-    right, action 0 stays; moving right from 2 pays 1 and terminates. With
-    gamma .9: Q*(s,1) = .9**(2-s), Q*(s,0) = .9 * Q*(s,1)."""
-    torch.manual_seed(0)
-    cfg = DQNConfig(gamma=0.9, n_step=1, reward_scale=1.0, target_every=50, lr=1e-2,
-                    batch_size=64, frame_stack=1)
-    rng = np.random.default_rng(0)
-    s = TransitionSampler(seed=0, cfg=cfg)
-    for _ in range(200):
-        state, feats, acts, rews, term = 0, [np.eye(3)[0]], [], [], []
-        while True:
-            a = int(rng.integers(0, 2))
-            done = state == 2 and a == 1
-            nxt = state if a == 0 else min(state + 1, 2)
-            acts.append(a); rews.append(1.0 if done else 0.0); term.append(done)
-            feats.append(np.eye(3)[nxt]); state = nxt
-            if done or len(acts) >= 12:
-                break
-        s.add(np.asarray(feats, np.float32)[:, None, :], np.asarray(acts), np.asarray(rews, np.float32),
-              np.asarray(term), np.asarray([False] * (len(acts) - 1) + [not term[-1]]))
-    q = nn.Sequential(nn.Flatten(), nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 2))
-    q_target = copy.deepcopy(q)
-    opt = torch.optim.Adam(q.parameters(), lr=cfg.lr)
-    for i in range(1, 3001):
-        dqn_step(q, q_target, opt, s.sample(cfg.batch_size), i, cfg, torch.device("cpu"))
-    with torch.no_grad():
-        got = q(torch.eye(3)[:, None, None, :].float()).numpy()
-    want = np.array([[0.9 * 0.81, 0.81], [0.9 * 0.9, 0.9], [0.9 * 1.0, 1.0]])
-    np.testing.assert_allclose(got, want, atol=0.05)
-
-
 def test_dqn_step_copies_target_on_schedule():
     cfg = DQNConfig(target_every=2, n_step=1, frame_stack=1)
     s = TransitionSampler(seed=0, cfg=cfg)
@@ -176,3 +144,76 @@ def test_policy_without_an_action_count_refuses():
     q = nn.Sequential(nn.Flatten(), nn.Linear(3, 2))
     with pytest.raises(ValueError, match="n_actions"):
         EpsilonGreedyQPolicy(q, encode=None, device=torch.device("cpu"), epsilon_fn=lambda: 1.0)
+
+
+def _chain_episodes(rng, n_episodes: int):
+    """Spec §5.4 chain: states 0-3 (one-hot over 5; 4 is the terminal frame).
+    Action 1 moves right and, from 3, pays 1 and terminates; action 0 stays.
+    Each episode starts at a random state with a random first action, then acts
+    optimally, so n-step returns are unbiased for Q*. Half are truncated early:
+    a truncation must bootstrap, a termination must not."""
+    eye = np.eye(5, dtype=np.float32)
+    out = []
+    for _ in range(n_episodes):
+        s = int(rng.integers(0, 4))
+        feats, acts, rews, term = [eye[s]], [], [], []
+        a = int(rng.integers(0, 2))
+        while True:
+            done = s == 3 and a == 1
+            s = 4 if done else (s + 1 if a == 1 else s)
+            acts.append(a); rews.append(1.0 if done else 0.0); term.append(done)
+            feats.append(eye[s])
+            if done:
+                break
+            a = 1
+        trunc = [False] * len(acts)
+        if len(acts) > 1 and rng.random() < 0.5:
+            cut = int(rng.integers(1, len(acts)))
+            feats, acts, rews, term, trunc = feats[:cut + 1], acts[:cut], rews[:cut], term[:cut], \
+                [False] * (cut - 1) + [True]
+        out.append((np.asarray(feats)[:, None, :], np.asarray(acts), np.asarray(rews, np.float32),
+                    np.asarray(term), np.asarray(trunc)))
+    return out
+
+
+@pytest.mark.parametrize("n_step", [1, 3])
+def test_dqn_converges_to_known_q_on_a_chain_with_both_endings(n_step):
+    """M5a §5.4: n-step targets, termination vs truncation, Double-DQN selection
+    and the target copy, against Q*(s,1) = .9**(3-s) and Q*(s,0) = .9**(4-s)."""
+    torch.manual_seed(0)
+    cfg = DQNConfig(gamma=0.9, n_step=n_step, reward_scale=1.0, target_every=50, lr=1e-2,
+                    batch_size=64, frame_stack=1)
+    s = TransitionSampler(seed=0, cfg=cfg)
+    episodes = _chain_episodes(np.random.default_rng(0), 400)
+    assert any(e[4].any() for e in episodes) and any(e[3].any() for e in episodes)
+    for e in episodes:
+        s.add(*e)
+    q = nn.Sequential(nn.Flatten(), nn.Linear(5, 2))
+    q_target = copy.deepcopy(q)
+    opt = torch.optim.Adam(q.parameters(), lr=cfg.lr)
+    for i in range(1, 4001):
+        dqn_step(q, q_target, opt, s.sample(cfg.batch_size), i, cfg, torch.device("cpu"))
+    with torch.no_grad():
+        got = q(torch.eye(5)[:4, None, None, :]).numpy()
+    want = np.array([[0.9 ** (4 - st), 0.9 ** (3 - st)] for st in range(4)])
+    np.testing.assert_allclose(got, want, atol=0.03)
+
+
+def test_double_dqn_target_uses_the_online_argmax_valued_by_the_target_net():
+    """Online net prefers action 0 at the next state; the target net values
+    action 1 at 5. Double DQN's target is q_target(next)[0] = 0, so the loss is
+    0. Vanilla DQN (max of the target net) would give 4.5; bootstrapping from
+    the online net itself would give 0.5."""
+    def table(rows):
+        net = nn.Sequential(nn.Flatten(), nn.Linear(2, 2, bias=False))
+        with torch.no_grad():
+            net[1].weight.copy_(torch.tensor(rows, dtype=torch.float32).T)
+        return net
+    q = table([[0.0, 0.0], [1.0, 0.0]])          # rows: Q(A,.), Q(B,.)
+    q_target = table([[0.0, 0.0], [0.0, 5.0]])
+    batch = {"obs": np.array([[[1.0, 0.0]]], np.float32), "next_obs": np.array([[[0.0, 1.0]]], np.float32),
+             "action": np.array([0]), "ret": np.array([0.0], np.float32),
+             "discount": np.array([1.0], np.float32)}
+    out = dqn_step(q, q_target, torch.optim.SGD(q.parameters(), lr=0.0), batch, 1,
+                   DQNConfig(target_every=10**9), torch.device("cpu"))
+    assert out["loss"] == pytest.approx(0.0)
