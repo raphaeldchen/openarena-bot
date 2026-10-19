@@ -78,14 +78,17 @@ def _set_rng_state(state: dict, device) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict, device) -> dict:
+def _meta(arm_name: str, seed: int, cfg: OnlineConfig, arm_kwargs: dict, device,
+          scenario: str | None = None, n_actions: int | None = None) -> dict:
     """What identifies a run. A dataclass kwarg (DQNConfig) is stored by value.
 
-    The commit and the device type are part of it: a resume on other code or on
-    another device is not the run that was started, and is refused."""
+    The commit, the device type, the scenario and its action count are part of
+    it: a resume on other code, on another device or in another environment is
+    not the run that was started, and is refused."""
     kwargs = {k: asdict(v) if is_dataclass(v) else v for k, v in arm_kwargs.items()}
     return {"arm": arm_name, "seed": seed, "cfg": asdict(cfg), "arm_kwargs": kwargs,
-            "git_sha": git_sha(), "device": device.type}
+            "git_sha": git_sha(), "device": device.type, "scenario": scenario,
+            "n_actions": n_actions}
 
 
 def _prune_replay(root: Path, keep: set[str]) -> None:
@@ -120,7 +123,15 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
                            "is finished and its resumable state was removed; refusing to "
                            "start a fresh run on top of its replay")
     arm_kwargs = arm_kwargs or {}
-    meta = _meta(arm_name, seed, cfg, arm_kwargs, device)
+    if "n_actions" in arm_kwargs:
+        raise ValueError("n_actions comes from the environment's action space; do not pass it "
+                         "in arm_kwargs")
+    # The environments are built before the arm: the action count is the
+    # environment's, and the arm's seed_everything resets every global RNG anyway.
+    train_env, eval_env = env_factory(), env_factory()
+    n_actions = int(train_env.action_space.n)
+    meta = _meta(arm_name, seed, cfg, arm_kwargs, device,
+                 scenario=getattr(train_env, "scenario", None), n_actions=n_actions)
     saved = None
     if state_path.exists():
         # weights_only=False: the state holds NumPy RNG states and frame stacks,
@@ -128,6 +139,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         # `_checkpoint` below, into this run's own directory, and never shipped.
         saved = torch.load(state_path, weights_only=False)
         if saved["meta"] != meta:
+            train_env.close(), eval_env.close()
             raise RuntimeError(f"{out_dir} holds a run that differs from this call: saved "
                                f"{saved['meta']}, called with {meta}")
     replay_dir = out_dir / "replay"
@@ -138,9 +150,8 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
     _prune_replay(replay_dir, {Path(p).name.split(".")[0] for p in saved["replay_paths"]}
                   if saved else set())
     replay = ReplayBuffer(replay_dir, capacity_transitions=10**9)
-    arm = _make_arm(arm_name, seed, device, encode, replay, arm_kwargs)
-    train_env, eval_env = env_factory(), env_factory()
-    rollout = OnlineRollout(train_env, encode, replay, run_seed=seed,
+    arm = _make_arm(arm_name, seed, device, encode, replay, {**arm_kwargs, "n_actions": n_actions})
+    rollout = OnlineRollout(train_env, encode, replay, run_seed=seed, backbone=arm.backbone,
                             on_episode=arm.add_episode, policy_name=arm.name)
     policy = arm.behaviour_policy(lambda: rollout.budget_step)
     timing = {"act": 0.0, "train": 0.0, "eval": 0.0}
@@ -157,7 +168,7 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         record, update_rounds, timing = saved["record"], saved["update_rounds"], saved["timing"]
         write_record(record_path, record)   # record.json is a derived copy; resync it
     else:
-        prefill_policy = RandomPolicy(4, seed=seed)
+        prefill_policy = RandomPolicy(n_actions, seed=seed)
         rollout.policy_name = "random"
         t0 = time.perf_counter()
         while rollout.budget_step < cfg.prefill:
@@ -166,9 +177,10 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
         rollout.policy_name = arm.name
         timing["act"] += time.perf_counter() - t0
         record = {"arm": arm.name, "seed": seed, "gated_mode": arm.gated_mode, "seeds": seeds,
-                  "config": asdict(cfg), "git_sha": meta["git_sha"], "evals": [],
-                  "complete": False,
-                  "random": run_episodes(eval_env, RandomPolicy(4, seed=0), seeds)}
+                  "config": asdict(cfg), "git_sha": meta["git_sha"],
+                  "scenario": meta["scenario"], "encoder": arm.encoder, "n_actions": n_actions,
+                  "evals": [], "complete": False,
+                  "random": run_episodes(eval_env, RandomPolicy(n_actions, seed=0), seeds)}
         update_rounds = 0
         t0 = time.perf_counter()
         record["evals"].append({"step": 0, "modes": _evaluate(arm, eval_env, seeds),

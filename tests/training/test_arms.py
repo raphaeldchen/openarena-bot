@@ -114,3 +114,26 @@ def test_state_dict_is_a_snapshot_not_a_view(tmp_path):
     before = [p.clone() for p in sd["world_model"].values()]
     arm.update_round()
     assert all(torch.equal(b, p) for b, p in zip(before, sd["world_model"].values()))
+
+
+@pytest.mark.parametrize("encoder, backbone", [("frozen_ssl", "dinov2"),
+                                               ("pixel_ae", "pixel_ae"),
+                                               ("random_vit", "random_vit")])
+def test_arms_read_the_encoder_kinds_backbone(tmp_path, encoder, backbone):
+    replay = ReplayBuffer(tmp_path / "replay", capacity_transitions=10**9)
+    d = DreamerArm(seed=0, device=CPU, encode=fake_encode, replay=replay, batch_size=2,
+                   seq_len=8, encoder=encoder, n_actions=3)
+    q = DQNArm(seed=0, device=CPU, encode=fake_encode, encoder=encoder, n_actions=3)
+    assert d.backbone == q.backbone == backbone
+    assert d.n_actions == q.n_actions == 3
+    assert d.world_model.cfg.train.n_actions == 3
+    assert [m for m in d.learner.actor.modules() if isinstance(m, torch.nn.Linear)][-1].out_features == 3
+    assert q.q.n_actions == 3
+
+
+def test_arms_refuse_a_pixel_encoder(tmp_path):
+    replay = ReplayBuffer(tmp_path / "replay", capacity_transitions=10**9)
+    with pytest.raises(ValueError, match="cached features"):
+        DreamerArm(seed=0, device=CPU, encode=fake_encode, replay=replay, encoder="cnn")
+    with pytest.raises(ValueError, match="cached features"):
+        DQNArm(seed=0, device=CPU, encode=fake_encode, encoder="cnn")

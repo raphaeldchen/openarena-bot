@@ -143,3 +143,36 @@ def test_policy_repeats_first_frame_and_is_seeded():
     p.act_from_features(feats(3))
     stack = p.get_state()["stack"]
     assert len(stack) == 4 and all(np.array_equal(f, feats(3)) for f in stack)
+
+
+@pytest.mark.parametrize("kind", ["frozen_ssl", "pixel_ae", "random_vit"])
+def test_qnetwork_builds_each_study_encoder(kind):
+    q = QNetwork(3, seed=0, encoder_kind=kind)
+    assert q.encoder_kind == kind and q.n_actions == 3
+    assert q.head[-1].out_features == 3
+
+
+def test_qnetwork_frozen_ssl_is_the_default_and_matches_it():
+    a, b = QNetwork(4, seed=0), QNetwork(4, seed=0, encoder_kind="frozen_ssl")
+    for (n, p), (_, r) in zip(a.state_dict().items(), b.state_dict().items()):
+        assert torch.equal(p, r), n
+
+
+def test_qnetwork_refuses_a_pixel_encoder():
+    with pytest.raises(ValueError, match="cached features"):
+        QNetwork(4, seed=0, encoder_kind="cnn")
+
+
+@pytest.mark.parametrize("n", [3, 7])
+def test_random_action_covers_exactly_the_action_space(n):
+    p = EpsilonGreedyQPolicy(QNetwork(n, seed=0), encode=None, device=torch.device("cpu"),
+                             epsilon_fn=lambda: 1.0)
+    p.reset(seed=1)
+    feats = np.zeros((64, 384), np.float16)
+    assert {p.act_from_features(feats) for _ in range(400)} == set(range(n))
+
+
+def test_policy_without_an_action_count_refuses():
+    q = nn.Sequential(nn.Flatten(), nn.Linear(3, 2))
+    with pytest.raises(ValueError, match="n_actions"):
+        EpsilonGreedyQPolicy(q, encode=None, device=torch.device("cpu"), epsilon_fn=lambda: 1.0)

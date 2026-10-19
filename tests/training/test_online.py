@@ -287,3 +287,39 @@ def test_prefill_must_precede_the_first_checkpoint(kw):
 def test_default_and_tiny_configs_construct():
     assert OnlineConfig().prefill < OnlineConfig().eval_every
     assert TINY.prefill < TINY.eval_every
+
+
+class _ThreeActionEnv(FakeEnv):
+    """FakeEnv with a 3-action space and its own scenario name (never shoots)."""
+
+    def __init__(self, limit: int = 12) -> None:
+        super().__init__(limit)
+        from gymnasium import spaces
+        self.action_space, self.scenario = spaces.Discrete(3), "fake_three"
+
+
+@pytest.mark.parametrize("arm", ["dreamer", "dqn"])
+def test_the_action_count_comes_from_the_environment(tmp_path, arm):
+    rec = train_online(arm, seed=0, out_dir=tmp_path, env_factory=_ThreeActionEnv,
+                       encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=_kw(arm) or DREAMER_KW)
+    acts = np.concatenate([load_episode(p).actions
+                           for p in (tmp_path / "replay").glob("ep_*.npz")])
+    assert acts.max() <= 2
+    assert (rec["scenario"], rec["encoder"], rec["n_actions"]) == ("fake_three", "frozen_ssl", 3)
+
+
+def test_the_record_names_the_m5a_defaults(tmp_path):
+    rec = _run(tmp_path)
+    assert (rec["scenario"], rec["encoder"], rec["n_actions"]) == ("fake_basic", "frozen_ssl", 4)
+
+
+def test_arm_kwargs_may_not_set_the_action_count(tmp_path):
+    with pytest.raises(ValueError, match="n_actions"):
+        _run(tmp_path, "dqn", kw={"n_actions": 3})
+
+
+def test_resume_refuses_a_different_scenario(tmp_path):
+    _run(tmp_path, stop=30)
+    with pytest.raises(RuntimeError, match="differs"):
+        train_online("dreamer", seed=0, out_dir=tmp_path, env_factory=_ThreeActionEnv,
+                     encode=fake_encode, device=CPU, cfg=TINY, arm_kwargs=DREAMER_KW)
