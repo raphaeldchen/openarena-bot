@@ -397,6 +397,8 @@ def test_the_record_carries_the_arms_effective_settings(tmp_path):
     s = dreamer["arm_settings"]
     assert (s["encoder"], s["n_actions"], s["batch_size"], s["seq_len"]) == ("frozen_ssl", 4, 2, 8)
     assert s["ac"]["bound_reward_readout"] is True and s["ac"]["drop_terminal_starts"] is True
+    assert s["world_model"]["arm"] == "frozen_ssl"
+    assert s["world_model"]["train"]["reward_transform"] == "symlog"
     assert load_record(tmp_path / "dqn" / "record.json")["arm_settings"] == dqn["arm_settings"]
 
 
@@ -437,3 +439,21 @@ def test_a_random_vit_run_completes_and_deletes(tmp_path, arm):
     assert list((tmp_path / "replay").glob("*.features_random_vit.npy"))
     delete_replay_features(tmp_path, TINY)
     assert list((tmp_path / "replay").iterdir()) == []
+
+
+def test_a_failing_second_environment_closes_the_first(tmp_path):
+    made, closed = [], []
+
+    class _Env(FakeEnv):
+        def close(self):
+            closed.append(1)
+
+    def factory():
+        if made:
+            raise OSError("no second display")
+        made.append(1)
+        return _Env()
+
+    with pytest.raises(OSError, match="second"):
+        train_online(**_call(tmp_path, env_factory=factory))
+    assert closed == [1]

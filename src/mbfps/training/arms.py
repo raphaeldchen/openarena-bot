@@ -80,7 +80,7 @@ class DreamerArm:
         """The settings this arm ran with, defaults included (written to the record)."""
         return {"encoder": self.encoder, "n_actions": self.n_actions,
                 "batch_size": self.batch_size, "seq_len": self.seq_len,
-                "ac": asdict(self.learner.cfg)}
+                "world_model": asdict(self.world_model.cfg), "ac": asdict(self.learner.cfg)}
 
     def add_episode(self, path: Path) -> None:
         self.loader.add(path)

@@ -129,7 +129,7 @@ def _check_owner(replay_dir: Path, meta: dict, resuming: bool) -> None:
         if owner != _owner(meta):
             raise RuntimeError(
                 f"{replay_dir} holds episode files this run does not own (owner: {owner}); "
-                f"move or delete them, or choose another output directory")
+                "move or delete them, or choose another output directory")
 
 
 def _write_owner(replay_dir: Path, meta: dict) -> None:
@@ -168,7 +168,12 @@ def train_online(arm_name: str, seed: int, out_dir: Path, env_factory, encode, d
                          "in arm_kwargs")
     # The environments are built before the arm: the action count is the
     # environment's, and the arm's seed_everything resets every global RNG anyway.
-    train_env, eval_env = env_factory(), env_factory()
+    train_env = env_factory()
+    try:
+        eval_env = env_factory()
+    except BaseException:
+        train_env.close()
+        raise
     n_actions = int(train_env.action_space.n)
     meta = _meta(arm_name, seed, cfg, arm_kwargs, device,
                  scenario=getattr(train_env, "scenario", None), n_actions=n_actions)
